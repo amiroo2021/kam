@@ -9,6 +9,8 @@ Everything here is offline. No exchange is contacted, no order is placed.
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = REPO_ROOT / "installer"
@@ -234,6 +237,28 @@ class FixtureCase(unittest.TestCase):
     def commands(self) -> Path:
         return self.hermes / "hermes_cli" / "commands.py"
 
+    def load_adapter_module(self):
+        spec = importlib.util.spec_from_file_location("fixture_adapter", self.adapter)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        module.Any = Any
+        module.Optional = Optional
+        module.Dict = Dict
+        module.List = List
+        module.normalize_telegram_chat_id = lambda chat_id: chat_id
+        module._redact_telegram_error_text = lambda exc: str(exc)
+        module.InlineKeyboardButton = lambda *args, **kwargs: (args, kwargs)
+        module.InlineKeyboardMarkup = lambda rows: rows
+        module.ParseMode = type("ParseMode", (), {"MARKDOWN_V2": "MARKDOWN_V2"})
+        module.SendResult = type(
+            "SendResult",
+            (),
+            {"__init__": lambda self, success=False, error=None, message_id=None: setattr(self, "success", success) or setattr(self, "error", error) or setattr(self, "message_id", message_id)},
+        )
+        spec.loader.exec_module(module)
+        return module
+
 
 # ---------------------------------------------------------------------------
 # 1. fresh install
@@ -289,6 +314,27 @@ class TestFreshInstall(FixtureCase):
                 [PY, "-m", "py_compile", str(path)], capture_output=True, text=True
             )
             self.assertEqual(proc.returncode, 0, f"{path}: {proc.stderr}")
+
+    def test_helper_inserted_at_class_indentation_and_is_direct_method(self):
+        proc = run_installer(self.hermes)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = self.adapter.read_text()
+        self.assertIn("\n    async def send_inline_keyboard(\n", text)
+        self.assertNotIn("\n        async def send_inline_keyboard(\n", text)
+
+        module = self.load_adapter_module()
+        cls = module.TelegramAdapter
+        self.assertTrue(hasattr(cls, "send_inline_keyboard"))
+        self.assertTrue(callable(cls.send_inline_keyboard))
+        source = inspect.getsource(cls.send_inline_keyboard)
+        self.assertIn("async def send_inline_keyboard", source)
+        self.assertTrue(source.startswith("    async def send_inline_keyboard"))
+
+        instance = cls()
+        bound = getattr(instance, "send_inline_keyboard", None)
+        self.assertIsNotNone(bound)
+        self.assertTrue(callable(bound))
+        self.assertIs(getattr(bound, "__self__", None), instance)
 
     def test_manifest_written_with_required_fields(self):
         run_installer(self.hermes)

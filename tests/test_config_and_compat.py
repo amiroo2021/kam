@@ -25,12 +25,15 @@ INSTALLER = REPO_ROOT / "installer"
 sys.path.insert(0, str(INSTALLER))
 
 import kamconfig as C  # noqa: E402
+import kamlib as K  # noqa: E402
 import yaml  # noqa: E402
 from patchspecs import (  # noqa: E402
     all_specs,
     commands_specs,
+    helper_specs,
     legacy_commands_specs,
     supported_commanddef_kwargs,
+    validate_telegram_adapter_helper_scope,
 )
 
 
@@ -320,6 +323,34 @@ class TestNoGatewayPlatformsEmission(unittest.TestCase):
                 spec.relative_path.name, "commands.py",
                 "commands.py patch must not be in the default install path",
             )
+
+    def test_helper_spec_uses_explicit_class_indent(self):
+        helper = helper_specs()[0]
+        self.assertEqual(helper.insertion_indent, "    ")
+        self.assertIn("async def send_inline_keyboard", helper.block)
+
+    def test_helper_scope_validator_rejects_nested_method(self):
+        fixture = (
+            "class TelegramAdapter:\n"
+            "    async def _handle_command(self, update, context):\n"
+            "        await self.handle_message(event)\n"
+            "\n"
+            "    def _should_process_message(self, msg, is_command=False):\n"
+            "        return True\n"
+        )
+        helper = helper_specs()[0]
+        bad_spec = K.PatchSpec(
+            seam=helper.seam,
+            relative_path=helper.relative_path,
+            anchor_before="        await self.handle_message(event)",
+            anchor_after="    def _should_process_message",
+            block=helper.block,
+            native_sentinel=helper.native_sentinel,
+            insertion_indent="        ",
+            ast_validator=validate_telegram_adapter_helper_scope,
+        )
+        with self.assertRaises(K.InstallError):
+            K.apply_patch(fixture, bad_spec)
 
     def test_default_specs_never_emit_gateway_platforms(self):
         blocks = "".join(s.block for s in all_specs())

@@ -14,6 +14,7 @@ runtime by ``plugins/trade/tradedesk.py`` scanning ``agents/x_*_agent.py``.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 INSTALLER_VERSION = "1.0.0"
 KAM_VERSION = "1.0.0"
@@ -263,9 +264,11 @@ class PatchSpec:
     anchor_before: str
     anchor_after: str
     block: str
+    insertion_indent: str
     # If this literal already exists without a KAM marker, the seam is
     # considered natively present and is left alone.
     native_sentinel: str
+    ast_validator: Optional[Callable[[str, "PatchSpec"], None]] = None
 
     def marker_begin(self) -> str:
         return f"{MARKER_BEGIN} ({self.seam})"
@@ -284,8 +287,17 @@ class PatchOutcome:
     sha256_after: Optional[str] = None
 
 
-def _indent_of(line: str) -> str:
-    return line[: len(line) - len(line.lstrip())]
+def _ast_validate_python(text: str, spec: PatchSpec) -> None:
+    try:
+        ast.parse(text, filename=str(spec.relative_path))
+    except SyntaxError as exc:
+        message = exc.msg or "invalid syntax"
+        line = exc.lineno or "?"
+        raise InstallError(
+            f"[{spec.seam}] AST validation failed for {spec.relative_path}: {message} at line {line}. Refusing to patch."
+        ) from exc
+    if spec.ast_validator is not None:
+        spec.ast_validator(text, spec)
 
 
 def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
@@ -299,6 +311,9 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
 
     if spec.native_sentinel in text:
         return text, "native-present", "seam already wired natively (left untouched)"
+
+    if not spec.insertion_indent:
+        raise InstallError(f"[{spec.seam}] insertion_indent is empty; refusing to patch.")
 
     before_count = text.count(spec.anchor_before)
     if before_count != 1:
@@ -321,7 +336,6 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
             f"({idx_before} >= {idx_after}). Refusing to patch."
         )
 
-    # Locate the physical line holding anchor_before so indentation matches.
     lines = text.splitlines(keepends=True)
     target_line_index: Optional[int] = None
     running = 0
@@ -333,9 +347,7 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
     if target_line_index is None:
         raise InstallError(f"[{spec.seam}] could not locate anchor line; refusing to patch.")
 
-    indent = _indent_of(lines[target_line_index])
-
-    # Insertion = comment marker, code block at matching indent, comment marker.
+    indent = spec.insertion_indent
     marker_open = f"{indent}# {spec.marker_begin()}\n"
     marker_close = f"{indent}# {spec.marker_end()}\n"
     code = ""
@@ -349,11 +361,12 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
         + "".join(lines[target_line_index + 1 :])
     )
 
-    # Re-verify ordering survived the edit.
     if new_text.index(spec.marker_begin()) >= new_text.index(spec.anchor_after):
         raise InstallError(
             f"[{spec.seam}] post-insert ordering check failed; refusing to keep patch."
         )
+    if spec.relative_path.suffix == ".py":
+        _ast_validate_python(new_text, spec)
     return new_text, "patched", "inserted after anchor_before"
 
 

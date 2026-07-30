@@ -15,6 +15,7 @@ interception. Everything exchange-specific lives inside
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import subprocess
@@ -22,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
-from kamlib import PatchSpec
+from kamlib import InstallError, PatchSpec
 
 TELEGRAM_ADAPTER = Path("plugins") / "platforms" / "telegram" / "adapter.py"
 HERMES_COMMANDS = Path("hermes_cli") / "commands.py"
@@ -275,6 +276,47 @@ async def send_inline_keyboard(
 INLINE_KEYBOARD_HELPER_SENTINEL = 'suffix.startswith(f"{callback_prefix}:")'
 
 
+def validate_telegram_adapter_helper_scope(text: str, spec: PatchSpec) -> None:
+    """Refuse helper installs unless the helper is a direct TelegramAdapter member."""
+    try:
+        tree = ast.parse(text, filename=str(spec.relative_path))
+    except SyntaxError as exc:  # pragma: no cover - generic AST guard fires first
+        raise InstallError(
+            f"[{spec.seam}] AST validation failed for {spec.relative_path}: {exc.msg}. Refusing to patch."
+        ) from exc
+
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TelegramAdapter"),
+        None,
+    )
+    if adapter is None:
+        raise InstallError(
+            f"[{spec.seam}] TelegramAdapter class not found in {spec.relative_path}. Refusing to patch."
+        )
+
+    direct = [
+        node for node in adapter.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "send_inline_keyboard"
+    ]
+    if len(direct) == 1:
+        return
+
+    nested = any(
+        isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "send_inline_keyboard"
+        for node in ast.walk(adapter)
+    )
+    if nested:
+        raise InstallError(
+            f"[{spec.seam}] send_inline_keyboard landed at the wrong lexical scope in {spec.relative_path}; "
+            "it is nested inside another method instead of being a direct member of TelegramAdapter. Refusing to patch."
+        )
+    raise InstallError(
+        f"[{spec.seam}] send_inline_keyboard is not a direct member of TelegramAdapter in {spec.relative_path}. Refusing to patch."
+    )
+
+
 def _choose_helper_anchor(hermes_root: Optional[Path]) -> tuple[str, str]:
     """Pick a portable insertion anchor for the helper override.
 
@@ -318,7 +360,9 @@ def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             anchor_before=anchor_before,
             anchor_after=anchor_after,
             block=_INLINE_KEYBOARD_HELPER_BLOCK,
+            insertion_indent="    ",
             native_sentinel=INLINE_KEYBOARD_HELPER_SENTINEL,
+            ast_validator=validate_telegram_adapter_helper_scope,
         ),
     ]
 
@@ -332,6 +376,7 @@ def adapter_specs() -> List[PatchSpec]:
             anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
             anchor_after="# --- Model picker callbacks ---",
             block=_CALLBACK_BLOCK,
+            insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_callback",
         ),
         PatchSpec(
@@ -343,6 +388,7 @@ def adapter_specs() -> List[PatchSpec]:
                 "update_id=update.update_id)"
             ),
             block=_TEXT_BLOCK,
+            insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
         ),
         PatchSpec(
@@ -354,6 +400,7 @@ def adapter_specs() -> List[PatchSpec]:
                 "update_id=update.update_id)"
             ),
             block=_COMMAND_BLOCK,
+            insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_command",
         ),
     ]
@@ -376,6 +423,7 @@ def legacy_commands_specs() -> List[PatchSpec]:
             ),
             anchor_after='CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",',
             block=_LEGACY_COMMANDDEF_BLOCK,
+            insertion_indent="    ",
             native_sentinel='CommandDef("trade",',
         ),
     ]
