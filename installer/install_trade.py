@@ -17,6 +17,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+from packaging.requirements import Requirement
+from packaging.version import InvalidVersion, Version
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kamlib as K  # noqa: E402
@@ -96,6 +99,7 @@ def iter_sdk_dependencies(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
             version = str(sdk.get("version") or "").strip()
             import_probe = str(sdk.get("import_probe") or "").strip()
             install_args = sdk.get("install_args") or []
+            runtime_dependencies = sdk.get("runtime_dependencies") or []
             if not package or not version or not import_probe:
                 raise K.InstallError(
                     f"Exchange '{exchange_name}' sdk entry must declare package, version, and import_probe"
@@ -104,14 +108,65 @@ def iter_sdk_dependencies(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 raise K.InstallError(
                     f"Exchange '{exchange_name}' sdk '{package}' install_args must be a list of strings"
                 )
+            if not isinstance(runtime_dependencies, list):
+                raise K.InstallError(
+                    f"Exchange '{exchange_name}' sdk '{package}' runtime_dependencies must be a list"
+                )
+            normalized_runtime_dependencies = [
+                _normalize_runtime_dependency(exchange_name, package, dep)
+                for dep in runtime_dependencies
+            ]
             record = dict(sdk)
             record["exchange"] = exchange_name
             record["package"] = package
             record["version"] = version
             record["import_probe"] = import_probe
             record["install_args"] = [str(arg) for arg in install_args]
+            record["runtime_dependencies"] = normalized_runtime_dependencies
             records.append(record)
     return records
+
+
+def _normalize_runtime_dependency(
+    exchange_name: str,
+    sdk_package: str,
+    dep: Any,
+) -> Dict[str, Any]:
+    if not isinstance(dep, dict):
+        raise K.InstallError(
+            f"Exchange '{exchange_name}' sdk '{sdk_package}' has a non-object runtime dependency entry"
+        )
+    package = str(dep.get("package") or "").strip()
+    version = str(dep.get("version") or "").strip()
+    version_spec = str(dep.get("version_spec") or "").strip()
+    install_args = dep.get("install_args") or []
+    if not package:
+        raise K.InstallError(
+            f"Exchange '{exchange_name}' sdk '{sdk_package}' runtime dependency missing package"
+        )
+    if version and version_spec:
+        raise K.InstallError(
+            f"Exchange '{exchange_name}' sdk '{sdk_package}' runtime dependency '{package}' cannot declare both version and version_spec"
+        )
+    if not isinstance(install_args, list) or any(not isinstance(arg, str) for arg in install_args):
+        raise K.InstallError(
+            f"Exchange '{exchange_name}' sdk '{sdk_package}' runtime dependency '{package}' install_args must be a list of strings"
+        )
+    record = dict(dep)
+    record["package"] = package
+    record["version"] = version or None
+    record["version_spec"] = version_spec or None
+    record["install_args"] = [str(arg) for arg in install_args]
+    record["install_if_missing_only"] = bool(dep.get("install_if_missing_only", True))
+    return record
+
+
+def _dependency_requirement_string(dep: Dict[str, Any]) -> str:
+    if dep.get("version"):
+        return f"{dep['package']}=={dep['version']}"
+    if dep.get("version_spec"):
+        return f"{dep['package']}{dep['version_spec']}"
+    return str(dep["package"])
 
 
 def _sdk_requirement_string(spec: Dict[str, Any]) -> str:
@@ -130,15 +185,148 @@ def _sdk_install_command(python_exe: Path, spec: Dict[str, Any]) -> List[str]:
     ]
 
 
-def _verify_import_probe(python_exe: Path, spec: Dict[str, Any]) -> None:
+def _runtime_dependency_install_command(python_exe: Path, dep: Dict[str, Any]) -> List[str]:
+    return [
+        str(python_exe),
+        "-m",
+        "pip",
+        "install",
+        "--no-input",
+        *[str(arg) for arg in dep.get("install_args") or []],
+        _dependency_requirement_string(dep),
+    ]
+
+
+def _installed_version_satisfies(installed_version: str | None, dep: Dict[str, Any]) -> bool:
+    if not installed_version:
+        return False
+    try:
+        if dep.get("version"):
+            return installed_version == str(dep["version"])
+        if dep.get("version_spec"):
+            req = Requirement(f"placeholder{dep['version_spec']}")
+            return Version(installed_version) in req.specifier
+        return True
+    except (InvalidVersion, ValueError):
+        return False
+
+
+def _minimum_required_version(dep: Dict[str, Any]) -> tuple[Version, bool] | None:
+    try:
+        if dep.get("version"):
+            return Version(str(dep["version"])), False
+        if not dep.get("version_spec"):
+            return None
+        req = Requirement(f"placeholder{dep['version_spec']}")
+        minimum: tuple[Version, bool] | None = None
+        for specifier in req.specifier:
+            if specifier.operator not in {">=", ">", "==", "~=", "==="}:
+                continue
+            try:
+                version = Version(specifier.version)
+            except InvalidVersion:
+                continue
+            candidate = (version, specifier.operator in {">", "~="})
+            if minimum is None or version > minimum[0] or (version == minimum[0] and candidate[1] and not minimum[1]):
+                minimum = candidate
+        return minimum
+    except ValueError:
+        return None
+
+
+def _installed_version_is_below_minimum(installed_version: str | None, dep: Dict[str, Any]) -> bool:
+    if not installed_version:
+        return True
+    minimum = _minimum_required_version(dep)
+    if minimum is None:
+        return False
+    try:
+        installed = Version(installed_version)
+    except InvalidVersion:
+        return False
+    minimum_version, exclusive = minimum
+    if installed < minimum_version:
+        return True
+    if exclusive and installed == minimum_version:
+        return True
+    return False
+
+
+def _runtime_dependency_action(installed_version: str | None, dep: Dict[str, Any]) -> str:
+    if not installed_version:
+        return "install"
+    if _installed_version_satisfies(installed_version, dep):
+        return "already-satisfied"
+    if _installed_version_is_below_minimum(installed_version, dep):
+        return "install"
+    return "preserved-newer-installed-version"
+
+
+def _plan_runtime_dependency_actions(
+    current_versions: Dict[str, str],
+    spec: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    for dep in spec.get("runtime_dependencies") or []:
+        installed_version = current_versions.get(_normalize_dist_name(dep["package"]))
+        action = _runtime_dependency_action(installed_version, dep)
+        action_record = {
+            "package": dep["package"],
+            "version": dep.get("version"),
+            "version_spec": dep.get("version_spec"),
+            "requirement": _dependency_requirement_string(dep),
+            "manifest_requirement": _dependency_requirement_string(dep),
+            "installed_version": installed_version,
+            "install_args": list(dep.get("install_args") or []),
+            "install_command": _runtime_dependency_install_command(Path("/unused/python"), dep),
+            "action": action,
+        }
+        if action == "preserved-newer-installed-version":
+            action_record["report"] = (
+                "Preserved newer installed version. No downgrade performed. "
+                "Import probe will determine compatibility with current Hermes environment."
+            )
+        actions.append(action_record)
+    return actions
+
+
+def _bind_runtime_dependency_commands(
+    python_exe: Path,
+    runtime_dependency_actions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    bound: List[Dict[str, Any]] = []
+    for action in runtime_dependency_actions:
+        item = dict(action)
+        item["install_command"] = _runtime_dependency_install_command(python_exe, item)
+        bound.append(item)
+    return bound
+
+
+def _verify_import_probe(
+    python_exe: Path,
+    spec: Dict[str, Any],
+    runtime_dependency_reports: List[Dict[str, Any]] | None = None,
+) -> None:
     proc = subprocess.run(
         [str(python_exe), "-c", str(spec.get("import_probe") or "")],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
+        preserved = [
+            dep for dep in (runtime_dependency_reports or [])
+            if dep.get("action") == "preserved-newer-installed-version"
+        ]
+        details = []
+        for dep in preserved:
+            details.append(
+                f"dependency={dep.get('package')} installed={dep.get('installed_version')} manifest={dep.get('manifest_requirement')}"
+            )
+        preserved_block = ""
+        if details:
+            preserved_block = "\nPreserved runtime dependencies:\n" + "\n".join(details)
         raise K.InstallError(
-            f"SDK import probe failed for {spec.get('package')}=={spec.get('version')}:\n"
-            f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+            f"SDK import probe failed for {spec.get('package')}=={spec.get('version')}:"
+            f"{preserved_block}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
         )
 
 
@@ -146,6 +334,7 @@ def _assert_dependency_state_preserved(
     before: Dict[str, str],
     after: Dict[str, str],
     policy: Dict[str, Any] | None,
+    allowed_changed_packages: set[str] | None = None,
 ) -> Dict[str, Any]:
     policy = dict(policy or {})
     preserve_existing_versions = bool(policy.get("preserve_existing_versions", True))
@@ -154,6 +343,11 @@ def _assert_dependency_state_preserved(
         for name in (policy.get("protected_packages") or [])
         if str(name).strip()
     ]
+    allowed_changed = {
+        _normalize_dist_name(name)
+        for name in (allowed_changed_packages or set())
+        if str(name).strip()
+    }
 
     protected_changes = [
         {
@@ -173,7 +367,7 @@ def _assert_dependency_state_preserved(
     changed = [
         {"package": name, "before": before[name], "after": after.get(name)}
         for name in sorted(before)
-        if name in after and before[name] != after[name]
+        if name in after and before[name] != after[name] and name not in allowed_changed
     ]
     removed = [name for name in sorted(before) if name not in after]
     if preserve_existing_versions and (changed or removed):
@@ -192,6 +386,7 @@ def _assert_dependency_state_preserved(
     return {
         "preserve_existing_versions": preserve_existing_versions,
         "protected_packages": protected_packages,
+        "allowed_changed_packages": sorted(allowed_changed),
         "changed_packages": changed,
         "removed_packages": removed,
         "ok": True,
@@ -494,6 +689,15 @@ def install_dependencies(
                 f"Would run SDK install [{spec['exchange']}:{spec.get('id') or spec['package']}] "
                 f"{' '.join(command)}"
             )
+            runtime_dependency_actions = _bind_runtime_dependency_commands(
+                python_exe,
+                _plan_runtime_dependency_actions({}, spec),
+            )
+            for dep_action in runtime_dependency_actions:
+                ok(
+                    f"Would run runtime dependency install [{spec['exchange']}:{spec.get('id') or spec['package']}] "
+                    f"{' '.join(dep_action['install_command'])}"
+                )
             sdk_reports.append({
                 "exchange": spec["exchange"],
                 "id": spec.get("id") or spec["package"],
@@ -501,6 +705,7 @@ def install_dependencies(
                 "version": spec["version"],
                 "install_args": list(spec.get("install_args") or []),
                 "install_command": command,
+                "runtime_dependencies": runtime_dependency_actions,
                 "import_probe": spec["import_probe"],
                 "import_verification": "pending",
                 "preservation": dict(spec.get("preservation_policy") or {}),
@@ -541,7 +746,45 @@ def install_dependencies(
             after_sdk,
             spec.get("preservation_policy"),
         )
-        _verify_import_probe(python_exe, spec)
+        runtime_dependency_actions = _bind_runtime_dependency_commands(
+            python_exe,
+            _plan_runtime_dependency_actions(after_sdk, spec),
+        )
+        runtime_dependency_reports = []
+        runtime_versions = after_sdk
+        for dep_action in runtime_dependency_actions:
+            dep_report = dict(dep_action)
+            if dep_action["action"] == "install":
+                proc = subprocess.run(dep_action["install_command"], capture_output=True, text=True)
+                if proc.returncode != 0:
+                    raise K.InstallError(
+                        f"Runtime dependency install failed for {dep_action['requirement']}:\n"
+                        f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+                    )
+                after_dep = _pip_list_versions(python_exe)
+                dep_report["preservation"] = _assert_dependency_state_preserved(
+                    runtime_versions,
+                    after_dep,
+                    spec.get("preservation_policy"),
+                    allowed_changed_packages={dep_action["package"]},
+                )
+                dep_report["action"] = "installed"
+                runtime_versions = after_dep
+            elif dep_action["action"] == "already-satisfied":
+                dep_report["preservation"] = {
+                    "ok": True,
+                    "reason": "already-satisfied",
+                    "installed_version": dep_action.get("installed_version"),
+                }
+            else:
+                dep_report["preservation"] = {
+                    "ok": True,
+                    "reason": "preserved-newer-installed-version",
+                    "installed_version": dep_action.get("installed_version"),
+                    "manifest_requirement": dep_action.get("manifest_requirement"),
+                }
+            runtime_dependency_reports.append(dep_report)
+        _verify_import_probe(python_exe, spec, runtime_dependency_reports)
         sdk_reports.append({
             "exchange": spec["exchange"],
             "id": spec.get("id") or spec["package"],
@@ -549,6 +792,7 @@ def install_dependencies(
             "version": spec["version"],
             "install_args": list(spec.get("install_args") or []),
             "install_command": command,
+            "runtime_dependencies": runtime_dependency_reports,
             "import_probe": spec["import_probe"],
             "import_verification": "passed",
             "preservation": preservation,
@@ -558,7 +802,7 @@ def install_dependencies(
             f"SDK installed: {spec['package']}=={spec['version']} "
             f"args={spec.get('install_args') or []} import=passed preservation=passed"
         )
-        current_versions = after_sdk
+        current_versions = runtime_versions
 
     ok("Dependencies satisfied")
     return {

@@ -9,13 +9,24 @@
           "package": "lighter-sdk",
           "version": "1.1.2",
           "install_args": ["--no-deps"],
+          "runtime_dependencies": [
+            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"},
+            {"package": "python-dateutil"},
+            {"package": "aiohttp", "version_spec": ">=3.0.0"},
+            {"package": "aiohttp-retry", "version_spec": ">=2.8.3"},
+            {"package": "pydantic", "version_spec": ">=2"},
+            {"package": "typing-extensions", "version_spec": ">=4.7.1"},
+            {"package": "websockets", "version_spec": ">=12.0.0"},
+            {"package": "eth-account", "version_spec": ">=0.13.4"},
+            {"package": "requests", "version_spec": ">=2.31.0"}
+          ],
           "import_probe": "import lighter; from lighter import SignerClient",
           "preservation_policy": {
             "preserve_existing_versions": true,
             "protected_packages": ["urllib3"]
           },
           "metadata": {
-            "notes": "Official Lighter SDK installed without dependency resolution so Hermes-managed packages are untouched."
+            "notes": "Install the SDK without resolver-managed deps, then add any missing runtime dependencies explicitly while preserving Hermes-managed package versions."
           }
         }
       ]

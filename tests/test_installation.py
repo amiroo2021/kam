@@ -618,6 +618,7 @@ class TestDependencyInstallUnit(unittest.TestCase):
                             "package": "alpha-sdk",
                             "version": "1.2.3",
                             "install_args": ["--no-deps"],
+                            "runtime_dependencies": [],
                             "import_probe": "import alpha; from alpha import Client",
                             "preservation_policy": {
                                 "preserve_existing_versions": True,
@@ -804,6 +805,240 @@ class TestDependencyInstallUnit(unittest.TestCase):
         with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(K.InstallError):
                 IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+    def test_installs_missing_runtime_dependencies_before_import_probe(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "runtime_dependencies": [
+                            {
+                                "package": "alpha-runtime",
+                                "version_spec": ">=0.4.0",
+                                "install_args": [],
+                            }
+                        ],
+                        "import_probe": "import alpha; from alpha import Client",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    }
+                ],
+            }
+        ]))
+        snapshots = [
+            {"urllib3": "2.2.3"},
+            {"urllib3": "2.2.3", "alpha-sdk": "1.2.3"},
+            {"urllib3": "2.2.3", "alpha-sdk": "1.2.3", "alpha-runtime": "0.4.1"},
+        ]
+        list_count = {"n": 0}
+        calls: List[List[str]] = []
+
+        def fake_run(cmd, capture_output=True, text=True):
+            calls.append(cmd)
+            if cmd[-2:] == ["list", "--format=json"]:
+                payload = snapshots[list_count["n"]]
+                list_count["n"] += 1
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                runtime_installed = any("alpha-runtime" in " ".join(c) for c in calls if c[:4] == ["/fake/python", "-m", "pip", "install"])
+                if runtime_installed:
+                    return self._proc(stdout="ok")
+                return self._proc(returncode=1, stderr="ModuleNotFoundError: No module named 'alpha_runtime'")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        self.assertEqual(result["sdks"][0]["import_verification"], "passed")
+        runtime_commands = result["sdks"][0]["runtime_dependencies"]
+        self.assertEqual(len(runtime_commands), 1)
+        self.assertIn("alpha-runtime>=0.4.0", " ".join(runtime_commands[0]["install_command"]))
+
+    def test_dry_run_reports_runtime_dependency_commands(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "runtime_dependencies": [
+                            {
+                                "package": "alpha-runtime",
+                                "version_spec": ">=0.4.0",
+                                "install_args": ["--quiet"],
+                            }
+                        ],
+                        "import_probe": "import alpha",
+                    }
+                ],
+            }
+        ]))
+        result = IT.install_dependencies(Path("/fake/python"), dry_run=True, manifest_path=manifest_path)
+        self.assertEqual(result["sdks"][0]["runtime_dependencies"][0]["package"], "alpha-runtime")
+        self.assertIn("alpha-runtime>=0.4.0", " ".join(result["sdks"][0]["runtime_dependencies"][0]["install_command"]))
+        self.assertIn("--quiet", result["sdks"][0]["runtime_dependencies"][0]["install_command"])
+
+    def test_upgrades_existing_runtime_dependency_when_version_is_too_low(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "runtime_dependencies": [
+                            {
+                                "package": "alpha-runtime",
+                                "version_spec": ">=0.4.0",
+                                "install_args": [],
+                            }
+                        ],
+                        "import_probe": "import alpha",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    }
+                ],
+            }
+        ]))
+        snapshots = [
+            {"urllib3": "2.2.3", "alpha-runtime": "0.3.0"},
+            {"urllib3": "2.2.3", "alpha-runtime": "0.3.0", "alpha-sdk": "1.2.3"},
+            {"urllib3": "2.2.3", "alpha-runtime": "0.4.1", "alpha-sdk": "1.2.3"},
+        ]
+        list_count = {"n": 0}
+        calls: List[List[str]] = []
+
+        def fake_run(cmd, capture_output=True, text=True):
+            calls.append(cmd)
+            if cmd[-2:] == ["list", "--format=json"]:
+                payload = snapshots[list_count["n"]]
+                list_count["n"] += 1
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        dep_report = result["sdks"][0]["runtime_dependencies"][0]
+        self.assertEqual(dep_report["action"], "installed")
+        self.assertEqual(dep_report["installed_version"], "0.3.0")
+        self.assertIn("alpha-runtime>=0.4.0", " ".join(dep_report["install_command"]))
+
+    def test_preserves_newer_runtime_dependency_when_above_manifest_and_import_passes(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "runtime_dependencies": [
+                            {
+                                "package": "alpha-runtime",
+                                "version_spec": ">=0.4.0,<0.5.0",
+                                "install_args": [],
+                            }
+                        ],
+                        "import_probe": "import alpha",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    }
+                ],
+            }
+        ]))
+        snapshots = [
+            {"urllib3": "2.2.3", "alpha-runtime": "0.7.0"},
+            {"urllib3": "2.2.3", "alpha-runtime": "0.7.0", "alpha-sdk": "1.2.3"},
+        ]
+        list_count = {"n": 0}
+        calls: List[List[str]] = []
+
+        def fake_run(cmd, capture_output=True, text=True):
+            calls.append(cmd)
+            if cmd[-2:] == ["list", "--format=json"]:
+                payload = snapshots[list_count["n"]]
+                list_count["n"] += 1
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        dep_report = result["sdks"][0]["runtime_dependencies"][0]
+        self.assertEqual(dep_report["action"], "preserved-newer-installed-version")
+        self.assertEqual(dep_report["installed_version"], "0.7.0")
+        self.assertEqual(dep_report["manifest_requirement"], "alpha-runtime>=0.4.0,<0.5.0")
+        pip_install_commands = [cmd for cmd in calls if cmd[:4] == ["/fake/python", "-m", "pip", "install"]]
+        self.assertEqual(len([cmd for cmd in pip_install_commands if any("alpha-runtime" in part for part in cmd)]), 0)
+
+    def test_preserved_newer_runtime_dependency_fails_if_import_probe_fails(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "runtime_dependencies": [
+                            {
+                                "package": "alpha-runtime",
+                                "version_spec": ">=0.4.0,<0.5.0",
+                                "install_args": [],
+                            }
+                        ],
+                        "import_probe": "import alpha",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    }
+                ],
+            }
+        ]))
+        snapshots = [
+            {"urllib3": "2.2.3", "alpha-runtime": "0.7.0"},
+            {"urllib3": "2.2.3", "alpha-runtime": "0.7.0", "alpha-sdk": "1.2.3"},
+        ]
+        list_count = {"n": 0}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                payload = snapshots[list_count["n"]]
+                list_count["n"] += 1
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(returncode=1, stderr="Traceback\nModuleNotFoundError: No module named 'alpha'\n")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(K.InstallError) as ctx:
+                IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        message = str(ctx.exception)
+        self.assertIn("alpha-runtime", message)
+        self.assertIn("0.7.0", message)
+        self.assertIn("alpha-runtime>=0.4.0,<0.5.0", message)
+        self.assertIn("ModuleNotFoundError", message)
 
     def test_dry_run_reports_all_sdk_commands(self):
         manifest_path = self._write_manifest(self._manifest(exchanges=[
