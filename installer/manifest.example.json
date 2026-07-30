@@ -1,0 +1,91 @@
+{
+  "_comment": [
+    "TEMPLATE / SCHEMA REFERENCE ONLY - this file documents the shape of the",
+    "manifest the installer writes. It is not read by any code.",
+    "",
+    "At install time the installer writes a real manifest to two locations:",
+    "  1. installer/manifest.json                        (in this repo, gitignored)",
+    "  2. <HERMES_ROOT>/.kam-trade/manifest.json               (authoritative, used by uninstall)",
+    "",
+    "The real manifest contains absolute machine-specific paths, which is why it",
+    "is gitignored and never committed.",
+    "",
+    "'action' values for copied_files : created | updated | unchanged | would-write",
+    "'action' values for patched_files: patched | already-installed | native-present | would-patch",
+    "",
+    "sha256_before is null for a newly created file. For patched files, all seams",
+    "sharing one target file report that file's hash before and after the whole",
+    "patch pass, so seams in the same file share before/after values."
+  ],
+
+  "kam_version": "1.0.0",
+  "installer_version": "1.0.0",
+  "timestamp": "2026-01-01T00:00:00Z",
+
+  "hermes_root": "/path/to/hermes",
+  "hermes_home": "/root/.hermes",
+  "gateway_python": "/path/to/hermes/venv/bin/python",
+
+  "compatible_hermes": {
+    "commit": "<git rev-parse HEAD of the target Hermes checkout>",
+    "describe": "<git describe --tags --always>",
+    "adapter_sha256": "<sha256 of plugins/platforms/telegram/adapter.py>"
+  },
+
+  "backup_dir": "/path/to/hermes/.kam-trade/backups/YYYYMMDD-HHMMSS",
+  "dry_run": false,
+
+  "copied_files": [
+    {
+      "path": "plugins/trade/wizard.py",
+      "sha256_before": null,
+      "sha256_after": "<sha256 of the installed file>",
+      "action": "created"
+    }
+  ],
+
+  "patched_files": [
+    {
+      "seam": "callback dispatch",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "action": "patched",
+      "detail": "inserted after anchor_before",
+      "sha256_before": "<sha256 before the patch pass>",
+      "sha256_after": "<sha256 after the patch pass>"
+    },
+    {
+      "seam": "wizard text interception",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "action": "patched",
+      "detail": "inserted after anchor_before",
+      "sha256_before": "<sha256 before the patch pass>",
+      "sha256_after": "<sha256 after the patch pass>"
+    },
+    {
+      "seam": "slash command dispatch",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "action": "patched",
+      "detail": "inserted after anchor_before",
+      "sha256_before": "<sha256 before the patch pass>",
+      "sha256_after": "<sha256 after the patch pass>"
+    },
+    {
+      "seam": "command menu entry",
+      "path": "hermes_cli/commands.py",
+      "action": "patched",
+      "detail": "inserted after anchor_before",
+      "sha256_before": "<sha256 before the patch pass>",
+      "sha256_after": "<sha256 after the patch pass>"
+    }
+  ],
+
+  "dependencies": {
+    "requirements": "/path/to/kam/installer/requirements.txt",
+    "action": "installed"
+  },
+
+  "restart": {
+    "action": "restarted",
+    "state": "active"
+  }
+}

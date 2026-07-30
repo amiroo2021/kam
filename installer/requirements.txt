@@ -1,0 +1,16 @@
+# Runtime dependencies for the KAM /trade add-on.
+#
+# Only packages actually imported by the shipped exchange agents are listed.
+# Versions are lower bounds so the installer never force-upgrades unrelated
+# Hermes packages. Most Hermes installations already satisfy all of these.
+#
+# Deliberately NOT listed (verified unimported by every shipped agent):
+#   pynacl  - no agent imports nacl
+#   base58  - base58 decoding is implemented in-agent
+
+requests>=2.28
+cryptography>=41.0
+eth-abi>=4.0
+eth-account>=0.10
+eth-utils>=2.2
+hyperliquid-python-sdk>=0.9

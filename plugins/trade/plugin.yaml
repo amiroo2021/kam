@@ -1,0 +1,7 @@
+name: trade
+version: 0.1.0
+description: >-
+  /trade wizard — exchange-agnostic Telegram interface to a pluggable set
+  of exchange agents (Hyperliquid, Rise, Pacifica, ...). Phase 1 supports
+  selecting exchange + account + action and reading the canonical balance.
+hooks: []

@@ -1,0 +1,54 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Logs and runtime state
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Backups produced by the installer
+backups/
+.kam-trade/
+
+# Credentials and key material - never commit
+auth.json
+*_auth.json
+*.pem
+*.key
+*.keystore
+id_rsa*
+id_ed25519*
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Written by the installer at install time (contains machine-specific paths)
+installer/manifest.json
