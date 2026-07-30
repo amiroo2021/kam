@@ -20,12 +20,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = REPO_ROOT / "installer"
 sys.path.insert(0, str(INSTALLER))
 
 import kamlib as K  # noqa: E402
+import install_trade as IT  # noqa: E402
 from patchspecs import adapter_specs, all_specs  # noqa: E402
 
 PY = sys.executable
@@ -593,6 +595,302 @@ class TestVerificationGate(FixtureCase):
             self.assertNotIn(forbidden, lowered)
 
 
+class TestDependencyInstallUnit(unittest.TestCase):
+    def _proc(self, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _write_manifest(self, payload: Dict[str, Any]) -> Path:
+        td = tempfile.TemporaryDirectory(prefix="kam-sdk-manifest-")
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / "sdk_dependencies.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def _manifest(self, exchanges: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "exchanges": exchanges or [
+                {
+                    "exchange": "alpha",
+                    "sdks": [
+                        {
+                            "id": "sdk-a",
+                            "package": "alpha-sdk",
+                            "version": "1.2.3",
+                            "install_args": ["--no-deps"],
+                            "import_probe": "import alpha; from alpha import Client",
+                            "preservation_policy": {
+                                "preserve_existing_versions": True,
+                                "protected_packages": ["urllib3"],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_manifest_parsing_and_sdk_iteration(self):
+        path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "import_probe": "import alpha",
+                    },
+                    {
+                        "id": "sdk-b",
+                        "package": "alpha-helper",
+                        "version": "4.5.6",
+                        "install_args": ["--quiet"],
+                        "import_probe": "import alpha_helper",
+                    },
+                ],
+            },
+            {
+                "exchange": "beta",
+                "sdks": [
+                    {
+                        "id": "sdk-c",
+                        "package": "beta-sdk",
+                        "version": "7.8.9",
+                        "install_args": [],
+                        "import_probe": "import beta",
+                    }
+                ],
+            },
+        ]))
+        manifest = IT.load_dependency_manifest(path)
+        sdks = IT.iter_sdk_dependencies(manifest)
+        self.assertEqual([sdk["exchange"] for sdk in sdks], ["alpha", "alpha", "beta"])
+        self.assertEqual([sdk["package"] for sdk in sdks], ["alpha-sdk", "alpha-helper", "beta-sdk"])
+
+    def test_installs_every_sdk_declared_in_manifest_with_declared_args(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "import_probe": "import alpha; from alpha import Client",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    },
+                    {
+                        "id": "sdk-b",
+                        "package": "alpha-helper",
+                        "version": "4.5.6",
+                        "install_args": ["--quiet", "--no-deps"],
+                        "import_probe": "import alpha_helper",
+                        "preservation_policy": {"preserve_existing_versions": True},
+                    },
+                ],
+            },
+            {
+                "exchange": "beta",
+                "sdks": [
+                    {
+                        "id": "sdk-c",
+                        "package": "beta-sdk",
+                        "version": "7.8.9",
+                        "install_args": [],
+                        "import_probe": "import beta; from beta import Client",
+                        "preservation_policy": {"preserve_existing_versions": True},
+                    }
+                ],
+            },
+        ]))
+        before = {"urllib3": "2.2.3", "requests": "2.32.3"}
+        after = before | {"alpha-sdk": "1.2.3", "alpha-helper": "4.5.6", "beta-sdk": "7.8.9"}
+        calls: List[List[str]] = []
+        list_count = {"n": 0}
+        import_probes: List[str] = []
+
+        def fake_run(cmd, capture_output=True, text=True):
+            calls.append(cmd)
+            if cmd[-2:] == ["list", "--format=json"]:
+                list_count["n"] += 1
+                payload = before if list_count["n"] == 1 else after
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                import_probes.append(cmd[2])
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        sdk_commands = [cmd for cmd in calls if cmd[:4] == ["/fake/python", "-m", "pip", "install"] and "-r" not in cmd]
+        self.assertEqual(len(result["sdks"]), 3)
+        self.assertEqual(len(sdk_commands), 3)
+        self.assertIn("--no-deps", sdk_commands[0])
+        self.assertIn("alpha-sdk==1.2.3", sdk_commands[0])
+        self.assertIn("--quiet", sdk_commands[1])
+        self.assertIn("alpha-helper==4.5.6", sdk_commands[1])
+        self.assertEqual(import_probes, [
+            "import alpha; from alpha import Client",
+            "import alpha_helper",
+            "import beta; from beta import Client",
+        ])
+        self.assertEqual(result["versions_before"]["urllib3"], "2.2.3")
+        self.assertEqual(result["versions_after"]["urllib3"], "2.2.3")
+
+    def test_fails_if_protected_package_changes(self):
+        manifest_path = self._write_manifest(self._manifest())
+        before = {"urllib3": "2.2.3"}
+        after = {"urllib3": "2.1.0", "alpha-sdk": "1.2.3"}
+        list_count = {"n": 0}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                list_count["n"] += 1
+                payload = before if list_count["n"] == 1 else after
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(K.InstallError):
+                IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+    def test_fails_if_existing_package_version_changes(self):
+        manifest_path = self._write_manifest(self._manifest())
+        before = {"urllib3": "2.2.3", "requests": "2.32.3"}
+        after = {"urllib3": "2.2.3", "requests": "2.31.0", "alpha-sdk": "1.2.3"}
+        list_count = {"n": 0}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                list_count["n"] += 1
+                payload = before if list_count["n"] == 1 else after
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(K.InstallError):
+                IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+    def test_fails_if_import_probe_fails(self):
+        manifest_path = self._write_manifest(self._manifest())
+        before = {"urllib3": "2.2.3"}
+        after = {"urllib3": "2.2.3", "alpha-sdk": "1.2.3"}
+        list_count = {"n": 0}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                list_count["n"] += 1
+                payload = before if list_count["n"] == 1 else after
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(returncode=1, stderr="ModuleNotFoundError")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(K.InstallError):
+                IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+    def test_dry_run_reports_all_sdk_commands(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "alpha",
+                "sdks": [
+                    {
+                        "id": "sdk-a",
+                        "package": "alpha-sdk",
+                        "version": "1.2.3",
+                        "install_args": ["--no-deps"],
+                        "import_probe": "import alpha",
+                    },
+                    {
+                        "id": "sdk-b",
+                        "package": "alpha-helper",
+                        "version": "4.5.6",
+                        "install_args": ["--quiet"],
+                        "import_probe": "import alpha_helper",
+                    },
+                ],
+            }
+        ]))
+        result = IT.install_dependencies(Path("/fake/python"), dry_run=True, manifest_path=manifest_path)
+        self.assertEqual(result["action"], "would-install")
+        self.assertEqual(len(result["sdks"]), 2)
+        self.assertIn("alpha-sdk==1.2.3", " ".join(result["sdks"][0]["install_command"]))
+        self.assertIn("--no-deps", result["sdks"][0]["install_command"])
+        self.assertIn("alpha-helper==4.5.6", " ".join(result["sdks"][1]["install_command"]))
+
+    def test_repeated_install_is_idempotent(self):
+        manifest_path = self._write_manifest(self._manifest())
+        before = {"urllib3": "2.2.3", "requests": "2.32.3", "alpha-sdk": "1.2.3"}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in before.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="Requirement already satisfied")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        self.assertEqual(result["versions_before"], result["versions_after"])
+        self.assertEqual(result["sdks"][0]["import_verification"], "passed")
+
+    def test_future_exchange_requires_only_manifest_change(self):
+        manifest_path = self._write_manifest(self._manifest(exchanges=[
+            {
+                "exchange": "futuredex",
+                "sdks": [
+                    {
+                        "id": "sdk-future",
+                        "package": "future-sdk",
+                        "version": "9.9.9",
+                        "install_args": ["--no-deps"],
+                        "import_probe": "import future_sdk",
+                        "preservation_policy": {"preserve_existing_versions": True, "protected_packages": ["urllib3"]},
+                    }
+                ],
+            }
+        ]))
+        before = {"urllib3": "2.2.3"}
+        after = {"urllib3": "2.2.3", "future-sdk": "9.9.9"}
+        list_count = {"n": 0}
+
+        def fake_run(cmd, capture_output=True, text=True):
+            if cmd[-2:] == ["list", "--format=json"]:
+                list_count["n"] += 1
+                payload = before if list_count["n"] == 1 else after
+                return self._proc(stdout=json.dumps([{"name": k, "version": v} for k, v in payload.items()]))
+            if cmd[:4] == ["/fake/python", "-m", "pip", "install"]:
+                return self._proc(stdout="ok")
+            if cmd[:2] == ["/fake/python", "-c"]:
+                return self._proc(stdout="ok")
+            self.fail(f"unexpected command: {cmd}")
+
+        with mock.patch.object(IT.subprocess, "run", side_effect=fake_run):
+            result = IT.install_dependencies(Path("/fake/python"), dry_run=False, manifest_path=manifest_path)
+
+        self.assertEqual(result["sdks"][0]["exchange"], "futuredex")
+        self.assertEqual(result["sdks"][0]["package"], "future-sdk")
+
+
 # ---------------------------------------------------------------------------
 # 10-11. uninstall
 # ---------------------------------------------------------------------------
@@ -695,6 +993,24 @@ class TestNonInterference(FixtureCase):
         run_uninstaller(self.hermes)
         self.assertTrue(env.is_file(), ".env deleted by uninstall")
         self.assertEqual(env.read_text(), payload)
+
+    def test_uninstall_does_not_alter_fixture_packages(self):
+        def pkg_snapshot() -> Dict[str, str]:
+            proc = subprocess.run(
+                [FIXTURE_PY, "-m", "pip", "list", "--format=json"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            rows = json.loads(proc.stdout)
+            return {str(row["name"]): str(row["version"]) for row in rows}
+
+        before = pkg_snapshot()
+        self.assertIn("urllib3", before)
+        run_installer(self.hermes)
+        run_uninstaller(self.hermes)
+        after = pkg_snapshot()
+        self.assertEqual(after.get("urllib3"), before.get("urllib3"))
+        self.assertEqual(after, before)
 
     def test_unrelated_plugin_untouched(self):
         other = self.hermes / "plugins" / "other_plugin"

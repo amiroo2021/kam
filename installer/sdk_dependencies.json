@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "exchanges": [
+    {
+      "exchange": "lighter",
+      "sdks": [
+        {
+          "id": "official-python-sdk",
+          "package": "lighter-sdk",
+          "version": "1.1.2",
+          "install_args": ["--no-deps"],
+          "import_probe": "import lighter; from lighter import SignerClient",
+          "preservation_policy": {
+            "preserve_existing_versions": true,
+            "protected_packages": ["urllib3"]
+          },
+          "metadata": {
+            "notes": "Official Lighter SDK installed without dependency resolution so Hermes-managed packages are untouched."
+          }
+        }
+      ]
+    }
+  ]
+}

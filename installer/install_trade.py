@@ -9,6 +9,8 @@ exchange, never touches ``.env``, and never places a trade.
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,178 @@ import kamconfig as C  # noqa: E402
 from patchspecs import all_specs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DEPENDENCY_MANIFEST_PATH = REPO_ROOT / "installer" / "sdk_dependencies.json"
+
+
+def _normalize_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+
+def _pip_list_versions(python_exe: Path) -> Dict[str, str]:
+    proc = subprocess.run(
+        [str(python_exe), "-m", "pip", "list", "--format=json"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise K.InstallError(
+            f"Package snapshot failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+        )
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise K.InstallError(f"Package snapshot was not valid JSON: {exc}") from exc
+    out: Dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        version = row.get("version")
+        if name and version:
+            out[_normalize_dist_name(str(name))] = str(version)
+    return out
+
+
+def load_dependency_manifest(manifest_path: Path | None = None) -> Dict[str, Any]:
+    path = manifest_path or DEPENDENCY_MANIFEST_PATH
+    if not path.is_file():
+        raise K.InstallError(f"Dependency manifest missing: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise K.InstallError(f"Dependency manifest is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise K.InstallError("Dependency manifest root must be an object")
+    if payload.get("schema_version") != 1:
+        raise K.InstallError(
+            f"Unsupported dependency manifest schema_version: {payload.get('schema_version')!r}"
+        )
+    exchanges = payload.get("exchanges")
+    if not isinstance(exchanges, list):
+        raise K.InstallError("Dependency manifest must contain exchanges[]")
+    return payload
+
+
+def iter_sdk_dependencies(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    exchanges = manifest.get("exchanges")
+    if not isinstance(exchanges, list):
+        raise K.InstallError("Dependency manifest must contain exchanges[]")
+    for exchange_entry in exchanges:
+        if not isinstance(exchange_entry, dict):
+            raise K.InstallError("Each exchange manifest entry must be an object")
+        exchange_name = str(exchange_entry.get("exchange") or "").strip()
+        if not exchange_name:
+            raise K.InstallError("Exchange manifest entry missing exchange name")
+        sdks = exchange_entry.get("sdks")
+        if not isinstance(sdks, list) or not sdks:
+            raise K.InstallError(f"Exchange '{exchange_name}' must declare at least one sdk")
+        for sdk in sdks:
+            if not isinstance(sdk, dict):
+                raise K.InstallError(f"Exchange '{exchange_name}' has a non-object sdk entry")
+            package = str(sdk.get("package") or "").strip()
+            version = str(sdk.get("version") or "").strip()
+            import_probe = str(sdk.get("import_probe") or "").strip()
+            install_args = sdk.get("install_args") or []
+            if not package or not version or not import_probe:
+                raise K.InstallError(
+                    f"Exchange '{exchange_name}' sdk entry must declare package, version, and import_probe"
+                )
+            if not isinstance(install_args, list) or any(not isinstance(arg, str) for arg in install_args):
+                raise K.InstallError(
+                    f"Exchange '{exchange_name}' sdk '{package}' install_args must be a list of strings"
+                )
+            record = dict(sdk)
+            record["exchange"] = exchange_name
+            record["package"] = package
+            record["version"] = version
+            record["import_probe"] = import_probe
+            record["install_args"] = [str(arg) for arg in install_args]
+            records.append(record)
+    return records
+
+
+def _sdk_requirement_string(spec: Dict[str, Any]) -> str:
+    return f"{spec['package']}=={spec['version']}"
+
+
+def _sdk_install_command(python_exe: Path, spec: Dict[str, Any]) -> List[str]:
+    return [
+        str(python_exe),
+        "-m",
+        "pip",
+        "install",
+        "--no-input",
+        *[str(arg) for arg in spec.get("install_args") or []],
+        _sdk_requirement_string(spec),
+    ]
+
+
+def _verify_import_probe(python_exe: Path, spec: Dict[str, Any]) -> None:
+    proc = subprocess.run(
+        [str(python_exe), "-c", str(spec.get("import_probe") or "")],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise K.InstallError(
+            f"SDK import probe failed for {spec.get('package')}=={spec.get('version')}:\n"
+            f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+        )
+
+
+def _assert_dependency_state_preserved(
+    before: Dict[str, str],
+    after: Dict[str, str],
+    policy: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    policy = dict(policy or {})
+    preserve_existing_versions = bool(policy.get("preserve_existing_versions", True))
+    protected_packages = [
+        _normalize_dist_name(name)
+        for name in (policy.get("protected_packages") or [])
+        if str(name).strip()
+    ]
+
+    protected_changes = [
+        {
+            "package": name,
+            "before": before.get(name),
+            "after": after.get(name),
+        }
+        for name in protected_packages
+        if before.get(name) is not None and before.get(name) != after.get(name)
+    ]
+    if protected_changes:
+        detail = ", ".join(
+            f"{item['package']}: {item['before']} -> {item['after']}" for item in protected_changes
+        )
+        raise K.InstallError(f"Protected package(s) changed during dependency installation: {detail}")
+
+    changed = [
+        {"package": name, "before": before[name], "after": after.get(name)}
+        for name in sorted(before)
+        if name in after and before[name] != after[name]
+    ]
+    removed = [name for name in sorted(before) if name not in after]
+    if preserve_existing_versions and (changed or removed):
+        details: List[str] = []
+        if changed:
+            details.append(
+                "changed packages: " + ", ".join(
+                    f"{item['package']}: {item['before']} -> {item['after']}" for item in changed
+                )
+            )
+        if removed:
+            details.append("removed packages: " + ", ".join(removed))
+        raise K.InstallError(
+            "Dependency preservation check failed; Hermes-managed packages changed. " + " | ".join(details)
+        )
+    return {
+        "preserve_existing_versions": preserve_existing_versions,
+        "protected_packages": protected_packages,
+        "changed_packages": changed,
+        "removed_packages": removed,
+        "ok": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -297,27 +471,105 @@ def enable_plugin_in_config(
     return record
 
 
-def install_dependencies(python_exe: Path, dry_run: bool) -> Dict[str, Any]:
+def install_dependencies(
+    python_exe: Path,
+    dry_run: bool,
+    manifest_path: Path | None = None,
+) -> Dict[str, Any]:
     step("Dependencies")
     req = REPO_ROOT / "installer" / "requirements.txt"
-    if not req.is_file():
-        skip("No requirements.txt; nothing to install")
-        return {"requirements": None, "action": "skipped"}
+    req_command = [str(python_exe), "-m", "pip", "install", "--no-input", "-r", str(req)]
+    manifest = load_dependency_manifest(manifest_path)
+    sdk_specs = iter_sdk_dependencies(manifest)
 
     if dry_run:
-        ok(f"Would run: {python_exe} -m pip install -r {req}")
-        return {"requirements": str(req), "action": "would-install"}
+        if req.is_file():
+            ok(f"Would run: {' '.join(req_command)}")
+        else:
+            skip("No requirements.txt; skipping base dependency install")
+        sdk_reports = []
+        for spec in sdk_specs:
+            command = _sdk_install_command(python_exe, spec)
+            ok(
+                f"Would run SDK install [{spec['exchange']}:{spec.get('id') or spec['package']}] "
+                f"{' '.join(command)}"
+            )
+            sdk_reports.append({
+                "exchange": spec["exchange"],
+                "id": spec.get("id") or spec["package"],
+                "package": spec["package"],
+                "version": spec["version"],
+                "install_args": list(spec.get("install_args") or []),
+                "install_command": command,
+                "import_probe": spec["import_probe"],
+                "import_verification": "pending",
+                "preservation": dict(spec.get("preservation_policy") or {}),
+                "action": "would-install",
+            })
+        return {
+            "manifest": str(manifest_path or DEPENDENCY_MANIFEST_PATH),
+            "requirements": str(req) if req.is_file() else None,
+            "requirements_command": req_command,
+            "sdks": sdk_reports,
+            "action": "would-install",
+        }
 
-    proc = subprocess.run(
-        [str(python_exe), "-m", "pip", "install", "--no-input", "-r", str(req)],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise K.InstallError(
-            f"Dependency install failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    before = _pip_list_versions(python_exe)
+
+    if req.is_file():
+        proc = subprocess.run(req_command, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise K.InstallError(
+                f"Dependency install failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+            )
+    else:
+        skip("No requirements.txt; skipping base dependency install")
+
+    sdk_reports = []
+    current_versions = before
+    for spec in sdk_specs:
+        command = _sdk_install_command(python_exe, spec)
+        proc = subprocess.run(command, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise K.InstallError(
+                f"SDK install failed for {spec['package']}=={spec['version']}:\n"
+                f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+            )
+        after_sdk = _pip_list_versions(python_exe)
+        preservation = _assert_dependency_state_preserved(
+            current_versions,
+            after_sdk,
+            spec.get("preservation_policy"),
         )
+        _verify_import_probe(python_exe, spec)
+        sdk_reports.append({
+            "exchange": spec["exchange"],
+            "id": spec.get("id") or spec["package"],
+            "package": spec["package"],
+            "version": spec["version"],
+            "install_args": list(spec.get("install_args") or []),
+            "install_command": command,
+            "import_probe": spec["import_probe"],
+            "import_verification": "passed",
+            "preservation": preservation,
+            "action": "installed",
+        })
+        ok(
+            f"SDK installed: {spec['package']}=={spec['version']} "
+            f"args={spec.get('install_args') or []} import=passed preservation=passed"
+        )
+        current_versions = after_sdk
+
     ok("Dependencies satisfied")
-    return {"requirements": str(req), "action": "installed"}
+    return {
+        "manifest": str(manifest_path or DEPENDENCY_MANIFEST_PATH),
+        "requirements": str(req) if req.is_file() else None,
+        "requirements_command": req_command,
+        "sdks": sdk_reports,
+        "versions_before": before,
+        "versions_after": current_versions,
+        "action": "installed",
+    }
 
 
 def restart_gateway(dry_run: bool, no_restart: bool) -> Dict[str, Any]:
