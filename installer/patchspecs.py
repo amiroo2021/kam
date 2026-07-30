@@ -15,8 +15,12 @@ interception. Everything exchange-specific lives inside
 
 from __future__ import annotations
 
+import inspect
+import json
+import subprocess
+import sys
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional
 
 from kamlib import PatchSpec
 
@@ -81,16 +85,247 @@ if first_token:
             # Fall through to normal dispatch rather than swallow.
 '''
 
-# --- Seam D: Telegram command-menu visibility ------------------------------
-_COMMANDDEF_BLOCK = '''\
+# --- Seam D: Telegram command-menu visibility (LEGACY / OPT-IN ONLY) -------
+#
+# WARNING -- this patch is NO LONGER part of the default install path.
+#
+# The original block emitted ``gateway_platforms=("telegram",)``. That keyword
+# does not exist on every Hermes build: on Hermes
+# 2d404942471633d5338a8ff514ea7da24549274f, CommandDef.__init__ accepts
+#
+#     name, description, category, aliases, args_hint, subcommands,
+#     cli_only, gateway_only, gateway_config_gate, busy_policy,
+#     busy_handler, execute
+#
+# with NO gateway_platforms. Injecting it raised TypeError while the module-level
+# COMMANDS list was being built, which took down the whole command registry and
+# broke native commands such as /restart.
+#
+# ``/trade`` is now advertised through the supported plugin API instead:
+# ``plugins/trade/__init__.py`` calls ``PluginContext.register_command`` and the
+# installer enables the plugin via ``plugins.enabled`` in the Hermes config. See
+# ``legacy_commands_specs()`` below -- retained only so an older KAM install can
+# still be *detected and cleanly removed*, never applied by default.
+_LEGACY_COMMANDDEF_BLOCK = '''\
 CommandDef("trade", "Open the Telegram trading console wizard", "Trading",
            gateway_only=True, gateway_platforms=("telegram",)),
 '''
 
 
-def adapter_specs() -> List[PatchSpec]:
-    """The three Telegram adapter seams, in file order."""
+def supported_commanddef_kwargs(command_def_cls: Any) -> set:
+    """Return the keyword names ``command_def_cls`` actually accepts.
+
+    Used to guarantee the installer never emits a keyword the target build's
+    ``CommandDef`` cannot accept. Returns an empty set when the signature
+    cannot be inspected, which callers must treat as "unknown -> skip".
+    """
+    try:
+        sig = inspect.signature(command_def_cls.__init__)
+    except (TypeError, ValueError):  # pragma: no cover - exotic builds
+        return set()
+    return {
+        name for name, param in sig.parameters.items()
+        if name != "self"
+        and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+    }
+
+
+def _load_command_def(hermes_root: Path) -> Optional[Any]:
+    """Import ``CommandDef`` from *hermes_root* without polluting sys.modules.
+
+    Returns ``None`` when the class cannot be loaded, which callers must treat
+    as "compatibility unknown".
+    """
+    commands_py = hermes_root / HERMES_COMMANDS
+    if not commands_py.is_file():
+        return None
+    probe = (
+        "import sys, inspect, json\n"
+        f"sys.path.insert(0, {str(hermes_root)!r})\n"
+        "try:\n"
+        "    from hermes_cli.commands import CommandDef\n"
+        "    names = [n for n in inspect.signature(CommandDef.__init__).parameters\n"
+        "             if n != 'self']\n"
+        "    print(json.dumps(names))\n"
+        "except Exception:\n"
+        "    print(json.dumps(None))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout.strip() or "null")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def commanddef_supports_gateway_platforms(hermes_root: Optional[Path] = None) -> bool:
+    """True only when the target build's ``CommandDef`` accepts the keyword.
+
+    Returns ``False`` when compatibility cannot be determined -- the optional
+    menu patch is skipped rather than risk breaking native commands. That is
+    the whole point: emitting this keyword against a build that lacks it raises
+    TypeError while the command table is being built and takes ``/restart``
+    down with it.
+    """
+    if hermes_root is None:
+        return False
+    params = _load_command_def(Path(hermes_root))
+    if not params:
+        return False
+    return "gateway_platforms" in params
+
+
+# --- Helper seam: inline-keyboard transport bridge --------------------------
+#
+# Ported from the validated powerkam live fix. This method must preserve BOTH
+# the wizard's text and its InlineKeyboardMarkup, and it must never double-
+# prefix a callback that already carries the plugin namespace.
+#
+# We inject it as a *later* method definition inside TelegramAdapter, just
+# before `_MODEL_PAGE_SIZE`. On builds that already have a send_inline_keyboard
+# helper, the later definition overrides the older one without rewriting the
+# file wholesale. On builds that lack the helper entirely, it simply provides
+# it. Uninstall removes only the marked block, restoring the pre-install file
+# byte-for-byte.
+_INLINE_KEYBOARD_HELPER_BLOCK = '''\
+async def send_inline_keyboard(
+    self,
+    chat_id: str,
+    text: str,
+    buttons: Any,
+    callback_prefix: str = "",
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    parse_mode: Optional[Any] = None,
+) -> SendResult:
+    """Plugin-facing inline-keyboard sender.
+
+    Mirrors the native prompt senders so the KAM ``/trade`` wizard can render
+    text + a multi-row ``InlineKeyboardMarkup`` through the same transport the
+    built-in Hermes prompts use.
+
+    ``buttons`` is a list-of-lists of ``{"text", "callback_data"}`` dicts.
+    Empty/missing ``buttons`` gracefully degrades to a plain text message.
+    A callback suffix already carrying ``callback_prefix`` is preserved as-is;
+    otherwise the prefix is prepended exactly once.
+    """
+    if not self._bot:
+        return SendResult(success=False, error="Not connected")
+
+    rows: List[List[Any]] = []
+    if buttons:
+        for row in buttons:
+            btn_row: List[Any] = []
+            for btn in row or []:
+                if not isinstance(btn, dict):
+                    continue
+                label = str(btn.get("text", "") or "")
+                suffix = str(btn.get("callback_data", "") or "")
+                if not label or not suffix:
+                    continue
+                if callback_prefix and not suffix.startswith(f"{callback_prefix}:"):
+                    cb = f"{callback_prefix}:{suffix}"
+                else:
+                    cb = suffix
+                btn_row.append(InlineKeyboardButton(label, callback_data=cb))
+            if btn_row:
+                rows.append(btn_row)
+
+    try:
+        formatted = self.format_message(text or "") if hasattr(self, "format_message") else (text or "")
+        thread_id = self._metadata_thread_id(metadata)
+        reply_to_id = self._reply_to_message_id_for_send(
+            None, metadata, reply_to_mode=self._reply_to_mode
+        )
+        kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(chat_id),
+            "text": formatted,
+            **self._link_preview_kwargs(),
+        }
+        if rows:
+            kwargs["reply_markup"] = InlineKeyboardMarkup(rows)
+        kwargs["reply_to_message_id"] = reply_to_id
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        else:
+            kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
+        kwargs.update(
+            self._thread_kwargs_for_send(
+                chat_id,
+                thread_id,
+                metadata,
+                reply_to_message_id=reply_to_id,
+                reply_to_mode=self._reply_to_mode,
+            )
+        )
+        msg = await self._send_message_with_thread_fallback(**kwargs)
+        return SendResult(success=True, message_id=str(msg.message_id))
+    except Exception as e:
+        logger.warning(
+            "[%s] send_inline_keyboard failed: %s",
+            self.name, _redact_telegram_error_text(e),
+        )
+        return SendResult(success=False, error=_redact_telegram_error_text(e))
+'''
+
+
+INLINE_KEYBOARD_HELPER_SENTINEL = 'suffix.startswith(f"{callback_prefix}:")'
+
+
+def _choose_helper_anchor(hermes_root: Optional[Path]) -> tuple[str, str]:
+    """Pick a portable insertion anchor for the helper override.
+
+    Real Hermes builds differ substantially. The validated powerkam diff added
+    the helper near the model-picker section; the synthetic clean fixture used in
+    unit tests has neither that section nor a pre-existing helper. We therefore
+    inspect the target adapter and choose a stable line that exists in that
+    specific file.
+    """
+    if hermes_root is not None:
+        try:
+            text = (Path(hermes_root) / TELEGRAM_ADAPTER).read_text()
+        except OSError:
+            text = ""
+        if "    _MODEL_PAGE_SIZE = 8" in text:
+            return (
+                "        bot_id = getattr(self._bot, \"id\", None)\n"
+                "        user_id = getattr(from_user, \"id\", None)\n"
+                "        return bot_id is not None and user_id is not None and bot_id == user_id",
+                "    def _should_process_message",
+            )
+        if "    async def handle_message(self, event):" in text and "        return None" in text:
+            return (
+                "        event.text = self._clean_bot_trigger_text(event.text)\n"
+                "        await self.handle_message(event)",
+                "    def _should_process_message",
+            )
+    # Conservative fallback for unknown adapters: insert immediately before the
+    # message-trigger gate when present.
+    return ("    return bot_id is not None and user_id is not None and bot_id == user_id",
+            "    def _should_process_message")
+
+
+def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
+    """Adapter helper overrides required for validated /trade behavior."""
+    anchor_before, anchor_after = _choose_helper_anchor(hermes_root)
     return [
+        PatchSpec(
+            seam="inline keyboard helper",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=anchor_before,
+            anchor_after=anchor_after,
+            block=_INLINE_KEYBOARD_HELPER_BLOCK,
+            native_sentinel=INLINE_KEYBOARD_HELPER_SENTINEL,
+        ),
+    ]
+
+
+def adapter_specs() -> List[PatchSpec]:
+     """The three Telegram adapter seams, in file order."""
+     return [
         PatchSpec(
             seam="callback dispatch",
             relative_path=TELEGRAM_ADAPTER,
@@ -124,8 +359,13 @@ def adapter_specs() -> List[PatchSpec]:
     ]
 
 
-def commands_specs() -> List[PatchSpec]:
-    """Telegram command-menu registration (cosmetic but approved)."""
+def legacy_commands_specs() -> List[PatchSpec]:
+    """The retired ``hermes_cli/commands.py`` patch.
+
+    NOT applied by default. Exposed so the uninstaller can find and strip a
+    marked block left behind by an older KAM version, and so tests can assert
+    that the default install path does not include it.
+    """
     return [
         PatchSpec(
             seam="command menu entry",
@@ -135,11 +375,35 @@ def commands_specs() -> List[PatchSpec]:
                 '"Session",'
             ),
             anchor_after='CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",',
-            block=_COMMANDDEF_BLOCK,
+            block=_LEGACY_COMMANDDEF_BLOCK,
             native_sentinel='CommandDef("trade",',
         ),
     ]
 
 
-def all_specs() -> List[PatchSpec]:
-    return adapter_specs() + commands_specs()
+# Backwards-compatible alias. Returns an EMPTY list: the command-menu patch is
+# no longer part of any install path.
+def commands_specs() -> List[PatchSpec]:
+    """Deprecated. ``/trade`` is advertised via the plugin API instead."""
+    return []
+
+
+def all_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
+    """Specs applied by a default install.
+
+    The default install path patches Telegram in two layers:
+
+    1. the three /trade dispatch seams; and
+    2. the validated ``send_inline_keyboard`` helper override.
+
+    The ``hermes_cli/commands.py`` menu patch is **never** included by default:
+    ``/trade`` is advertised through ``PluginContext.register_command`` plus
+    ``plugins.enabled`` instead.
+
+    *hermes_root* is accepted so callers can pass the install target. It is used
+    only for compatibility-aware tests; even on a build that *does* support
+    ``gateway_platforms`` the legacy patch stays out of the default path,
+    because plugin-API registration already covers the menu and touching a
+    shared 100+ command table is strictly riskier.
+    """
+    return adapter_specs() + helper_specs(hermes_root)

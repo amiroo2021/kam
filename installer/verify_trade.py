@@ -19,7 +19,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kamlib as K  # noqa: E402
-from patchspecs import adapter_specs, all_specs, commands_specs  # noqa: E402
+import kamconfig as KC  # noqa: E402
+from patchspecs import (  # noqa: E402
+    adapter_specs,
+    all_specs,
+    legacy_commands_specs,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -119,14 +124,37 @@ def main(argv: List[str]) -> int:
 
     c.run("no invented plugin entry points", check_no_plugin_py)
 
-    def check_register_noop() -> str:
+    def check_register_registers_trade() -> str:
+        """register() must advertise /trade via the supported plugin API.
+
+        Replaces the old "register() is a no-op" assertion: /trade is now
+        surfaced through PluginContext.register_command instead of a
+        hermes_cli/commands.py patch.
+        """
         mod = importlib.import_module("plugins.trade")
         if not hasattr(mod, "register"):
             raise AssertionError("plugins.trade.register missing")
-        mod.register(None)
-        return "register(ctx) is a safe no-op"
 
-    c.run("plugin register() is a no-op", check_register_noop)
+        seen: List[Dict[str, Any]] = []
+
+        class _Ctx:
+            def register_command(self, name, handler=None, description="", args_hint=""):
+                seen.append({"name": name, "handler": handler, "description": description})
+
+        mod.register(_Ctx())
+        names = [s["name"] for s in seen]
+        if names.count("trade") != 1:
+            raise AssertionError(f"expected one 'trade' registration, got {names}")
+
+        # And it must not explode on a context that predates register_command.
+        class _Bare:
+            pass
+
+        mod.register(_Bare())
+        mod.register(None)
+        return f"registers 'trade' once ({seen[0]['description']!r}); tolerates old contexts"
+
+    c.run("plugin register() advertises /trade", check_register_registers_trade)
 
     # --- 7-8: exchange discovery -----------------------------------------
     discovered: List[str] = []
@@ -172,6 +200,58 @@ def main(argv: List[str]) -> int:
 
     c.run("/trade entry points exist", check_entry_points)
 
+    def check_initial_screen_has_keyboard() -> str:
+        """The first /trade screen must carry text AND a non-empty keyboard.
+
+        This is the regression that lost the inline keyboard: routing worked but
+        the markup never reached Telegram.
+        """
+        from plugins.trade.tradedesk import TradeDesk
+        from plugins.trade.wizard import TradeWizard
+
+        with _no_network_guard():
+            desk = TradeDesk()
+            exchanges = sorted(desk.list_exchanges())
+            wizard = TradeWizard(tradedesk=desk)
+            screen = wizard.open(("verify", "chat"))
+
+        text = getattr(screen, "text", "") or ""
+        buttons = getattr(screen, "buttons", None) or []
+        if "exchange" not in text.lower():
+            raise AssertionError(f"initial screen text lacks an exchange prompt: {text!r}")
+        flat = [b for row in buttons for b in (row or [])]
+        if not flat:
+            raise AssertionError("initial screen has an EMPTY keyboard")
+
+        cbs = " ".join(str(b.get("callback_data", "")) for b in flat if isinstance(b, dict))
+        missing = [e for e in exchanges if e not in cbs]
+        if missing:
+            raise AssertionError(f"no callback_data for exchanges: {missing}")
+        return f"{len(flat)} button(s), callbacks for all {len(exchanges)} exchanges"
+
+    c.run("initial /trade screen has a non-empty keyboard", check_initial_screen_has_keyboard)
+
+    if not source_mode:
+        def check_adapter_preserves_markup() -> str:
+            """The adapter must expose an inline-keyboard sender for the wizard."""
+            adapter = hermes_root / adapter_specs()[0].relative_path
+            text = adapter.read_text()
+            if "async def send_inline_keyboard" not in text:
+                raise AssertionError(
+                    "adapter has no send_inline_keyboard; the wizard cannot render buttons"
+                )
+            start = text.index("async def send_inline_keyboard")
+            body = text[start:start + 4000]
+            for needed, why in (
+                ("InlineKeyboardMarkup", "markup construction"),
+                ("reply_markup", "markup attached to the outgoing message"),
+            ):
+                if needed not in body:
+                    raise AssertionError(f"send_inline_keyboard missing {needed} ({why})")
+            return "adapter builds InlineKeyboardMarkup and sets reply_markup"
+
+        c.run("adapter preserves inline markup", check_adapter_preserves_markup)
+
     if not source_mode:
         def check_adapter_wired() -> str:
             adapter = hermes_root / adapter_specs()[0].relative_path
@@ -199,19 +279,168 @@ def main(argv: List[str]) -> int:
         c.run("handlers not registered twice", check_no_double_registration)
 
         def check_command_menu() -> str:
-            spec = commands_specs()[0]
-            text = (hermes_root / spec.relative_path).read_text()
-            n = text.count(spec.native_sentinel)
-            if n == 0:
-                raise AssertionError("CommandDef(\"trade\" missing from commands.py")
-            if n > 1:
-                raise AssertionError(f"CommandDef(\"trade\" appears {n} times")
-            return "command menu entry present exactly once"
+            """/trade must be advertised via the plugin API, not a commands.py patch."""
+            import inspect as _inspect
 
-        c.run("/trade in Telegram command menu", check_command_menu)
+            plugin = importlib.import_module("plugins.trade")
+            src = _inspect.getsource(plugin.register)
+            if "register_command" not in src:
+                raise AssertionError("plugins.trade.register does not call register_command")
+            if "gateway_platforms" in src:
+                raise AssertionError("plugin register() emits gateway_platforms")
+
+            recorded: List[Dict[str, Any]] = []
+
+            class _Ctx:
+                def register_command(self, name, handler=None, description="", args_hint=""):
+                    recorded.append({
+                        "name": name, "handler": handler,
+                        "description": description, "args_hint": args_hint,
+                    })
+
+            plugin.register(_Ctx())
+            names = [r["name"] for r in recorded]
+            if names.count("trade") != 1:
+                raise AssertionError(f"register() registered 'trade' {names.count('trade')}x")
+            entry = recorded[0]
+            if not callable(entry["handler"]):
+                raise AssertionError("registered handler is not callable")
+            if not entry["description"].strip():
+                raise AssertionError("registered command has an empty description")
+            return f"register_command('trade', description={entry['description']!r})"
+
+        c.run("/trade registered via plugin API exactly once", check_command_menu)
+
+        def check_register_tolerates_old_context() -> str:
+            """An older Hermes whose context lacks register_command must not crash."""
+            plugin = importlib.import_module("plugins.trade")
+
+            class _Bare:
+                pass
+
+            plugin.register(_Bare())
+            plugin.register(None)
+            return "register() degrades gracefully without register_command"
+
+        c.run("plugin registration is compatibility-safe", check_register_tolerates_old_context)
+
+        def check_no_commands_py_patch() -> str:
+            """The retired commands.py patch must not be applied."""
+            from patchspecs import all_specs as _all
+
+            for spec in _all():
+                if spec.relative_path.name == "commands.py":
+                    raise AssertionError("commands.py patch is in the default install path")
+            blocks = "".join(s.block for s in _all())
+            if "gateway_platforms" in blocks:
+                raise AssertionError("a default patch block emits gateway_platforms")
+            return "no commands.py patch, no gateway_platforms emitted"
+
+        c.run("no legacy commands.py patch applied", check_no_commands_py_patch)
+
+        def check_commanddef_signature_respected() -> str:
+            """Never emit a keyword the target build's CommandDef rejects."""
+            import inspect as _inspect
+
+            sys.path.insert(0, str(hermes_root))
+            try:
+                from hermes_cli.commands import CommandDef  # type: ignore
+            except Exception as exc:  # noqa: BLE001
+                return f"CommandDef not importable ({type(exc).__name__}); nothing emitted anyway"
+
+            params = {
+                n for n, p in _inspect.signature(CommandDef.__init__).parameters.items()
+                if n != "self"
+            }
+            blocks = "".join(s.block for s in all_specs(hermes_root))
+            emitted = {
+                kw for kw in ("gateway_platforms", "gateway_only", "gateway_config_gate")
+                if f"{kw}=" in blocks
+            }
+            unsupported = emitted - params
+            if unsupported:
+                raise AssertionError(f"emits unsupported CommandDef kwargs: {unsupported}")
+            has_gp = "gateway_platforms" in params
+            return (
+                f"target CommandDef {'supports' if has_gp else 'lacks'} gateway_platforms; "
+                f"installer emits none"
+            )
+
+        c.run("CommandDef signature respected", check_commanddef_signature_respected)
+
+        def check_native_registry_constructs() -> str:
+            """The native command registry must still build (this is /restart).
+
+            Importing hermes_cli.commands executes the module-level command
+            table. The legacy patch injected an unsupported CommandDef keyword
+            here, raising TypeError during import and taking every native
+            command down with it -- which is how /restart broke.
+            """
+            probe = (
+                "import sys; sys.path.insert(0, %r)\n"
+                "import hermes_cli.commands as m\n"
+                "names = set()\n"
+                "reg = getattr(m, 'COMMAND_REGISTRY', None)\n"
+                "if reg:\n"
+                "    names |= {str(getattr(c, 'name', c)).lstrip('/') for c in reg}\n"
+                "cmds = getattr(m, 'COMMANDS', None)\n"
+                "if isinstance(cmds, dict):\n"
+                "    names |= {str(k).lstrip('/') for k in cmds}\n"
+                "elif cmds:\n"
+                "    names |= {str(getattr(c, 'name', c)).lstrip('/') for c in cmds}\n"
+                "assert 'restart' in names, sorted(names)[:25]\n"
+                "print('OK', len(names))\n" % str(hermes_root)
+            )
+            proc = subprocess.run([sys.executable, "-c", probe],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise AssertionError(
+                    "native command registry failed to construct: "
+                    + (proc.stderr.strip().splitlines() or [""])[-1][:200]
+                )
+            return f"registry constructs, /restart present ({proc.stdout.strip()})"
+
+        c.run("native command registry intact (/restart)", check_native_registry_constructs)
+
+        def check_config_enables_trade() -> str:
+            """trade must be enabled exactly once via the real config loader."""
+            sys.path.insert(0, str(hermes_root))
+            hermes_home = K.resolve_hermes_home()
+            config_path = KC.find_config(hermes_home)
+            if config_path is None:
+                return f"no config under {hermes_home}; menu entry not asserted"
+
+            parsed = KC.parse_config(config_path)          # raises on malformed
+            enabled = KC.enabled_plugins(parsed)
+            count = enabled.count("trade")
+            if count != 1:
+                raise AssertionError(
+                    f"plugins.enabled contains 'trade' {count}x (expected 1): {enabled}"
+                )
+
+            probe = (
+                "import sys; sys.path.insert(0, %r)\n"
+                "from hermes_cli.config import load_config\n"
+                "load_config()\n"
+                "from hermes_cli.plugins import _get_enabled_plugins\n"
+                "e = _get_enabled_plugins()\n"
+                "assert 'trade' in e, e\n"
+                "print('OK')\n" % str(hermes_root)
+            )
+            proc = subprocess.run([sys.executable, "-c", probe],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise AssertionError(
+                    "load_config()/_get_enabled_plugins() rejected the config: "
+                    + (proc.stderr.strip().splitlines() or [""])[-1][:200]
+                )
+            return f"trade enabled exactly once; {len(enabled)} plugin(s) enabled"
+
+        c.run("Hermes config enables trade exactly once", check_config_enables_trade)
 
         def check_other_commands_intact() -> str:
-            text = (hermes_root / commands_specs()[0].relative_path).read_text()
+            spec = legacy_commands_specs()[0]
+            text = (hermes_root / spec.relative_path).read_text()
             for required in ('CommandDef("help"', 'CommandDef("new"', 'CommandDef("status"'):
                 if required not in text:
                     raise AssertionError(f"unrelated command missing: {required}")

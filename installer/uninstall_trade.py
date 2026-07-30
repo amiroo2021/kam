@@ -18,7 +18,8 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kamlib as K  # noqa: E402
-from patchspecs import all_specs  # noqa: E402
+import kamconfig as C  # noqa: E402
+from patchspecs import all_specs, legacy_commands_specs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -115,7 +116,9 @@ def unpatch(
     outcomes: List[Dict[str, Any]] = []
 
     by_file: Dict[Path, List] = {}
-    for spec in all_specs():
+    # Include the retired commands.py spec so a block left by an older KAM
+    # version is still found and cleanly removed.
+    for spec in list(all_specs(hermes_root)) + list(legacy_commands_specs()):
         by_file.setdefault(spec.relative_path, []).append(spec)
 
     backup = latest_backup(hermes_root) if use_backup else None
@@ -160,6 +163,50 @@ def unpatch(
     return outcomes
 
 
+def revert_config(
+    manifest: Dict[str, Any] | None, dry_run: bool
+) -> Dict[str, Any]:
+    """Remove the ``trade`` entry KAM added -- and only that.
+
+    If the manifest records that ``trade`` was already enabled before KAM was
+    installed, the entry is user-owned and is left alone.
+    """
+    step("Revert Hermes config")
+    record = (manifest or {}).get("config") or {}
+    config_path_text = record.get("path")
+
+    if not config_path_text:
+        skip("No config change recorded in manifest; nothing to revert")
+        return {"action": "skipped", "reason": "not-recorded"}
+
+    config_path = Path(config_path_text)
+    if not config_path.is_file():
+        skip(f"{config_path} no longer present")
+        return {"action": "skipped", "reason": "config-missing"}
+
+    was_already = bool(record.get("trade_was_already_enabled"))
+    try:
+        result = C.disable_trade(
+            config_path,
+            was_already_enabled=was_already,
+            backup_dir=None,
+            dry_run=dry_run,
+        )
+    except C.ConfigError as exc:
+        say(f"    [!!] Config not reverted: {exc}")
+        return {"action": "failed", "reason": str(exc)}
+
+    if result["action"] == "preserved-user-owned":
+        skip("trade was enabled before KAM installed it; left enabled")
+    elif result["action"] in ("removed", "would-removed"):
+        ok(f"trade removed from plugins.enabled ({config_path})")
+        if result.get("other_plugins_preserved"):
+            ok(f"preserved {len(result['other_plugins_preserved'])} other plugin(s)")
+    else:
+        skip(f"config: {result['action']}")
+    return result
+
+
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Uninstall the KAM /trade add-on")
     parser.add_argument("--hermes-root", default=None)
@@ -190,6 +237,8 @@ def main(argv: List[str]) -> int:
         remove_files(hermes_root, manifest, args.dry_run)
         say()
         unpatch(hermes_root, python_exe, args.dry_run, use_backup=True)
+        say()
+        revert_config(manifest, args.dry_run)
         say()
 
         step("Post-uninstall check")

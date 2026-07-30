@@ -23,7 +23,7 @@ INSTALLER = REPO_ROOT / "installer"
 sys.path.insert(0, str(INSTALLER))
 
 import kamlib as K  # noqa: E402
-from patchspecs import adapter_specs, all_specs, commands_specs  # noqa: E402
+from patchspecs import adapter_specs, all_specs  # noqa: E402
 
 PY = sys.executable
 
@@ -139,22 +139,26 @@ class CommandDef:
     name: str
     description: str
     category: str
-    gateway_only: bool = False
-    cli_only: bool = False
     aliases: tuple = ()
     args_hint: str = ""
-    gateway_platforms: tuple = ()
+    subcommands: tuple = ()
+    cli_only: bool = False
+    gateway_only: bool = False
+    gateway_config_gate: str | None = None
 
 
-COMMANDS = [
+COMMAND_REGISTRY = [
     CommandDef("help", "Show help", "Session"),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("status", "Show status", "Session"),
+    CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
+               gateway_only=True),
 ]
 
+COMMANDS = {f"/{cmd.name}": cmd.description for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
 _TELEGRAM_MENU_PRIORITY = ("help", "new", "stop", "status")
 '''
 
@@ -228,7 +232,7 @@ class FixtureCase(unittest.TestCase):
 
     @property
     def commands(self) -> Path:
-        return self.hermes / commands_specs()[0].relative_path
+        return self.hermes / "hermes_cli" / "commands.py"
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +262,9 @@ class TestFreshInstall(FixtureCase):
             self.assertIn(spec.marker_begin(), text)
             self.assertIn(spec.marker_end(), text)
 
-        # command menu patched
-        self.assertIn('CommandDef("trade"', self.commands.read_text())
+        # commands.py must remain untouched by the default install path
+        self.assertNotIn('CommandDef("trade"', self.commands.read_text())
+        self.assertNotIn("gateway_platforms", self.commands.read_text())
 
     def test_patched_adapter_preserves_seam_ordering(self):
         run_installer(self.hermes)
@@ -296,6 +301,11 @@ class TestFreshInstall(FixtureCase):
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
         self.assertEqual(len(patched), 4, patched)
+        seams = {p["seam"] for p in patched}
+        self.assertEqual(
+            seams,
+            {"callback dispatch", "wizard text interception", "slash command dispatch", "inline keyboard helper"},
+        )
         for entry in patched:
             self.assertTrue(entry["sha256_before"])
             self.assertTrue(entry["sha256_after"])
@@ -354,7 +364,7 @@ class TestIdempotency(FixtureCase):
         for spec in adapter_specs():
             self.assertEqual(after_second.count(spec.marker_begin()), 1, spec.seam)
             self.assertEqual(after_second.count(spec.native_sentinel), 1, spec.seam)
-        self.assertEqual(self.commands.read_text().count('CommandDef("trade"'), 1)
+        self.assertNotIn('CommandDef("trade"', self.commands.read_text())
         self.assertIn("already-installed", second.stdout)
 
     def test_third_install_still_stable(self):

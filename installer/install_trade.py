@@ -18,6 +18,7 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kamlib as K  # noqa: E402
+import kamconfig as C  # noqa: E402
 from patchspecs import all_specs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -120,7 +121,7 @@ def preflight(hermes_root: Path, payload_root: Path, python_exe: Path) -> None:
         raise K.InstallError(f"{dest_parent} is not writable: {exc}") from exc
     ok(f"{dest_parent} is writable")
 
-    for spec in all_specs():
+    for spec in all_specs(hermes_root):
         target = hermes_root / spec.relative_path
         if not target.is_file():
             raise K.InstallError(f"Integration target missing: {target}")
@@ -202,7 +203,7 @@ def apply_patches(
     outcomes: List[K.PatchOutcome] = []
 
     by_file: Dict[Path, List] = {}
-    for spec in all_specs():
+    for spec in all_specs(hermes_root):
         by_file.setdefault(spec.relative_path, []).append(spec)
 
     for rel, specs in by_file.items():
@@ -252,6 +253,48 @@ def apply_patches(
             ok(f"{rel} would be patched (no write in dry-run)")
 
     return outcomes
+
+
+def enable_plugin_in_config(
+    hermes_home: Path, backup_dir: Path, dry_run: bool
+) -> Dict[str, Any]:
+    """Enable the trade plugin via ``plugins.enabled`` in the Hermes config.
+
+    This is how ``/trade`` reaches Telegram's slash-command menu: the plugin's
+    ``register()`` calls ``PluginContext.register_command``, and that only runs
+    when the plugin is enabled. It replaces the old ``hermes_cli/commands.py``
+    patch, which emitted a ``gateway_platforms`` keyword that some Hermes builds
+    reject -- taking the whole command registry down with it.
+    """
+    step("Enable trade plugin in Hermes config")
+    config_path = C.find_config(hermes_home)
+    if config_path is None:
+        warn(f"No config.yaml/config.yml under {hermes_home}")
+        warn("/trade will still route, but may not appear in the Telegram menu.")
+        return {"action": "skipped", "reason": "config-not-found"}
+
+    ok(f"Config: {config_path}")
+    try:
+        record = C.enable_trade(
+            config_path,
+            None if dry_run else backup_dir,
+            dry_run=dry_run,
+        )
+    except C.ConfigError as exc:
+        # Never fail the whole install for an optional menu entry.
+        warn(f"Config not edited: {exc}")
+        warn("/trade will still route via the adapter seams.")
+        return {"action": "skipped", "reason": str(exc)}
+
+    if record["action"] == "already-enabled":
+        skip("trade already present in plugins.enabled")
+    else:
+        ok(f"plugins.enabled -> {record['action']}")
+    if record.get("other_plugins_preserved"):
+        ok(f"preserved {len(record['other_plugins_preserved'])} other enabled plugin(s)")
+    if record.get("trade_was_already_enabled"):
+        ok("recorded: trade was user-enabled before install (uninstall will keep it)")
+    return record
 
 
 def install_dependencies(python_exe: Path, dry_run: bool) -> Dict[str, Any]:
@@ -343,6 +386,8 @@ def main(argv: List[str]) -> int:
         say()
         patches = apply_patches(hermes_root, backup_dir, python_exe, args.dry_run)
         say()
+        config_record = enable_plugin_in_config(hermes_home, backup_dir, args.dry_run)
+        say()
 
         deps = {"action": "skipped"} if args.skip_deps else install_dependencies(
             python_exe, args.dry_run
@@ -372,6 +417,7 @@ def main(argv: List[str]) -> int:
                 for p in patches
             ],
             "dependencies": deps,
+            "config": config_record,
         }
 
         if not args.dry_run:
