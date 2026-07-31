@@ -11,6 +11,7 @@ spec, but the canonical value preserves the source currency unit.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, asdict
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
@@ -359,8 +360,8 @@ class CanonicalResponse:
     "balance"), ``error`` is None.
 
     On failure: ``success=False``, ``error`` populated, ``balance`` is None.
-    The ``error`` message is sanitized inside the agent — no secrets,
-    headers, signatures, URLs, or stack traces leak.
+    The ``error`` message is sanitized inside the agent — no real secret
+    values (API keys, signatures, auth tokens, private keys) leak.
     """
 
     success: bool
@@ -466,7 +467,8 @@ def make_failure(
 
     The message MUST already be sanitized — never pass raw exception text
     that may contain credentials, signatures, URLs with secrets, or
-    authentication material.
+    authentication material. Use :func:`sanitize_error_message` to redact
+    credential values while preserving diagnostic context.
     """
     sanitized_message = (message or "").strip() or "Unknown error"
     sanitized_exchange_reason = (exchange_reason or "").strip() or None
@@ -492,45 +494,70 @@ def make_failure(
 # ---------------------------------------------------------------------------
 # Sanitization helpers
 # ---------------------------------------------------------------------------
-
-# Substrings that, if present in an error message, indicate potential secret
-# leakage. The agent uses these to redact before sending to Telegram.
-_SECRET_MARKERS: tuple[str, ...] = (
-    "secret",
-    "private_key",
-    "private key",
-    "api_key",
-    "api-key",
-    "apikey",
-    "authorization",
-    "bearer ",
-    "wallet",
-    "0x",
-    "signature",
-    "signed",
-    "x-api",
-    "x-auth",
-    "https://api.hyperliquid",
-    "hyperliquid.xyz",
-    "token=",
+# Redact credential VALUES from an error message while preserving the
+# surrounding diagnostic context.
+#
+# Strategy: scan for credential-bearing field names and redact the value that
+# follows. Wallet addresses, orderIds, hashes, timestamps, and generic URLs are
+# NOT secrets and must remain visible. A 64-char hex string is NOT a secret by
+# itself; only when paired with a credential name does it become one. A final
+# defense-in-depth scan catches obviously-shaped private-key/seed values.
+#
+# This is a defense-in-depth check; agents should never pass raw exception
+# text into the canonical error in the first place. When a real secret
+# does leak, this helper strips the offending value while keeping the
+# surrounding diagnostic context visible.
+_CREDENTIAL_VALUE_PATTERNS = (
+    # JSON-style quoted credential values
+    (re.compile(r'("X-API-Key"\s*:\s*")([^"]+)(")'), r'\1[REDACTED_API_KEY]\3'),
+    (re.compile(r'("X-Signature"\s*:\s*")([^"]+)(")'), r'\1[REDACTED_SIGNATURE]\3'),
+    (re.compile(r'("X-Auth[^"]*"\s*:\s*")([^"]+)(")'), r'\1[REDACTED_AUTH]\3'),
+    (re.compile(r'("X-API-Key"\s*:\s*\'?)(\b[A-Fa-f0-9]{32,})(\b\'?)'), r'\1[REDACTED_API_KEY]\3'),
+    (re.compile(r'("X-Signature"\s*:\s*\'?)(\b[A-Fa-f0-9]{64,128})(\b\'?)'), r'\1[REDACTED_SIGNATURE]\3'),
+    (re.compile(r'("signed[Pp]ayload"\s*:\s*")([^"]+)(?<!\\)(")'), r'\1[REDACTED_PAYLOAD]\3'),
+    # Bare key:value: capture the key=value prefix, retain it in output.
+    # The negative lookbehind rejects alphanumerics, underscores, AND hyphens,
+    # so 'X-API-Key' is not confused with 'api_key' or 'api-key'.
+    (re.compile(r'(?<![A-Za-z0-9_-])(signature[\'"]?\s*:\s*[\'"]?)\b([A-Fa-f0-9]{64,128})\b(?=[\'"\s,;})\)]|$)', re.IGNORECASE), r'\1[REDACTED_SIGNATURE]'),
+    (re.compile(r'(?<![A-Za-z0-9_-])(api[_-]?key[\'"]?\s*:\s*[\'"]?)\b([A-Fa-f0-9]{32,})\b(?=[\'"\s,;})\)]|$)', re.IGNORECASE), r'\1[REDACTED_API_KEY]'),
+    (re.compile(r'(?<![A-Za-z0-9_-])(private[_-]?key[\'"]?\s*:\s*[\'"]?)\b([A-Fa-f0-9]{32,})\b(?=[\'"\s,;})\)]|$)', re.IGNORECASE), r'\1[REDACTED_PRIVATE_KEY]'),
+    (re.compile(r'(?<![A-Za-z0-9_-])(token[\'"]?\s*:\s*[\'"]?)\b([A-Fa-f0-9]{20,})\b(?=[\'"\s,;})\)]|$)', re.IGNORECASE), r'\1[REDACTED_TOKEN]'),
+    (re.compile(r'(?<![A-Za-z0-9_-])(secret[\'"]?\s*:\s*[\'"]?)([A-Za-z0-9._\-+/=]{16,})(?=[\'"\s,;})\)]|$)', re.IGNORECASE), r'\1[REDACTED_SECRET]'),
+    # HTTP header style: "Header: value" with a value boundary so we only
+    # match the value, not the rest of the message.
+    (re.compile(r'(X-API-Key\s*:\s*)([A-Fa-f0-9]{32,})(?=\b|\s|$)', re.IGNORECASE), r'\1[REDACTED_API_KEY]'),
+    (re.compile(r'(X-Signature\s*:\s*)([A-Fa-f0-9]{64,128})(?=\b|\s|$)', re.IGNORECASE), r'\1[REDACTED_SIGNATURE]'),
+    (re.compile(r'(X-Auth[^:]*\s*:\s*)([A-Za-z0-9._\-+/=]+)(?=\b|\s|$)', re.IGNORECASE), r'\1[REDACTED_AUTH]'),
+    (re.compile(r'(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._\-+/=]+)', re.IGNORECASE), r'\1[REDACTED_BEARER]'),
+    (re.compile(r'(Authorization\s*:\s*Basic\s+)([A-Za-z0-9._\-+/=]+)', re.IGNORECASE), r'\1[REDACTED_BASIC]'),
+    # URL query parameter (?token=, ?signature=, ?apikey=, ?sig=, etc.). Capture name
+    # and value separately so the replacement does not duplicate the name.
+    (re.compile(r'([?&](?:token|signature|api[_-]?key|access[_-]?token|sig)=)([^&\s"\'">]+)', re.IGNORECASE), r'\1[REDACTED]'),
+    # env var style: ARCUS_***_APISIGNINGKEY=<value>, *_API_KEY=<value>, etc.
+    (re.compile(r'((?:ARCUS_[A-Z0-9_]+_APISIGNINGKEY|[A-Z_]+_API_KEY|[A-Z_]+_SECRET|[A-Z_]+_TOKEN)\s*=\s*)([A-Za-z0-9._\-+/=]+)'), r'\1[REDACTED]'),
+    # ed25519 seed explicit prefix
+    (re.compile(r'(ed25519:)([A-Fa-f0-9]{32,})'), r'\1[REDACTED_ED25519_SEED]'),
+    # Defense-in-depth: 64-char hex adjacent to a credential-shaped keyword
+    # (signer, signing_key, api_key, private_key, secret, seed, signature).
+    (re.compile(r'((?:seed|signing[_-]?key|api[_-]?key|private[_-]?key|secret|signer|signature)\s*[:=]\s*)([A-Fa-f0-9]{64,128})', re.IGNORECASE), r'\1[REDACTED]'),
 )
 
 
 def sanitize_error_message(message: str) -> str:
-    """Strip any obvious secret-bearing substrings from an error message.
+    """Redact credential VALUES from an error message while preserving context.
 
-    This is a defense-in-depth check; agents should never put raw
-    exception text in the canonical error in the first place. But if a
-    future bug slips through, this collapses the message to a generic
-    one before it reaches the user.
+    This is a defense-in-depth check; agents should never pass raw exception
+    text into the canonical error in the first place. When a real secret does
+    leak, this helper strips the offending value while keeping the surrounding
+    diagnostic context visible. Wallet addresses, orderIds, hashes, timestamps,
+    and generic URLs are NOT secrets and remain in the message untouched.
     """
     if not message:
         return "Unknown error"
-    lowered = message.lower()
-    for marker in _SECRET_MARKERS:
-        if marker in lowered:
-            return "Error message suppressed: potentially sensitive content."
-    return message
+    result = message
+    for pattern, replacement in _CREDENTIAL_VALUE_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
 
 
 __all__ = [

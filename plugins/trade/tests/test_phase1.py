@@ -381,27 +381,159 @@ class TestErrorSafety(unittest.TestCase):
         self.assertEqual(response.error.exchange_reason, "Insufficient margin for order placement.")
 
     def test_11_no_secrets_in_error_message(self):
-        """sanitize_error_message strips any obvious sensitive substrings."""
-        secret_bearing = [
-            "HTTP 401 with wallet 0xabcd1234abcd1234abcd1234abcd1234abcd1234",
-            "Authorization: Bearer ***",
-            "API_KEY=abc123 in request",
-            "POST https://api.hyperliquid.xyz/info with secret",
-            "Signed payload: signature=0xdead",
-            "Private key leaked: 0xabcdef...",
+        """sanitize_error_message redacts credential VALUES while preserving diagnostic context.
+
+        Wallet addresses, orderIds, hashes, timestamps, and generic URLs are
+        NOT secrets and must remain visible. Wholesale 'Error message suppressed'
+        is NEVER triggered by these tokens. Only adjacent credential-shaped
+        values are redacted.
+        """
+        # Cases that must REMAIN visible (wallet / URL / context words).
+        keep_cases = [
+            "HTTP 401 with wallet 0xd230724148476cf0f1e8bbcfa90e305a9ad670aa",
+            "Address '0xd230724148476cf0f1e8bbcfa90e305a9ad670aa' not found",
+            "INVALID_SIGNATURE: Invalid signature for account",
+            "SIGNATURE_MISMATCH: signature verification failed",
+            "ORDER_NOT_FOUND: orderId 0xdeadbeef not found",
+            "signature_payload={\"ad\":\"0xd230724148476cf0f1e8bbcfa90e305a9ad670aa\",\"ai\":0,\"c\":\"client\",\"ct\":1785494168557347248}",
+            "orderId 6cb5c8036da942a2",
+            "0xdeadbeef",
+            "timestamp 1785494168557347248",
+            "I made a signature on the document.",
+            "POST https://api.hyperliquid.xyz/info failed",
         ]
-        for msg in secret_bearing:
+        for msg in keep_cases:
             sanitized = sanitize_error_message(msg)
-            self.assertNotIn("0x", sanitized)
-            self.assertNotIn("api.hyperliquid", sanitized.lower())
-            self.assertNotIn("secret", sanitized.lower())
-            self.assertNotIn("private key", sanitized.lower())
-            self.assertNotIn("authorization", sanitized.lower())
-            self.assertNotIn("bearer", sanitized.lower())
-            self.assertNotIn("signature", sanitized.lower())
+            self.assertEqual(
+                sanitized, msg, f"unexpectedly redacted: {msg!r} -> {sanitized!r}"
+            )
+
+        # The wholesale suppression boilerplate must NEVER appear.
+        suppress_boilerplate = "Error message suppressed: potentially sensitive content."
+        for msg in keep_cases:
+            self.assertNotEqual(sanitize_error_message(msg), suppress_boilerplate)
+
+        # Real credentials must still be redacted.
+        secret_a_64 = "a" * 64
+        secret_a_128 = "a" * 128
+        secret_b_128 = "b" * 128
+        secret_c_32 = "c" * 32
+        redact_cases = [
+            ("X-API-Key: " + secret_a_64, "X-API-Key: [REDACTED_API_KEY]"),
+            ("X-Signature: " + secret_a_128, "X-Signature: [REDACTED_SIGNATURE]"),
+            ('{"X-API-Key": "' + secret_a_64 + '", "X-Signature": "' + secret_b_128 + '"}',
+             '{"X-API-Key": "[REDACTED_API_KEY]", "X-Signature": "[REDACTED_SIGNATURE]"}'),
+            ("Authorization: Bearer " + secret_c_32, "Authorization: Bearer [REDACTED_BEARER]"),
+            ("?token=" + secret_c_32 + "&symbol=SOL-USD", "?token=[REDACTED]&symbol=SOL-USD"),
+            ("ARCUS_AMIROO_APISIGNINGKEY=" + secret_a_64, "ARCUS_AMIROO_APISIGNINGKEY=[REDACTED]"),
+            ("ed25519:" + secret_c_32, "ed25519:[REDACTED_ED25519_SEED]"),
+            ("signature: " + secret_a_64, "signature: [REDACTED_SIGNATURE]"),
+            ("api_key: " + secret_a_64, "api_key: [REDACTED_API_KEY]"),
+            ("private_key: " + secret_a_64, "private_key: [REDACTED_PRIVATE_KEY]"),
+        ]
+        for msg, expected in redact_cases:
+            sanitized = sanitize_error_message(msg)
+            self.assertEqual(
+                sanitized, expected, f"bad redact: {msg!r} -> {sanitized!r}"
+            )
+
+        # Mixed: useful error text preserved, signature value redacted.
+        mixed = (
+            "Arcus returned 401: {\"code\":\"INVALID_SIGNATURE\",\"error\":\"signature verification failed for request signer: "
+            + secret_a_64 + "\"}"
+        )
+        mixed_expected = (
+            "Arcus returned 401: {\"code\":\"INVALID_SIGNATURE\",\"error\":\"signature verification failed for request signer: [REDACTED]\"}"
+        )
+        self.assertEqual(sanitize_error_message(mixed), mixed_expected)
+
+        # Empty / None must normalize to the unknown indicator.
+        self.assertEqual(sanitize_error_message(""), "Unknown error")
+        self.assertEqual(sanitize_error_message(None), "Unknown error")  # type: ignore[arg-type]
+
+    def test_11c_sanitize_error_message_is_idempotent_and_handles_multiple_credentials(self):
+        """Idempotency + multiple credentials in one message.
+
+        1. A message that already had its credential redacted must remain
+           unchanged on a second pass (no further mutation).
+        2. A single message containing multiple different credentials must
+           have each credential value redacted exactly once.
+        """
+        # Idempotency: re-running on an already-redacted message is a no-op.
+        already_redacted_cases = [
+            "X-API-Key: [REDACTED_API_KEY]",
+            "X-Signature: [REDACTED_SIGNATURE]",
+            "Authorization: Bearer [REDACTED_BEARER]",
+            "ed25519:[REDACTED_ED25519_SEED]",
+            "signature: [REDACTED_SIGNATURE]",
+            "api_key: [REDACTED_API_KEY]",
+            "private_key: [REDACTED_PRIVATE_KEY]",
+            "ARCUS_AMIROO_APISIGNINGKEY=[REDACTED]",
+            "X-API-Key: [REDACTED_API_KEY], X-Signature: [REDACTED_SIGNATURE]",
+            "?token=[REDACTED]&symbol=SOL-USD",
+        ]
+        for msg in already_redacted_cases:
+            once = sanitize_error_message(msg)
+            twice = sanitize_error_message(once)
+            self.assertEqual(once, msg, f"first pass mutated: {msg!r} -> {once!r}")
+            self.assertEqual(twice, msg, f"second pass mutated: {once!r} -> {twice!r}")
+
+        # Multiple credentials in one message: each value redacted; surrounding
+        # context preserved.
+        secret_a_64 = "a" * 64
+        secret_a_128 = "a" * 128
+        secret_b_64 = "b" * 64
+        secret_c_32 = "c" * 32
+        multi = (
+            "header dump: X-API-Key: " + secret_a_64 + " "
+            "X-Signature: " + secret_a_128 + " "
+            "Authorization: Bearer " + secret_c_32 + " "
+            "url: ?token=" + secret_c_32 + "&symbol=SOL-USD "
+            "ARCUS_AMIROO_APISIGNINGKEY=" + secret_b_64 + " "
+            "ed25519:" + secret_c_32
+        )
+        multi_expected = (
+            "header dump: X-API-Key: [REDACTED_API_KEY] "
+            "X-Signature: [REDACTED_SIGNATURE] "
+            "Authorization: Bearer [REDACTED_BEARER] "
+            "url: ?token=[REDACTED]&symbol=SOL-USD "
+            "ARCUS_AMIROO_APISIGNINGKEY=[REDACTED] "
+            "ed25519:[REDACTED_ED25519_SEED]"
+        )
+        out = sanitize_error_message(multi)
+        self.assertEqual(out, multi_expected)
+        # And it must be idempotent on the redacted output.
+        self.assertEqual(sanitize_error_message(out), out)
+
+        # Sanity: a 64-char hex string that is NOT adjacent to a credential name
+        # must remain visible (e.g. a bare tx hash).
+        bare_tx = "fee tx-hash 0x" + "b" * 64
+        self.assertEqual(sanitize_error_message(bare_tx), bare_tx)
+
+        # URL query parameters: ?signature=, ?token=, ?apikey= etc. must be
+        # redacted (with the surrounding context preserved).
+        for msg, expected in [
+            ("?signature=abc&symbol=SOL", "?signature=[REDACTED]&symbol=SOL"),
+            ("?Signature=abc&symbol=SOL", "?Signature=[REDACTED]&symbol=SOL"),
+            ("?SIGNATURE=abc&symbol=SOL", "?SIGNATURE=[REDACTED]&symbol=SOL"),
+            ("?sig=abc&symbol=SOL", "?sig=[REDACTED]&symbol=SOL"),
+            ("?token=abc&symbol=SOL-USD", "?token=[REDACTED]&symbol=SOL-USD"),
+            ("?apikey=xxx&sig=yyy", "?apikey=[REDACTED]&sig=[REDACTED]"),
+            ("?access_token=zzz&symbol=SOL", "?access_token=[REDACTED]&symbol=SOL"),
+            # Non-credential query params must NOT be redacted.
+            ("?account_id=0x1234&symbol=SOL", "?account_id=0x1234&symbol=SOL"),
+            ("?symbol=SOL-USD", "?symbol=SOL-USD"),
+        ]:
+            sanitized = sanitize_error_message(msg)
+            self.assertEqual(sanitized, expected, f"bad URL redact: {msg!r} -> {sanitized!r}")
 
     def test_11b_tradedesk_neutralizes_exchange_native_exceptions(self):
-        """TradeDesk wraps raw exceptions in a canonical failure envelope."""
+        """TradeDesk wraps raw exceptions in a canonical failure envelope.
+
+        Diagnostic context (wallet, URL, error term) is preserved by the
+        new value-redacting sanitizer. The wholesale suppression boilerplate
+        must NOT appear.
+        """
         class BoomAgent:
             name = "boom"
 
@@ -427,8 +559,14 @@ class TestErrorSafety(unittest.TestCase):
         })
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "AGENT_EXCEPTION")
-        self.assertNotIn("0x", response.error.message)
-        self.assertNotIn("api.hyperliquid", response.error.message.lower())
+        # The wholesale suppression boilerplate must NOT appear.
+        self.assertNotEqual(
+            response.error.message,
+            "Error message suppressed: potentially sensitive content.",
+        )
+        # Diagnostic context is preserved (wallet address, URL, error term).
+        self.assertIn("0xdead1234dead1234dead1234dead1234dead1234", response.error.message)
+        self.assertIn("api.hyperliquid", response.error.message.lower())
 
 
 class TestHermesIntegration(unittest.TestCase):
