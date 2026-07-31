@@ -269,6 +269,14 @@ class PatchSpec:
     # considered natively present and is left alone.
     native_sentinel: str
     ast_validator: Optional[Callable[[str, "PatchSpec"], None]] = None
+    # Optional structural pre-check. If set, apply_patch calls it before
+    # sentinel/anchor matching. It returns:
+    #   (True, reason)  -> treat as native-present; do not insert or replace
+    #   (False, reason) -> raise InstallError with reason
+    #   (None, "")     -> no signal; fall through to sentinel/anchor logic
+    # Used to recognize structurally compatible helpers whose textual
+    # sentinel may differ between Hermes builds.
+    native_presence_check: Optional[Callable[[str, "PatchSpec"], Tuple[bool, str]]] = None
 
     def marker_begin(self) -> str:
         return f"{MARKER_BEGIN} ({self.seam})"
@@ -308,6 +316,18 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
     """
     if spec.marker_begin() in text:
         return text, "already-installed", "KAM marker already present"
+
+    # Structural pre-check: detect a compatible native helper before falling
+    # back to textual sentinel matching. This lets the installer recognize
+    # helpers whose textual fingerprint differs from the KAM sentinel token.
+    if spec.native_presence_check is not None:
+        present, reason = spec.native_presence_check(text, spec)
+        if present is True:
+            return text, "native-present", reason or "structural native presence detected"
+        if present is False:
+            raise InstallError(
+                f"[{spec.seam}] {reason or 'structural native presence check failed'} in {spec.relative_path}. Refusing to patch."
+            )
 
     if spec.native_sentinel in text:
         return text, "native-present", "seam already wired natively (left untouched)"

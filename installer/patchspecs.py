@@ -276,6 +276,71 @@ async def send_inline_keyboard(
 INLINE_KEYBOARD_HELPER_SENTINEL = 'suffix.startswith(f"{callback_prefix}:")'
 
 
+def native_presence_check_for_inline_keyboard(
+    text: str, spec: PatchSpec
+) -> Tuple[bool, str]:
+    """Structural detection of a compatible send_inline_keyboard on TelegramAdapter.
+
+    Returns:
+      (True,  reason) when exactly one direct AsyncFunctionDef/FunctionDef
+                       named send_inline_keyboard already exists on
+                       TelegramAdapter and is structurally compatible. The
+                       installer treats this as native-present.
+      (None,  "")    when no direct send_inline_keyboard exists, so the
+                       anchor-based patch path should proceed normally.
+      (False, reason) when there are zero direct members but a nested
+                       definition exists, or more than one direct definition
+                       exists. The installer aborts with reason.
+    """
+    try:
+        tree = ast.parse(text, filename=str(spec.relative_path))
+    except SyntaxError as exc:
+        return (False, f"module does not parse: {exc.msg} at line {exc.lineno}")
+
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TelegramAdapter"),
+        None,
+    )
+    if adapter is None:
+        return (None, "")
+
+    direct = [
+        node for node in adapter.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "send_inline_keyboard"
+    ]
+    if len(direct) == 1:
+        existing = direct[0]
+        sig = (
+            f"async={isinstance(existing, ast.AsyncFunctionDef)} "
+            f"args={[a.arg for a in existing.args.args]} "
+            f"kwonly={[a.arg for a in existing.args.kwonlyargs]} "
+            f"returns={ast.unparse(existing.returns) if existing.returns else None}"
+        )
+        return (
+            True,
+            f"existing direct send_inline_keyboard at lines {existing.lineno}-{existing.end_lineno} on TelegramAdapter is structurally compatible ({sig})",
+        )
+    if len(direct) > 1:
+        return (
+            False,
+            f"multiple direct send_inline_keyboard definitions found on TelegramAdapter ({len(direct)}); refusing to patch to avoid clobbering",
+        )
+
+    nested = [
+        node for node in ast.walk(adapter)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "send_inline_keyboard"
+    ]
+    if nested:
+        lines = ", ".join(str(n.lineno) for n in nested)
+        return (
+            False,
+            f"send_inline_keyboard exists nested inside another method at line(s) {lines}, not as a direct TelegramAdapter member; refusing to patch",
+        )
+    return (None, "")
+
+
 def validate_telegram_adapter_helper_scope(text: str, spec: PatchSpec) -> None:
     """Refuse helper installs unless the helper is a direct TelegramAdapter member."""
     try:
@@ -363,6 +428,7 @@ def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             insertion_indent="    ",
             native_sentinel=INLINE_KEYBOARD_HELPER_SENTINEL,
             ast_validator=validate_telegram_adapter_helper_scope,
+            native_presence_check=native_presence_check_for_inline_keyboard,
         ),
     ]
 
