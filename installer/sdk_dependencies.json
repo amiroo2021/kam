@@ -30,6 +30,29 @@
           }
         }
       ]
+    },
+    {
+      "exchange": "apex",
+      "sdks": [
+        {
+          "id": "apexomni",
+          "package": "apexomni",
+          "version": "3.3.1",
+          "install_args": ["--no-deps"],
+          "runtime_dependencies": [
+            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"},
+            {"package": "requests", "version_spec": ">=2.31.0"}
+          ],
+          "import_probe": "import apexomni; from apexomni.http_private_sign import HttpPrivateRwaSign",
+          "preservation_policy": {
+            "preserve_existing_versions": true,
+            "protected_packages": ["urllib3"]
+          },
+          "metadata": {
+            "notes": "Pin exact: apexomni 3.3.1 is the version where the v3 endpoint methods (get_account_balance_v3, history_orders_v3, open_orders_v3) live on HttpPrivateRwaSign. Newer apexomni versions may rename or move these methods. The KAM /trade add-on also lists apexomni==3.3.1 in installer/requirements.txt so a clean pip install reproduces the live environment."
+          }
+        }
+      ]
     }
   ]
 }

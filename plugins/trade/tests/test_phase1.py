@@ -888,6 +888,29 @@ class TestArcusAgentPhase1(unittest.TestCase):
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = self._hermes_home_backup
+
+    def _setUp_env(self):
+        """Set up an isolated APEX_<alias>_BITGET env config so the
+        agent's account-discovery path has something to find. Idempotent:
+        re-entrant calls reuse the same tmpdir-backed HERMES_HOME.
+        """
+        self._apex_env_backup = {k: v for k, v in os.environ.items() if k.startswith("APEX_")}
+        for key in list(os.environ.keys()):
+            if key.startswith("APEX_"):
+                os.environ.pop(key, None)
+        os.environ["APEX_BITGET_ACCOUNTID"] = "686607787470356535"
+        os.environ["APEX_BITGET_APIKEY"] = "00000000-0000-0000-0000-000000000000"
+        os.environ["APEX_BITGET_APIKEYSECRET"] = "placeholder-secret-replace-at-runtime"
+        os.environ["APEX_BITGET_APIKEYPASSPHRASE"] = "placeholder-passphrase"
+        os.environ["APEX_BITGET_SEEDS"] = ("0x" + "ab" * 32)
+        os.environ["APEX_BITGET_L2KEY"] = ("0x" + "cd" * 32)
+
+    def _tearDown_env(self):
+        """Restore the live process environment after _setUp_env."""
+        for key in list(os.environ.keys()):
+            if key.startswith("APEX_"):
+                os.environ.pop(key, None)
+        os.environ.update(getattr(self, "_apex_env_backup", {}))
         self._arcus_tmpdir.cleanup()
         _restore_env()
 
@@ -1757,6 +1780,409 @@ class TestArcusAgentPhase1(unittest.TestCase):
                             "account": "amiroo", "symbol": "BTC-USD"})
         self.assertFalse(r2.success)
         self.assertEqual(r2.error.code, "INVALID_SL_PRICE")
+
+    def test_apex_cancel_order_group_rejects_missing_symbol(self):
+        """cancel_order_group must require symbol — otherwise the operator
+        would mass-cancel without realising it."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "cancel_order_group", "exchange": "apex",
+                    "account": "BITGET", "side": "buy",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "MISSING_SYMBOL")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_cancel_order_group_rejects_invalid_side(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "cancel_order_group", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT", "side": "long",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "INVALID_SIDE")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_cancel_order_group_dispatch_reaches_handler(self):
+        """Dispatching ``cancel_order_group`` must reach the real handler —
+        the stubbed implementation returns MISSING_SYMBOL when symbol is
+        absent, NOT NOT_IMPLEMENTED (which is reserved for unwired ops).
+        """
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "cancel_order_group", "exchange": "apex",
+                    "account": "BITGET",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "MISSING_SYMBOL")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_tp_rejects_missing_symbol(self):
+        """set_tp must require symbol — otherwise the operator would
+        configure TP on the wrong position."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_tp", "exchange": "apex",
+                    "account": "BITGET", "price": "70000",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "MISSING_SYMBOL")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_tp_rejects_missing_price(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_tp", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "INVALID_TP_PRICE")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_tp_rejects_non_numeric_price(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_tp", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                    "price": "not-a-number",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "INVALID_TP_PRICE")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_sl_rejects_missing_symbol(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_sl", "exchange": "apex",
+                    "account": "BITGET", "price": "50000",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "MISSING_SYMBOL")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_sl_rejects_missing_price(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_sl", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "INVALID_SL_PRICE")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_close_position_rejects_missing_symbol(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "close_position", "exchange": "apex",
+                    "account": "BITGET",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertEqual(resp.error.code, "MISSING_SYMBOL")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_positions_management_dispatches_to_positions_orders(self):
+        """positions_management must reach the real handler. With stubbed
+        credentials it fails before the SDK call — the failure code is
+        APEX_ERROR (network), NOT NOT_IMPLEMENTED."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "positions_management", "exchange": "apex",
+                    "account": "BITGET",
+                })
+                # We get an APEX_ERROR because the stub creds don't connect.
+                # The crucial assertion is that we DID reach the handler
+                # (NOT_IMPLEMENTED would mean we didn't).
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_tp_dispatches_to_handler(self):
+        """set_tp must reach the real handler — with stub creds it fails
+        with INVALID_TP_PRICE if missing, otherwise APEX_ERROR (network)."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                # With both symbol and price present, the call gets past
+                # validation. With stub creds the network call fails, so we
+                # expect APEX_ERROR (not NOT_IMPLEMENTED).
+                resp = apex.execute({
+                    "operation": "set_tp", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                    "price": "70000",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_set_sl_dispatches_to_handler(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "set_sl", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                    "price": "50000",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_close_position_dispatches_to_handler(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "close_position", "exchange": "apex",
+                    "account": "BITGET", "symbol": "BTC-USDT",
+                })
+                self.assertFalse(resp.success)
+                self.assertIsNotNone(resp.error)
+                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_capabilities_advertise_position_management(self):
+        """The Apex capabilities list must include positions_management,
+        set_tp, set_sl, close_position — they are all implemented."""
+        import plugins.trade.agents.x_apex_agent as apex
+        caps = apex.capabilities()
+        for op in ("positions_management", "set_tp", "set_sl", "close_position"):
+            self.assertIn(op, caps, f"missing capability: {op}")
+
+    def test_apex_closing_side_inverts_position_side(self):
+        """_apex_closing_side must return SELL for longs, BUY for shorts —
+        otherwise the close order would open a new position instead of
+        closing the existing one."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self.assertEqual(apex._apex_closing_side("long"), "sell")
+        self.assertEqual(apex._apex_closing_side("short"), "buy")
+
+    def test_apex_position_side_reads_known_signals(self):
+        """_apex_position_side must map Apex's side/posSide values to
+        the canonical ``long``/``short`` strings the rest of the code
+        uses."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self.assertEqual(apex._apex_position_side({"side": "LONG"}), "long")
+        self.assertEqual(apex._apex_position_side({"side": "SHORT"}), "short")
+        self.assertEqual(apex._apex_position_side({"posSide": "LONG"}), "long")
+        self.assertEqual(apex._apex_position_side({"posSide": "SHORT"}), "short")
+        # Size sign fallback: positive = long, negative = short
+        self.assertEqual(apex._apex_position_side({"size": "1.5"}), "long")
+        self.assertEqual(apex._apex_position_side({"size": "-0.5"}), "short")
+        self.assertEqual(apex._apex_position_side({}), "long")  # default
+
+    def test_apex_position_size_returns_absolute_value(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        from decimal import Decimal
+        self.assertEqual(apex._apex_position_size({"size": "1.5"}), Decimal("1.5"))
+        self.assertEqual(apex._apex_position_size({"size": "-0.5"}), Decimal("0.5"))
+        self.assertEqual(apex._apex_position_size({}), Decimal("0"))
+
+    def test_apex_normalize_meta_picks_required_fields(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        from decimal import Decimal
+        meta = apex._apex_normalize_meta({
+            "symbol": "BTC-USDT",
+            "tickSize": "0.1",
+            "stepSize": "0.001",
+            "lotSize": "0.0005",
+            "minOrderSize": "0.001",
+            "irrelevant_field": "ignored",
+        })
+        self.assertEqual(meta["symbol"], "BTC-USDT")
+        self.assertEqual(meta["tick_size"], Decimal("0.1"))
+        # stepSize wins over lotSize (lotSize is fallback)
+        self.assertEqual(meta["step_size"], Decimal("0.001"))
+        self.assertEqual(meta["min_order_size"], Decimal("0.001"))
+        # Falls back to lotSize when stepSize is absent
+        meta_no_step = apex._apex_normalize_meta({
+            "symbol": "SOL-USDT", "lotSize": "0.1", "tickSize": "0.01",
+        })
+        self.assertEqual(meta_no_step["step_size"], Decimal("0.1"))
+
+    def test_apex_order_tpsl_kind_uses_trigger_price_relation(self):
+        """_apex_order_tpsl_kind must return 'TP' when trigger > price
+        (closing the position above market), 'SL' when trigger < price.
+        This is the only reliable signal for orders that don't carry
+        an explicit tpslType."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self.assertEqual(
+            apex._apex_order_tpsl_kind({"triggerPrice": "70000", "price": "69999"}),
+            "TP",
+        )
+        self.assertEqual(
+            apex._apex_order_tpsl_kind({"triggerPrice": "50000", "price": "50001"}),
+            "SL",
+        )
+        # Explicit tpslType wins
+        self.assertEqual(
+            apex._apex_order_tpsl_kind({"tpslType": "SL", "triggerPrice": "70000", "price": "69999"}),
+            "SL",
+        )
+        # No triggerPrice → None (not a TP/SL)
+        self.assertIsNone(apex._apex_order_tpsl_kind({"price": "100"}))
+        self.assertIsNone(apex._apex_order_tpsl_kind({}))
 
 
 def main():
