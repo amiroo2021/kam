@@ -52,3 +52,5 @@ Thumbs.db
 
 # Written by the installer at install time (contains machine-specific paths)
 installer/manifest.json
+
+.backups/
