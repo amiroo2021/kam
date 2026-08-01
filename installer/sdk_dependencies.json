@@ -40,8 +40,18 @@
           "version": "3.3.1",
           "install_args": ["--no-deps"],
           "runtime_dependencies": [
-            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"},
-            {"package": "requests", "version_spec": ">=2.31.0"}
+            {"package": "web3", "version_spec": ">=6.0.0"},
+            {"package": "eth-account", "version_spec": ">=0.13.7"},
+            {"package": "sympy", "version_spec": "==1.6"},
+            {"package": "mpmath", "version_spec": ">=1.0.0"},
+            {"package": "requests", "version_spec": ">=2.32.3,<3"},
+            {"package": "ecdsa", "version_spec": ">=0.16.0"},
+            {"package": "dateparser", "version_spec": ">=1.0.0"},
+            {"package": "numpy", "version_spec": ""},
+            {"package": "mnemonic", "version_spec": ""},
+            {"package": "websocket-client", "version_spec": ""},
+            {"package": "websockets", "version_spec": ">=12"},
+            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"}
           ],
           "import_probe": "import apexomni; from apexomni.http_private_sign import HttpPrivateRwaSign",
           "preservation_policy": {
@@ -49,7 +59,7 @@
             "protected_packages": ["urllib3"]
           },
           "metadata": {
-            "notes": "Pin exact: apexomni 3.3.1 is the version where the v3 endpoint methods (get_account_balance_v3, history_orders_v3, open_orders_v3) live on HttpPrivateRwaSign. Newer apexomni versions may rename or move these methods. The KAM /trade add-on also lists apexomni==3.3.1 in installer/requirements.txt so a clean pip install reproduces the live environment."
+            "notes": "Apex SDK runtime dependencies. Minimum compatible requirements; pins are loosened where newer versions are not known to break Apex. sympy is pinned to ==1.6 because sympy 1.13+ removed sympy.core.numbers.igcdex, which apexomni starkex still imports. urllib3 is a protected package: Hermes-managed versions newer than 2.1.0 are preserved (never downgraded). Transitive deps (eth-abi, eth-utils, rlp, hexbytes, pydantic, aiohttp, lru-dict, parsimonious, jsonschema, protobuf, ckzg, bitarray, pycryptodome) are resolved automatically by pip when web3/eth-account install without --no-deps. numpy and mnemonic are direct apexomni imports not pulled by the wheel metadata resolver."
           }
         }
       ]
