@@ -2257,18 +2257,15 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
                             code="INVALID_LADDER_DIRECTION",
                             message="SELL ladders require end price above start price.")
 
-    # Preflight: total volume must produce at least 2 valid children above
-    # the notional floor. Cheap heuristic — runs BEFORE we touch the network
-    # so cheap unit tests don't have to stub the SDK client.
-    if total_volume < _APEX_LADDER_MIN_NOTIONAL_USD * Decimal("2"):
-        return make_failure(
-            operation="ladder", exchange=name, account=credentials["account"],
-            code="INSUFFICIENT_VOLUME_FOR_ORDER_COUNT",
-            message=f"Total volume {total_volume} is too small to produce two non-empty children above the {_APEX_LADDER_MIN_NOTIONAL_USD} USD floor.",
-        )
+    # Preflight intentionally omitted: total_volume is a base-asset
+    # quantity (e.g. 3 BTC, 100 SOL), not USD. Comparing it directly to
+    # the per-child USD notional floor (_APEX_LADDER_MIN_NOTIONAL_USD)
+    # was a unit mismatch that rejected feasible orders like "3 BTC
+    # ladder across 50 orders between 60k-62k". The per-child check
+    # inside _apex_build_ladder_children (price * size < _APEX_LADDER_MIN_NOTIONAL_USD)
+    # is the correct USD-side check and is enforced there.
 
-    # Bootstrap client + resolve market metadata. We do this AFTER the cheap
-    # preflight so volume-too-small errors don't waste a network round-trip.
+    # Bootstrap client + resolve market metadata.
     try:
         client = _client_for_credentials(credentials)
         client.set_default_account_type("primary")

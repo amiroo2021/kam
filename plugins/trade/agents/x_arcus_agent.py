@@ -1271,14 +1271,12 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     # min_notional (which is typically the same value). Whichever is larger.
     effective_min_notional = max(_ARCUS_MIN_NOTIONAL_USD, min_notional) if min_notional > 0 else _ARCUS_MIN_NOTIONAL_USD
 
-    # Preflight: ensure total volume can produce at least 2 valid children.
-    # Cheap heuristic: total_volume must exceed 2 × effective_min_notional.
-    if total_volume < effective_min_notional * Decimal("2"):
-        return make_failure(
-            operation="ladder", exchange=name, account=account,
-            code="INSUFFICIENT_VOLUME_FOR_ORDER_COUNT",
-            message=f"Total volume {total_volume} is too small to produce two non-empty children above the {effective_min_notional} USD floor.",
-        )
+    # Preflight intentionally omitted: total_volume is a base-asset
+    # quantity (e.g. 3 BTC, 100 SOL), not USD. Comparing it directly to
+    # the per-child USD notional floor (effective_min_notional) was a unit
+    # mismatch. The per-child check inside _build_arcus_ladder_children
+    # (price * size < effective_min_notional) is the correct USD-side check
+    # and is enforced there.
 
     # The actual `ct` (timestamp_ns) and `g` (good_til_time_us) are computed
     # per-batch by `_submit_arcus_ladder_batch` — that's why we don't set

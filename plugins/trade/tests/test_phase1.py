@@ -2161,6 +2161,222 @@ class TestArcusAgentPhase1(unittest.TestCase):
         })
         self.assertEqual(meta_no_step["step_size"], Decimal("0.1"))
 
+    def test_apex_ladder_3btc_50orders_not_rejected_by_unit_mismatch(self):
+        """Regression: 3 BTC total volume across 50 orders between 60k-62k
+        must NOT be rejected by the dispatcher-level preflight (the previous
+        preflight incorrectly compared total_volume in instruments to a USD
+        floor, so 3 BTC ~= $190k USD was wrongly rejected as 'too small').
+
+        The dispatcher will fail later for OTHER reasons (no real SDK
+        client is stubbed here) but the error code must NOT be
+        INSUFFICIENT_VOLUME_FOR_ORDER_COUNT — that proves the preflight
+        was removed and the correct per-child price * size check is left
+        to the child-builder.
+        """
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                # No _client_for_credentials stub — the dispatcher will fail
+                # somewhere AFTER the preflight (e.g. CONFIGURATION_ERROR or
+                # bootstrap failure). The point is the preflight didn't fire.
+                resp = apex.execute({
+                    "operation": "ladder",
+                    "exchange": "apex",
+                    "account": "BITGET",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "distribution": "half_gaussian",
+                    "order_count": 50,
+                    "total_volume": "3",
+                    "start_price": "62000",
+                    "end_price": "60000",
+                })
+                # We're not asserting success — there's no SDK client.
+                # We only assert the preflight bad code did NOT surface.
+                if not resp.success and resp.error is not None:
+                    self.assertNotEqual(
+                        resp.error.code, "INSUFFICIENT_VOLUME_FOR_ORDER_COUNT",
+                        f"Dispatcher preflight unit-mismatch regression: "
+                        f"3 BTC ladder wrongly rejected as {resp.error.code}",
+                    )
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_apex_ladder_child_builder_keeps_instrument_units(self):
+        """total_volume is in INSTRUMENTS (e.g. BTC), not USD. Verify the
+        child builder distributes total_volume as base-asset sizes —
+        not as USD-denominated sizes."""
+        import plugins.trade.agents.x_apex_agent as apex
+        # 3 BTC across 10 orders at $60k: each child ~0.3 BTC (notional ~$18k)
+        children, kept_volume, omitted, kept_count = apex._apex_build_ladder_children(
+            symbol="BTC-USDT",
+            side="buy",
+            distribution="half_gaussian",
+            order_count=10,
+            total_volume=Decimal("3"),
+            start_price=Decimal("60000"),
+            end_price=Decimal("62000"),
+            size_increment=Decimal("0.001"),
+            price_increment=Decimal("0.1"),
+            min_order_size=Decimal("0.001"),
+        )
+        self.assertEqual(kept_count, 10)
+        self.assertEqual(omitted, 0)
+        # sum of sizes should equal total_volume (in BTC)
+        total_size = sum(Decimal(c["size"]) for c in children)
+        self.assertAlmostEqual(float(total_size), 3.0, places=2)
+        # each child notional = price * size must be > $10 (the per-child floor)
+        for c in children:
+            size = Decimal(c["size"])
+            notional = Decimal(c["price"]) * size
+            self.assertGreater(notional, Decimal("10"))
+
+    def test_apex_ladder_child_builder_drops_sub_floor_children(self):
+        """Per-child notional floor (price * size < $10) must still be
+        enforced when total_volume is too small to give every child a
+        $10 USD notional. This proves the per-child USD check is intact.
+
+        5 SOL across 50 orders at $90 = 0.1 SOL each = $9 each -> all sub-floor.
+        """
+        import plugins.trade.agents.x_apex_agent as apex
+        children, kept_volume, omitted, kept_count = apex._apex_build_ladder_children(
+            symbol="SOL-USDT",
+            side="buy",
+            distribution="uniform",
+            order_count=50,
+            total_volume=Decimal("5"),
+            start_price=Decimal("90"),
+            end_price=Decimal("91"),
+            size_increment=Decimal("0.001"),
+            price_increment=Decimal("0.01"),
+            min_order_size=Decimal("0.001"),
+        )
+        # Per-child notional floor drops sub-floor children
+        self.assertGreater(omitted, 0,
+                           f"Per-child USD notional floor should drop sub-floor children; "
+                           f"got kept_count={kept_count}, omitted={omitted}")
+
+    def test_apex_ladder_sol_100sol_50orders_not_rejected(self):
+        """Same regression for SOL: 100 SOL across 50 orders must not
+        be rejected by the unit-mismatch preflight."""
+        import plugins.trade.agents.x_apex_agent as apex
+        self._setUp_env()
+        try:
+            apex._lookup_credentials = lambda account: {
+                "account": account,
+                "account_id": "686607787470356535",
+                "api_key": "k", "api_secret": "s", "passphrase": "p",
+                "seeds": "0x" + "ab" * 32, "l2_private_key": "0x" + "cd" * 32,
+            }
+            try:
+                resp = apex.execute({
+                    "operation": "ladder",
+                    "exchange": "apex",
+                    "account": "BITGET",
+                    "symbol": "SOL",
+                    "side": "buy",
+                    "distribution": "uniform",
+                    "order_count": 50,
+                    "total_volume": "100",
+                    "start_price": "150",
+                    "end_price": "140",
+                })
+                if not resp.success and resp.error is not None:
+                    self.assertNotEqual(
+                        resp.error.code, "INSUFFICIENT_VOLUME_FOR_ORDER_COUNT",
+                        f"Dispatcher preflight unit-mismatch regression: "
+                        f"100 SOL ladder wrongly rejected as {resp.error.code}",
+                    )
+            finally:
+                apex._lookup_credentials = apex._lookup_credentials
+        finally:
+            self._tearDown_env()
+
+    def test_arcus_ladder_3btc_50orders_not_rejected_by_unit_mismatch(self):
+        """Same regression for Arcus: 3 BTC total volume across 50 orders
+        must NOT be rejected by the dispatcher-level preflight (which had
+        the same unit-mismatch bug)."""
+        import plugins.trade.agents.x_arcus_agent as arcus
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+        # Stub the network-touching bits so the dispatcher fails AFTER
+        # the preflight (any failure except INSUFFICIENT_VOLUME_FOR_ORDER_COUNT).
+        original_resolve = getattr(arcus, "_resolve_market", None)
+        original_signed = getattr(arcus, "_signed_post", None)
+        arcus._resolve_market = lambda symbol: {"market_id": 1, "tick_size": "0.1",
+                                                "step_size": "0.001",
+                                                "size_precision": 3,
+                                                "price_precision": 1,
+                                                "min_notional": "10"}
+        arcus._signed_post = lambda *a, **kw: {"status": "ok"}
+        try:
+            resp = arcus.execute({
+                "operation": "ladder",
+                "exchange": "arcus",
+                "account": "amiroo",
+                "symbol": "BTC-USD",
+                "side": "buy",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "3",
+                "start_price": "62000",
+                "end_price": "60000",
+            })
+            if not resp.success and resp.error is not None:
+                self.assertNotEqual(
+                    resp.error.code, "INSUFFICIENT_VOLUME_FOR_ORDER_COUNT",
+                    f"Arcus dispatcher preflight unit-mismatch regression: "
+                    f"3 BTC ladder wrongly rejected as {resp.error.code}",
+                )
+        finally:
+            if original_resolve is not None:
+                arcus._resolve_market = original_resolve
+            if original_signed is not None:
+                arcus._signed_post = original_signed
+            for key in ("ARCUS_AMIROO_WALLET", "ARCUS_AMIROO_APISIGNINGKEY",
+                        "ARCUS_AMIROO_PRIVATE_KEY"):
+                os.environ.pop(key, None)
+
+    def test_arcus_ladder_child_builder_keeps_instrument_units(self):
+        """Arcus analog: total_volume is in instruments; the child builder
+        distributes as base-asset sizes, not USD."""
+        import plugins.trade.agents.x_arcus_agent as arcus
+        children, kept_volume, omitted_below_minimum, kept_count = \
+            arcus._build_arcus_ladder_children(
+                credentials={"wallet": "0xabc", "account_index": 0},
+                market_id=1,
+                price_increment=Decimal("0.1"),
+                size_increment=Decimal("0.001"),
+                side="buy",
+                distribution="half_gaussian",
+                order_count=10,
+                total_volume=Decimal("3"),
+                start_price=Decimal("60000"),
+                end_price=Decimal("62000"),
+                size_precision=3,
+                price_precision=1,
+                min_notional=Decimal("10"),
+                batch_id_prefix="test",
+            )
+        self.assertEqual(kept_count, 10)
+        # sum of sizes should equal total_volume (in BTC)
+        total_size = sum(Decimal(c["size"]) for c in children)
+        self.assertAlmostEqual(float(total_size), 3.0, places=2)
+        for c in children:
+            size = Decimal(c["size"])
+            notional = Decimal(c["price"]) * size
+            self.assertGreater(notional, Decimal("10"))
+
     def test_apex_order_tpsl_kind_uses_trigger_price_relation(self):
         """_apex_order_tpsl_kind must return 'TP' when trigger > price
         (closing the position above market), 'SL' when trigger < price.
