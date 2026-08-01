@@ -533,8 +533,9 @@ _CREDENTIAL_VALUE_PATTERNS = (
     # URL query parameter (?token=, ?signature=, ?apikey=, ?sig=, etc.). Capture name
     # and value separately so the replacement does not duplicate the name.
     (re.compile(r'([?&](?:token|signature|api[_-]?key|access[_-]?token|sig)=)([^&\s"\'">]+)', re.IGNORECASE), r'\1[REDACTED]'),
-    # env var style: ARCUS_***_APISIGNINGKEY=<value>, *_API_KEY=<value>, etc.
-    (re.compile(r'((?:ARCUS_[A-Z0-9_]+_APISIGNINGKEY|[A-Z_]+_API_KEY|[A-Z_]+_SECRET|[A-Z_]+_TOKEN)\s*=\s*)([A-Za-z0-9._\-+/=]+)'), r'\1[REDACTED]'),
+    # env var style: ARCUS_***_APISIGNINGKEY=<value>, ARCUS_***_PRIVATE_KEY=<value>,
+    # *_API_KEY=<value>, etc.
+    (re.compile(r'((?:ARCUS_[A-Z0-9_]+_(?:APISIGNINGKEY|PRIVATE_KEY)|[A-Z_]+_API_KEY|[A-Z_]+_SECRET|[A-Z_]+_TOKEN)\s*=\s*)([A-Za-z0-9._\-+/=]+)'), r'\1[REDACTED]'),
     # ed25519 seed explicit prefix
     (re.compile(r'(ed25519:)([A-Fa-f0-9]{32,})'), r'\1[REDACTED_ED25519_SEED]'),
     # Defense-in-depth: 64-char hex adjacent to a credential-shaped keyword

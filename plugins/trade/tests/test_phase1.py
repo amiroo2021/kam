@@ -999,9 +999,57 @@ class TestArcusAgentPhase1(unittest.TestCase):
         os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
         os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
         arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
-        response = arcus.execute({"operation": "ladder", "exchange": "arcus", "account": "amiroo"})
+        # `set_leverage` is not implemented for Arcus (only Hyperliquid-style
+        # agents support it). Pick an op that has no other validation path so
+        # we hit the NOT_IMPLEMENTED fallback cleanly.
+        response = arcus.execute({"operation": "set_leverage", "exchange": "arcus", "account": "amiroo"})
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "NOT_IMPLEMENTED")
+
+    def test_arcus_capabilities_advertise_cancel_order_group(self):
+        """Regression: the wizard dispatches the Cancel menu using
+        ``cancel_order_group`` (singular). Arcus must advertise that operation
+        in ``capabilities()`` and the dispatcher must accept it; otherwise the
+        Cancel menu hits the ``NOT_IMPLEMENTED`` fallback. ``cancel_orders``
+        (plural) remains a backwards-compat alias."""
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        caps = arcus.capabilities()
+        self.assertIn("cancel_order_group", caps)
+        self.assertIn("cancel_orders", caps)
+
+        # Both operation spellings must route to the cancel handler, not the
+        # NOT_IMPLEMENTED fallback. We mock _cancel_order_group to assert it
+        # gets called for either name.
+        import unittest.mock as mock
+        called_with = {}
+        def fake_cancel(req):
+            called_with["req"] = req
+            return arcus.make_success(
+                operation="cancel_order_group", exchange="arcus",
+                account="amiroo",
+                cancel_group=arcus.CanonicalCancelGroupResult(
+                    symbol="BTC-USD", side="buy",
+                    targeted_order_count=0, cancelled_order_count=0,
+                    confirmed_absent_count=0, remaining_target_count=0,
+                    verified=True, partial=False, status="success",
+                    batch_count=0,
+                ),
+            )
+        with mock.patch.object(arcus, "_cancel_order_group", side_effect=fake_cancel):
+            r1 = arcus.execute({
+                "operation": "cancel_order_group",
+                "exchange": "arcus", "account": "amiroo",
+                "symbol": "BTC-USD", "side": "buy",
+            })
+            self.assertTrue(r1.success, f"cancel_order_group should work: {r1}")
+            r2 = arcus.execute({
+                "operation": "cancel_orders",
+                "exchange": "arcus", "account": "amiroo",
+                "symbol": "BTC-USD", "side": "buy",
+            })
+            self.assertTrue(r2.success, f"cancel_orders alias should work: {r2}")
 
     def test_arcus_signed_post_serializes_object_body_and_signs_with_ed25519(self):
         arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
@@ -1064,9 +1112,10 @@ class TestArcusAgentPhase1(unittest.TestCase):
         def fake_resolve_market(symbol):
             return market
 
-        def fake_signed_post(credentials, path, payload):
+        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
             seen["path"] = path
             seen["payload"] = payload
+            seen["typed_payload"] = typed_payload
             seen["client_id_prefix"] = payload["clientId"][:5]
             return {"orderId": "deadbeef", "status": "OPEN"}
 
@@ -1136,7 +1185,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
         def fake_resolve_market(symbol):
             return market
 
-        def fake_signed_post(credentials, path, payload):
+        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
             calls.append((path, payload.get("orderId")))
             if payload.get("orderId") == "ord-2":
                 raise RuntimeError("HTTP 500: error")
@@ -1184,7 +1233,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
         arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
         market = {"market_id": 1, "display_symbol": "BTC-USD", "tick_size": arcus._decimal_or_zero("0.1"), "step_size": arcus._decimal_or_zero("0.00000001"), "price_precision": 1, "size_precision": 8, "min_notional": arcus._decimal_or_zero("5")}
 
-        def fake_signed_post(credentials, path, payload):
+        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
             return {"status": "CANCELED"}
 
         open_orders_before = [
@@ -1231,7 +1280,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
                 ]
             }
 
-        def fake_signed_post(credentials, path, payload):
+        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
             return {"orderId": "deadbeef", "status": "OPEN"}
 
         with mock.patch.object(arcus, "_public_get", side_effect=fake_public_get), \
@@ -1271,10 +1320,444 @@ class TestArcusAgentPhase1(unittest.TestCase):
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "SYMBOL_NOT_FOUND")
 
+    def test_arcus_typed_payload_place_has_exact_field_set_and_types(self):
+        """Regression: /v1/placeOrder Scheme 1 typed payload must be exactly the
+        set of integer/str fields below. If this test fails, a future change
+        has drifted the signed bytes away from what Arcus's matching engine
+        verifies against — the same root cause as the 2026-07-31 'invalid
+        order signature' outage."""
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+
+        creds = {
+            "wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+            "api_signing_key": "any",
+            "private_key_hex": "00" * 32,
+            "account_index": 0,
+            "base_url": "https://api.arcus.xyz",
+        }
+        typed = arcus._build_arcus_typed_payload_place(
+            credentials=creds,
+            market_id=1,
+            price_ticks=74000,
+            qty_quantums=70000,
+            side="sell",
+            time_in_force="gtt",
+            good_til_time_us=1788986953972341,
+            timestamp_ns=1785530953972340120,
+            reduce_only=False,
+        )
+
+        self.assertEqual(
+            list(typed.keys()),
+            ["ad", "ai", "ct", "g", "m", "op", "p", "q", "r", "s", "t", "v"],
+        )
+        self.assertEqual(typed["ad"], "0x742d35cc6634c0532925a3b844bc454e4438f44e")
+        self.assertIsInstance(typed["ad"], str)
+        self.assertEqual(typed["ai"], 0)
+        self.assertIsInstance(typed["ai"], int)
+        self.assertEqual(typed["ct"], 1785530953972340120)
+        self.assertIsInstance(typed["ct"], int)
+        self.assertEqual(typed["g"], 1788986953972341 * 1000)
+        self.assertIsInstance(typed["g"], int)
+        self.assertEqual(typed["m"], 1)
+        self.assertIsInstance(typed["m"], int)
+        self.assertEqual(typed["op"], arcus._ARCUS_OP_PLACE)
+        self.assertEqual(typed["op"], 1)
+        self.assertIsInstance(typed["op"], int)
+        self.assertEqual(typed["p"], 74000)
+        self.assertIsInstance(typed["p"], int)
+        self.assertEqual(typed["q"], 70000)
+        self.assertIsInstance(typed["q"], int)
+        self.assertEqual(typed["r"], 0)
+        self.assertIsInstance(typed["r"], int)
+        self.assertEqual(typed["s"], 1)  # SELL = 1 (verified live)
+        self.assertIsInstance(typed["s"], int)
+        self.assertEqual(typed["t"], 0)  # GTT = 0 (verified live)
+        self.assertIsInstance(typed["t"], int)
+        self.assertEqual(typed["v"], 1)
+        self.assertIsInstance(typed["v"], int)
+
+        signed_bytes = arcus._typed_payload_bytes(typed)
+        expected = (
+            '{"ad":"0x742d35cc6634c0532925a3b844bc454e4438f44e",'
+            '"ai":0,'
+            '"ct":1785530953972340120,'
+            '"g":1788986953972341000,'
+            '"m":1,'
+            '"op":1,'
+            '"p":74000,'
+            '"q":70000,'
+            '"r":0,'
+            '"s":1,'
+            '"t":0,'
+            '"v":1}'
+        )
+        self.assertEqual(signed_bytes, expected)
+
+        # BUY=0, SELL=1; reduce_only=True → r=1; other TIF codes.
+        typed_buy = arcus._build_arcus_typed_payload_place(
+            credentials=creds, market_id=1, price_ticks=1, qty_quantums=1,
+            side="buy", time_in_force="gtt", good_til_time_us=1,
+            timestamp_ns=1, reduce_only=True,
+        )
+        self.assertEqual(typed_buy["s"], 0)
+        self.assertEqual(typed_buy["r"], 1)
+        self.assertEqual(arcus._SIDE_TO_INT, {"buy": 0, "sell": 1})
+        self.assertEqual(arcus._TIF_TO_INT, {"gtt": 0, "fok": 1, "ioc": 2, "alo": 3})
+
+        # When client_id is provided, the typed payload MUST include `c` between
+        # `ai` and `ct` (alphabetical canonical order). When empty, `c` is OMITTED
+        # entirely. Including an empty `c` (or omitting a non-empty `c`) causes
+        # Arcus's signature verifier to reject with HTTP 401 — see the live
+        # debugging notes from 2026-07-31.
+        typed_with_id = arcus._build_arcus_typed_payload_place(
+            credentials=creds, market_id=1, price_ticks=74000, qty_quantums=70000,
+            side="sell", time_in_force="gtt",
+            good_til_time_us=1788986953972341, timestamp_ns=1785530953972340120,
+            reduce_only=False, client_id="arcus-test-123",
+        )
+        self.assertEqual(
+            list(typed_with_id.keys()),
+            ["ad", "ai", "c", "ct", "g", "m", "op", "p", "q", "r", "s", "t", "v"],
+        )
+        self.assertEqual(typed_with_id["c"], "arcus-test-123")
+        signed_with_id = arcus._typed_payload_bytes(typed_with_id)
+        expected_with_id = (
+            '{"ad":"0x742d35cc6634c0532925a3b844bc454e4438f44e",'
+            '"ai":0,'
+            '"c":"arcus-test-123",'
+            '"ct":1785530953972340120,'
+            '"g":1788986953972341000,'
+            '"m":1,'
+            '"op":1,'
+            '"p":74000,'
+            '"q":70000,'
+            '"r":0,'
+            '"s":1,'
+            '"t":0,'
+            '"v":1}'
+        )
+        self.assertEqual(signed_with_id, expected_with_id)
+
+        # client_id="" → c is absent (not present as empty string).
+        typed_empty_id = arcus._build_arcus_typed_payload_place(
+            credentials=creds, market_id=1, price_ticks=74000, qty_quantums=70000,
+            side="sell", time_in_force="gtt",
+            good_til_time_us=1788986953972341, timestamp_ns=1785530953972340120,
+            reduce_only=False, client_id="",
+        )
+        self.assertNotIn("c", typed_empty_id)
+        self.assertEqual(
+            list(typed_empty_id.keys()),
+            ["ad", "ai", "ct", "g", "m", "op", "p", "q", "r", "s", "t", "v"],
+        )
+
+    def test_arcus_typed_payload_cancel_has_exact_field_set_and_types(self):
+        """Regression: /v1/cancelOrder Scheme 1 typed payload is the exact 7-key
+        shape below. g/p/q/s/t are intentionally absent — cancel doesn't carry
+        them. Drift here = the same 'invalid signature' bug as for place."""
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+
+        creds = {
+            "wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+            "api_signing_key": "any",
+            "private_key_hex": "00" * 32,
+            "account_index": 0,
+            "base_url": "https://api.arcus.xyz",
+        }
+        typed = arcus._build_arcus_typed_payload_cancel(
+            credentials=creds,
+            market_id=3,
+            order_id="a07e3d675d154daa",
+            timestamp_ns=1785530957476746009,
+        )
+
+        self.assertEqual(
+            list(typed.keys()),
+            ["ad", "ai", "ct", "id", "m", "op", "v"],
+        )
+        self.assertEqual(typed["ad"], "0x742d35cc6634c0532925a3b844bc454e4438f44e")
+        self.assertEqual(typed["ai"], 0)
+        self.assertEqual(typed["ct"], 1785530957476746009)
+        self.assertEqual(typed["id"], "a07e3d675d154daa")
+        self.assertEqual(typed["m"], 3)
+        self.assertEqual(typed["op"], arcus._ARCUS_OP_CANCEL)
+        self.assertEqual(typed["op"], 2)
+        self.assertEqual(typed["v"], 1)
+
+        signed_bytes = arcus._typed_payload_bytes(typed)
+        expected = (
+            '{"ad":"0x742d35cc6634c0532925a3b844bc454e4438f44e",'
+            '"ai":0,'
+            '"ct":1785530957476746009,'
+            '"id":"a07e3d675d154daa",'
+            '"m":3,'
+            '"op":2,'
+            '"v":1}'
+        )
+        self.assertEqual(signed_bytes, expected)
+
+    def test_arcus_signed_post_passes_typed_payload_as_signed_bytes_and_body_as_data(self):
+        """Regression: _signed_post must sign the typed payload, send the body
+        as the request body, and use the typed payload's ct as X-Timestamp.
+        This is what makes the live API accept signatures — body-signing here
+        was the original 'invalid order signature' bug."""
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("00" * 32))
+        pub = priv.public_key().public_bytes_raw().hex()
+        creds = {
+            "wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+            "api_signing_key": pub,
+            "private_key_hex": "00" * 32,
+            "account_index": 0,
+            "base_url": "https://api.arcus.xyz",
+        }
+
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+            def json(self):
+                return {"orderId": "deadbeef"}
+
+        def fake_post(url, *, headers, data, timeout):
+            captured["url"] = url
+            captured["headers"] = dict(headers)
+            captured["data"] = data
+            return _Resp()
+
+        typed = {
+            "ad": "0x742d35cc6634c0532925a3b844bc454e4438f44e",
+            "ai": 0,
+            "ct": 1785530953972340120,
+            "g": 1788986953972341000,
+            "m": 1,
+            "op": 1,
+            "p": 74000,
+            "q": 70000,
+            "r": 0,
+            "s": 1,
+            "t": 0,
+            "v": 1,
+        }
+        body = {
+            "address": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+            "marketId": 1,
+            "accountIndex": 0,
+            "orderSide": "SELL",
+            "orderType": "LIMIT",
+            "quantity": "0.07",
+            "price": "74",
+            "timeInForce": "GTT",
+            "goodTilTime": "1788986953972341",
+            "timestamp": 1785530953972340120,
+        }
+
+        with mock.patch.object(arcus.requests, "post", side_effect=fake_post):
+            arcus._signed_post(creds, "/v1/placeOrder", body, typed_payload=typed)
+
+            self.assertEqual(captured["headers"]["X-Timestamp"], "1785530953972340120")
+            self.assertEqual(captured["headers"]["X-API-Key"], pub)
+            self.assertEqual(captured["data"], arcus._canonical_json(body))
+            self.assertNotIn('"op"', captured["data"])
+            expected_signed = arcus._typed_payload_bytes(typed).encode("utf-8")
+            self.assertEqual(
+                captured["headers"]["X-Signature"],
+                priv.sign(expected_signed).hex(),
+            )
+
+    # --- Ladder tests --------------------------------------------------
+
+    def test_arcus_ladder_distribution_weights_uniform_returns_ones(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        weights = arcus._ladder_distribution_weights(5, "uniform")
+        self.assertEqual(weights, [arcus.Decimal("1")] * 5)
+
+    def test_arcus_ladder_distribution_weights_half_gaussian_orientation(self):
+        """Half-Gaussian: index 0 = smallest weight, index N-1 = largest."""
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        weights = arcus._ladder_distribution_weights(10, "half_gaussian")
+        self.assertEqual(len(weights), 10)
+        for i in range(len(weights) - 1):
+            self.assertLess(weights[i], weights[i + 1],
+                            f"weight[{i}] should be < weight[{i+1}]")
+        self.assertAlmostEqual(float(weights[0]), arcus.math.exp(-4.5), places=6)
+        self.assertAlmostEqual(float(weights[-1]), 1.0, places=6)
+
+    def test_arcus_ladder_build_prices_monotonic_after_tick_quantization(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        D = arcus.Decimal
+        prices = arcus._build_ladder_prices(D("70"), D("80"), 5, D("0.001"))
+        self.assertEqual(len(prices), 5)
+        self.assertEqual(prices[0], D("70"))
+        for i in range(len(prices) - 1):
+            self.assertLessEqual(prices[i], prices[i + 1])
+        prices_buy = arcus._build_ladder_prices(D("80"), D("70"), 5, D("0.001"))
+        for i in range(len(prices_buy) - 1):
+            self.assertGreaterEqual(prices_buy[i], prices_buy[i + 1])
+
+    def test_arcus_ladder_omits_sub_10usd_children_without_redistributing(self):
+        """Children whose price × size < $10 are omitted; survivors keep original sizes."""
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        D = arcus.Decimal
+        creds = {"wallet": "0x" + "11" * 20, "api_signing_key": "x",
+                 "private_key_hex": "00" * 32, "account_index": 0}
+        children, kept_volume, omitted, kept_count = arcus._build_arcus_ladder_children(
+            credentials=creds, market_id=1, price_increment=D("0.1"),
+            size_increment=D("0.1"), side="sell", distribution="uniform",
+            order_count=5, total_volume=D("100"), start_price=D("70"),
+            end_price=D("80"), size_precision=1, price_precision=1,
+            min_notional=D("10"), batch_id_prefix="t",
+        )
+        self.assertGreaterEqual(kept_count, 2)
+        for c in children:
+            self.assertGreaterEqual(c["price"] * c["size"], D("10"))
+        self.assertEqual(omitted, 5 - kept_count)
+
+    def test_arcus_ladder_execute_returns_failure_for_buy_with_inverted_prices(self):
+        """BUY ladders need end_price < start_price; otherwise INVALID_LADDER_DIRECTION."""
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        response = arcus.execute({
+            "operation": "ladder",
+            "exchange": "arcus",
+            "account": "amiroo",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "distribution": "half_gaussian",
+            "order_count": 10,
+            "total_volume": "100",
+            "start_price": "60000",
+            "end_price": "65000",  # wrong direction for buy
+        })
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "INVALID_LADDER_DIRECTION")
+
+    def test_arcus_ladder_capabilities_advertise_ladder(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        self.assertIn("ladder", arcus.capabilities())
+
+    # --- Position management tests -------------------------------------
+
+    def test_arcus_capabilities_advertise_position_management(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        caps = arcus.capabilities()
+        for op in ("positions_management", "set_tp", "set_sl", "close_position"):
+            self.assertIn(op, caps, f"missing capability: {op}")
+
+    def test_arcus_op_tpsl_is_op4(self):
+        """Plain TPSL place uses op=4 (OpPlaceUntriggered) per Arcus auth spec.
+
+        Distinct from op=1 (place) so signatures don't cross-replay between
+        TPSL and plain placeOrder. This constant is the single source of
+        truth for the typed payload's `op` field when placing TPSL.
+        """
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        self.assertEqual(arcus._ARCUS_OP_TPSL, 4)
+
+    def test_arcus_typed_tpsl_payload_has_op4_and_positive_qty(self):
+        """The TPSL typed payload uses op=4 and a positive q (the engine
+        resizes to the full position at trigger time when isPositionTPSL=true;
+        Arcus's signature verification rejects q=0)."""
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        from decimal import Decimal
+        creds = {"wallet": "0x" + "11" * 20, "api_signing_key": "x",
+                 "private_key_hex": "00" * 32, "account_index": 0}
+        # Build the typed payload the way set_tp would (side="sell" for a long
+        # position; client_id non-empty so `c` is included; positive qty).
+        typed = arcus._build_arcus_typed_payload_place(
+            credentials=creds, market_id=1, price_ticks=74000, qty_quantums=57470338,
+            side="sell", time_in_force="gtt", good_til_time_us=1788986953972341,
+            timestamp_ns=1785530953972340120, reduce_only=True,
+            client_id="arcus-tp-test",
+        )
+        typed["op"] = arcus._ARCUS_OP_TPSL  # what _execute_set_tp does
+        self.assertEqual(typed["op"], 4)
+        self.assertEqual(typed["q"], 57470338)
+        self.assertGreater(typed["q"], 0, "typed payload q must be positive")
+        # Same field set as op=1 except `op` is 4.
+        self.assertIn("ad", typed)
+        self.assertIn("ai", typed)
+        self.assertIn("ct", typed)
+        self.assertIn("g", typed)
+        self.assertIn("m", typed)
+        self.assertIn("p", typed)
+        self.assertIn("r", typed)
+        self.assertIn("s", typed)
+        self.assertIn("t", typed)
+        self.assertIn("v", typed)
+        # `c` should be present when clientId is non-empty.
+        self.assertEqual(typed["c"], "arcus-tp-test")
+
+    def test_arcus_normalize_tpsl_side_inverts_position_side(self):
+        """A TPSL closes the position when triggered: long→SELL, short→BUY."""
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        self.assertEqual(arcus._arcus_normalize_tpsl_side("long"), "sell")
+        self.assertEqual(arcus._arcus_normalize_tpsl_side("short"), "buy")
+
+    def test_arcus_find_existing_tpsl_matches_take_profit_and_stop_loss(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        orders = [
+            {"orderId": "a", "marketDisplayName": "BTC-USD", "type": "TAKE_PROFIT", "side": "SELL"},
+            {"orderId": "b", "marketDisplayName": "BTC-USD", "type": "STOP_LOSS",  "side": "SELL"},
+            {"orderId": "c", "marketDisplayName": "ETH-USD", "type": "TAKE_PROFIT", "side": "SELL"},
+            {"orderId": "d", "marketDisplayName": "BTC-USD", "type": "LIMIT",      "side": "SELL"},
+        ]
+        tp = arcus._arcus_find_existing_tpsl(orders, "BTC-USD", "TP")
+        self.assertEqual(tp["orderId"], "a")
+        sl = arcus._arcus_find_existing_tpsl(orders, "BTC-USD", "SL")
+        self.assertEqual(sl["orderId"], "b")
+        # Wrong symbol — no rows match.
+        self.assertIsNone(arcus._arcus_find_existing_tpsl(orders, "SOL-USD", "TP"))
+        # Unknown class — fail loudly rather than silently returning a wrong
+        # row (a previous version of this function mapped "INVALID" → "SL"
+        # because the else branch always picked STOP_LOSS — bug).
+        with self.assertRaises(ValueError):
+            arcus._arcus_find_existing_tpsl(orders, "BTC-USD", "INVALID")
+
+    def test_arcus_execute_set_tp_requires_symbol_and_price(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+        r1 = arcus.execute({"operation": "set_tp", "exchange": "arcus", "account": "amiroo"})
+        self.assertFalse(r1.success)
+        self.assertEqual(r1.error.code, "MISSING_SYMBOL")
+        r2 = arcus.execute({"operation": "set_tp", "exchange": "arcus",
+                            "account": "amiroo", "symbol": "BTC-USD"})
+        self.assertFalse(r2.success)
+        self.assertEqual(r2.error.code, "INVALID_TP_PRICE")
+
+    def test_arcus_execute_set_sl_requires_symbol_and_price(self):
+        arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
+        os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+        os.environ["ARCUS_AMIROO_APISIGNINGKEY"] = "secret-a"
+        os.environ["ARCUS_AMIROO_PRIVATE_KEY"] = "00" * 32
+        r1 = arcus.execute({"operation": "set_sl", "exchange": "arcus", "account": "amiroo"})
+        self.assertFalse(r1.success)
+        self.assertEqual(r1.error.code, "MISSING_SYMBOL")
+        r2 = arcus.execute({"operation": "set_sl", "exchange": "arcus",
+                            "account": "amiroo", "symbol": "BTC-USD"})
+        self.assertFalse(r2.success)
+        self.assertEqual(r2.error.code, "INVALID_SL_PRICE")
+
 
 def main():
     loader = unittest.TestLoader()
