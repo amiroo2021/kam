@@ -1722,6 +1722,111 @@ def _arcus_cancel_one_tpsl(
         return False
 
 
+def _arcus_remove_existing_tpsl(
+    *,
+    account: str,
+    request: Dict[str, Any],
+    tpsl_class: str,
+) -> CanonicalResponse:
+    """Handle `set_tp` / `set_sl` with price=0 — remove the existing
+    position-level TP or SL for the requested symbol.
+
+    Mirrors the contract the other agents expose: price <= 0 means
+    "remove the existing protection". If no matching protection exists,
+    report success (idempotent no-op).
+    """
+    requested_symbol = str(request.get("symbol") or "").strip()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Arcus account is not configured.",
+        )
+    # Verify there's an open position for this symbol (matches the
+    # context-driven semantics of the other agents' implementations).
+    ctx = _arcus_position_context(account, requested_symbol)
+    position_side, current_size, _, open_orders = ctx if ctx is not None else (None, None, None, [])
+    if ctx is None:
+        return make_success(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            position_action=_position_action_result(
+                operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+                symbol=requested_symbol, verified=True, status="success",
+                removed=False, current_side=position_side,
+                current_size=str(current_size) if current_size is not None else "0",
+                message=f"No open position for {requested_symbol}; nothing to remove.",
+            ),
+        )
+    market_meta = _arcus_resolve_market_meta(credentials, requested_symbol)
+    if market_meta is None:
+        return make_failure(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Market not found for {requested_symbol}.",
+        )
+    market_id = market_meta["market_id"]
+    # At most one position-level TP/SL per (account, market) is the
+    # documented invariant; surface ambiguity if it ever happens.
+    matches = [o for o in open_orders
+               if isinstance(o, dict)
+               and str(o.get("marketDisplayName") or "").upper() == requested_symbol.upper()
+               and str(o.get("tpslType") or "").strip().upper() == ("TAKE_PROFIT" if tpsl_class == "TP" else "STOP_LOSS")
+               and str(o.get("status") or "").strip().upper() == "UNTRIGGERED"]
+    if len(matches) > 1:
+        return make_failure(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            code="AMBIGUOUS_PROTECTION_STATE",
+            message=f"Multiple matching {tpsl_class} orders found; cannot determine removal target safely.",
+            position_action=_position_action_result(
+                operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+                symbol=requested_symbol, verified=False, status="failed",
+                current_side=position_side, current_size=str(current_size),
+            ),
+        )
+    if not matches:
+        # Idempotent: nothing to remove.
+        return make_success(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            position_action=_position_action_result(
+                operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+                symbol=requested_symbol, verified=True, status="success",
+                removed=False, current_side=position_side,
+                current_size=str(current_size),
+                message=f"No {'Take Profit' if tpsl_class == 'TP' else 'Stop Loss'} was set.",
+            ),
+        )
+    target = matches[0]
+    if not _arcus_cancel_one_tpsl(credentials, market_id, target):
+        return make_failure(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            exchange=name, account=account,
+            code=("TP_REMOVAL_FAILED" if tpsl_class == "TP" else "SL_REMOVAL_FAILED"),
+            message=f"Failed to cancel existing {'Take Profit' if tpsl_class == 'TP' else 'Stop Loss'}.",
+            position_action=_position_action_result(
+                operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+                symbol=requested_symbol, verified=False, status="failed",
+                removed=True, current_side=position_side,
+                current_size=str(current_size),
+            ),
+        )
+    return make_success(
+        operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+        exchange=name, account=credentials["account"],
+        position_action=_position_action_result(
+            operation=("set_tp" if tpsl_class == "TP" else "set_sl"),
+            symbol=requested_symbol, verified=True, status="success",
+            removed=True, current_side=position_side,
+            current_size=str(current_size),
+        ),
+    )
+
+
 def _arcus_batch_place_tpsl(
     credentials: Dict[str, Any],
     market_id: int,
@@ -1810,7 +1915,12 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     except Exception:
         return make_failure(operation="set_tp", exchange=name, account=account, code="INVALID_TP_PRICE", message="TP price must be numeric.")
     if price_value <= 0:
-        return make_failure(operation="set_tp", exchange=name, account=account, code="INVALID_TP_PRICE", message="TP price must be positive.")
+        # `price == 0` is the wizard's "remove existing TP" intent (same
+        # contract as the other agents). Cancel any existing position-level
+        # TP for this symbol and report success.
+        return _arcus_remove_existing_tpsl(
+            account=account, request=request, tpsl_class="TP",
+        )
     credentials = _lookup_credentials(account)
     if credentials is None:
         return make_failure(operation="set_tp", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
@@ -1924,7 +2034,12 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     except Exception:
         return make_failure(operation="set_sl", exchange=name, account=account, code="INVALID_SL_PRICE", message="SL price must be numeric.")
     if price_value <= 0:
-        return make_failure(operation="set_sl", exchange=name, account=account, code="INVALID_SL_PRICE", message="SL price must be positive.")
+        # `price == 0` is the wizard's "remove existing SL" intent (same
+        # contract as the other agents). Cancel any existing position-level
+        # SL for this symbol and report success.
+        return _arcus_remove_existing_tpsl(
+            account=account, request=request, tpsl_class="SL",
+        )
     credentials = _lookup_credentials(account)
     if credentials is None:
         return make_failure(operation="set_sl", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
