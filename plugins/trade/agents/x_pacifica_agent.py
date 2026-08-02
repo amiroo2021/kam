@@ -1119,14 +1119,6 @@ PACIFICA_LADDER_VALID_DISTRIBUTIONS = {
     PACIFICA_LADDER_DISTRIBUTION_HALF_GAUSSIAN,
 }
 
-# Hard cap on the number of children the agent will attempt to submit
-# in a single ladder. The wizard doesn't impose a limit, but Pacifica
-# has no documented cap and an accidental 1000-order ladder would
-# take minutes and clutter the book. 50 is generous for any normal
-# trading strategy and keeps the per-call latency bounded.
-PACIFICA_LADDER_MAX_ORDER_COUNT = 50
-
-
 def _ladder_distribution_weights(order_count: int, distribution: str) -> List[Decimal]:
     """Return per-child weights (sum ≈ 1.0) for the chosen distribution.
 
@@ -1490,15 +1482,6 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         return make_failure(
             operation="ladder", exchange=name, account=account,
             code="INVALID_ORDER_COUNT", message="Order count must be positive.",
-        )
-    if order_count > PACIFICA_LADDER_MAX_ORDER_COUNT:
-        return make_failure(
-            operation="ladder", exchange=name, account=account,
-            code="INVALID_ORDER_COUNT",
-            message=(
-                f"Order count {order_count} exceeds the per-ladder cap of "
-                f"{PACIFICA_LADDER_MAX_ORDER_COUNT}."
-            ),
         )
     if total_volume <= 0:
         return make_failure(
