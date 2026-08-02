@@ -50,6 +50,10 @@ id_ed25519*
 .DS_Store
 Thumbs.db
 
+# Local virtualenvs used during agent development
+.venv-*/
+.venv/
+
 # Written by the installer at install time (contains machine-specific paths)
 installer/manifest.json
 

@@ -6,7 +6,11 @@
 #
 # Deliberately NOT listed (verified unimported by every shipped agent):
 #   pynacl  - no agent imports nacl
-#   base58  - base58 decoding is implemented in-agent
+#
+# Per-exchange extra notes:
+#   - Pacifica (Solana): signed write operations import `solders` (the
+#     official Solana Python SDK) and `base58`. Read-only operations
+#     (balance / positions) do not require either.
 
 requests>=2.28
 cryptography>=41.0
@@ -14,3 +18,5 @@ eth-abi>=4.0
 eth-account>=0.10
 eth-utils>=2.2
 hyperliquid-python-sdk>=0.9
+solders>=0.19
+base58>=2.1

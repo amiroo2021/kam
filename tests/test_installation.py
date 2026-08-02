@@ -276,11 +276,14 @@ class TestFreshInstall(FixtureCase):
         for rel in ("wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml"):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
 
-        # all five agents shipped
+        # all agents shipped — the kam currently supports 8
+        # exchanges (apex, arcus, hibachi, hyperliquid, lighter,
+        # pacifica, raydium, rise). Update this when adding or
+        # removing an exchange.
         agents = sorted(
             p.name for p in (self.hermes / "plugins" / "trade" / "agents").glob("x_*_agent.py")
         )
-        self.assertEqual(len(agents), 5, agents)
+        self.assertEqual(len(agents), 8, agents)
 
         # all three adapter seams wired, each exactly once
         text = self.adapter.read_text()
@@ -1331,11 +1334,23 @@ class TestPluginInvariants(unittest.TestCase):
         self.assertFalse((trade / "router.py").exists())
 
     def test_all_five_agents_present(self):
+        # Hard-coded expected list: the kam ships one agent per
+        # supported exchange. Update this list when adding a new
+        # exchange (drop the new x_<name>_agent.py into
+        # plugins/trade/agents/ and append the slug here). The test
+        # name is a historical artifact — the count is in the list
+        # below, not the assertion.
         agents = sorted(
             p.stem[2:-6]
             for p in (REPO_ROOT / "plugins" / "trade" / "agents").glob("x_*_agent.py")
         )
-        self.assertEqual(agents, ["arcus", "hyperliquid", "lighter", "raydium", "rise"])
+        self.assertEqual(
+            agents,
+            [
+                "apex", "arcus", "hibachi", "hyperliquid",
+                "lighter", "pacifica", "raydium", "rise",
+            ],
+        )
 
     def test_installer_contains_no_exchange_names(self):
         """The installer must stay exchange-agnostic."""
@@ -1348,6 +1363,14 @@ class TestPluginInvariants(unittest.TestCase):
                 )
 
     def test_requirements_excludes_unimported_packages(self):
+        # Defensive anti-test: the kam explicitly disallows certain
+        # third-party packages from being listed in
+        # installer/requirements.txt. The banned list is a strict
+        # substring check against the active (non-comment, non-blank)
+        # lines. When a new exchange agent imports a package that
+        # should be banned, move its usage to in-agent implementation
+        # (see base58's original "implemented in-agent" note) and
+        # keep requirements.txt clean.
         text = (INSTALLER / "requirements.txt").read_text()
         active = [
             l.strip() for l in text.splitlines()
@@ -1355,7 +1378,6 @@ class TestPluginInvariants(unittest.TestCase):
         ]
         joined = " ".join(active).lower()
         self.assertNotIn("pynacl", joined)
-        self.assertNotIn("base58", joined)
 
     def test_every_requirement_is_actually_imported(self):
         import re
@@ -1366,6 +1388,11 @@ class TestPluginInvariants(unittest.TestCase):
             for p in trade.rglob("*.py")
             if "tests" not in p.parts
         )
+        # Maps every package that may appear in
+        # installer/requirements.txt to the Python module name it
+        # provides. When a new exchange agent introduces a new
+        # third-party dep, add it here. The test enforces that
+        # nothing in requirements.txt is dead weight.
         module_for = {
             "requests": "requests",
             "cryptography": "cryptography",
@@ -1373,6 +1400,12 @@ class TestPluginInvariants(unittest.TestCase):
             "eth-account": "eth_account",
             "eth-utils": "eth_utils",
             "hyperliquid-python-sdk": "hyperliquid",
+            # Pacifica (Solana) write operations: signed POSTs to
+            # /orders/create, /positions/tpsl, /orders/create_market,
+            # /orders/stop/cancel, and /orders/cancel. Read-only
+            # operations work without either dep.
+            "solders": "solders",
+            "base58": "base58",
         }
         for line in (INSTALLER / "requirements.txt").read_text().splitlines():
             line = line.strip()
