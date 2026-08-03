@@ -271,6 +271,47 @@ class TradeDesk:
             return []
         return [c for c in caps if isinstance(c, str)]
 
+    def ladder_max_orders_per_instrument(self, exchange: str) -> Optional[int]:
+        """Return the exchange's per-instrument open-order cap, or None.
+
+        Surfaced for the wizard's ladder order-count screen so the
+        operator can see ``MAX ORDERS PER INSTRUMENT = N`` before typing
+        a ladder size. **Informational only** — the wizard does not
+        clamp, reject, or otherwise act on this number.
+
+        Returns ``None`` when:
+
+        - ``exchange`` is not a registered agent (unknown / typo'd);
+        - the agent does not expose ``ladder_max_orders_per_instrument``;
+        - the accessor raises for any reason (logged at WARNING).
+
+        Callers should treat ``None`` as "unknown — show ``?`` in the
+        wizard" rather than as an error.
+        """
+        self._ensure_loaded()
+        agent = self._agents.get(exchange)
+        if agent is None:
+            return None
+        accessor = getattr(agent, "ladder_max_orders_per_instrument", None)
+        if not callable(accessor):
+            return None
+        try:
+            value = accessor()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ladder_max_orders_per_instrument(%s) failed: %s", exchange, exc
+            )
+            return None
+        if isinstance(value, bool):
+            # ``bool`` is a subclass of ``int`` in Python; reject ``True``
+            # (which would otherwise pass the ``isinstance(value, int)``
+            # check and mean "1 order"). Operators should never enable
+            # a per-instrument cap at 1.
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        return None
+
     def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
         """Dispatch a canonical request to the resolved agent.
 
