@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -345,12 +346,26 @@ def _positions_orders(account: str) -> CanonicalResponse:
 # ---------------------------------------------------------------------------
 
 def _run_async(coro: Any) -> Any:
-    """Run an SDK coroutine in a fresh asyncio loop."""
-    loop = asyncio.new_event_loop()
+    """Run an SDK coroutine without nesting an event loop in the gateway thread."""
     try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: Dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(target=_runner, name="edgex-sdk-async", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def _build_client(creds: Mapping[str, str]) -> Client:

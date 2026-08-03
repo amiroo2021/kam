@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, sys, tempfile, unittest
+import asyncio, os, sys, tempfile, unittest
 from pathlib import Path
 from decimal import Decimal
 from unittest import mock
@@ -10,6 +10,25 @@ from plugins.trade.agents import x_edgex_agent as edgex
 from plugins.trade import tradedesk
 
 class EdgeXAgentTests(unittest.TestCase):
+    class _FakeClient:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+        async def create_limit_order(self, **kwargs):
+            self.calls.append(("create_limit_order", kwargs))
+            return {"code": "SUCCESS", "data": {"orderId": "101"}}
+        async def create_market_order(self, **kwargs):
+            self.calls.append(("create_market_order", kwargs))
+            return {"code": "SUCCESS", "data": {"orderId": "102"}}
+        async def cancel_order(self, params):
+            self.calls.append(("cancel_order", params))
+            return {"code": "SUCCESS", "data": {"orderId": str(getattr(params, 'order_id', '103'))}}
+        async def create_order(self, params):
+            self.calls.append(("create_order", params))
+            return {"code": "SUCCESS", "data": {"orderId": "104"}}
+        async def close(self):
+            self.closed = True
+
     def setUp(self):
         self.old={k:v for k,v in os.environ.items() if k.startswith('EDGEX_')}
         for k in list(os.environ):
@@ -92,5 +111,55 @@ class EdgeXAgentTests(unittest.TestCase):
             result=edgex.execute({"operation":"new_order","account":"main","symbol":"SOLUSDC","side":"sell","volume":"1","price":"120"}).to_dict()
         self.assertTrue(result["success"])
         self.assertEqual(result["order"]["exchange_order_id"], 99)
+
+    def test__run_async_works_inside_running_loop_after_fix(self):
+        async def scenario():
+            self.assertEqual(edgex._run_async(asyncio.sleep(0, result="ok")), "ok")
+        asyncio.run(scenario())
+
+    def test_new_order_can_run_inside_existing_event_loop(self):
+        self.set_account()
+        async def scenario():
+            fake = self._FakeClient()
+            with mock.patch.object(edgex, "_build_client", return_value=fake), \
+                 mock.patch.object(edgex, "_resolve_contract", return_value=("42", "SOLUSDC")):
+                result = edgex.execute({"operation":"new_order","account":"main","symbol":"SOLUSDC","side":"sell","volume":"1","price":"120"}).to_dict()
+            self.assertTrue(result["success"])
+            self.assertEqual(result["order"]["exchange_order_id"], 101)
+            self.assertEqual(fake.calls[0][0], "create_limit_order")
+            self.assertTrue(fake.closed)
+        asyncio.run(scenario())
+
+    def test_ladder_can_run_inside_existing_event_loop(self):
+        self.set_account()
+        async def scenario():
+            fake = self._FakeClient()
+            with mock.patch.object(edgex, "_build_client", return_value=fake), \
+                 mock.patch.object(edgex, "_resolve_contract", return_value=("42", "SOLUSDC")), \
+                 mock.patch.object(edgex, "_contract_rules", return_value=(Decimal("0.01"), Decimal("0.1"), Decimal("0.1"))):
+                result = edgex.execute({
+                    "operation":"ladder","account":"main","symbol":"SOLUSDC","side":"sell",
+                    "order_count":"2","total_volume":"1.0","start_price":"120","end_price":"121","distribution":"uniform"
+                }).to_dict()
+            self.assertTrue(result["success"])
+            self.assertEqual(result["ladder"]["submitted_order_count"], 2)
+            self.assertEqual([name for name, _ in fake.calls if name == "create_limit_order"], ["create_limit_order", "create_limit_order"])
+            self.assertTrue(fake.closed)
+        asyncio.run(scenario())
+
+    def test_cancel_tp_sl_close_write_helpers_can_run_inside_existing_event_loop(self):
+        self.set_account()
+        async def scenario():
+            fake = self._FakeClient()
+            with mock.patch.object(edgex, "_build_client", return_value=fake):
+                cancel = edgex._cancel_order_by_id({"account_id":"123","api_key":"k","passphrase":"p","api_secret":"s","signer_key":"sig"}, "777")
+                market = edgex._create_market_order({"account_id":"123","api_key":"k","passphrase":"p","api_secret":"s","signer_key":"sig"}, "42", "1", "sell")
+                trigger = edgex._create_trigger_order({"account_id":"123","api_key":"k","passphrase":"p","api_secret":"s","signer_key":"sig"}, "42", "1", "sell", "70000", "tp")
+            self.assertEqual(cancel["code"], "SUCCESS")
+            self.assertEqual(market["code"], "SUCCESS")
+            self.assertEqual(trigger["code"], "SUCCESS")
+            self.assertEqual([name for name, _ in fake.calls], ["cancel_order", "create_market_order", "create_order"])
+            self.assertTrue(fake.closed)
+        asyncio.run(scenario())
 
 if __name__=='__main__': unittest.main()
