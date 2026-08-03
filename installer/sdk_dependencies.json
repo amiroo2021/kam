@@ -8,22 +8,52 @@
           "id": "official-python-sdk",
           "package": "lighter-sdk",
           "version": "1.1.2",
-          "install_args": ["--no-deps"],
+          "install_args": [
+            "--no-deps"
+          ],
           "runtime_dependencies": [
-            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"},
-            {"package": "python-dateutil"},
-            {"package": "aiohttp", "version_spec": ">=3.0.0"},
-            {"package": "aiohttp-retry", "version_spec": ">=2.8.3"},
-            {"package": "pydantic", "version_spec": ">=2"},
-            {"package": "typing-extensions", "version_spec": ">=4.7.1"},
-            {"package": "websockets", "version_spec": ">=12.0.0"},
-            {"package": "eth-account", "version_spec": ">=0.13.4"},
-            {"package": "requests", "version_spec": ">=2.31.0"}
+            {
+              "package": "urllib3",
+              "version_spec": ">=1.25.3,<2.1.0"
+            },
+            {
+              "package": "python-dateutil"
+            },
+            {
+              "package": "aiohttp",
+              "version_spec": ">=3.0.0"
+            },
+            {
+              "package": "aiohttp-retry",
+              "version_spec": ">=2.8.3"
+            },
+            {
+              "package": "pydantic",
+              "version_spec": ">=2"
+            },
+            {
+              "package": "typing-extensions",
+              "version_spec": ">=4.7.1"
+            },
+            {
+              "package": "websockets",
+              "version_spec": ">=12.0.0"
+            },
+            {
+              "package": "eth-account",
+              "version_spec": ">=0.13.4"
+            },
+            {
+              "package": "requests",
+              "version_spec": ">=2.31.0"
+            }
           ],
           "import_probe": "import lighter; from lighter import SignerClient",
           "preservation_policy": {
             "preserve_existing_versions": true,
-            "protected_packages": ["urllib3"]
+            "protected_packages": [
+              "urllib3"
+            ]
           },
           "metadata": {
             "notes": "Install the SDK without resolver-managed deps, then add any missing runtime dependencies explicitly while preserving Hermes-managed package versions."
@@ -38,28 +68,117 @@
           "id": "apexomni",
           "package": "apexomni",
           "version": "3.3.1",
-          "install_args": ["--no-deps"],
+          "install_args": [
+            "--no-deps"
+          ],
           "runtime_dependencies": [
-            {"package": "web3", "version_spec": ">=6.0.0"},
-            {"package": "eth-account", "version_spec": ">=0.13.7"},
-            {"package": "sympy", "version_spec": "==1.6"},
-            {"package": "mpmath", "version_spec": ">=1.0.0"},
-            {"package": "requests", "version_spec": ">=2.32.3,<3"},
-            {"package": "ecdsa", "version_spec": ">=0.16.0"},
-            {"package": "dateparser", "version_spec": ">=1.0.0"},
-            {"package": "numpy", "version_spec": ""},
-            {"package": "mnemonic", "version_spec": ""},
-            {"package": "websocket-client", "version_spec": ""},
-            {"package": "websockets", "version_spec": ">=12"},
-            {"package": "urllib3", "version_spec": ">=1.25.3,<2.1.0"}
+            {
+              "package": "web3",
+              "version_spec": ">=6.0.0"
+            },
+            {
+              "package": "eth-account",
+              "version_spec": ">=0.13.7"
+            },
+            {
+              "package": "sympy",
+              "version_spec": "==1.6"
+            },
+            {
+              "package": "mpmath",
+              "version_spec": ">=1.0.0"
+            },
+            {
+              "package": "requests",
+              "version_spec": ">=2.32.3,<3"
+            },
+            {
+              "package": "ecdsa",
+              "version_spec": ">=0.16.0"
+            },
+            {
+              "package": "dateparser",
+              "version_spec": ">=1.0.0"
+            },
+            {
+              "package": "numpy",
+              "version_spec": ""
+            },
+            {
+              "package": "mnemonic",
+              "version_spec": ""
+            },
+            {
+              "package": "websocket-client",
+              "version_spec": ""
+            },
+            {
+              "package": "websockets",
+              "version_spec": ">=12"
+            },
+            {
+              "package": "urllib3",
+              "version_spec": ">=1.25.3,<2.1.0"
+            }
           ],
           "import_probe": "import apexomni; from apexomni.http_private_sign import HttpPrivateRwaSign",
           "preservation_policy": {
             "preserve_existing_versions": true,
-            "protected_packages": ["urllib3"]
+            "protected_packages": [
+              "urllib3"
+            ]
           },
           "metadata": {
             "notes": "Apex SDK runtime dependencies. Minimum compatible requirements; pins are loosened where newer versions are not known to break Apex. sympy is pinned to ==1.6 because sympy 1.13+ removed sympy.core.numbers.igcdex, which apexomni starkex still imports. urllib3 is a protected package: Hermes-managed versions newer than 2.1.0 are preserved (never downgraded). Transitive deps (eth-abi, eth-utils, rlp, hexbytes, pydantic, aiohttp, lru-dict, parsimonious, jsonschema, protobuf, ckzg, bitarray, pycryptodome) are resolved automatically by pip when web3/eth-account install without --no-deps. numpy and mnemonic are direct apexomni imports not pulled by the wheel metadata resolver."
+          }
+        }
+      ]
+    },
+    {
+      "exchange": "edgex",
+      "sdks": [
+        {
+          "id": "edgex-python-sdk",
+          "package": "edgex-python-sdk",
+          "version": "2.0.0",
+          "install_args": [
+            "--no-deps"
+          ],
+          "runtime_dependencies": [
+            {
+              "package": "eth-account",
+              "version_spec": ">=0.13.4"
+            },
+            {
+              "package": "eth-utils",
+              "version_spec": ">=5.0.0"
+            },
+            {
+              "package": "pydantic",
+              "version_spec": ">=2"
+            },
+            {
+              "package": "typing-extensions",
+              "version_spec": ">=4.7.1"
+            },
+            {
+              "package": "aiohttp",
+              "version_spec": ">=3.0.0"
+            },
+            {
+              "package": "websocket-client",
+              "version_spec": ">=1.6.0"
+            }
+          ],
+          "import_probe": "import edgex_sdk; from edgex_sdk import Client, OrderSide, CancelOrderParams, CreateOrderParams, OrderType; from edgex_sdk.quote.client import PriceType",
+          "preservation_policy": {
+            "preserve_existing_versions": true,
+            "protected_packages": [
+              "urllib3"
+            ]
+          },
+          "metadata": {
+            "notes": "EdgeX V2 SDK runs in-process inside the shared Hermes venv. The end-to-end compatibility was verified: eth_account 0.13.7, eth-utils 5.3.1, eth_abi 5.2.0, pydantic 2.13.4, aiohttp 3.14.1, urllib3 2.7.0, web3 7.16.0 all satisfy the SDK's requirements and produce valid EIP-712 signatures. No dedicated EdgeX venv is required or maintained. --no-deps keeps pip from downgrading the shared-venv eth stack. The compatibility check (imports + EIP-712 sign + re-sign + focused tests + read-only live probe + write-path construction) is authoritative."
           }
         }
       ]

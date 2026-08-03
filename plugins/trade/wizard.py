@@ -169,12 +169,22 @@ def _account_option_parts(entry: Any) -> Tuple[Optional[str], Optional[str]]:
     return (None, None)
 
 
+def _rounded_money_display(value: Any) -> str:
+    """Render price-like values to at most two decimals for compact menus."""
+    try:
+        number = Decimal(str(value))
+        rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{rounded:,.2f}"
+    except Exception:
+        return _display_or_dash(value)
+
+
 def _order_group_summary_line(group: Any) -> str:
     symbol = str(getattr(group, "symbol", "")).strip() or "Symbol"
     side = str(getattr(group, "side", "")).strip().lower() or "side"
     count = int(getattr(group, "order_count", 0) or 0)
     total_size = _display_or_dash(getattr(group, "total_size", ""))
-    vwap = _display_or_dash(getattr(group, "vwap", ""))
+    vwap = _rounded_money_display(getattr(group, "vwap", ""))
     min_price = _display_or_dash(getattr(group, "min_price", ""))
     max_price = _display_or_dash(getattr(group, "max_price", ""))
     count_label = "order" if count == 1 else "orders"
