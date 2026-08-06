@@ -2301,6 +2301,105 @@ class TestArcusAgentPhase1(unittest.TestCase):
         finally:
             self._tearDown_env()
 
+    def test_apex_sell_half_gaussian_sizes_increase_from_start_to_end(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        children, kept_volume, omitted, kept_count = apex._apex_build_ladder_children(
+            symbol="BTC-USDT",
+            side="sell",
+            distribution="half_gaussian",
+            order_count=6,
+            total_volume=Decimal("2.1"),
+            start_price=Decimal("1000"),
+            end_price=Decimal("1005"),
+            size_increment=Decimal("0.01"),
+            price_increment=Decimal("0.1"),
+            min_order_size=Decimal("0"),
+        )
+        self.assertEqual(kept_count, 6)
+        self.assertEqual(omitted, 0)
+        prices = [Decimal(c["price"]) for c in children]
+        sizes = [Decimal(c["size"]) for c in children]
+        self.assertEqual(prices, sorted(prices))
+        self.assertTrue(all(a <= b for a, b in zip(sizes, sizes[1:])), sizes)
+        self.assertLess(sizes[0], sizes[-1])
+        self.assertEqual(sum(sizes), kept_volume)
+        self.assertEqual(sum(sizes), Decimal("2.1"))
+
+    def test_apex_buy_half_gaussian_progression_remains_increasing_along_start_to_end(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        children, kept_volume, omitted, kept_count = apex._apex_build_ladder_children(
+            symbol="SOL-USDT",
+            side="buy",
+            distribution="half_gaussian",
+            order_count=6,
+            total_volume=Decimal("2.1"),
+            start_price=Decimal("1005"),
+            end_price=Decimal("1000"),
+            size_increment=Decimal("0.01"),
+            price_increment=Decimal("0.1"),
+            min_order_size=Decimal("0"),
+        )
+        self.assertEqual(kept_count, 6)
+        self.assertEqual(omitted, 0)
+        prices = [Decimal(c["price"]) for c in children]
+        sizes = [Decimal(c["size"]) for c in children]
+        self.assertEqual(prices, sorted(prices, reverse=True))
+        self.assertTrue(all(a <= b for a, b in zip(sizes, sizes[1:])), sizes)
+        self.assertLess(sizes[0], sizes[-1])
+        self.assertEqual(sum(sizes), kept_volume)
+        self.assertEqual(sum(sizes), Decimal("2.1"))
+
+    def test_apex_uniform_buy_and_sell_sizes_remain_equal_subject_to_rounding(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        for side in ("buy", "sell"):
+            children, kept_volume, omitted, kept_count = apex._apex_build_ladder_children(
+                symbol="BTC-USDT",
+                side=side,
+                distribution="uniform",
+                order_count=5,
+                total_volume=Decimal("1.0"),
+                start_price=(Decimal("1005") if side == "buy" else Decimal("1000")),
+                end_price=(Decimal("1000") if side == "buy" else Decimal("1005")),
+                size_increment=Decimal("0.01"),
+                price_increment=Decimal("0.1"),
+                min_order_size=Decimal("0"),
+            )
+            self.assertEqual(kept_count, 5)
+            self.assertEqual(omitted, 0)
+            sizes = [Decimal(c["size"]) for c in children]
+            self.assertLessEqual(max(sizes) - min(sizes), Decimal("0.1"), (side, sizes))
+            self.assertEqual(sum(sizes), kept_volume)
+            self.assertEqual(sum(sizes), Decimal("1.0"))
+
+    def test_apex_batch_models_preserve_ladder_builder_orientation(self):
+        import plugins.trade.agents.x_apex_agent as apex
+        children, _, _, _ = apex._apex_build_ladder_children(
+            symbol="BTC-USDT",
+            side="sell",
+            distribution="half_gaussian",
+            order_count=6,
+            total_volume=Decimal("2.1"),
+            start_price=Decimal("1000"),
+            end_price=Decimal("1005"),
+            size_increment=Decimal("0.01"),
+            price_increment=Decimal("0.1"),
+            min_order_size=Decimal("0"),
+        )
+        models = [
+            apex._ApexLadderOrder(
+                symbol=c["symbol"],
+                side=c["side"],
+                price=c["price"],
+                size=c["size"],
+                client_id=c["client_id"],
+            )
+            for c in children
+        ]
+        self.assertEqual(
+            [(m.price, m.size) for m in models],
+            [(c["price"], c["size"]) for c in children],
+        )
+
     def test_arcus_ladder_3btc_50orders_not_rejected_by_unit_mismatch(self):
         """Same regression for Arcus: 3 BTC total volume across 50 orders
         must NOT be rejected by the dispatcher-level preflight (which had

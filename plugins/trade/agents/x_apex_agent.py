@@ -2156,13 +2156,6 @@ def _apex_build_ladder_children(
         distribution=distribution,
     )
 
-    # For SELL ladders the lowest-price child is the closest to market, so
-    # the smallest-size child sits there (matches the other agents).
-    # For BUY ladders the lowest-price child is farthest from market, so
-    # it gets the smallest size. Mirror Arcus's allocation orientation.
-    if side == "sell":
-        raw_sizes = list(reversed(raw_sizes))
-
     children: List[Dict[str, Any]] = []
     omitted_below_minimum = 0
     for index, price in enumerate(prices):
