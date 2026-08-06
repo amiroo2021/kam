@@ -173,7 +173,7 @@ class CanonicalOrderResult:
     submitted_price: str
     verified: bool
     status: str = "success"
-    exchange_order_id: Optional[int] = None
+    exchange_order_id: Optional[str | int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -202,7 +202,7 @@ class CanonicalPositionActionResult:
     price: Optional[str] = None
     removed: Optional[bool] = None
     status: str = "success"
-    exchange_order_id: Optional[int] = None
+    exchange_order_id: Optional[str | int] = None
     current_side: Optional[str] = None
     current_size: Optional[str] = None
     message: Optional[str] = None
@@ -247,7 +247,7 @@ class CanonicalLadderResult:
     accepted_child_count: Optional[int] = None
     omitted_order_count: Optional[int] = None
     omitted_below_minimum: Optional[int] = None
-    child_order_ids: Optional[list[int]] = None
+    child_order_ids: Optional[list[str | int]] = None
     batches: Optional[list[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:

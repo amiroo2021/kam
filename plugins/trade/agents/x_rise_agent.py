@@ -800,15 +800,42 @@ def _rise_sig_to_base64(signature: bytes) -> str:
     return base64.b64encode(signature).decode("ascii")
 
 
-def _extract_exchange_order_id(order: Dict[str, Any]) -> Optional[int]:
-    for key in ("resting_order_id", "wide_order_id", "order_id"):
-        raw = str(order.get(key) or "").strip()
-        if not raw:
+def _canonical_order_id(order: Dict[str, Any]) -> Optional[str]:
+    raw = str(order.get("order_id") or "").strip()
+    return raw or None
+
+
+def _find_matching_open_order(
+    *,
+    post_orders: List[Dict[str, Any]],
+    market_id: str,
+    side_int: int,
+    size_steps: int,
+    price_ticks: int,
+    response_order_id: Optional[str],
+    used_positions: Optional[set[int]] = None,
+    require_response_order_id: bool = True,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    normalized_response_order_id = str(response_order_id or "").strip()
+    if require_response_order_id and not normalized_response_order_id:
+        return None
+    for index, order in enumerate(post_orders):
+        if used_positions is not None and index in used_positions:
             continue
-        try:
-            return int(raw)
-        except Exception:  # noqa: BLE001
+        if str(order.get("market_id") or "") != market_id:
             continue
+        if int(str(order.get("side_int") if order.get("side_int") is not None else -1)) != side_int:
+            continue
+        if int(order.get("size_steps") or -1) != size_steps:
+            continue
+        if int(order.get("price_ticks") or -1) != price_ticks:
+            continue
+        canonical_id = _canonical_order_id(order)
+        if require_response_order_id and canonical_id != normalized_response_order_id:
+            continue
+        if not require_response_order_id and normalized_response_order_id and canonical_id != normalized_response_order_id:
+            continue
+        return index, order
     return None
 
 
@@ -1102,22 +1129,24 @@ def _verify_new_order_submission(
     size_steps: int,
     price_ticks: int,
     response_order_id: Optional[str],
-) -> Tuple[bool, Optional[int]]:
+) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    if not str(response_order_id or "").strip():
+        return False, None, None
     post_payload = _fetch_open_orders_payload(wallet)
     post_orders = _normalize_open_orders(post_payload, market_cache)
-    for order in post_orders:
-        if str(order.get("market_id") or "") != market_id:
-            continue
-        if int(str(order.get("side_int") if order.get("side_int") is not None else -1)) != side_int:
-            continue
-        if int(order.get("size_steps") or -1) != size_steps:
-            continue
-        if int(order.get("price_ticks") or -1) != price_ticks:
-            continue
-        if response_order_id and str(order.get("order_id") or "").strip() != response_order_id:
-            continue
-        return True, _extract_exchange_order_id(order)
-    return False, None
+    matched = _find_matching_open_order(
+        post_orders=post_orders,
+        market_id=market_id,
+        side_int=side_int,
+        size_steps=size_steps,
+        price_ticks=price_ticks,
+        response_order_id=response_order_id,
+        require_response_order_id=True,
+    )
+    if matched is None:
+        return False, None, None
+    _index, order = matched
+    return True, _canonical_order_id(order), order
 
 
 def _extract_response_order_id(payload: Any) -> Optional[str]:
@@ -1125,14 +1154,12 @@ def _extract_response_order_id(payload: Any) -> Optional[str]:
         return None
     data = payload.get("data")
     if isinstance(data, dict):
-        for key in ("order_id", "resting_order_id", "wide_order_id"):
-            value = str(data.get(key) or "").strip()
-            if value:
-                return value
-    for key in ("order_id", "resting_order_id", "wide_order_id"):
-        value = str(payload.get(key) or "").strip()
+        value = str(data.get("order_id") or "").strip()
         if value:
             return value
+    value = str(payload.get("order_id") or "").strip()
+    if value:
+        return value
     return None
 
 
@@ -1364,7 +1391,7 @@ def _submit_rise_limit_order(
 
     response_order_id = _extract_response_order_id(submission_payload)
     if verify_after_submit:
-        verified, exchange_order_id = _verify_new_order_submission(
+        verified, exchange_order_id, _matched_order = _verify_new_order_submission(
             wallet=wallet,
             market_cache=market_cache,
             market_id=str(market_id),
@@ -1374,7 +1401,7 @@ def _submit_rise_limit_order(
             response_order_id=response_order_id,
         )
     else:
-        verified, exchange_order_id = True, None
+        verified, exchange_order_id = bool(response_order_id), response_order_id
     result = CanonicalOrderResult(
         symbol=requested_symbol,
         side=requested_side,
@@ -1387,6 +1414,8 @@ def _submit_rise_limit_order(
         status="success" if verified else "partial",
         exchange_order_id=exchange_order_id,
     )
+    if not verify_after_submit:
+        return make_success(operation=operation, exchange=name, account=account, order=result), payload, submitted_volume, submitted_price
     if verified:
         return make_success(operation=operation, exchange=name, account=account, order=result), payload, submitted_volume, submitted_price
     return make_failure(operation=operation, exchange=name, account=account, code="VERIFICATION_FAILED", message="Order submission could not be verified.", order=result), payload, submitted_volume, submitted_price
@@ -1399,33 +1428,33 @@ def _verify_rise_ladder_submission(
     market_id: str,
     side_int: int,
     expected_payloads: List[Dict[str, Any]],
-) -> Tuple[bool, List[int]]:
+) -> Tuple[bool, List[str], List[Dict[str, Any]]]:
     post_payload = _fetch_open_orders_payload(wallet)
     post_orders = _normalize_open_orders(post_payload, market_cache)
-    matched_ids: List[int] = []
+    matched_ids: List[str] = []
+    matched_rows: List[Dict[str, Any]] = []
     used_positions: set[int] = set()
     for expected in expected_payloads:
-        matched = False
-        for index, order in enumerate(post_orders):
-            if index in used_positions:
-                continue
-            if str(order.get("market_id") or "") != market_id:
-                continue
-            if int(str(order.get("side_int") if order.get("side_int") is not None else -1)) != side_int:
-                continue
-            if int(order.get("size_steps") or -1) != int(expected.get("size_steps") or -1):
-                continue
-            if int(order.get("price_ticks") or -1) != int(expected.get("price_ticks") or -1):
-                continue
-            used_positions.add(index)
-            order_id = _extract_exchange_order_id(order)
-            if order_id is not None:
-                matched_ids.append(order_id)
-            matched = True
-            break
-        if not matched:
-            return False, matched_ids
-    return True, matched_ids
+        matched = _find_matching_open_order(
+            post_orders=post_orders,
+            market_id=market_id,
+            side_int=side_int,
+            size_steps=int(expected.get("size_steps") or -1),
+            price_ticks=int(expected.get("price_ticks") or -1),
+            response_order_id=str(expected.get("response_order_id") or "").strip() or None,
+            used_positions=used_positions,
+            require_response_order_id=True,
+        )
+        if matched is None:
+            return False, matched_ids, matched_rows
+        index, order = matched
+        used_positions.add(index)
+        order_id = _canonical_order_id(order)
+        if order_id is None:
+            return False, matched_ids, matched_rows
+        matched_ids.append(order_id)
+        matched_rows.append(order)
+    return True, matched_ids, matched_rows
 
 
 def _rise_encode_cancel_action_hash(*, market_id: int, resting_order_id: int) -> bytes:
@@ -1898,7 +1927,7 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
                 ),
             )
         response_order_id = _extract_response_order_id(submission_payload)
-        verified, exchange_order_id = _verify_new_order_submission(
+        verified, exchange_order_id, _matched_order = _verify_new_order_submission(
             wallet=wallet,
             market_cache=cache,
             market_id=str(market_id),
@@ -2023,7 +2052,7 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         accepted_payloads: List[Dict[str, Any]] = []
         accepted_count = 0
         accepted_volume = Decimal("0")
-        child_order_ids: List[int] = []
+        child_order_ids: List[str | int] = []
         for child in children:
             child_response, payload, child_volume, _child_price = _submit_rise_limit_order(
                 wallet=wallet,
@@ -2041,12 +2070,16 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 verify_after_submit=False,
             )
             if child_response.success:
-                accepted_payloads.append(payload)
+                accepted_payload = dict(payload)
+                if child_response.order and child_response.order.exchange_order_id is not None:
+                    accepted_payload["response_order_id"] = str(child_response.order.exchange_order_id)
+                accepted_payloads.append(accepted_payload)
                 accepted_count += 1
                 accepted_volume += child_volume
                 if child_response.order and child_response.order.exchange_order_id is not None:
-                    child_order_ids.append(child_response.order.exchange_order_id)
+                    child_order_ids.append(str(child_response.order.exchange_order_id))
                 continue
+            reported_child_order_ids: List[str | int] = list(child_order_ids)
             ladder = CanonicalLadderResult(
                 symbol=requested_symbol,
                 side=requested_side,
@@ -2062,8 +2095,8 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 accepted_child_count=accepted_count,
                 omitted_order_count=order_count - accepted_count,
                 omitted_below_minimum=omitted_below_minimum,
-                child_order_ids=child_order_ids or None,
-                batches=[{"batch_index": 1, "submitted_order_count": accepted_count, "accepted_child_count": accepted_count, "child_order_ids": child_order_ids}],
+                child_order_ids=reported_child_order_ids or None,
+                batches=[{"batch_index": 1, "submitted_order_count": accepted_count, "accepted_child_count": accepted_count, "child_order_ids": reported_child_order_ids}],
             )
             return make_failure(
                 operation="ladder",
@@ -2074,13 +2107,14 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 ladder=ladder,
             )
 
-        verified, verified_order_ids = _verify_rise_ladder_submission(
+        verified, verified_order_ids, _matched_rows = _verify_rise_ladder_submission(
             wallet=wallet,
             market_cache=cache,
             market_id=str(market.get("market_id") or ""),
             side_int=RISE_SIDE_TO_INT[requested_side],
             expected_payloads=accepted_payloads,
         )
+        reported_child_order_ids: List[str | int] = list(verified_order_ids or child_order_ids)
         ladder = CanonicalLadderResult(
             symbol=requested_symbol,
             side=requested_side,
@@ -2096,8 +2130,8 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             accepted_child_count=accepted_count,
             omitted_order_count=order_count - accepted_count,
             omitted_below_minimum=omitted_below_minimum,
-            child_order_ids=verified_order_ids or child_order_ids or None,
-            batches=[{"batch_index": 1, "submitted_order_count": accepted_count, "accepted_child_count": accepted_count, "child_order_ids": verified_order_ids or child_order_ids}],
+            child_order_ids=reported_child_order_ids or None,
+            batches=[{"batch_index": 1, "submitted_order_count": accepted_count, "accepted_child_count": accepted_count, "child_order_ids": reported_child_order_ids}],
         )
         if verified and accepted_count == len(children):
             return make_success(operation="ladder", exchange=name, account=account, ladder=ladder)
