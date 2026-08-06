@@ -1267,13 +1267,12 @@ def _ladder_build_children(
     """Build the per-child ladder rows, snap to instrument precision,
     drop sub-floor children, and return the kept list.
 
-    The size-allocation convention matches the other agents: for SELL
-    ladders the lowest-price child is the closest to market, so the
-    smallest-size child sits there (i.e. we reverse the size array
-    before assigning to prices, so the smallest size lands at the
-    lowest price). For BUY ladders the lowest-price child is farthest
-    from market, so it gets the smallest size — which is the natural
-    ordering.
+    The size-allocation convention matches the other agents: the
+    Half-Gaussian allocator already produces sizes in ladder progression
+    order, from smallest at index 0 to largest at the final index. We
+    preserve that ordering for both SELL and BUY when pairing sizes with
+    the start→end price sequence, so the smallest child stays near
+    ``start_price`` and the largest stays near ``end_price``.
 
     Children below the per-order $10 USD notional floor are dropped
     WITHOUT redistribution. This matches the policy in every other
@@ -1293,8 +1292,6 @@ def _ladder_build_children(
         size_increment=size_increment,
         distribution=distribution,
     )
-    if side == "sell":
-        raw_sizes = list(reversed(raw_sizes))
 
     children: List[Dict[str, Any]] = []
     omitted_below_minimum = 0
