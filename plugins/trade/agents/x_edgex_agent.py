@@ -60,6 +60,8 @@ _FIELDS = {
     "APIPASSPHRASE": "passphrase", "SIGNERKEY": "signer_key",
 }
 _ALIAS = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_ACTIVE_ORDERS_PAGE_SIZE = 200
+_ACTIVE_ORDERS_MAX_PAGES = 20
 
 
 def _env() -> Dict[str, str]:
@@ -238,9 +240,51 @@ def _balance(account: str) -> CanonicalResponse:
 
 
 def _active_orders(creds: Mapping[str, str]) -> List[Dict[str, Any]]:
-    data = _request(creds, "/api/v2/private/order/getActiveOrderPage",
-                   {"accountId": creds["account_id"], "size": "200"}) or {}
-    return [x for x in (data.get("dataList") or []) if isinstance(x, dict)]
+    account_id = str(creds["account_id"])
+    all_rows: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_request_offsets: set[str] = set()
+    seen_next_offsets: set[str] = set()
+    next_offset = ""
+
+    for _page_index in range(_ACTIVE_ORDERS_MAX_PAGES):
+        request_offset = str(next_offset or "")
+        if request_offset in seen_request_offsets:
+            raise ValueError("Active-order pagination repeated a request offset.")
+        seen_request_offsets.add(request_offset)
+
+        params: Dict[str, Any] = {"accountId": account_id, "size": str(_ACTIVE_ORDERS_PAGE_SIZE)}
+        if request_offset:
+            params["offsetData"] = request_offset
+        data = _request(creds, "/api/v2/private/order/getActiveOrderPage", params) or {}
+        if not isinstance(data, dict):
+            raise ValueError("Active-order pagination response was not an object.")
+        if "nextPageOffsetData" not in data:
+            raise ValueError("Active-order pagination response omitted nextPageOffsetData.")
+        rows = data.get("dataList") or []
+        if not isinstance(rows, list):
+            raise ValueError("Active-order pagination response dataList was not a list.")
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_id = str(row.get("id") or "").strip()
+            if not raw_id:
+                all_rows.append(row)
+                continue
+            if raw_id in seen_ids:
+                continue
+            seen_ids.add(raw_id)
+            all_rows.append(row)
+
+        next_offset = str(data.get("nextPageOffsetData") or "").strip()
+        if not next_offset:
+            return all_rows
+        if next_offset in seen_next_offsets:
+            raise ValueError("Active-order pagination repeated nextPageOffsetData.")
+        seen_next_offsets.add(next_offset)
+
+    raise ValueError("Active-order pagination exceeded bounded page limit.")
 
 
 def _trigger_time_in_force() -> str:
@@ -289,13 +333,12 @@ def _positions_orders(account: str) -> CanonicalResponse:
     try:
         aid = creds["account_id"]
         data = _request(creds, "/api/v2/private/account/getAccountAsset", {"accountId": aid}) or {}
-        orders_data = _request(creds, "/api/v2/private/order/getActiveOrderPage",
-                              {"accountId": aid, "size": "200"}) or {}
+        active_rows = _active_orders(creds)
         symbols = _metadata()
         positions: List[CanonicalPosition] = []
         asset_by_contract = {str(x.get("contractId")): x for x in (data.get("positionAssetList") or [])}
         contract_ids = {str(x.get("contractId")) for x in (data.get("positionList") or [])}
-        protection_by_contract = {cid: _protection_prices(orders_data.get("dataList") or [], cid) for cid in contract_ids}
+        protection_by_contract = {cid: _protection_prices(active_rows, cid) for cid in contract_ids}
         for row in data.get("positionList", []) or []:
             size = Decimal(str(row.get("openSize") or "0"))
             if size == 0:
@@ -312,7 +355,7 @@ def _positions_orders(account: str) -> CanonicalResponse:
                 tp=tp, sl=sl,
             ))
         groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-        for row in orders_data.get("dataList", []) or []:
+        for row in active_rows:
             cid = str(row.get("contractId"))
             symbol = symbols.get(cid, cid)
             side = str(row.get("side") or "").lower()
@@ -634,6 +677,51 @@ def _ladder_sizes(total: Decimal, count: int, increment: Decimal, distribution: 
     return [Decimal(x) * increment for x in allocated]
 
 
+def _canonical_order_id(row: Mapping[str, Any]) -> str:
+    return str(row.get("id") or "").strip()
+
+
+def _verify_ladder_submission(
+    creds: Mapping[str, str],
+    contract_id: str,
+    side: str,
+    submitted_children: List[Dict[str, Any]],
+) -> Tuple[bool, List[str]]:
+    live_rows = _active_orders(creds)
+    used_positions: set[int] = set()
+    verified_ids: List[str] = []
+    for child in submitted_children:
+        matched = False
+        expected_id = str(child["order_id"])
+        expected_price = Decimal(str(child["price"]))
+        expected_size = Decimal(str(child["size"]))
+        for index, row in enumerate(live_rows):
+            if index in used_positions:
+                continue
+            if _canonical_order_id(row) != expected_id:
+                continue
+            if str(row.get("contractId") or "") != contract_id:
+                continue
+            if str(row.get("side") or "").lower() != side:
+                continue
+            try:
+                live_price = Decimal(str(row.get("price") or "0"))
+                live_size = Decimal(str(row.get("size") or "0"))
+            except Exception:  # noqa: BLE001
+                continue
+            if live_price != expected_price:
+                continue
+            if live_size != expected_size:
+                continue
+            used_positions.add(index)
+            verified_ids.append(expected_id)
+            matched = True
+            break
+        if not matched:
+            return False, verified_ids
+    return True, verified_ids
+
+
 def _ladder(request: Dict[str, Any]) -> CanonicalResponse:
     account = str(request.get("account") or "")
     creds = _credentials(account)
@@ -651,22 +739,40 @@ def _ladder(request: Dict[str, Any]) -> CanonicalResponse:
         prices = _ladder_prices(start, end, count, tick)
         distribution = str(request.get("distribution") or "uniform")
         sizes = _ladder_sizes(total, count, size_increment, distribution, min_size)
-        ids: List[int] = []
+        submitted_children: List[Dict[str, Any]] = []
         for price, size in zip(prices, sizes):
             raw = _create_limit_order(creds, cid, format(size, "f"), format(price, "f"), side)
-            oid = (raw.get("data") or {}).get("orderId")
+            oid = str((raw.get("data") or {}).get("orderId") or "").strip()
             if oid:
-                ids.append(int(oid))
-        submitted = sum(sizes[: len(ids)], Decimal(0))
+                submitted_children.append({
+                    "order_id": oid,
+                    "price": price,
+                    "size": size,
+                })
+        ids = [str(child["order_id"]) for child in submitted_children]
+        submitted = sum((Decimal(str(child["size"])) for child in submitted_children), Decimal(0))
+        verified = False
+        if len(submitted_children) == count:
+            try:
+                verified, _verified_ids = _verify_ladder_submission(creds, cid, side, submitted_children)
+            except Exception:  # noqa: BLE001
+                verified = False
+        reported_child_order_ids: List[str | int] = list(ids)
         result = CanonicalLadderResult(
             symbol=symbol, side=side, distribution=distribution,
             requested_order_count=count, submitted_order_count=len(ids),
             requested_volume=str(total), submitted_volume=str(submitted),
-            batch_count=count, verified=len(ids) == count, partial=len(ids) != count,
-            child_order_ids=ids,
+            batch_count=count, verified=verified, partial=(len(ids) != count) or not verified,
+            child_order_ids=reported_child_order_ids,
         )
-        return make_success(
-            operation="ladder", exchange=name, account=creds["account"], ladder=result,
+        if verified:
+            return make_success(
+                operation="ladder", exchange=name, account=creds["account"], ladder=result,
+            )
+        return make_failure(
+            operation="ladder", exchange=name, account=creds["account"],
+            code="VERIFICATION_FAILED", message="Ladder submission could not be verified.",
+            ladder=result,
         )
     except Exception as exc:
         return make_failure(
