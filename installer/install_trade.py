@@ -28,6 +28,15 @@ from patchspecs import all_specs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPENDENCY_MANIFEST_PATH = REPO_ROOT / "installer" / "sdk_dependencies.json"
+FIBO_UNIT_TEMPLATE_PATH = REPO_ROOT / "installer" / "fibo.service.template"
+DEFAULT_SYSTEMD_DIR = Path("/etc/systemd/system")
+SUSPICIOUS_UNIT_PATH_TOKENS = (
+    "/tmp/",
+    "/var/tmp/",
+    "kam-itest",
+    "kam-ik-itest",
+    "kam-fibo-verify",
+)
 
 
 def _normalize_dist_name(name: str) -> str:
@@ -666,6 +675,130 @@ def enable_plugin_in_config(
     return record
 
 
+def _render_fibo_unit(
+    *,
+    hermes_root: Path,
+    hermes_home: Path,
+    python_exe: Path,
+) -> str:
+    template = FIBO_UNIT_TEMPLATE_PATH.read_text(encoding="utf-8")
+    runtime_dir = hermes_home / "fibo"
+    replacements = {
+        "{{HERMES_ROOT}}": str(hermes_root),
+        "{{HERMES_HOME}}": str(hermes_home),
+        "{{PYTHON_EXE}}": str(python_exe),
+        "{{SOCKET_PATH}}": str(runtime_dir / "service.sock"),
+        "{{STATE_PATH}}": str(runtime_dir / "service_state.json"),
+        "{{LEDGER_PATH}}": str(runtime_dir / "service_ledger.jsonl"),
+        "{{EVENT_LOG_PATH}}": str(runtime_dir / "service-events.log"),
+    }
+    rendered = template
+    for old, new in replacements.items():
+        rendered = rendered.replace(old, new)
+    return rendered
+
+
+def _is_real_systemd_dir(systemd_dir: Path) -> bool:
+    try:
+        return systemd_dir.expanduser().resolve() == DEFAULT_SYSTEMD_DIR.resolve()
+    except Exception:
+        return str(systemd_dir) == str(DEFAULT_SYSTEMD_DIR)
+
+
+def _validate_production_fibo_unit(rendered: str, *, systemd_dir: Path) -> None:
+    if not _is_real_systemd_dir(systemd_dir):
+        return
+    lowered = rendered.lower()
+    hits = [token for token in SUSPICIOUS_UNIT_PATH_TOKENS if token.lower() in lowered]
+    if hits:
+        raise K.InstallError(
+            "Refusing to install fibo.service into the real production systemd directory "
+            f"because the rendered unit contains suspicious temporary/test paths: {', '.join(hits)}"
+        )
+
+
+def install_fibo_service_unit(
+    hermes_root: Path,
+    hermes_home: Path,
+    python_exe: Path,
+    backup_dir: Path,
+    dry_run: bool,
+    systemd_dir: Path,
+) -> Dict[str, Any]:
+    step("Install fibo.service unit")
+    if not FIBO_UNIT_TEMPLATE_PATH.is_file():
+        raise K.InstallError(f"Missing systemd unit template: {FIBO_UNIT_TEMPLATE_PATH}")
+    systemd_dir = Path(systemd_dir)
+    target = systemd_dir / "fibo.service"
+    rendered = _render_fibo_unit(hermes_root=hermes_root, hermes_home=hermes_home, python_exe=python_exe)
+    _validate_production_fibo_unit(rendered, systemd_dir=systemd_dir)
+    before = K.sha256_file(target) if target.is_file() else None
+    after = K.sha256_text(rendered)
+    runtime_dir = hermes_home / "fibo"
+    runtime_paths = [
+        runtime_dir,
+        runtime_dir / "service_state.json",
+        runtime_dir / "service_ledger.jsonl",
+        runtime_dir / "service-events.log",
+        runtime_dir / "service.sock",
+    ]
+    if dry_run:
+        ok(f"Would install {target}")
+        ok(f"Would ensure runtime dir {runtime_dir}")
+        action = "unchanged" if before == after else ("would-update" if before else "would-create")
+        return {
+            "action": action,
+            "path": str(target),
+            "sha256_before": before,
+            "sha256_after": after,
+            "runtime_dir": str(runtime_dir),
+            "runtime_paths": [str(p) for p in runtime_paths],
+        }
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and before != after:
+        bk = backup_dir / "systemd" / "fibo.service"
+        bk.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, bk)
+    target.write_text(rendered, encoding="utf-8")
+    ok(f"Installed {target}")
+    ok(f"Runtime dir ready: {runtime_dir}")
+    action = "unchanged" if before == after else ("updated" if before else "created")
+    return {
+        "action": action,
+        "path": str(target),
+        "sha256_before": before,
+        "sha256_after": after,
+        "runtime_dir": str(runtime_dir),
+        "runtime_paths": [str(p) for p in runtime_paths],
+    }
+
+
+def activate_fibo_service(dry_run: bool, no_restart: bool, systemd_dir: Path) -> Dict[str, Any]:
+    step("Activate fibo.service")
+    target = Path(systemd_dir) / "fibo.service"
+    if not target.is_file():
+        skip("fibo.service unit not present; activation skipped")
+        return {"action": "skipped", "reason": "unit-not-installed", "path": str(target)}
+    if no_restart:
+        skip("--no-restart supplied; fibo.service not daemon-reloaded/enabled/started")
+        return {"action": "skipped", "reason": "no-restart-flag", "path": str(target)}
+    if dry_run:
+        ok("Would run: systemctl daemon-reload")
+        ok("Would run: systemctl enable fibo.service")
+        ok("Would run: systemctl restart fibo.service")
+        return {"action": "would-activate", "path": str(target)}
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "fibo.service"], check=True)
+    subprocess.run(["systemctl", "restart", "fibo.service"], check=True)
+    proc = subprocess.run(["systemctl", "is-active", "fibo.service"], capture_output=True, text=True)
+    state = proc.stdout.strip()
+    if state != "active":
+        raise K.InstallError(f"fibo.service did not return to active (state={state})")
+    ok("fibo.service active")
+    return {"action": "activated", "state": state, "path": str(target)}
+
+
 def install_dependencies(
     python_exe: Path,
     dry_run: bool,
@@ -847,6 +980,7 @@ def restart_gateway(dry_run: bool, no_restart: bool) -> Dict[str, Any]:
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Install the KAM /trade add-on")
     parser.add_argument("--hermes-root", default=None)
+    parser.add_argument("--systemd-dir", default=str(DEFAULT_SYSTEMD_DIR))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--skip-deps", action="store_true")
@@ -890,6 +1024,19 @@ def main(argv: List[str]) -> int:
         )
         say()
 
+        fibo_service_unit = install_fibo_service_unit(
+            hermes_root,
+            hermes_home,
+            python_exe,
+            backup_dir,
+            args.dry_run,
+            Path(args.systemd_dir),
+        )
+        say()
+
+        fibo_service_activation = activate_fibo_service(args.dry_run, args.no_restart, Path(args.systemd_dir))
+        say()
+
         manifest = {
             "kam_version": K.KAM_VERSION,
             "installer_version": K.INSTALLER_VERSION,
@@ -914,6 +1061,8 @@ def main(argv: List[str]) -> int:
             ],
             "dependencies": deps,
             "config": config_record,
+            "fibo_service_unit": fibo_service_unit,
+            "fibo_service_activation": fibo_service_activation,
         }
 
         if not args.dry_run:
@@ -928,7 +1077,7 @@ def main(argv: List[str]) -> int:
         step("Verification")
         verifier = REPO_ROOT / "installer" / "verify_trade.py"
         proc = subprocess.run(
-            [str(python_exe), str(verifier), "--hermes-root", str(hermes_root)]
+            [str(python_exe), str(verifier), "--hermes-root", str(hermes_root), "--systemd-dir", str(Path(args.systemd_dir))]
             + (["--dry-run-source"] if args.dry_run else []),
             text=True,
         )

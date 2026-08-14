@@ -161,6 +161,30 @@ class CanonicalInstrument:
 
 
 @dataclass(frozen=True)
+class CanonicalMarketPrice:
+    """Canonical current market-price snapshot for one instrument."""
+
+    requested_symbol: str
+    market: str
+    mark_price: Optional[str] = None
+    oracle_price: Optional[str] = None
+    last_external_price: Optional[str] = None
+    last_updated_time: Optional[str] = None
+    price: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "requested_symbol": self.requested_symbol,
+            "market": self.market,
+            "mark_price": self.mark_price,
+            "oracle_price": self.oracle_price,
+            "last_external_price": self.last_external_price,
+            "last_updated_time": self.last_updated_time,
+            "price": self.price,
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalOrderResult:
     """Canonical write summary for a single new order submission."""
 
@@ -374,6 +398,7 @@ class CanonicalResponse:
     open_order_count: Optional[int] = None
     order_groups: Optional[list[CanonicalOrderGroup]] = None
     instrument: Optional[CanonicalInstrument] = None
+    market_price: Optional[CanonicalMarketPrice] = None
     order: Optional[CanonicalOrderResult] = None
     ladder: Optional[CanonicalLadderResult] = None
     cancel_group: Optional[CanonicalCancelGroupResult] = None
@@ -399,6 +424,8 @@ class CanonicalResponse:
             data["order_groups"] = [group.to_dict() for group in self.order_groups]
         if self.instrument is not None:
             data["instrument"] = self.instrument.to_dict()
+        if self.market_price is not None:
+            data["market_price"] = self.market_price.to_dict()
         if self.order is not None:
             data["order"] = self.order.to_dict()
         if self.ladder is not None:
@@ -422,6 +449,7 @@ def make_success(
     open_order_count: Optional[int] = None,
     order_groups: Optional[list[CanonicalOrderGroup]] = None,
     instrument: Optional[CanonicalInstrument] = None,
+    market_price: Optional[CanonicalMarketPrice] = None,
     order: Optional[CanonicalOrderResult] = None,
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
@@ -438,6 +466,7 @@ def make_success(
         open_order_count=open_order_count,
         order_groups=order_groups,
         instrument=instrument,
+        market_price=market_price,
         order=order,
         ladder=ladder,
         cancel_group=cancel_group,
@@ -457,6 +486,7 @@ def make_failure(
     open_order_count: Optional[int] = None,
     order_groups: Optional[list[CanonicalOrderGroup]] = None,
     instrument: Optional[CanonicalInstrument] = None,
+    market_price: Optional[CanonicalMarketPrice] = None,
     order: Optional[CanonicalOrderResult] = None,
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
@@ -483,6 +513,7 @@ def make_failure(
         open_order_count=open_order_count,
         order_groups=order_groups,
         instrument=instrument,
+        market_price=market_price,
         order=order,
         ladder=ladder,
         cancel_group=cancel_group,

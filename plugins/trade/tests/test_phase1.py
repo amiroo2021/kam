@@ -573,14 +573,30 @@ class TestHermesIntegration(unittest.TestCase):
     """Test 12: existing non-/trade Telegram behavior is unaffected."""
 
     def test_12a_trade_in_command_registry(self):
-        """The /trade command is registered in COMMAND_REGISTRY."""
-        from hermes_cli.commands import COMMAND_REGISTRY
-        names = {cmd.name for cmd in COMMAND_REGISTRY}
+        """The plugin registers /trade as a Telegram-menu command."""
+        from plugins.trade import register as trade_register, _handle_trade_slash
+
+        class _StubCtx:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def register_command(self, name, handler, description="", args_hint=""):
+                self.calls.append(
+                    {
+                        "name": name,
+                        "handler": handler,
+                        "description": description,
+                        "args_hint": args_hint,
+                    }
+                )
+
+        ctx = _StubCtx()
+        trade_register(ctx)
+        names = {call["name"] for call in ctx.calls}
         self.assertIn("trade", names)
-        # Locate the trade entry and check its fields.
-        trade_cmd = next(c for c in COMMAND_REGISTRY if c.name == "trade")
-        self.assertEqual(trade_cmd.category, "Trading")
-        self.assertTrue(trade_cmd.gateway_only)
+        trade_cmd = next(call for call in ctx.calls if call["name"] == "trade")
+        self.assertEqual(trade_cmd["description"], "Open the trading wizard")
+        self.assertIs(trade_cmd["handler"], _handle_trade_slash)
 
     def test_12b_trade_dispatch_in_handle_command(self):
         """The adapter's _handle_command path contains direct /trade
@@ -2015,12 +2031,13 @@ class TestArcusAgentPhase1(unittest.TestCase):
                     "operation": "positions_management", "exchange": "apex",
                     "account": "BITGET",
                 })
-                # We get an APEX_ERROR because the stub creds don't connect.
-                # The crucial assertion is that we DID reach the handler
-                # (NOT_IMPLEMENTED would mean we didn't).
-                self.assertFalse(resp.success)
-                self.assertIsNotNone(resp.error)
-                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
+                # The crucial assertion is that we reached the real handler
+                # rather than falling through to NOT_IMPLEMENTED. Depending on
+                # the local Apex SDK fixture state this may fail or succeed.
+                self.assertIsNotNone(resp)
+                if not resp.success:
+                    self.assertIsNotNone(resp.error)
+                    self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
             finally:
                 apex._lookup_credentials = apex._lookup_credentials
         finally:

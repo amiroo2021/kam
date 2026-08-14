@@ -22,9 +22,10 @@ from test_installation import make_clean_hermes as _make_clean_hermes
 
 
 def _run_installer(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    systemd_dir = hermes_root.parent / "systemd"
     return subprocess.run(
         [PY, str(INSTALLER / "install_trade.py"),
-         "--hermes-root", str(hermes_root), "--skip-deps", "--no-restart", *extra],
+         "--hermes-root", str(hermes_root), "--systemd-dir", str(systemd_dir), "--skip-deps", "--no-restart", *extra],
         capture_output=True, text=True,
     )
 

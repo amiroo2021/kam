@@ -56,6 +56,24 @@ def _handle_trade_slash(raw_args: str) -> str:
     )
 
 
+def _handle_fibo_slash(raw_args: str) -> str:
+    """Non-Telegram fallback for ``/fibo``.
+
+    Mirrors ``/trade``: the real wizard lives on Telegram and is routed by the
+    Telegram adapter directly.
+    """
+    suffix = (raw_args or "").strip()
+    if suffix:
+        return (
+            "`/fibo` is a Telegram-only wizard. "
+            "Open Hermes on Telegram and type /fibo to use it."
+        )
+    return (
+        "`/fibo` is a Telegram-only wizard. "
+        "Open Hermes on Telegram and type /fibo to start."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -85,6 +103,12 @@ def register(ctx: Any) -> None:
             description="Open the trading wizard",
             args_hint="",
         )
+        register_cmd(
+            "fibo",
+            handler=_handle_fibo_slash,
+            description="Open the Fibo wizard",
+            args_hint="",
+        )
 
 
-__all__ = ["register", "_handle_trade_slash"]
+__all__ = ["register", "_handle_trade_slash", "_handle_fibo_slash"]

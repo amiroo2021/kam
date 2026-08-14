@@ -207,9 +207,26 @@ def revert_config(
     return result
 
 
+def remove_fibo_service_unit(systemd_dir: Path, dry_run: bool, no_restart: bool) -> Dict[str, Any]:
+    step("Remove fibo.service unit")
+    target = Path(systemd_dir) / "fibo.service"
+    if not target.exists():
+        skip(f"{target} not present")
+        return {"action": "absent", "path": str(target)}
+    if not dry_run:
+        if not no_restart:
+            subprocess.run(["systemctl", "disable", "--now", "fibo.service"], check=False)
+        target.unlink()
+        if not no_restart:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+    ok(f"{'Would remove' if dry_run else 'Removed'} {target}")
+    return {"action": "would-remove" if dry_run else "removed", "path": str(target)}
+
+
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Uninstall the KAM /trade add-on")
     parser.add_argument("--hermes-root", default=None)
+    parser.add_argument("--systemd-dir", default="/etc/systemd/system")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument(
@@ -239,6 +256,8 @@ def main(argv: List[str]) -> int:
         unpatch(hermes_root, python_exe, args.dry_run, use_backup=True)
         say()
         revert_config(manifest, args.dry_run)
+        say()
+        remove_fibo_service_unit(Path(args.systemd_dir), args.dry_run, args.no_restart)
         say()
 
         step("Post-uninstall check")

@@ -56,6 +56,7 @@ from ..canonical import (
     CanonicalBalance,
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -123,8 +124,95 @@ _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PATH_PERPS_BALANCE = "/v1/perps/balance"
 _PATH_PERPS_POSITIONS = "/v1/perps/positions"
 _PATH_PERPS_ORDERS = "/v1/perps/orders"
+_PATH_PERPS_MARK_PRICES = "/v1/perps/mark_prices"
 _PATH_MARKETS = "/v1/markets"
 _PATH_ACCOUNT = "/v1/account"
+
+_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _client_order_lookup_path(client_order_id: str) -> str:
+    """Official lookup path for a client order id.
+
+    Ondo Perps documents ``GET /v1/perps/orders/{orderID}`` where
+    ``orderID`` can be ``client:{clientOrderID}``.
+    """
+    text = str(client_order_id or "").strip()
+    if not text:
+        raise ValueError("client_order_id is required")
+    return f"{_PATH_PERPS_ORDERS}/client:{text}"
+
+
+def _fetch_order_by_client_order_id(credentials: Dict[str, Any], client_order_id: str) -> Dict[str, Any]:
+    payload = _signed_get(credentials, _client_order_lookup_path(client_order_id))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _verify_exact_order_by_client_order_id(
+    credentials: Dict[str, Any],
+    *,
+    client_order_id: str,
+    market: str,
+    side: str,
+    size: Decimal,
+    attempts: int = 4,
+    base_delay: float = 0.25,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Verify an order by exact clientOrderId lookup.
+
+    For market orders, Ondo documents ``GET /v1/perps/orders/client:<id>``.
+    We use that exact lookup instead of inferring success from a generic
+    position row or from the presence of an ``orderId`` alone.
+    """
+    last: Optional[Dict[str, Any]] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            order = _fetch_order_by_client_order_id(credentials, client_order_id)
+        except OndoHTTPError as exc:
+            if exc.status == 400 and "order_not_found" in str(exc.body):
+                order = None
+            else:
+                raise
+        except RuntimeError as exc:
+            if "order_not_found" in str(exc):
+                order = None
+            else:
+                raise
+        if isinstance(order, dict) and order:
+            last = order
+            order_market = str(order.get("market") or "").strip()
+            order_side = str(order.get("side") or "").strip().lower()
+            order_status = str(order.get("status") or "").strip().lower()
+            order_size = _decimal_or_none(order.get("size"))
+            filled_size = _decimal_or_none(order.get("filledSize"))
+            if (
+                order_market == market
+                and order_side == side
+                and order_size == size
+                and order_status in {"open", "pending", "fullyfilled"}
+                and (filled_size is None or filled_size >= 0)
+            ):
+                return True, order
+            return False, order
+        if attempt < attempts - 1:
+            time.sleep(base_delay)
+    return False, last
+
+
+def _normalize_client_order_id(value: Any) -> Optional[str]:
+    """Validate a client-provided order id against the official schema."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > 64:
+        raise ValueError("Client order ID must be at most 64 characters.")
+    if not _CLIENT_ORDER_ID_PATTERN.fullmatch(text):
+        raise ValueError(
+            "Client order ID must use only letters, digits, underscores, or dashes."
+        )
+    return text
 
 # Ondo's documented order statuses. We only consider "open" / "pending" /
 # "untriggered" as resting for the wizard's open-orders surface.
@@ -324,10 +412,14 @@ def capabilities() -> List[str]:
         "positions_orders",
         "positions_management",
         "new_order",
+        "get_exact_order",
         "ladder",
         "cancel_order_group",
         "set_tp",
         "set_sl",
+        "set_position_protections",
+        "position_state",
+        "market_price",
         "close_position",
         "resolve_instrument",
     ]
@@ -398,6 +490,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _resolve_instrument(account, request)
         if operation == "new_order":
             return _new_order(account, request)
+        if operation == "get_exact_order":
+            return _get_exact_order(account, request)
         if operation == "ladder":
             return _ladder(account, request)
         if operation == "cancel_order_group":
@@ -406,6 +500,12 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _set_position_trigger(account, request, kind="takeProfit")
         if operation == "set_sl":
             return _set_position_trigger(account, request, kind="stopLoss")
+        if operation == "set_position_protections":
+            return _set_position_protections(account, request)
+        if operation == "position_state":
+            return _position_state(account, request)
+        if operation == "market_price":
+            return _market_price(account, request)
         if operation == "close_position":
             return _close_position(account, request)
     except Exception as exc:  # noqa: BLE001
@@ -1677,18 +1777,52 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     order_type = str(request.get("order_type") or "limit").strip().lower() or "limit"
     volume_text = str(request.get("volume") or "").strip()
     price_text = str(request.get("price") or "").strip()
+    client_order_id_raw = request.get("client_order_id")
+    if client_order_id_raw is None:
+        client_order_id_raw = request.get("clientOrderId")
 
     if not requested_symbol:
         return make_failure(operation="new_order", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
     if requested_side not in {"buy", "sell"}:
         return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_SIDE", message="Side must be buy or sell.")
-    if order_type != "limit":
-        return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_ORDER_TYPE", message="Only limit orders are supported on Ondo Perps.")
+    if order_type not in {"limit", "market"}:
+        # Phase 2: market orders are now supported through this path in
+        # addition to limit. Any other type (e.g. stop) is still rejected
+        # at this boundary; if a future Fibo / robot needs stop variants
+        # the agent should be extended then.
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="INVALID_ORDER_TYPE",
+            message="Ondo Perps supports 'limit' and 'market' orders on this path.",
+        )
+    # ``reduce_only`` is optional on this path. ``close_position`` has its
+    # own dedicated market-close body builder and always sets
+    # ``reduceOnly: true``. Normal entry orders (limit or market) should
+    # OMIT ``reduceOnly`` when false rather than send ``false`` explicitly —
+    # the live API rejected the oversized market-entry body with
+    # ``invalid_market_order_fields``.
+    reduce_only_raw = request.get("reduce_only")
+    if reduce_only_raw is None:
+        reduce_only = False
+    else:
+        reduce_only = bool(reduce_only_raw)
     requested_volume = _decimal_or_none(volume_text)
-    requested_price = _decimal_or_none(price_text)
+    requested_price = _decimal_or_none(price_text) if order_type == "limit" else None
+    try:
+        client_order_id = _normalize_client_order_id(client_order_id_raw)
+    except ValueError as exc:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="INVALID_CLIENT_ORDER_ID",
+            message=str(exc),
+        )
     if requested_volume is None or requested_volume <= 0:
         return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_VOLUME", message="Volume must be positive.")
-    if requested_price is None or requested_price <= 0:
+    if order_type == "limit" and (requested_price is None or requested_price <= 0):
         return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_PRICE", message="Price must be positive.")
 
     metadata, error = _resolve_market_metadata(credentials, requested_symbol)
@@ -1702,20 +1836,28 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         )
 
     submitted_volume = _align_size(requested_volume, metadata)
-    submitted_price = _align_price(requested_price, metadata)
     if submitted_volume <= 0:
         return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_VOLUME", message="Volume must be positive after market-quantisation.")
-    if submitted_price <= 0:
-        return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_PRICE", message="Price must be positive after market-quantisation.")
+    if order_type == "limit":
+        submitted_price = _align_price(requested_price, metadata)
+        if submitted_price <= 0:
+            return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_PRICE", message="Price must be positive after market-quantisation.")
+    else:
+        submitted_price = None
 
-    body = {
+    body: Dict[str, Any] = {
         "market": metadata["market"],
         "side": requested_side,
-        "type": "limit",
-        "price": _decimal_string(submitted_price),
+        "type": order_type,
         "size": _decimal_string(submitted_volume),
-        "timeInForce": "GTC",
     }
+    if order_type == "limit":
+        body["price"] = _decimal_string(submitted_price)
+        body["timeInForce"] = "GTC"
+    if reduce_only:
+        body["reduceOnly"] = True
+    if client_order_id is not None:
+        body["clientOrderId"] = client_order_id
 
     try:
         response = _signed_post(credentials, _PATH_PERPS_ORDERS, body)
@@ -1733,9 +1875,9 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 side=requested_side,
                 order_type=order_type,
                 requested_volume=_decimal_text(requested_volume),
-                requested_price=_decimal_text(requested_price),
+                requested_price=_decimal_text(requested_price) if requested_price is not None else None,
                 submitted_volume=_decimal_text(submitted_volume),
-                submitted_price=_decimal_text(submitted_price),
+                submitted_price=_decimal_text(submitted_price) if submitted_price is not None else None,
                 verified=False,
                 status="failed",
             ),
@@ -1753,9 +1895,9 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 side=requested_side,
                 order_type=order_type,
                 requested_volume=_decimal_text(requested_volume),
-                requested_price=_decimal_text(requested_price),
+                requested_price=_decimal_text(requested_price) if requested_price is not None else None,
                 submitted_volume=_decimal_text(submitted_volume),
-                submitted_price=_decimal_text(submitted_price),
+                submitted_price=_decimal_text(submitted_price) if submitted_price is not None else None,
                 verified=False,
                 status="failed",
             ),
@@ -1763,58 +1905,95 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
 
     exchange_order_id = response.get("orderId")
     submitted_size_text = _decimal_text(response.get("size")) or _decimal_text(submitted_volume)
-    submitted_price_text = _decimal_text(response.get("price")) or _decimal_text(submitted_price)
+    # Market orders have no price on the body; ``response.get("price")`` may
+    # carry the mark price or be absent. We report whatever the server sent
+    # (or empty string for market) and never coerce ``None`` into a string.
+    if order_type == "market":
+        submitted_price_text = _decimal_text(response.get("price"))
+    else:
+        submitted_price_text = (
+            _decimal_text(response.get("price"))
+            or (_decimal_text(submitted_price) if submitted_price is not None else "")
+        )
     canonical_order = CanonicalOrderResult(
         symbol=requested_symbol,
         side=requested_side,
         order_type=order_type,
         requested_volume=_decimal_text(requested_volume),
-        requested_price=_decimal_text(requested_price),
+        requested_price=_decimal_text(requested_price) if requested_price is not None else None,
         submitted_volume=submitted_size_text,
-        submitted_price=submitted_price_text,
+        submitted_price=submitted_price_text or None,
         verified=False,  # verified below
         status="submitted",
         exchange_order_id=_safe_int_id(exchange_order_id),
     )
 
-    # Verify by re-fetching the open-orders snapshot. Ondo returns
-    # alphanumeric order IDs that don't fit the int-typed
-    # ``exchange_order_id`` slot on the canonical model, so we capture
-    # the raw string and verify against it directly. The verify helper
-    # falls back to the unfiltered ``/v1/perps/orders`` endpoint and
-    # backs off on HTTP 429, so a transient snapshot rate-limit never
-    # produces a false VERIFICATION_FAILED when the order actually
-    # landed.
+    # Verify differently for limit vs market orders.
+    #   - Limit: the order sits in the open-orders list; we look it up by ID.
+    #   - Market: when a clientOrderId is available, use the official exact
+    #     lookup path ``GET /v1/perps/orders/client:<id>`` and verify the
+    #     actual order object (market, side, size, status). Only then does
+    #     the Fibo engine proceed to cumulative-position confirmation.
+    #     Without a clientOrderId, fall back to the server-side ``orderId``
+    #     presence check.
     raw_exchange_order_id = str(exchange_order_id or "").strip()
-    verified = False
-    if raw_exchange_order_id:
-        fetch = lambda: _fetch_orders_for_verification(credentials)
-        if _verify_snapshot_with_backoff(
-            credentials,
-            fetch,
-            {raw_exchange_order_id},
-        ):
-            # The ID is present. Match the (market, side) for sanity and
-            # confirm the resting size / price align with what we sent.
+    if order_type == "market":
+        verified = False
+        if client_order_id is not None:
             try:
-                open_orders = _fetch_orders_for_verification(credentials)
-            except Exception:  # noqa: BLE001
-                open_orders = []
-            for order in open_orders:
-                if str(order.get("orderId") or "").strip() != raw_exchange_order_id:
-                    continue
-                if _order_matches(
-                    order,
+                verified, looked_up_order = _verify_exact_order_by_client_order_id(
+                    credentials,
+                    client_order_id=client_order_id,
                     market=metadata["market"],
                     side=requested_side,
-                    price=submitted_price,
                     size=submitted_volume,
-                ):
-                    verified = True
-                else:
-                    # ID is present and resting; close enough.
-                    verified = True
-                break
+                )
+            except OndoHTTPError as exc:
+                return _map_http_error_to_failure(exc, operation="new_order", account=account)
+            except Exception as exc:  # noqa: BLE001
+                return make_failure(
+                    operation="new_order",
+                    exchange=name,
+                    account=account,
+                    code="VERIFICATION_FAILED",
+                    message=_redact(sanitize_error_message(str(exc))),
+                    order=canonical_order,
+                )
+            if isinstance(looked_up_order, dict):
+                submitted_size_text = _decimal_text(looked_up_order.get("size")) or submitted_size_text
+                submitted_price_text = _decimal_text(looked_up_order.get("price")) or submitted_price_text
+        else:
+            verified = bool(raw_exchange_order_id)
+    else:
+        verified = False
+        if raw_exchange_order_id:
+            fetch = lambda: _fetch_orders_for_verification(credentials)
+            if _verify_snapshot_with_backoff(
+                credentials,
+                fetch,
+                {raw_exchange_order_id},
+            ):
+                # The ID is present. Match the (market, side) for sanity and
+                # confirm the resting size / price align with what we sent.
+                try:
+                    open_orders = _fetch_orders_for_verification(credentials)
+                except Exception:  # noqa: BLE001
+                    open_orders = []
+                for order in open_orders:
+                    if str(order.get("orderId") or "").strip() != raw_exchange_order_id:
+                        continue
+                    if _order_matches(
+                        order,
+                        market=metadata["market"],
+                        side=requested_side,
+                        price=submitted_price,
+                        size=submitted_volume,
+                    ):
+                        verified = True
+                    else:
+                        # ID is present and resting; close enough.
+                        verified = True
+                    break
 
     new_order_result = CanonicalOrderResult(
         symbol=requested_symbol,
@@ -1840,8 +2019,112 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         exchange=name,
         account=account,
         code="VERIFICATION_FAILED",
-        message="Order was accepted but could not be verified in the open-orders snapshot.",
-        order=new_order_result,
+        message="Order was accepted but could not be verified in Ondo's snapshots.",
+        order=canonical_order,
+    )
+
+
+def _get_exact_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if not credentials:
+        return make_failure(
+            operation="get_exact_order",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    requested_side = str(request.get("side") or "").strip().lower()
+    volume_text = str(request.get("volume") or "").strip()
+    client_order_id_raw = request.get("client_order_id")
+    if client_order_id_raw is None:
+        client_order_id_raw = request.get("clientOrderId")
+
+    if not requested_symbol:
+        return make_failure(operation="get_exact_order", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    if requested_side not in {"buy", "sell"}:
+        return make_failure(operation="get_exact_order", exchange=name, account=account, code="INVALID_SIDE", message="Side must be buy or sell.")
+    try:
+        client_order_id = _normalize_client_order_id(client_order_id_raw)
+    except ValueError as exc:
+        return make_failure(
+            operation="get_exact_order",
+            exchange=name,
+            account=account,
+            code="INVALID_CLIENT_ORDER_ID",
+            message=str(exc),
+        )
+    if client_order_id is None:
+        return make_failure(operation="get_exact_order", exchange=name, account=account, code="MISSING_CLIENT_ORDER_ID", message="Client order ID is required.")
+
+    requested_volume = _decimal_or_none(volume_text)
+    if requested_volume is None or requested_volume <= 0:
+        return make_failure(operation="get_exact_order", exchange=name, account=account, code="INVALID_VOLUME", message="Volume must be positive.")
+
+    metadata, error = _resolve_market_metadata(credentials, requested_symbol)
+    if error is not None:
+        return make_failure(
+            operation="get_exact_order",
+            exchange=name,
+            account=account,
+            code=error.error.code if error.error else "INSTRUMENT_NOT_FOUND",
+            message=error.error.message if error.error else "Instrument resolution failed.",
+        )
+
+    submitted_volume = _align_size(requested_volume, metadata)
+    if submitted_volume <= 0:
+        return make_failure(operation="get_exact_order", exchange=name, account=account, code="INVALID_VOLUME", message="Volume must be positive after market-quantisation.")
+
+    try:
+        verified, looked_up_order = _verify_exact_order_by_client_order_id(
+            credentials,
+            client_order_id=client_order_id,
+            market=metadata["market"],
+            side=requested_side,
+            size=submitted_volume,
+            attempts=1,
+            base_delay=0,
+        )
+    except OndoHTTPError as exc:
+        return _map_http_error_to_failure(exc, operation="get_exact_order", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_exact_order",
+            exchange=name,
+            account=account,
+            code="ORDER_VERIFY_FAILED",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    looked_up_order = looked_up_order if isinstance(looked_up_order, dict) else {}
+    canonical_order = CanonicalOrderResult(
+        symbol=requested_symbol,
+        side=requested_side,
+        order_type=str(looked_up_order.get("type") or "market"),
+        requested_volume=_decimal_text(requested_volume),
+        requested_price=None,
+        submitted_volume=_decimal_text(looked_up_order.get("size")) or _decimal_text(submitted_volume),
+        submitted_price=_decimal_text(looked_up_order.get("price")) or None,
+        verified=bool(verified),
+        status=str(looked_up_order.get("status") or ("verified" if verified else "unverified")),
+        exchange_order_id=_safe_int_id(looked_up_order.get("orderId")) or str(looked_up_order.get("orderId") or "").strip() or None,
+    )
+    if verified:
+        return make_success(
+            operation="get_exact_order",
+            exchange=name,
+            account=account,
+            order=canonical_order,
+        )
+    return make_failure(
+        operation="get_exact_order",
+        exchange=name,
+        account=account,
+        code="ORDER_VERIFY_FAILED",
+        message="Exact clientOrderId lookup did not verify the expected Ondo order.",
+        order=canonical_order,
     )
 
 
@@ -2504,15 +2787,6 @@ def _set_position_trigger(
         current_size = _decimal_text(row.get("netQuantity"))
         current_side = direct
         break
-    if direction is None:
-        return make_failure(
-            operation=operation,
-            exchange=name,
-            account=account,
-            code="POSITION_NOT_FOUND",
-            message=f"No open {requested_symbol} position found.",
-        )
-
     # --- Delete branch ---------------------------------------------------
     if is_delete:
         delete_query = urllib.parse.urlencode({
@@ -2545,47 +2819,49 @@ def _set_position_trigger(
                 ),
             )
         # Verify by re-querying the stop-order snapshot and confirming
-        # the requested kind is now absent for (market, direction).
+        # the requested kind is now absent for the relevant market lane.
+        verify_directions = [direction] if direction in {"long", "short"} else ["long", "short"]
         verified = False
         for attempt in range(ORDER_VERIFY_ATTEMPTS):
-            try:
-                stop_payload = _signed_get(
-                    credentials,
-                    f"{_STOP_ORDER_PATH}?market={urllib.parse.quote(metadata['market'], safe='')}&positionDirection={direction}",
-                )
-            except OndoHTTPError as exc:
-                if exc.status == 429 and attempt < ORDER_VERIFY_ATTEMPTS - 1:
-                    time.sleep(ORDER_VERIFY_BACKOFF_SECONDS)
-                    continue
-                stop_payload = None
-            except Exception:  # noqa: BLE001
-                stop_payload = None
             expected_key = "takeProfit" if kind == "takeProfit" else "stopLoss"
-            # The snapshot returns either a list of {market, direction,
-            # takeProfit, stopLoss} entries or a single object; either
-            # way we check the matching entry has no trigger for ``kind``.
-            entry: Optional[Dict[str, Any]] = None
-            if isinstance(stop_payload, list):
-                for candidate in stop_payload:
-                    if not isinstance(candidate, dict):
-                        continue
-                    if str(candidate.get("market") or "") != metadata["market"]:
-                        continue
-                    if str(candidate.get("positionDirection") or "").lower() != direction:
-                        continue
-                    entry = candidate
-                    break
-            elif isinstance(stop_payload, dict):
-                if str(stop_payload.get("market") or "") == metadata["market"] and \
-                   str(stop_payload.get("positionDirection") or "").lower() == direction:
-                    entry = stop_payload
-            # ``removed`` is True if no trigger remains for this kind OR
-            # if no entry exists at all (no TP/SL ever set for this
-            # (market, direction) pair). Either way the user's intent
-            # is satisfied.
-            current_value = entry.get(expected_key) if isinstance(entry, dict) else None
-            if current_value in (None, "", "null") or _decimal_or_none(current_value) is None:
-                verified = True
+            direction_states: list[bool] = []
+            retry_due_to_rate_limit = False
+            for verify_direction in verify_directions:
+                try:
+                    stop_payload = _signed_get(
+                        credentials,
+                        f"{_STOP_ORDER_PATH}?market={urllib.parse.quote(metadata['market'], safe='')}&positionDirection={verify_direction}",
+                    )
+                except OndoHTTPError as exc:
+                    if exc.status == 429 and attempt < ORDER_VERIFY_ATTEMPTS - 1:
+                        retry_due_to_rate_limit = True
+                        break
+                    stop_payload = None
+                except Exception:  # noqa: BLE001
+                    stop_payload = None
+                entry: Optional[Dict[str, Any]] = None
+                if isinstance(stop_payload, list):
+                    for candidate in stop_payload:
+                        if not isinstance(candidate, dict):
+                            continue
+                        if str(candidate.get("market") or "") != metadata["market"]:
+                            continue
+                        if str(candidate.get("positionDirection") or "").lower() != verify_direction:
+                            continue
+                        entry = candidate
+                        break
+                elif isinstance(stop_payload, dict):
+                    if str(stop_payload.get("market") or "") == metadata["market"] and \
+                       str(stop_payload.get("positionDirection") or "").lower() == verify_direction:
+                        entry = stop_payload
+                current_value = entry.get(expected_key) if isinstance(entry, dict) else None
+                direction_states.append(
+                    current_value in (None, "", "null") or _decimal_or_none(current_value) is None
+                )
+            if retry_due_to_rate_limit:
+                time.sleep(ORDER_VERIFY_BACKOFF_SECONDS)
+                continue
+            verified = bool(direction_states) and all(direction_states)
             if verified:
                 break
             if attempt < ORDER_VERIFY_ATTEMPTS - 1:
@@ -2614,6 +2890,15 @@ def _set_position_trigger(
             code="VERIFICATION_FAILED",
             message=f"{operation.replace('_', ' ').title()} removal could not be verified in the stop-order snapshot.",
             position_action=action_result,
+        )
+
+    if direction is None:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code="POSITION_NOT_FOUND",
+            message=f"No open {requested_symbol} position found.",
         )
 
     # --- Set / replace branch --------------------------------------------
@@ -2698,6 +2983,465 @@ def _set_position_trigger(
         code="VERIFICATION_FAILED",
         message=f"{operation.replace('_', ' ').title()} was accepted but could not be verified in the stop-order snapshot.",
         position_action=action_result,
+    )
+
+
+# --- Set both TP and SL ----------------------------------------------------
+#
+# ``_set_position_protections`` is a thin wrapper that drives the existing
+# ``_set_position_trigger`` helper twice (once per leg) and verifies both
+# fields are present in the resulting ``/v1/perps/stop_order`` snapshot.
+# The behaviour mirrors what Fibo needs for its 5-step handoff (steps 3–5):
+#   1. set TP, wait for it to be reflected on the snapshot
+#   2. set SL, wait for it to be reflected on the snapshot
+#   3. re-read the snapshot once more and confirm BOTH legs are at the
+#      requested prices. This third read is the "verify BOTH" pass.
+#
+# Both calls MUST succeed for the response to be ``success``. If either
+# leg fails, the response carries the failing leg's error code and the
+# opposite leg's verification state so the caller can reason about which
+# leg is missing. We deliberately do NOT silently roll back the leg that
+# succeeded — once the TP lands on the exchange, removing it would
+# change the position's behaviour. The frozen-registration contract for
+# Fibo lives above this layer.
+
+
+def _set_position_protections(
+    account: str, request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Atomically set both TP and SL on the account's current position.
+
+    Request keys (all required):
+
+      - ``symbol``        : canonical Fibo symbol (e.g. ``"US100"``).
+      - ``take_profit``   : positive Decimal price for the TP trigger.
+      - ``stop_loss``     : positive Decimal price for the SL trigger.
+
+    Returns a CanonicalResponse whose ``position_action`` carries the per-leg
+    verification state, OR a failure with the failing leg's code. The
+    canonical ``position_action.verified`` reflects BOTH legs being present.
+    """
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    tp_text = str(request.get("take_profit") or "").strip()
+    sl_text = str(request.get("stop_loss") or "").strip()
+    if not requested_symbol:
+        return make_failure(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    if not tp_text or not sl_text:
+        return make_failure(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            code="MISSING_PROTECTION_PRICE",
+            message="Both take_profit and stop_loss are required.",
+        )
+
+    tp_price = _decimal_or_none(tp_text)
+    sl_price = _decimal_or_none(sl_text)
+    if tp_price is None or tp_price <= 0 or sl_price is None or sl_price <= 0:
+        return make_failure(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            code="INVALID_PROTECTION_PRICE",
+            message="take_profit and stop_loss must be positive.",
+        )
+
+    # Step 1 — set TP. We delegate to the existing helper which already
+    # does POST + verify-loop. If it fails we surface the failure verbatim.
+    tp_response = _set_position_trigger(
+        account,
+        {
+            "symbol": requested_symbol,
+            "price": _decimal_text(tp_price),
+        },
+        kind="takeProfit",
+    )
+    tp_ok = tp_response.success
+
+    # Step 2 — set SL. We always attempt the SL even if TP failed; this
+    # matches what the wizard already does (set_tp then set_sl are
+    # independent operations). The caller can read the per-leg status from
+    # the returned ``position_action`` data.
+    sl_response = _set_position_trigger(
+        account,
+        {
+            "symbol": requested_symbol,
+            "price": _decimal_text(sl_price),
+        },
+        kind="stopLoss",
+    )
+    sl_ok = sl_response.success
+
+    # Step 3 — final verification: re-read the stop-order snapshot and
+    # confirm both fields are at the requested prices. This is the
+    # "verify BOTH" pass Fibo's 5-step handoff demands.
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    metadata, error = _resolve_market_metadata(credentials, requested_symbol)
+    if error is not None:
+        return _bubble_failure(error, "set_position_protections", account)
+
+    final_tp_ok = False
+    final_sl_ok = False
+    try:
+        # Resolve the position's direction so we can target the
+        # (market, direction) record. If the position is already closed or
+        # the snapshot is unavailable, both legs report False and the
+        # response carries an explanation in ``message``.
+        positions = _fetch_positions_snapshot(credentials)
+        direction: Optional[str] = None
+        current_side = ""
+        current_size = "0"
+        for row in positions:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("market") or "") != metadata["market"]:
+                continue
+            direct = str(row.get("direction") or "").strip().lower()
+            if direct not in {"long", "short"}:
+                continue
+            direction = direct
+            current_side = direct
+            current_size = _decimal_text(row.get("netQuantity"))
+            break
+        if direction is None:
+            return make_failure(
+                operation="set_position_protections",
+                exchange=name,
+                account=account,
+                code="POSITION_NOT_FOUND",
+                message=(
+                    "Cannot verify protections: no open position on "
+                    f"{requested_symbol}."
+                ),
+            )
+        snap = _signed_get(
+            credentials,
+            f"{_STOP_ORDER_PATH}?market={urllib.parse.quote(metadata['market'], safe='')}&positionDirection={direction}",
+        )
+        entry: Optional[Dict[str, Any]] = None
+        if isinstance(snap, list):
+            for cand in snap:
+                if not isinstance(cand, dict):
+                    continue
+                if str(cand.get("market") or "") != metadata["market"]:
+                    continue
+                if str(cand.get("positionDirection") or "").lower() != direction:
+                    continue
+                entry = cand
+                break
+        elif isinstance(snap, dict):
+            if (
+                str(snap.get("market") or "") == metadata["market"]
+                and str(snap.get("positionDirection") or "").lower() == direction
+            ):
+                entry = snap
+        if entry is not None:
+            actual_tp = _decimal_or_none(entry.get("takeProfit"))
+            actual_sl = _decimal_or_none(entry.get("stopLoss"))
+            # Quantise the expected prices against the market's quoteIncrement
+            # before comparison — Ondo stores triggers at exchange precision.
+            aligned_tp = _align_price(tp_price, metadata)
+            aligned_sl = _align_price(sl_price, metadata)
+            final_tp_ok = actual_tp == aligned_tp
+            final_sl_ok = actual_sl == aligned_sl
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            code="VERIFY_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    overall_ok = tp_ok and sl_ok and final_tp_ok and final_sl_ok
+    action_result = CanonicalPositionActionResult(
+        operation="set_position_protections",
+        symbol=requested_symbol,
+        verified=overall_ok,
+        status="success" if overall_ok else "partial",
+        current_side=current_side,
+        current_size=current_size,
+        message=(
+            "TP and SL both attached and verified."
+            if overall_ok
+            else (
+                f"tp_ok={tp_ok},sl_ok={sl_ok},"
+                f"final_tp_ok={final_tp_ok},final_sl_ok={final_sl_ok}"
+            )
+        ),
+    )
+    # Per-leg codes for the caller to introspect.
+    if overall_ok:
+        return make_success(
+            operation="set_position_protections",
+            exchange=name,
+            account=account,
+            position_action=action_result,
+        )
+    return make_failure(
+        operation="set_position_protections",
+        exchange=name,
+        account=account,
+        code=(
+            "TP_SL_BOTH_MISSING"
+            if not final_tp_ok and not final_sl_ok
+            else "TP_ONLY"
+            if not final_tp_ok
+            else "SL_ONLY"
+        ),
+        message=action_result.message,
+        position_action=action_result,
+    )
+
+
+def _bubble_failure(
+    error: CanonicalResponse, operation: str, account: str
+) -> CanonicalResponse:
+    """Re-emit a failure response, retagging it for a new operation."""
+    if error.error is None:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message="Instrument resolution failed.",
+        )
+    return make_failure(
+        operation=operation,
+        exchange=name,
+        account=account,
+        code=error.error.code,
+        message=error.error.message,
+    )
+
+
+# --- Read single position state --------------------------------------------
+#
+# Cheap lookup of a single (symbol) position row + its current TP / SL +
+# the live markPrice. Used by Fibo's "confirm_fill" and "quote" paths.
+
+
+def _position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return the live position row for ``symbol``, including TP / SL.
+
+    Returns a CanonicalResponse whose ``positions`` carries a single-element
+    list (or empty list when no position exists). Ondo's ``/v1/perps/positions``
+    is the source for direction / netQuantity / markPrice; the stop-order
+    snapshot is the source for the current TP / SL.
+
+    Request keys:
+      - ``symbol`` (required)
+    """
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    metadata, error = _resolve_market_metadata(credentials, requested_symbol)
+    if error is not None:
+        return _bubble_failure(error, "position_state", account)
+    try:
+        positions = _fetch_positions_snapshot(credentials)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="POSITIONS_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    row: Optional[Dict[str, Any]] = None
+    direction: Optional[str] = None
+    for candidate in positions:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("market") or "") != metadata["market"]:
+            continue
+        direct = str(candidate.get("direction") or "").strip().lower()
+        if direct not in {"long", "short"}:
+            continue
+        row = candidate
+        direction = direct
+        break
+    if row is None or direction is None:
+        # No open position. We still succeed but with an empty list — the
+        # caller (Fibo's confirm_fill / quote adapter) treats this as
+        # "no position present yet."
+        return make_success(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            positions=[],
+            instrument=CanonicalInstrument(
+                requested_symbol=requested_symbol,
+                symbol=requested_symbol,
+                display_name=metadata.get("market", requested_symbol),
+                price_increment=_decimal_text(metadata.get("quote_increment")),
+                size_increment=_decimal_text(metadata.get("base_increment")),
+            ),
+        )
+
+    # Mark price from the same row.
+    mark_price_text = _decimal_text(row.get("markPrice"))
+
+    # Look up the current TP / SL for this (market, direction).
+    tp_text: Optional[str] = None
+    sl_text: Optional[str] = None
+    try:
+        protections = _safe_fetch_stop_protections(credentials)
+        protection = protections.get((requested_symbol, direction)) or {}
+        if isinstance(protection, dict):
+            tp_text = protection.get("tp") or None
+            sl_text = protection.get("sl") or None
+    except Exception:  # noqa: BLE001
+        pass
+
+    side_canonical = "long" if direction == "long" else "short"
+    position = CanonicalPosition(
+        symbol=requested_symbol,
+        side=side_canonical,
+        size=_decimal_text(row.get("netQuantity")),
+        entry_price=_decimal_text(row.get("averageEntryPrice")),
+        pnl=_decimal_text(row.get("unrealizedPnl")),
+        tp=tp_text,
+        sl=sl_text,
+        tp_count=1 if tp_text else None,
+        sl_count=1 if sl_text else None,
+    )
+    # We surface markPrice via the instrument descriptor's price_increment?
+    # No — price_increment is the quote tick, not a live price. Instead we
+    # pack markPrice into the position's ``entry_price`` is wrong too. We
+    # carry it as a side-channel: re-attach via a hidden ``order_groups``
+    # list — but that's a misuse. The cleanest option is to expose a new
+    # canonical position field; for v1 we use the existing CanonicalPosition
+    # and let Fibo parse ``pnl`` / ``entry_price`` from the row, and
+    # additionally fetch markPrice separately via the existing
+    # ``positions_orders`` read path. For the Fibo adapter's needs, the
+    # call to ``_signed_get(_PATH_PERPS_POSITIONS)`` directly inside the
+    # OndoPerps quote source provides the markPrice. See
+    # ``plugins/trade/fibo/quote_ondoperps.py``.
+    return make_success(
+        operation="position_state",
+        exchange=name,
+        account=account,
+        positions=[position],
+        instrument=CanonicalInstrument(
+            requested_symbol=requested_symbol,
+            symbol=requested_symbol,
+            display_name=metadata.get("market", requested_symbol),
+            price_increment=_decimal_text(metadata.get("quote_increment")),
+            size_increment=_decimal_text(metadata.get("base_increment")),
+        ),
+    )
+
+
+def _market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return a venue-native current market-price snapshot for one symbol."""
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    metadata, error = _resolve_market_metadata(credentials, requested_symbol)
+    if error is not None:
+        return _bubble_failure(error, "market_price", account)
+    try:
+        payload = _signed_get(credentials, _PATH_PERPS_MARK_PRICES)
+    except OndoHTTPError as exc:
+        return _map_http_error_to_failure(exc, operation="market_price", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MARK_PRICES_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    result = None
+    if isinstance(payload, dict):
+        nested = payload.get("result")
+        if isinstance(nested, dict):
+            result = nested
+        else:
+            result = payload
+    entry = result.get(metadata["market"]) if isinstance(result, dict) else None
+    if not isinstance(entry, dict):
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MARK_PRICE_NOT_FOUND",
+            message=f"Ondo Perps mark-price snapshot has no entry for '{metadata['market']}'.",
+            instrument=CanonicalInstrument(
+                requested_symbol=requested_symbol,
+                symbol=requested_symbol,
+                display_name=metadata.get("market", requested_symbol),
+                price_increment=_decimal_text(metadata.get("quote_increment")),
+                size_increment=_decimal_text(metadata.get("base_increment")),
+            ),
+        )
+
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account,
+        instrument=CanonicalInstrument(
+            requested_symbol=requested_symbol,
+            symbol=requested_symbol,
+            display_name=metadata.get("market", requested_symbol),
+            price_increment=_decimal_text(metadata.get("quote_increment")),
+            size_increment=_decimal_text(metadata.get("base_increment")),
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested_symbol,
+            market=str(metadata.get("market") or requested_symbol),
+            mark_price=_decimal_text(entry.get("markPrice")),
+            oracle_price=_decimal_text(entry.get("oraclePrice")),
+            last_external_price=_decimal_text(entry.get("lastExternalPrice")),
+            last_updated_time=str(entry.get("lastUpdatedTime") or "").strip() or None,
+            price=_decimal_text(entry.get("price")),
+        ),
     )
 
 
