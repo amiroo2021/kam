@@ -439,6 +439,58 @@ def main(argv: List[str]) -> int:
 
         c.run("Hermes config enables trade exactly once", check_config_enables_trade)
 
+        def check_telegram_menu_includes_trade_and_fibo() -> str:
+            """Telegram command-menu config must leave room for both plugin commands."""
+            sys.path.insert(0, str(hermes_root))
+            import hermes_cli.commands as HC  # type: ignore
+            import hermes_cli.plugins as HP  # type: ignore
+            if not hasattr(HC, "telegram_menu_commands") or not hasattr(HC, "telegram_menu_max_commands"):
+                return "target Hermes build lacks telegram_menu_commands helpers; plugin API registration already verified"
+
+            hermes_home = K.resolve_hermes_home()
+            config_path = KC.find_config(hermes_home)
+            if config_path is None:
+                return f"no config under {hermes_home}; Telegram menu capacity not asserted"
+
+            parsed = KC.parse_config(config_path)
+            menu_cfg = (((parsed.get("platforms") or {}).get("telegram") or {}).get("extra") or {})
+            menu_cfg = (menu_cfg.get("command_menu") or {}) if isinstance(menu_cfg, dict) else {}
+            raw_max = menu_cfg.get("max_commands", 60)
+            try:
+                max_commands = int(raw_max)
+            except (TypeError, ValueError):
+                max_commands = 60
+            if max_commands < 61:
+                raise AssertionError(
+                    f"Telegram command menu max_commands={max_commands} leaves /fibo trimmed; expected >= 61"
+                )
+
+            recorded: Dict[str, Dict[str, Any]] = {}
+            plugin = importlib.import_module("plugins.trade")
+
+            class _Ctx:
+                def register_command(self, name, handler=None, description="", args_hint=""):
+                    recorded[str(name)] = {
+                        "handler": handler,
+                        "description": description,
+                        "args_hint": args_hint,
+                    }
+
+            plugin.register(_Ctx())
+            original = HP.get_plugin_commands
+            HP.get_plugin_commands = lambda: recorded
+            try:
+                commands, _hidden = HC.telegram_menu_commands(max_commands=HC.telegram_menu_max_commands())
+            finally:
+                HP.get_plugin_commands = original
+            names = [name for name, _desc in commands]
+            missing = [name for name in ("trade", "fibo") if name not in names]
+            if missing:
+                raise AssertionError(f"Telegram menu still missing commands: {missing} (names={names[-5:]})")
+            return f"max_commands={max_commands}; Telegram menu includes /trade and /fibo"
+
+        c.run("Telegram menu publishes /trade and /fibo", check_telegram_menu_includes_trade_and_fibo)
+
         def check_other_commands_intact() -> str:
             spec = legacy_commands_specs()[0]
             text = (hermes_root / spec.relative_path).read_text()

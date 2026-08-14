@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -675,6 +676,89 @@ def enable_plugin_in_config(
     return record
 
 
+def ensure_telegram_menu_capacity(
+    hermes_root: Path,
+    hermes_home: Path,
+    python_exe: Path,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Ensure Telegram has enough BotCommand slots for both /trade and /fibo.
+
+    Hermes defaults the Telegram command menu cap to 60. On this host that
+    leaves room for ``/trade`` but trims ``/fibo`` from ``setMyCommands`` even
+    though the plugin API registers both commands correctly. Raising the cap to
+    61 is the smallest config change that makes both commands visible without
+    touching shared Hermes source files.
+    """
+    step("Ensure Telegram command menu has room for /trade and /fibo")
+    config_path = C.find_config(hermes_home)
+    if config_path is None:
+        warn(f"No config.yaml/config.yml under {hermes_home}")
+        warn("Telegram command menu capacity not adjusted; /fibo may be hidden from autocomplete.")
+        return {"action": "skipped", "reason": "config-not-found", "minimum_max_commands": 61}
+
+    try:
+        parsed = C.parse_config(config_path)
+    except C.ConfigError as exc:
+        warn(f"Config not inspected: {exc}")
+        warn("Telegram command menu capacity not adjusted.")
+        return {"action": "skipped", "reason": str(exc), "minimum_max_commands": 61}
+
+    current = (
+        ((parsed.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
+    )
+    current = (current.get("command_menu") or {}) if isinstance(current, dict) else {}
+    raw_max = current.get("max_commands", 60)
+    try:
+        current_max = int(raw_max)
+    except (TypeError, ValueError):
+        current_max = 60
+
+    if current_max >= 61:
+        ok(f"Telegram command menu max_commands already {current_max}")
+        return {
+            "action": "already-sufficient",
+            "path": str(config_path),
+            "max_commands": current_max,
+            "minimum_max_commands": 61,
+        }
+
+    if dry_run:
+        ok(f"Would set platforms.telegram.extra.command_menu.max_commands = 61 in {config_path}")
+        return {
+            "action": "would-set",
+            "path": str(config_path),
+            "max_commands_before": current_max,
+            "max_commands_after": 61,
+            "minimum_max_commands": 61,
+        }
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    subprocess.run(
+        [
+            str(python_exe),
+            "-m",
+            "hermes_cli.main",
+            "config",
+            "set",
+            "platforms.telegram.extra.command_menu.max_commands",
+            "61",
+        ],
+        check=True,
+        cwd=str(hermes_root),
+        env=env,
+    )
+    ok(f"Telegram command menu max_commands -> 61 in {config_path}")
+    return {
+        "action": "set",
+        "path": str(config_path),
+        "max_commands_before": current_max,
+        "max_commands_after": 61,
+        "minimum_max_commands": 61,
+    }
+
+
 def _render_fibo_unit(
     *,
     hermes_root: Path,
@@ -1018,6 +1102,8 @@ def main(argv: List[str]) -> int:
         say()
         config_record = enable_plugin_in_config(hermes_home, backup_dir, args.dry_run)
         say()
+        telegram_menu_record = ensure_telegram_menu_capacity(hermes_root, hermes_home, python_exe, args.dry_run)
+        say()
 
         deps = {"action": "skipped"} if args.skip_deps else install_dependencies(
             python_exe, args.dry_run
@@ -1061,6 +1147,7 @@ def main(argv: List[str]) -> int:
             ],
             "dependencies": deps,
             "config": config_record,
+            "telegram_command_menu": telegram_menu_record,
             "fibo_service_unit": fibo_service_unit,
             "fibo_service_activation": fibo_service_activation,
         }
