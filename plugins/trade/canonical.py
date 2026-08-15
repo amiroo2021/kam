@@ -249,6 +249,14 @@ class CanonicalLadderResult:
     omitted_below_minimum: Optional[int] = None
     child_order_ids: Optional[list[str | int]] = None
     batches: Optional[list[Dict[str, Any]]] = None
+    # Exchange-rejection signals. Populated when an exchange-native
+    # error stops the ladder before every requested child landed.
+    # ``rate_limited=True`` indicates a hard backend rate-limit (e.g.
+    # Lighter code 23000) — distinct from ``partial`` which can also
+    # arise from non-rate-limit rejections. ``exchange_reason`` carries
+    # the sanitized backend message (no L1 address, no SDK internals).
+    rate_limited: Optional[bool] = None
+    exchange_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -271,6 +279,10 @@ class CanonicalLadderResult:
             data["child_order_ids"] = list(self.child_order_ids)
         if self.batches is not None:
             data["batches"] = [dict(batch) for batch in self.batches]
+        if self.rate_limited is not None:
+            data["rate_limited"] = self.rate_limited
+        if self.exchange_reason is not None:
+            data["exchange_reason"] = self.exchange_reason
         return data
 
 
@@ -289,6 +301,16 @@ class CanonicalCancelGroupResult:
     status: str = "success"
     batch_count: int = 0
     batches: Optional[list[Dict[str, Any]]] = None
+    # Additive fields for the batched-cancel hardening (2026-08-15).
+    # ``requested_cancel_count`` = targets we intended to cancel.
+    # ``verified_cancel_count`` = targets authoritatively confirmed
+    # absent post-reconciliation. ``rate_limited`` marks a hard 429
+    # stop; ``exchange_reason`` carries the sanitized (L1-redacted)
+    # backend reason.
+    requested_cancel_count: Optional[int] = None
+    verified_cancel_count: Optional[int] = None
+    rate_limited: Optional[bool] = None
+    exchange_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -305,6 +327,14 @@ class CanonicalCancelGroupResult:
         }
         if self.batches is not None:
             data["batches"] = [dict(batch) for batch in self.batches]
+        if self.requested_cancel_count is not None:
+            data["requested_cancel_count"] = self.requested_cancel_count
+        if self.verified_cancel_count is not None:
+            data["verified_cancel_count"] = self.verified_cancel_count
+        if self.rate_limited is not None:
+            data["rate_limited"] = self.rate_limited
+        if self.exchange_reason is not None:
+            data["exchange_reason"] = self.exchange_reason
         return data
 
 
