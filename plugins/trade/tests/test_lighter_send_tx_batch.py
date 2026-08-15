@@ -29,6 +29,7 @@ import os
 import sys
 import threading
 import time
+import asyncio
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -4084,6 +4085,156 @@ class LighterCancelBatchTests(unittest.TestCase):
         # And the create budget path is untouched (separate constant).
         self.assertEqual(TxTypeL2CreateOrder, 14)
         self.assertEqual(TxTypeL2CancelOrder, 15)
+
+
+class LighterAsyncBridgeTests(unittest.TestCase):
+    """Reproduce the Hermes/Telegram execution context: invoke the
+    production synchronous ``execute()`` route (the same one TradeDesk
+    calls) FROM INSIDE an already-running asyncio event loop.
+
+    Root cause of the live failure: ``_submit_send_tx_batch`` and
+    ``_submit_cancel_tx_batch`` called ``asyncio.run(_run_batch())``
+    directly. On the gateway's already-running loop thread that raises
+    ``RuntimeError: asyncio.run() cannot be called from a running event
+    loop``. Direct-script tests passed because they ran with NO running
+    loop, so ``asyncio.run`` legitimately created a fresh one.
+
+    The fix (``_run_lighter_coro_blocking``) detects a running loop and
+    offloads the coroutine to a dedicated worker thread instead of
+    nesting ``asyncio.run``. These tests assert:
+      * no RuntimeError when invoked from a running loop
+      * the expected sendTxBatch write occurs exactly once (no retry)
+      * canonical success
+      * the SAME test also passes in the direct synchronous context
+    """
+
+    def setUp(self) -> None:
+        lighter._LIGHTER_LIMITERS.clear()
+        lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
+        lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        self._saved_send = lighter.LIGHTER_SEND_TX_BATCH_SIZE
+        self._saved_cancel = lighter.LIGHTER_CANCEL_TX_BATCH_SIZE
+        self._saved_send_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
+        self._saved_cancel_pause = lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS
+        lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 0.0
+        lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = 0.0
+
+    def tearDown(self) -> None:
+        lighter.LIGHTER_SEND_TX_BATCH_SIZE = self._saved_send
+        lighter.LIGHTER_CANCEL_TX_BATCH_SIZE = self._saved_cancel
+        lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_send_pause
+        lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = self._saved_cancel_pause
+
+    # ------------------------------------------------------------------
+    # LADDER from inside a running event loop (the reported failure).
+    # ------------------------------------------------------------------
+    def test_ladder_from_running_event_loop(self):
+        """Invoke _execute_ladder (sync public route) from a running loop.
+        Must NOT raise RuntimeError; must produce one sendTxBatch batch
+        and canonical success."""
+        state = _patch_lighter_for_test(
+            self,
+            send_tx_outcomes=[(200, "", None)],
+            auto_reconcile_with_allocator=True,
+        )
+        captured: Dict[str, Any] = {}
+
+        async def telegram_like_context():
+            # This is exactly what the Telegram gateway does: call the
+            # synchronous wizard/tradedesk/agent route from inside the
+            # already-running event loop.
+            captured["resp"] = lighter.execute(_ladder_request(order_count=10))
+
+        # Run the async context — this thread now HAS a running loop.
+        asyncio.run(telegram_like_context())
+
+        resp = captured["resp"]
+        self.assertTrue(resp.success, f"ladder failed inside running loop: {resp.error}")
+        self.assertIsNone(resp.error)
+        # Exactly one sendTxBatch write for 10 children (batch size 30).
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 1)
+        self.assertEqual(len(state["signer"].send_tx_batch_calls[0]["tx_infos"]), 10)
+        self.assertEqual(resp.ladder.accepted_child_count, 10)
+        self.assertTrue(resp.ladder.verified)
+
+    def test_ladder_from_running_event_loop_no_retry_on_429(self):
+        """From a running loop, a 429 must STOP (no retry, no RuntimeError)."""
+        state = _patch_lighter_for_test(
+            self,
+            send_tx_outcomes=[(23000, "Too Many Requests")],
+        )
+        captured: Dict[str, Any] = {}
+
+        async def telegram_like_context():
+            captured["resp"] = lighter.execute(_ladder_request(order_count=200))
+
+        asyncio.run(telegram_like_context())
+        resp = captured["resp"]
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "RATE_LIMITED")
+        # Exactly ONE write attempt — no retry.
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 1)
+
+    # ------------------------------------------------------------------
+    # CANCEL from inside a running event loop (shares the fixed bridge).
+    # ------------------------------------------------------------------
+    def test_cancel_from_running_event_loop(self):
+        """Batched cancel must also work from a running loop (the bridge
+        is shared)."""
+        ct = LighterCancelBatchTests("test_A_200_targets_correct_batch_count")
+        ct.setUp()
+        try:
+            target = [700001, 700002, 700003]
+            baseline = [900001]
+            state = ct._patch_cancel_env(target_oids=target, baseline_oids=baseline)
+            captured: Dict[str, Any] = {}
+
+            async def telegram_like_context():
+                captured["resp"] = lighter.execute(ct._cancel_request())
+
+            asyncio.run(telegram_like_context())
+            resp = captured["resp"]
+            self.assertTrue(resp.success, f"cancel failed inside running loop: {resp.error}")
+            self.assertEqual(resp.cancel_group.cancelled_order_count, 3)
+            # One batch for 3 targets (batch size 30).
+            self.assertEqual(len(state["signer"].send_tx_batch_calls), 1)
+        finally:
+            ct.doCleanups()
+            ct.tearDown()
+
+    # ------------------------------------------------------------------
+    # Direct synchronous context still works (no regression).
+    # ------------------------------------------------------------------
+    def test_ladder_direct_sync_context_still_works(self):
+        """The same ladder must ALSO succeed in the direct (no-loop)
+        context — proving the bridge is correct in both."""
+        state = _patch_lighter_for_test(
+            self,
+            send_tx_outcomes=[(200, "", None)],
+            auto_reconcile_with_allocator=True,
+        )
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertTrue(resp.success)
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 1)
+
+    # ------------------------------------------------------------------
+    # The bridge itself: running-loop path returns the coroutine's value.
+    # ------------------------------------------------------------------
+    def test_bridge_returns_value_and_does_not_nest(self):
+        """_run_lighter_coro_blocking from a running loop must execute
+        the coroutine (on the worker thread) and return its value."""
+        captured: Dict[str, Any] = {}
+
+        async def sample_coro():
+            return {"ok": True, "marker": 42}
+
+        async def telegram_like_context():
+            captured["value"] = lighter._run_lighter_coro_blocking(
+                {}, lambda: sample_coro(), thread_name="test-bridge"
+            )
+
+        asyncio.run(telegram_like_context())
+        self.assertEqual(captured["value"], {"ok": True, "marker": 42})
 
 
 class _FakeRateLimitExc(Exception):

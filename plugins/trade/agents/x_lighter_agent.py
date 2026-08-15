@@ -373,6 +373,73 @@ def _run_with_lighter_ratelimit(
     return None
 
 
+def _run_lighter_coro_blocking(
+    credentials: Dict[str, Any],
+    coro_factory: Any,
+    *,
+    thread_name: str,
+    max_retries: int = 0,
+) -> Any:
+    """Run a Lighter coroutine to completion from a synchronous caller,
+    safe whether or not the calling thread already has a running event
+    loop (the Hermes/Telegram gateway loop).
+
+    Bridge semantics (mirrors the established pattern in
+    ``_mint_auth_token`` / ``_submit_new_order`` / ``_submit_tpsl_order``
+    / ``_execute_close_position``):
+
+      * No running loop on this thread (direct script / CLI context):
+        run the coroutine under the per-L1 sliding-window limiter via
+        ``asyncio.run`` — the standard one-shot bridge.
+
+      * A loop IS already running on this thread (Hermes gateway loop):
+        NEVER call ``asyncio.run`` here (RuntimeError: "asyncio.run()
+        cannot be called from a running event loop"). Instead offload
+        the whole ``asyncio.run`` to a dedicated worker thread that has
+        no running loop, and synchronously join it for the result.
+
+    The coroutine object is constructed lazily *inside* the target
+    execution context (via ``coro_factory``), so no coroutine/future is
+    ever created on one loop and awaited on another. The
+    ``_run_with_lighter_ratelimit`` wrapper (and its limiter acquire) is
+    applied in the same context that runs the coroutine, keeping the
+    rate-limit accounting consistent.
+
+    ``coro_factory`` is a zero-arg callable returning the coroutine to
+    run (e.g. ``lambda: _run_batch()``); it is invoked only inside the
+    chosen execution context.
+    """
+    def _invoke() -> Any:
+        return _run_with_lighter_ratelimit(
+            credentials,
+            lambda: asyncio.run(coro_factory()),
+            max_retries=max_retries,
+        )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop on this thread — safe to asyncio.run directly.
+        return _invoke()
+
+    # A loop is already running on this thread (Hermes gateway). Offload
+    # to a worker thread with no running loop and bridge the result.
+    result: Dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = _invoke()
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(target=_runner, name=thread_name, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def _looks_like_lighter_429(exc: BaseException) -> Optional[float]:
     """Best-effort: detect Lighter's 23000 rate-limit error.
 
@@ -2240,10 +2307,16 @@ def _submit_send_tx_batch(
     # send_tx_batch). A 429 inside the envelope propagates through the
     # returned dict's outcome — caller decides whether to stop.
     # No retry at this layer — KAM safety contract.
+    #
+    # ``_run_lighter_coro_blocking`` bridges the coroutine safely whether
+    # or not the calling thread already has a running event loop (the
+    # Hermes/Telegram gateway loop). It never calls ``asyncio.run`` on a
+    # thread that already has a running loop.
     try:
-        return _run_with_lighter_ratelimit(
+        return _run_lighter_coro_blocking(
             credentials,
-            lambda: asyncio.run(_run_batch()),
+            lambda: _run_batch(),
+            thread_name="lighter-send-tx-batch",
             max_retries=0,
         )
     except _LighterRateLimitError as exc:
@@ -2635,10 +2708,16 @@ def _submit_cancel_tx_batch(
 
     # Wrap in the per-L1 sliding-window limiter (1 HTTP slot per
     # send_tx_batch). No retry at this layer — KAM safety contract.
+    #
+    # ``_run_lighter_coro_blocking`` bridges the coroutine safely whether
+    # or not the calling thread already has a running event loop (the
+    # Hermes/Telegram gateway loop). It never calls ``asyncio.run`` on a
+    # thread that already has a running loop.
     try:
-        return _run_with_lighter_ratelimit(
+        return _run_lighter_coro_blocking(
             credentials,
-            lambda: asyncio.run(_run_batch()),
+            lambda: _run_batch(),
+            thread_name="lighter-cancel-tx-batch",
             max_retries=0,
         )
     except _LighterRateLimitError as exc:
