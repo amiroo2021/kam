@@ -208,17 +208,19 @@ def make_clean_hermes(root: Path) -> Path:
 
 
 def run_installer(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    systemd_dir = hermes_root.parent / "systemd"
     return subprocess.run(
         [PY, str(INSTALLER / "install_trade.py"),
-         "--hermes-root", str(hermes_root), "--skip-deps", "--no-restart", *extra],
+         "--hermes-root", str(hermes_root), "--systemd-dir", str(systemd_dir), "--skip-deps", "--no-restart", *extra],
         capture_output=True, text=True,
     )
 
 
 def run_uninstaller(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    systemd_dir = hermes_root.parent / "systemd"
     return subprocess.run(
         [PY, str(INSTALLER / "uninstall_trade.py"),
-         "--hermes-root", str(hermes_root), "--no-restart", *extra],
+         "--hermes-root", str(hermes_root), "--systemd-dir", str(systemd_dir), "--no-restart", *extra],
         capture_output=True, text=True,
     )
 
@@ -273,17 +275,20 @@ class TestFreshInstall(FixtureCase):
         self.assertIn("KAM /trade installation: PASS", proc.stdout)
 
         # payload landed
-        for rel in ("wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml"):
+        for rel in (
+            "wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml",
+            "fibo_service.py", "fibo_wizard.py", "fibo_daemon.py",
+        ):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
 
-        # all agents shipped — the kam currently supports 8
-        # exchanges (apex, arcus, hibachi, hyperliquid, lighter,
-        # pacifica, raydium, rise). Update this when adding or
+        # all agents shipped — the kam currently supports 10
+        # exchanges (apex, arcus, edgex, hibachi, hyperliquid, lighter,
+        # ondoperps, pacifica, raydium, rise). Update this when adding or
         # removing an exchange.
         agents = sorted(
             p.name for p in (self.hermes / "plugins" / "trade" / "agents").glob("x_*_agent.py")
         )
-        self.assertEqual(len(agents), 8, agents)
+        self.assertEqual(len(agents), 10, agents)
 
         # all three adapter seams wired, each exactly once
         text = self.adapter.read_text()
@@ -351,11 +356,19 @@ class TestFreshInstall(FixtureCase):
         for entry in manifest["copied_files"]:
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
-        self.assertEqual(len(patched), 4, patched)
+        self.assertEqual(len(patched), 7, patched)
         seams = {p["seam"] for p in patched}
         self.assertEqual(
             seams,
-            {"callback dispatch", "wizard text interception", "slash command dispatch", "inline keyboard helper"},
+            {
+                "callback dispatch",
+                "wizard text interception",
+                "slash command dispatch",
+                "fibo callback dispatch",
+                "fibo text interception",
+                "fibo slash command dispatch",
+                "inline keyboard helper",
+            },
         )
         for entry in patched:
             self.assertTrue(entry["sha256_before"])
@@ -368,6 +381,19 @@ class TestFreshInstall(FixtureCase):
         self.assertEqual(len(backups), 1, backups)
         # backup is the PRE-patch content
         self.assertNotIn("handle_trade_command", backups[0].read_text())
+
+    def test_fibo_service_unit_and_runtime_layout_installed(self):
+        run_installer(self.hermes)
+        unit = self.hermes.parent / "systemd" / "fibo.service"
+        self.assertTrue(unit.is_file(), unit)
+        text = unit.read_text(encoding="utf-8")
+        self.assertIn("-m plugins.trade.fibo_daemon", text)
+        self.assertIn("service.sock", text)
+        self.assertIn("service_state.json", text)
+        runtime_dir = Path("/root/.hermes/fibo")
+        # synthetic fixture runs with host-default HERMES_HOME; verify installer records the intended runtime dir
+        manifest = K.read_manifest(K.installed_manifest_path(self.hermes))
+        self.assertEqual(manifest["fibo_service_unit"]["runtime_dir"], str(runtime_dir))
 
     def test_state_layout_is_manifest_plus_backups_subdir(self):
         run_installer(self.hermes)
@@ -395,6 +421,22 @@ class TestFreshInstall(FixtureCase):
         found = K.find_manifest(self.hermes)
         self.assertIsNotNone(found)
         self.assertEqual(found, legacy)
+
+
+class TestSystemdUnitIsolation(FixtureCase):
+    def test_installer_rejects_tmp_fixture_paths_for_real_systemd_dir(self):
+        real_unit = Path("/etc/systemd/system/fibo.service")
+        before = K.sha256_file(real_unit) if real_unit.is_file() else None
+        proc = subprocess.run(
+            [PY, str(INSTALLER / "install_trade.py"),
+             "--hermes-root", str(self.hermes), "--skip-deps", "--no-restart"],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("suspicious temporary/test paths", combined)
+        after = K.sha256_file(real_unit) if real_unit.is_file() else None
+        self.assertEqual(after, before)
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +615,7 @@ class TestVerificationGate(FixtureCase):
     def test_verifier_passes_after_install(self):
         run_installer(self.hermes)
         proc = subprocess.run(
-            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes)],
+            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes), "--systemd-dir", str(self.hermes.parent / "systemd")],
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -581,7 +623,7 @@ class TestVerificationGate(FixtureCase):
 
     def test_verifier_fails_when_plugin_absent(self):
         proc = subprocess.run(
-            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes)],
+            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes), "--systemd-dir", str(self.hermes.parent / "systemd")],
             capture_output=True, text=True,
         )
         self.assertNotEqual(proc.returncode, 0)
@@ -590,7 +632,7 @@ class TestVerificationGate(FixtureCase):
     def test_verifier_never_mentions_live_actions(self):
         run_installer(self.hermes)
         proc = subprocess.run(
-            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes)],
+            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes), "--systemd-dir", str(self.hermes.parent / "systemd")],
             capture_output=True, text=True,
         )
         lowered = proc.stdout.lower()
@@ -1347,8 +1389,8 @@ class TestPluginInvariants(unittest.TestCase):
         self.assertEqual(
             agents,
             [
-                "apex", "arcus", "hibachi", "hyperliquid",
-                "lighter", "pacifica", "raydium", "rise",
+                "apex", "arcus", "edgex", "hibachi", "hyperliquid",
+                "lighter", "ondoperps", "pacifica", "raydium", "rise",
             ],
         )
 

@@ -925,7 +925,9 @@ class TestNewOrder(_HibachiEnvTest):
             "00065804be87c855000000010000000005f5e100"
             "00000000000000028f5c28f5000000000000afc8"
         )
-        sdk_python = "/tmp/hibachi_sdk_venv/bin/python"
+        sdk_python = Path("/tmp/hibachi_sdk_venv/bin/python")
+        if not sdk_python.is_file():
+            self.skipTest("hibachi SDK venv fixture not present at /tmp/hibachi_sdk_venv/bin/python")
         script = r'''
 import typing
 if not hasattr(typing, 'override'):

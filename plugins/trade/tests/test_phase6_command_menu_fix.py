@@ -271,7 +271,7 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
     def test_telegram_menu_contains_trade_after_plugin_registration(self) -> None:
         # Register the trade plugin manually so the test doesn't depend
         # on global plugin discovery order.
-        from plugins.trade import register as trade_register, _handle_trade_slash
+        from plugins.trade import register as trade_register, _handle_trade_slash, _handle_fibo_slash
 
         class _StubCtx:
             def __init__(self) -> None:
@@ -286,11 +286,16 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
         ctx = _StubCtx()
         trade_register(ctx)
 
-        # Verify the plugin registered trade (test 7 covers idempotence).
-        self.assertEqual(len(ctx.calls), 1)
-        self.assertEqual(ctx.calls[0]["name"], "trade")
-        self.assertEqual(ctx.calls[0]["description"], "Open the trading wizard")
-        self.assertIs(ctx.calls[0]["handler"], _handle_trade_slash)
+        # Verify the plugin registered both Telegram-menu commands.
+        self.assertEqual(len(ctx.calls), 2)
+        names = {call["name"] for call in ctx.calls}
+        self.assertEqual(names, {"trade", "fibo"})
+        trade_call = next(call for call in ctx.calls if call["name"] == "trade")
+        fibo_call = next(call for call in ctx.calls if call["name"] == "fibo")
+        self.assertEqual(trade_call["description"], "Open the trading wizard")
+        self.assertIs(trade_call["handler"], _handle_trade_slash)
+        self.assertEqual(fibo_call["description"], "Open the Fibo wizard")
+        self.assertIs(fibo_call["handler"], _handle_fibo_slash)
 
     def test_no_gateway_platforms_keyword_in_register_call(self) -> None:
         """The plugin's register() must not emit gateway_platforms=.
@@ -398,9 +403,11 @@ class TradeRegistrationIsIdempotentTests(unittest.TestCase):
         ctx = _StubCtx()
         trade_register(ctx)
         trade_register(ctx)
-        self.assertEqual(list(ctx.entries.keys()), ["trade"])
+        self.assertEqual(set(ctx.entries.keys()), {"trade", "fibo"})
         self.assertEqual(ctx.entries["trade"]["description"],
                          "Open the trading wizard")
+        self.assertEqual(ctx.entries["fibo"]["description"],
+                         "Open the Fibo wizard")
 
     def test_register_handles_missing_register_command_gracefully(self) -> None:
         """If the plugin context lacks register_command (older Hermes),

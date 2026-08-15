@@ -49,6 +49,25 @@ if data.startswith("trade:"):
         return
 '''
 
+_FIBO_CALLBACK_BLOCK = '''\
+if data.startswith("fibo:"):
+    try:
+        from plugins.trade.fibo_wizard import handle_fibo_callback
+
+        await handle_fibo_callback(self, query, data)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] /fibo callback dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+'''
+
 # --- Seam B: wizard free-text interception ---------------------------------
 _TEXT_BLOCK = '''\
 try:
@@ -59,6 +78,19 @@ try:
 except Exception as exc:  # noqa: BLE001
     logger.error(
         "[%s] /trade text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
+'''
+
+_FIBO_TEXT_BLOCK = '''\
+try:
+    from plugins.trade.fibo_wizard import handle_fibo_text
+
+    if await handle_fibo_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /fibo text dispatch failed: %s",
         self.name, exc, exc_info=True,
     )
 '''
@@ -81,6 +113,26 @@ if first_token:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[%s] /trade command dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+            # Fall through to normal dispatch rather than swallow.
+'''
+
+_FIBO_COMMAND_BLOCK = '''\
+raw_text = (msg.text or "").strip()
+first_token = raw_text.split(None, 1)[0] if raw_text else ""
+if first_token:
+    cmd_body = first_token.lstrip("/").split("@", 1)[0].lower()
+    if cmd_body == "fibo":
+        try:
+            from plugins.trade.fibo_wizard import handle_fibo_command
+
+            handled = await handle_fibo_command(self, msg)
+            if handled:
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[%s] /fibo command dispatch failed: %s",
                 self.name, exc, exc_info=True,
             )
             # Fall through to normal dispatch rather than swallow.
@@ -434,8 +486,17 @@ def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
 
 
 def adapter_specs() -> List[PatchSpec]:
-     """The three Telegram adapter seams, in file order."""
+     """The Telegram adapter seams for /trade and /fibo, in file order."""
      return [
+        PatchSpec(
+            seam="fibo callback dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
+            anchor_after="# --- Model picker callbacks ---",
+            block=_FIBO_CALLBACK_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_callback",
+        ),
         PatchSpec(
             seam="callback dispatch",
             relative_path=TELEGRAM_ADAPTER,
@@ -444,6 +505,18 @@ def adapter_specs() -> List[PatchSpec]:
             block=_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_callback",
+        ),
+        PatchSpec(
+            seam="fibo text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before="await self._ensure_forum_commands(update.message)",
+            anchor_after=(
+                "event = self._build_message_event(msg, MessageType.TEXT, "
+                "update_id=update.update_id)"
+            ),
+            block=_FIBO_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_text",
         ),
         PatchSpec(
             seam="wizard text interception",
@@ -456,6 +529,18 @@ def adapter_specs() -> List[PatchSpec]:
             block=_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
+        ),
+        PatchSpec(
+            seam="fibo slash command dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before="await self._ensure_forum_commands(msg)",
+            anchor_after=(
+                "event = self._build_message_event(msg, MessageType.COMMAND, "
+                "update_id=update.update_id)"
+            ),
+            block=_FIBO_COMMAND_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_command",
         ),
         PatchSpec(
             seam="slash command dispatch",
