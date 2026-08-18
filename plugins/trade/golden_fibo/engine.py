@@ -296,11 +296,16 @@ class GoldenFiboEngine:
         client_id = self._next_client_id()
 
         # PREPARE: persist everything BEFORE the venue call.
+        # Cycle-boundary reset: every cycle-scoped field must reflect ONLY the
+        # current cycle. The previous cycle's step_orders map must NOT survive
+        # into the new cycle (historical evidence belongs in forensic logs,
+        # not the active state machine).
         self.state.cycle_id += 1
         self.state.next_step = 0
         self.state.highest_filled_step = -1
         self.state.fill_prices = {}
         self.state.expected_cumulative_size = Decimal("0")
+        self.state.step_orders = {}
         self.state.current_tp_price = None
         self.state.current_tp_size = None
         self.state.current_tp_order_id = None
