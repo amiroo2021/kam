@@ -40,7 +40,9 @@ from capabilities import (  # noqa: E402
     install_state_path,
     is_installed,
     is_no_flag,
+    legacy_trade_state_dir,
     load_manifest,
+    migrate_legacy_kam_trade,
     parse_capability_flags,
     resolve_hermes_home,
     save_manifest,
@@ -71,6 +73,10 @@ def cmd_install(argv: List[str]) -> int:
     caps = _resolve_capabilities(argv)
     _print_banner("install", caps)
     hermes_home = resolve_hermes_home()
+    # Migrate legacy .kam-trade/ directory if present (once per install).
+    legacy_payload = migrate_legacy_kam_trade(hermes_home)
+    if legacy_payload is not None:
+        print(f"migrated legacy {legacy_trade_state_dir(hermes_home)} → retired")
     # Lazy imports (avoid pulling capability modules unless needed).
     results: List[dict] = []
     # Shared is installed once (when ANY capability needs it).
