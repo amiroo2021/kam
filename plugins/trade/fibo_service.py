@@ -457,10 +457,12 @@ class PersistentFiboService:
             if (
                 s.pending_order_role == ROLE_ENTRY
                 and s.next_step == 0
-                and s.pending_order_exchange_id is not None
             ):
                 # Snapshot: don't recurse infinitely. The next tick
-                # will pick up the confirmed state.
+                # will pick up the confirmed state. The service's
+                # _maybe_confirm_step0 now handles both the case where
+                # pending_order_exchange_id is set (get_order_state path)
+                # and where it is None (position delta path).
                 self._maybe_confirm_step0(key)
             if (
                 s.pending_order_role == ROLE_LADDER
