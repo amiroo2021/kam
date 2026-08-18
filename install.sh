@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-# KAM /trade add-on installer (thin wrapper).
+# KAM modular installer dispatcher.
+#
+# Usage:
+#   ./install.sh --trade
+#   ./install.sh --fibo
+#   ./install.sh --trade --fibo
+#   ./install.sh                          # no-flag = TRADE ONLY (legacy compat)
+#
+# Optional flags (forwarded):
+#   --hermes-root PATH
+#   --systemd-dir DIR
+#   --dry-run
+#   --no-restart
+#   --skip-deps
+#
+# Implementation lives in installer/installer.py (capability-aware).
 set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 pick_python() {
-  # Prefer the Hermes gateway venv when --hermes-root is supplied.
   local root=""
   local prev=""
   for arg in "$@"; do
@@ -27,4 +41,4 @@ pick_python() {
 }
 
 PY="$(pick_python "$@")"
-exec "$PY" "$REPO_DIR/installer/install_trade.py" "$@"
+exec "$PY" "$REPO_DIR/installer/installer.py" --action install "$@"

@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# KAM /trade add-on uninstaller (thin wrapper).
+# KAM modular uninstaller dispatcher.
+#
+# Usage:
+#   ./uninstall.sh --trade
+#   ./uninstall.sh --fibo
+#   ./uninstall.sh --trade --fibo
+#   ./uninstall.sh                        # no-flag = --trade
+#
+# Optional flags (forwarded):
+#   --hermes-root PATH
+#   --purge-state                        # for capability-owned state (legacy compat)
 set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -26,4 +36,4 @@ pick_python() {
 }
 
 PY="$(pick_python "$@")"
-exec "$PY" "$REPO_DIR/installer/uninstall_trade.py" "$@"
+exec "$PY" "$REPO_DIR/installer/installer.py" --action uninstall "$@"
