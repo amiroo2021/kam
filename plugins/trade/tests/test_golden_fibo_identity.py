@@ -294,6 +294,36 @@ class TestStep1ToStep2Transition(unittest.TestCase):
         self.assertEqual(eng.state.step_orders[0]["client_id"], 100001)
         self.assertEqual(eng.state.step_orders[1]["client_id"], 1100002)
 
+class TestStateSerializationRoundTrip(unittest.TestCase):
+    """highest_filled_step must survive JSON round-trip, including the valid
+    value 0 (Step0 filled). Regression for the 'or -1' falsy-coercion bug
+    that silently turned hfs=0 into hfs=-1 on every save/load cycle."""
+
+    def test_highest_filled_step_zero_round_trips(self):
+        s = GoldenFiboState(registration_key="k")
+        s.highest_filled_step = 0
+        d = s.to_dict()
+        s2 = GoldenFiboState.from_dict(d)
+        self.assertEqual(s2.highest_filled_step, 0)
+
+    def test_highest_filled_step_positive_round_trips(self):
+        s = GoldenFiboState(registration_key="k")
+        s.highest_filled_step = 5
+        self.assertEqual(GoldenFiboState.from_dict(s.to_dict()).highest_filled_step, 5)
+
+    def test_highest_filled_step_minus_one_round_trips(self):
+        s = GoldenFiboState(registration_key="k")
+        s.highest_filled_step = -1
+        self.assertEqual(GoldenFiboState.from_dict(s.to_dict()).highest_filled_step, -1)
+
+    def test_highest_filled_step_json_round_trips(self):
+        import json
+        s = GoldenFiboState(registration_key="k")
+        s.highest_filled_step = 0
+        d = json.loads(json.dumps(s.to_dict()))
+        self.assertEqual(GoldenFiboState.from_dict(d).highest_filled_step, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

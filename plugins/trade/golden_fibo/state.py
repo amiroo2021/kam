@@ -157,7 +157,11 @@ class GoldenFiboState:
             direction=str(data.get("direction", "BUY")),
             percentage=Decimal(str(data.get("percentage", "0"))),
             step0_volume=Decimal(str(data.get("step0_volume", "0"))),
-            highest_filled_step=int(data.get("highest_filled_step", -1) or -1),
+            highest_filled_step=int(
+                data["highest_filled_step"]
+                if data.get("highest_filled_step") is not None
+                else -1
+            ),
             fill_prices={int(k): Decimal(v) for k, v in (data.get("fill_prices") or {}).items()},
             expected_cumulative_size=Decimal(str(data.get("expected_cumulative_size", "0"))),
             current_tp_price=None if data.get("current_tp_price") is None else Decimal(str(data.get("current_tp_price"))),
