@@ -475,22 +475,29 @@ class PersistentFiboService:
     def _maybe_confirm_step0(self, key: str) -> None:
         """For Step0 MARKET: confirm fill via the live venue, persist P0.
 
-        The service is the only place with adapter access. The engine
-        cannot query the adapter directly from inside _handle_confirmed_fill
-        because it is a pure state machine.
+        Normal Lighter Step0 confirmation path:
+          persisted client_order_index
+          -> get_order_state (when exchange_order_id is known)
+          -> get_order_state_by_client_id (when exchange_order_id is None)
+          -> confirm FILLED
+          -> backfill exchange order_index
+          -> recover authoritative P0 (native actual_fill_price, else
+             filled_quote / filled_base)
+          -> persist confirmed state and place TP + Step1.
 
-        We re-read get_order_state.actual_fill_price to confirm P0.
-        If pending_order_exchange_id is None (Lighter market orders may
-        return None), reconcile via position delta instead.
+        NEVER resubmits Step0. If the order cannot be found after a
+        bounded number of ticks, NEEDS_RECOVERY is set.
         """
         with self._lock:
             state = self._states.get(key)
             if state is None or state.pending_order_role != ROLE_ENTRY:
                 return
             exchange_order_id = state.pending_order_exchange_id
+            client_id = state.submission_client_id or state.pending_order_client_id
 
-        # Path 1: if we have an exchange_order_id, use get_order_state.
         order_state = None
+
+        # Path A: exchange_order_id known -> get_order_state.
         if exchange_order_id is not None:
             try:
                 order_state = self._adapter_for(key).get_order_state(
@@ -500,69 +507,105 @@ class PersistentFiboService:
                 logger.warning("step0 get_order_state failed for %s: %s", key, exc)
                 return
 
-        # Path 2: if no exchange_order_id or get_order_state returned
-        # nothing, reconcile via position delta.
-        if not order_state:
-            try:
-                position = self._adapter_for(key).position_state(
-                    state.account, state.instrument
-                )
-            except Exception as exc:
-                logger.warning("step0 position_state failed for %s: %s", key, exc)
-                return
-            if not isinstance(position, dict):
-                return
-            live_size_raw = position.get("size")
-            try:
-                live_size = Decimal(str(live_size_raw or "0"))
-            except Exception:
-                live_size = Decimal("0")
-            expected_size = Decimal(str(state.step0_volume or "0"))
-            if live_size < expected_size:
-                # Position not yet established; wait
-                return
-            # Position established — treat as Step0 filled.
-            # Use position entry price as fallback for P0.
-            ep = position.get("entry_price")
-            if ep is not None:
-                try:
-                    p0 = Decimal(str(ep))
-                except Exception:
-                    p0 = None
-            else:
-                p0 = None
-            if p0 is None or p0 <= 0:
+        # Path B: no exchange_order_id (Lighter market orders) ->
+        # look up by persisted client_order_index. This is the normal
+        # Lighter Step0 confirmation path. Bounded read-after-write.
+        if not order_state and client_id is not None:
+            attempts = getattr(self, "_step0_lookup_attempts", {}).get(key, 0)
+            if attempts >= 8:  # ~8 poll ticks of read-after-write
                 with self._lock:
+                    state = self._states.get(key)
+                    if state is None:
+                        return
                     state.status = STATUS_NEEDS_RECOVERY
-                    state.freeze_reason = "could not establish Step0 fill price via position"
+                    state.freeze_reason = (
+                        f"Step0 order with client_order_index={client_id} "
+                        f"not found in active/inactive surface after bounded retry"
+                    )
                     self._save_state()
                 return
-            # Promote P0 and place TP + Step1
+            try:
+                order_state = self._adapter_for(key).get_order_state_by_client_id(
+                    state.account, state.instrument, int(client_id)
+                )
+            except Exception as exc:
+                logger.warning("step0 get_order_state_by_client_id failed for %s: %s", key, exc)
+                return
+            if not hasattr(self, "_step0_lookup_attempts"):
+                self._step0_lookup_attempts = {}
+            self._step0_lookup_attempts[key] = attempts + 1
+
+        if not order_state:
+            # Not found yet — wait for the next poll tick (bounded).
+            return
+
+        # Ownership verification: client_order_index must match.
+        rec_client = order_state.get("client_order_index")
+        try:
+            rec_client_int = int(rec_client) if rec_client is not None else None
+        except (TypeError, ValueError):
+            rec_client_int = None
+        if client_id is not None and rec_client_int is not None and rec_client_int != int(client_id):
             with self._lock:
                 state = self._states.get(key)
                 if state is None:
                     return
-                from .golden_fibo.engine import GoldenFiboEngine
-                cfg = self._config_for(key, state)
-                adapter = self._adapter_for(key)
-                engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
-                engine.confirm_step0_filled(p0)
-                result = engine.place_step0_tp_and_step1(p0)
-                self._states[key] = engine.state
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = (
+                    f"client_order_index mismatch: expected {client_id}, "
+                    f"venue returned {rec_client_int}"
+                )
                 self._save_state()
-                if result is not None:
-                    # Engine froze — propagate
-                    self._states[key] = result.state
-                    self._save_state()
             return
 
-        # Path 1 continued: order_state exists and is not empty.
+        # Side verification.
+        expected_side = "buy" if state.direction == "BUY" else "sell"
+        rec_side = str(order_state.get("side") or "").lower()
+        if rec_side and rec_side != expected_side:
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = (
+                    f"Step0 side mismatch: expected {expected_side}, venue {rec_side}"
+                )
+                self._save_state()
+            return
+
+        expected_size = Decimal(str(state.step0_volume or "0"))
+        filled_size_raw = order_state.get("filled_size") or order_state.get("requested_size")
+        try:
+            filled_size = Decimal(str(filled_size_raw)) if filled_size_raw is not None else None
+        except Exception:
+            filled_size = None
+
         status = str(order_state.get("status") or "")
         taxonomy = str(order_state.get("taxonomy") or "")
-        if taxonomy != "FILLED" and status != "filled":
-            # Not yet filled; wait
+
+        # ACTIVE: keep waiting (do NOT resubmit).
+        if taxonomy == "ACTIVE":
             return
-        # Fill price: try actual_fill_price first, fall back to position entry
+
+        # Terminal non-fill: NEEDS_RECOVERY, never resubmit.
+        if taxonomy in ("CANCELED", "REJECTED", "EXPIRED"):
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = f"Step0 order {taxonomy.lower()}"
+                self._save_state()
+            return
+
+        # FILLED only.
+        if taxonomy != "FILLED" and status != "filled":
+            return
+
+        # Backfill exchange order_index discovered via client-id lookup.
+        backfilled_oid = order_state.get("exchange_order_id")
+
+        # P0: prefer native actual_fill_price; else filled_quote / filled_base.
         p0: Optional[Decimal] = None
         afp = order_state.get("actual_fill_price")
         if afp is not None:
@@ -570,37 +613,56 @@ class PersistentFiboService:
                 p0 = Decimal(str(afp))
             except Exception:
                 p0 = None
-        if p0 is None or p0 <= 0:
-            # Fall back to position entry (per the simplified spec)
+        if (p0 is None or p0 <= 0) and filled_size is not None and filled_size > 0:
+            fq = order_state.get("filled_quote")
             try:
-                position = self._adapter_for(key).position_state(
-                    state.account, state.instrument
-                )
+                fq_dec = Decimal(str(fq)) if fq is not None else None
             except Exception:
-                position = None
-            if isinstance(position, dict):
-                ep = position.get("entry_price")
-                if ep is not None:
-                    try:
-                        p0 = Decimal(str(ep))
-                    except Exception:
-                        p0 = None
+                fq_dec = None
+            if fq_dec is not None and fq_dec > 0:
+                p0 = fq_dec / filled_size
+
         if p0 is None or p0 <= 0:
-            # Cannot establish P0 yet — freeze
             with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
                 state.status = STATUS_NEEDS_RECOVERY
-                state.freeze_reason = "could not establish Step0 fill price"
+                state.freeze_reason = "could not establish Step0 fill price from order record"
                 self._save_state()
             return
-        # Now promote P0 and place TP + Step1
+
+        # Size verification: filled size must be >= expected step0.
+        if filled_size is not None and expected_size > 0 and filled_size < expected_size:
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = (
+                    f"Step0 filled size {filled_size} < expected {expected_size}"
+                )
+                self._save_state()
+            return
+
+        # Promote P0, backfill exchange identity, place TP + Step1.
         with self._lock:
             state = self._states.get(key)
             if state is None:
                 return
+            # Reset the bounded-lookup counter on success.
+            if hasattr(self, "_step0_lookup_attempts"):
+                self._step0_lookup_attempts.pop(key, None)
             from .golden_fibo.engine import GoldenFiboEngine
             cfg = self._config_for(key, state)
             adapter = self._adapter_for(key)
             engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
+            if backfilled_oid is not None:
+                try:
+                    engine.state.pending_order_exchange_id = int(backfilled_oid)
+                    engine.state.submission_exchange_order_id = int(backfilled_oid)
+                except (TypeError, ValueError):
+                    pass
             engine.confirm_step0_filled(p0)
             result = engine.place_step0_tp_and_step1(p0)
             self._states[key] = engine.state
@@ -609,10 +671,8 @@ class PersistentFiboService:
                 # Engine froze — propagate
                 self._states[key] = result.state
                 self._save_state()
+        return
 
-    # ------------------------------------------------------------------
-    # Public IPC commands
-    # ------------------------------------------------------------------
     def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             op = str(command.get("op") or "").strip()

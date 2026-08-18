@@ -3459,6 +3459,7 @@ def _submit_new_order(
     requested_volume: Decimal,
     requested_price: Decimal,
     reduce_only: bool,
+    client_order_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     async def _run_submit() -> Dict[str, Any]:
         signer = _build_signer_client(credentials)
@@ -3478,13 +3479,23 @@ def _submit_new_order(
                 raise RuntimeError("Volume must be positive after Lighter size quantization")
             if price_int <= 0:
                 raise RuntimeError("Price must be positive after Lighter price quantization")
-            client_order_index = int(time.time_ns() % LIGHTER_MAX_CLIENT_ORDER_INDEX)
-            if client_order_index <= 0:
-                client_order_index = 1
+            # Resolve the effective client identity. The caller-supplied
+            # parameter (client_order_index) is honored verbatim when
+            # present; otherwise fall back to a time-based value for
+            # backward compatibility with legacy /trade paths. Use a
+            # distinct local name to avoid shadowing the closure param.
+            effective_client_order_index = client_order_index
+            if effective_client_order_index is None:
+                effective_client_order_index = int(time.time_ns() % LIGHTER_MAX_CLIENT_ORDER_INDEX)
+            effective_client_order_index = int(effective_client_order_index)
+            if effective_client_order_index <= 0:
+                effective_client_order_index = 1
+            if effective_client_order_index > LIGHTER_MAX_CLIENT_ORDER_INDEX:
+                effective_client_order_index = int(effective_client_order_index % LIGHTER_MAX_CLIENT_ORDER_INDEX) or 1
             if order_type == "market":
                 tx, api_response, error = await signer.create_market_order_limited_slippage(
                     int(market["market_id"]),
-                    client_order_index,
+                    effective_client_order_index,
                     base_amount,
                     LIGHTER_CLOSE_MAX_SLIPPAGE,
                     side == "sell",
@@ -3494,7 +3505,7 @@ def _submit_new_order(
             else:
                 tx, api_response, error = await signer.create_order(
                     int(market["market_id"]),
-                    client_order_index,
+                    effective_client_order_index,
                     base_amount,
                     price_int,
                     side == "sell",
@@ -3520,7 +3531,7 @@ def _submit_new_order(
                 "submitted_volume": _decimal_text(submitted_volume),
                 "submitted_price": _decimal_text(submitted_price),
                 "exchange_order_id": exchange_order_id,
-                "client_order_index": client_order_index,
+                "client_order_index": effective_client_order_index,
                 "nonce": tx_nonce,
                 "tx_hash": response_hash,
             }
@@ -3641,6 +3652,25 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
     #   - On definite success the loop exits with the matched order.
     #   - On exhaustion return VERIFICATION_FAILED — never resubmit.
     try:
+        # Optional deterministic client identity supplied by the caller
+        # (e.g. GoldenFibo). When present, it is honored verbatim; when
+        # absent, _submit_new_order falls back to time-based generation.
+        requested_client_order_id = request.get("client_order_id")
+        if requested_client_order_id is None:
+            requested_client_order_id = request.get("client_order_index")
+        client_order_index_arg: Optional[int] = None
+        if requested_client_order_id is not None:
+            try:
+                client_order_index_arg = int(requested_client_order_id)
+            except (TypeError, ValueError):
+                return make_failure(
+                    operation="new_order",
+                    exchange=name,
+                    account=account_name,
+                    code="INVALID_INPUTS",
+                    message="client_order_id must be an integer when provided",
+                )
+
         submit_result = _submit_new_order(
             credentials,
             market,
@@ -3649,6 +3679,7 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
             requested_volume=submitted_volume_decimal,
             requested_price=submitted_price_decimal,
             reduce_only=reduce_only,
+            client_order_index=client_order_index_arg,
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(
@@ -4853,6 +4884,228 @@ def _resolve_lighter_market_by_id(
     return sym_map.get(int(market_id))
 
 
+def _normalize_order_record_by_client_id(
+    order: Dict[str, Any],
+    *,
+    market: Dict[str, Any],
+    size_decimals: int,
+) -> Dict[str, Any]:
+    """Normalize an active/inactive Lighter order record for the
+    generic get_order_state_by_client_id operation.
+
+    Returns a plain dict with the normalized fields; no venue mutation.
+    """
+    status_raw = str(order.get("status") or "").lower()
+    taxonomy = str(order.get("taxonomy") or "").upper()
+    if not taxonomy:
+        if status_raw in ("filled", "canceled", "cancelled", "rejected", "expired"):
+            taxonomy = {
+                "filled": "FILLED",
+                "canceled": "CANCELED",
+                "cancelled": "CANCELED",
+                "rejected": "REJECTED",
+                "expired": "EXPIRED",
+            }[status_raw]
+        else:
+            taxonomy = "ACTIVE"
+
+    # Best-effort fields (Lighter shapes vary between active/inactive).
+    filled_base = _decimal_or_none(
+        order.get("filled_base_amount")
+        or order.get("base_amount_filled")
+        or order.get("filled_size")
+    )
+    initial_base = _decimal_or_none(
+        order.get("initial_base_amount")
+        or order.get("base_amount")
+        or order.get("remaining_base_amount")
+        or order.get("size")
+    )
+    filled_quote = _decimal_or_none(
+        order.get("filled_quote_amount")
+        or order.get("quote_amount_filled")
+        or order.get("filled_quote")
+    )
+
+    # Actual fill price: prefer native field, then quote/base derivation.
+    actual_fill_price: Optional[Decimal] = None
+    afp = _decimal_or_none(
+        order.get("avg_execution_price")
+        or order.get("average_execution_price")
+        or order.get("avg_fill_price")
+    )
+    if afp is not None and afp > 0:
+        actual_fill_price = afp
+    elif (
+        filled_quote is not None
+        and filled_base is not None
+        and filled_base > 0
+        and filled_quote > 0
+    ):
+        # Lighter quote amounts are in quote units; base in base units.
+        # price = quote / base (both already unit-scaled by the API).
+        actual_fill_price = filled_quote / filled_base
+
+    # Side: Lighter encodes is_ask=true as SELL.
+    is_ask_raw = order.get("is_ask")
+    if is_ask_raw is not None:
+        side = "sell" if bool(is_ask_raw) else "buy"
+    else:
+        side = str(order.get("side") or "").lower() or None
+
+    return {
+        "exchange_order_id": order.get("order_index") or order.get("order_id"),
+        "client_order_index": order.get("client_order_index"),
+        "market_index": order.get("market_index"),
+        "symbol": str(market.get("symbol") or "").upper(),
+        "side": side,
+        "type": str(order.get("type") or order.get("order_type") or "").lower() or None,
+        "status": status_raw,
+        "taxonomy": taxonomy,
+        "requested_size": _decimal_text(initial_base) if initial_base is not None else None,
+        "filled_size": _decimal_text(filled_base) if filled_base is not None else None,
+        "filled_quote": _decimal_text(filled_quote) if filled_quote is not None else None,
+        "requested_price": _decimal_text(order.get("price")),
+        "actual_fill_price": str(actual_fill_price) if actual_fill_price is not None else None,
+        "reduce_only": bool(order.get("reduce_only") or False),
+        "created_at": order.get("created_at"),
+        "updated_at": order.get("updated_at"),
+        "raw": order,
+    }
+
+
+def _find_order_by_client_order_index(
+    credentials: Dict[str, Any],
+    market: Dict[str, Any],
+    client_order_index: int,
+    auth_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Search active orders, then inactive/history, for a Lighter order
+    whose client_order_index matches the given deterministic identity.
+
+    Returns the raw order dict, or None if not found. Read-only.
+    """
+    target = int(client_order_index)
+
+    # 1) Active orders
+    try:
+        for order in _fetch_active_orders(credentials, auth_token):
+            if not isinstance(order, dict):
+                continue
+            try:
+                if int(order.get("client_order_index") or 0) == target:
+                    return order
+            except (TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2) Inactive / history (fills land here). Bounded paging.
+    limit = 50
+    offset = 0
+    max_pages = 20
+    for _ in range(max_pages):
+        try:
+            batch = _fetch_lighter_inactive_orders_page(
+                credentials, auth_token, limit=limit, offset=offset
+            )
+        except Exception:  # noqa: BLE001
+            break
+        if not batch:
+            break
+        for order in batch:
+            if not isinstance(order, dict):
+                continue
+            try:
+                if int(order.get("client_order_index") or 0) == target:
+                    return order
+            except (TypeError, ValueError):
+                continue
+        if len(batch) < limit:
+            break
+        offset += limit
+    return None
+
+
+def _fetch_lighter_inactive_orders_page(
+    credentials: Dict[str, Any],
+    auth_token: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Single page of inactive orders (read-only)."""
+    limiter = _get_lighter_limiter(credentials)
+    limiter.acquire()
+    response = requests.get(
+        f"{credentials['base_url']}/api/v1/accountInactiveOrders",
+        params={
+            "account_index": str(credentials["account_index"]),
+            "limit": str(limit),
+            "offset": str(offset),
+        },
+        headers={"Accept": "application/json", "authorization": str(auth_token or "")},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json() or {}
+    batch = payload.get("orders") or []
+    return batch if isinstance(batch, list) else []
+
+
+def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalResponse:
+    """Generic lookup of an order by its deterministic client_order_index.
+
+    Not GoldenFibo-specific. Searches active orders first, then inactive
+    history, and returns the normalized record.
+    """
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account_name, code="UNKNOWN_ACCOUNT", message="Unknown or invalid Lighter account configuration")
+
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account_name, code="INVALID_INPUTS", message="symbol required")
+
+    client_raw = request.get("client_order_index")
+    if client_raw is None:
+        client_raw = request.get("client_order_id")
+    if client_raw is None:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account_name, code="INVALID_INPUTS", message="client_order_index required")
+    try:
+        client_order_index = int(client_raw)
+    except (TypeError, ValueError):
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account_name, code="INVALID_INPUTS", message="client_order_index must be an integer")
+
+    try:
+        market = _resolve_market(credentials["base_url"], requested_symbol)
+        size_decimals = int(market.get("size_decimals") or 0)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account_name, code="INSTRUMENT_RESOLUTION_FAILED", message=f"resolve_instrument({requested_symbol}) failed: {exc}")
+
+    auth_token = _mint_auth_token_cached(credentials)
+    order = _find_order_by_client_order_index(credentials, market, client_order_index, auth_token)
+    if order is None:
+        return make_failure(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account_name,
+            code="ORDER_NOT_FOUND",
+            message=f"no active/inactive order with client_order_index={client_order_index} on {requested_symbol}",
+        )
+
+    normalized = _normalize_order_record_by_client_id(
+        order, market=market, size_decimals=size_decimals
+    )
+    return make_success(
+        operation="get_order_state_by_client_id",
+        exchange=name,
+        account=account_name,
+        order_state=normalized,
+    )
+
+
 def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
     """Return the full state for an exact order_index.
 
@@ -5149,6 +5402,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_position_state(request)
         if operation == "get_order_state":
             return _execute_get_order_state(request)
+        if operation == "get_order_state_by_client_id":
+            return _execute_get_order_state_by_client_id(request)
         if operation == "cancel_order":
             return _execute_cancel_order(request)
         return _execute_ladder(request)

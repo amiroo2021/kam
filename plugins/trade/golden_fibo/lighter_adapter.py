@@ -128,6 +128,25 @@ class LighterGoldenFiboAdapter:
             return {}
         return _get_payload(resp).get("order_state") or _get_payload(resp).get("order") or {}
 
+    def get_order_state_by_client_id(
+        self, account: str, instrument: str, client_order_index: int
+    ) -> Dict[str, Any]:
+        """Look up an order by its deterministic client_order_index.
+
+        Returns the normalized record (with actual_fill_price derived
+        from filled_quote/filled_base when the native field is absent),
+        or {} when not found. Read-only.
+        """
+        resp = lighter_agent.execute({
+            "operation": "get_order_state_by_client_id",
+            "account": account,
+            "symbol": instrument,
+            "client_order_index": int(client_order_index),
+        })
+        if not _is_success(resp):
+            return {}
+        return _get_payload(resp).get("order_state") or {}
+
     # ------------------------------------------------------------------
     # Order placement
     # ------------------------------------------------------------------
