@@ -217,32 +217,46 @@ class LighterGoldenFiboAdapter:
         account: str,
         instrument: str,
         price: Decimal,
+        side: str,
+        size: Decimal,
+        client_order_id: int,
     ) -> Dict[str, Any]:
-        """Set/replace the ONE shared TP on the accumulated position.
+        """Set the ONE shared TP as an ordinary resting reduce-only GTC LIMIT.
 
-        Thin wrapper over x_lighter_agent.execute(operation="set_tp").
-        The agent derives the position size, closing side, quantization,
-        reduce_only, TP trigger semantics, and verification itself —
-        the adapter never constructs Lighter TP payloads.
+        GoldenFibo's shared TP must be a RESTING order that stays on the
+        venue until it fills — NOT an IOC take-profit trigger (which
+        Lighter cancels for slippage after the target is reached, proven
+        live). This delegates to the generic x_lighter_agent new_order
+        machinery with order_type="limit", reduce_only=True, and the
+        explicit closing side + accumulated size supplied by the engine.
+
+        The venue enforces min_quote_amount on LIMIT orders; the engine
+        validates notional >= min_quote before calling (no silent resize).
+
+        Returns the parsed submit record (exchange_order_id etc.).
         """
         resp = lighter_agent.execute({
-            "operation": "set_tp",
+            "operation": "new_order",
             "account": account,
             "symbol": instrument,
+            "side": side.lower(),
+            "order_type": "limit",
+            "volume": str(size),
             "price": str(price),
+            "reduce_only": True,
+            "client_order_id": int(client_order_id),
         })
-        state = _get_payload(resp).get("position_action") or {}
+        payload = _get_payload(resp)
         if not _is_success(resp):
-            raise RuntimeError(
-                f"set_shared_tp failed: {getattr(resp, 'error', None)}"
-            )
-        # Normalize the agent's verified result into the adapter shape.
+            raise RuntimeError(f"set_shared_tp (resting LIMIT) failed: {payload}")
+        order = payload.get("order") or {}
         return {
-            "verified": bool(state.get("verified")),
-            "submitted_price": state.get("price"),
-            "exchange_order_id": state.get("exchange_order_id"),
-            "current_side": state.get("current_side"),
-            "current_size": state.get("current_size"),
+            "exchange_order_id": order.get("exchange_order_id"),
+            "client_order_id": order.get("client_order_id") or client_order_id,
+            "submitted_price": order.get("submitted_price") or str(price),
+            "submitted_volume": order.get("submitted_volume") or str(size),
+            "status": order.get("status") or "submitted",
+            "verified": bool(order.get("verified")),
             "role": "tp",
         }
 

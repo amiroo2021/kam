@@ -113,6 +113,40 @@ class GoldenFiboEngine:
                     f"position size shrunk unexpectedly: live={live_size} expected>={expected}"
                 )
 
+        # TP liveness monitoring: while a position is open and a shared TP is
+        # expected (current_tp_order_id set), the TP order must remain ACTIVE.
+        # If it unexpectedly disappears/cancels WITHOUT a corresponding
+        # position close, the position is unprotected -> NEEDS_RECOVERY.
+        # We do NOT silently continue and we do NOT auto re-arm a new TP.
+        if has_position and self.state.current_tp_order_id is not None:
+            try:
+                tp_state = self.adapter.get_order_state(
+                    self.config.account,
+                    int(self.state.current_tp_order_id),
+                )
+            except Exception as exc:
+                return self._freeze(f"get_order_state(TP) failed: {exc}")
+            tp_taxonomy = str(tp_state.get("taxonomy") or "")
+            actions.append(
+                f"tp oid={self.state.current_tp_order_id} taxonomy={tp_taxonomy}"
+            )
+            if tp_taxonomy == "ACTIVE":
+                pass  # TP healthy
+            elif tp_taxonomy == "FILLED":
+                # TP filled but position still open -> partial TP fill or a
+                # residual; treat as unexpected and reconcile.
+                return self._freeze(
+                    f"shared TP oid={self.state.current_tp_order_id} FILLED but "
+                    f"position still open (size={live_size}); reconcile exchange state"
+                )
+            else:
+                # CANCELED / REJECTED / EXPIRED / missing -> unprotected position.
+                return self._freeze(
+                    f"shared TP oid={self.state.current_tp_order_id} unexpectedly "
+                    f"{tp_taxonomy or 'missing'} while position open (size={live_size}); "
+                    "position is unprotected. Reconcile exchange state before any resubmission."
+                )
+
         # Check pending order state
         pending_alive = False
         pending_state: Dict[str, Any] = {}
@@ -326,6 +360,9 @@ class GoldenFiboEngine:
 
         tp_size = self.config.cumulative_volume(self.state.highest_filled_step)
 
+        # Closing side for the shared TP is opposite the robot direction.
+        tp_side = "sell" if self.config.direction.upper() == "BUY" else "buy"
+
         # Guard: never resubmit an already-attempted TP for this step.
         if (
             self.state.submission_phase == SUBMISSION_ATTEMPTED
@@ -337,12 +374,43 @@ class GoldenFiboEngine:
                 "reconcile exchange state before any resubmission"
             )
 
-        # GoldenFibo does NOT construct Lighter TP payloads. It asks the
-        # thin adapter to set/replace the ONE shared TP on the accumulated
-        # position via the generic x_lighter_agent set_tp operation. The
-        # agent derives position size, closing side, quantization,
-        # reduce_only, TP trigger semantics, replacement, and verification.
+        # Validate TP notional >= venue min_quote (resting LIMIT TP is subject
+        # to the ordinary LIMIT minimum-notional rule). Do NOT silently resize.
+        vc = self._venue_constraints()
+        if vc is not None:
+            min_quote = vc.get("min_quote_amount") or Decimal("0")
+            notional = Decimal(tp_size) * Decimal(tp_price)
+            if min_quote > 0 and notional < min_quote:
+                return self._freeze(
+                    f"shared TP notional {notional} below venue minimum {min_quote} "
+                    f"(size={tp_size} price={tp_price}); refusing to place TP. "
+                    "Reconcile configuration before any resubmission."
+                )
+
         tp_client_id = self._next_client_id()
+
+        # Cancel the previous shared TP (if any) BEFORE placing the new one.
+        # The shared TP is a single resting reduce-only LIMIT; replacing it
+        # means canceling the old resting order first. This uses the fixed
+        # exact-order cancel path.
+        old_tp_oid = self.state.current_tp_order_id
+        if old_tp_oid is not None:
+            try:
+                canceled = self.adapter.cancel_order(
+                    account=self.config.account,
+                    order_index=int(old_tp_oid),
+                )
+            except Exception as exc:
+                return self._freeze(
+                    f"cancel previous shared TP oid={old_tp_oid} failed: {exc}. "
+                    "Reconcile exchange before any resubmission."
+                )
+            if not canceled:
+                return self._freeze(
+                    f"cancel previous shared TP oid={old_tp_oid} returned False. "
+                    "Reconcile exchange before any resubmission."
+                )
+            actions.append(f"canceled previous shared TP oid={old_tp_oid}")
 
         # PREPARE + ATTEMPT durable record for the TP submission.
         self.state.submission_phase = SUBMISSION_PREPARED
@@ -359,6 +427,9 @@ class GoldenFiboEngine:
                 account=self.config.account,
                 instrument=self.config.instrument,
                 price=tp_price,
+                side=tp_side,
+                size=tp_size,
+                client_order_id=tp_client_id,
             )
         except Exception as exc:
             self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
@@ -367,21 +438,21 @@ class GoldenFiboEngine:
                 f"Reconcile exchange before any resubmission."
             )
 
-        # set_tp verification is done inside the agent; verified=False is
-        # surfaced as an exception above (make_failure path raises).
+        # The resting LIMIT TP submit + verify is done inside the generic
+        # new_order path; a failure is surfaced as an exception above.
         self.state.submission_phase = SUBMISSION_CONFIRMED
         self.state.submission_exchange_order_id = (
             int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
         )
 
-        self.state.current_tp_price = tp_price
+        self.state.current_tp_price = Decimal(str(submit.get("submitted_price") or tp_price))
         self.state.current_tp_client_id = tp_client_id
         self.state.current_tp_order_id = (
             int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
         )
         self.state.current_tp_role = ROLE_TP
         actions.append(
-            f"shared TP set price={tp_price} size={submit.get('current_size') or tp_size} oid={self.state.current_tp_order_id}"
+            f"shared TP set price={self.state.current_tp_price} size={submit.get('submitted_volume') or tp_size} oid={self.state.current_tp_order_id}"
         )
         return None
 

@@ -82,7 +82,7 @@ class _IdAdapter:
                 "submitted_price": None, "submitted_volume": str(size),
                 "status": "filled", "verified": True, "role": "entry"}
 
-    def set_shared_tp(self, *, account, instrument, price):
+    def set_shared_tp(self, *, account, instrument, price, side=None, size=None, client_order_id=None):
         oid = 844426024069104  # matches live TP0 oid
         qp = Decimal(str(price)).quantize(Decimal("0.001"))
         live_side = self.position.get("side")

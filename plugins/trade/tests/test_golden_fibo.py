@@ -349,7 +349,7 @@ class FakeAdapter:
             "role": "tp" if reduce_only else "ladder",
         }
 
-    def set_shared_tp(self, *, account, instrument, price) -> Dict[str, object]:
+    def set_shared_tp(self, *, account, instrument, price, side=None, size=None, client_order_id=None) -> Dict[str, object]:
         """Stub for the thin adapter set_shared_tp. Mirrors x_lighter_agent
         set_tp semantics: derives size from the live position, closing side
         opposite to the position, and registers a TP order record so the

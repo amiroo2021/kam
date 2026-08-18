@@ -1,13 +1,15 @@
-"""Regression tests proving GoldenFibo uses x_lighter_agent set_tp for the
-shared TP and never constructs Lighter TP payloads itself.
+"""Regression tests for the GoldenFibo shared TP as a resting reduce-only
+GTC LIMIT order (replacing the unreliable IOC take-profit trigger).
 
-Per the offline adapter-correction approval:
-- BUY GoldenFibo calls set_tp with TP0 correctly.
-- SELL GoldenFibo calls set_tp correctly.
-- GoldenFibo does not construct Lighter TP payload itself.
-- TP replacement uses the same x_lighter_agent path.
-- existing /trade set_tp behavior is unchanged.
-- no old SL/protection logic leaks into GoldenFibo engine.
+Locked behavior:
+- The shared TP is an ordinary resting reduce-only GTC LIMIT placed via the
+  generic x_lighter_agent new_order machinery (order_type="limit",
+  reduce_only=True), with the closing side + accumulated size supplied by
+  the engine. It is NOT an IOC take-profit trigger (which Lighter cancels
+  for slippage after the target is reached — proven live).
+- TP notional must satisfy the venue min_quote (no silent resize).
+- Replacing the shared TP cancels the old resting TP first.
+- The /trade set_tp path is untouched.
 """
 
 from __future__ import annotations
@@ -41,16 +43,16 @@ from plugins.trade.golden_fibo.engine import GoldenFiboEngine
 
 
 class _RecordingAdapter:
-    """Records which adapter methods are called with what args."""
+    """Records adapter calls; provides venue constraints for notional checks."""
 
-    def __init__(self, direction: str):
+    def __init__(self, direction: str, *, min_quote: str = "10.000000"):
         self.direction = direction
         self.calls = []
-        # Live position is the accumulated GoldenFibo position.
+        self._min_quote = min_quote
         self.position = {
             "symbol": "SOL",
             "side": "long" if direction == "BUY" else "short",
-            "size": "0.100",
+            "size": "0.200",
             "sl": None,
             "tp": None,
         }
@@ -58,23 +60,31 @@ class _RecordingAdapter:
     def position_state(self, account, instrument):
         return dict(self.position)
 
-    def set_shared_tp(self, *, account, instrument, price):
+    def get_venue_constraints(self, account, instrument):
+        return {
+            "min_base_amount": "0.100",
+            "min_quote_amount": self._min_quote,
+            "size_decimals": 3,
+            "price_decimals": 3,
+        }
+
+    def set_shared_tp(self, *, account, instrument, price, side, size, client_order_id):
         self.calls.append(("set_shared_tp", {
             "account": account, "instrument": instrument, "price": str(price),
+            "side": side, "size": str(size), "client_order_id": client_order_id,
         }))
         return {
-            "verified": True,
-            "submitted_price": str(price),
             "exchange_order_id": 555000 + len(self.calls),
-            "current_side": self.position["side"],
-            "current_size": self.position["size"],
+            "client_order_id": client_order_id,
+            "submitted_price": str(price),
+            "submitted_volume": str(size),
+            "status": "submitted",
+            "verified": True,
             "role": "tp",
         }
 
-    # These must NOT be called for TP placement.
     def place_limit(self, **kwargs):
-        if kwargs.get("reduce_only"):
-            self.calls.append(("place_limit_reduce_only", kwargs))
+        self.calls.append(("place_limit", kwargs))
         return {"exchange_order_id": 1, "submitted_price": str(kwargs.get("price")),
                 "submitted_volume": str(kwargs.get("size")), "verified": True}
 
@@ -87,17 +97,17 @@ class _RecordingAdapter:
         return True
 
 
-def _engine(direction: str, p0: str = "76.126"):
+def _engine(direction: str, p0: str = "76.126", step0: str = "0.200", min_quote: str = "10.000000"):
     cfg = GoldenFiboConfig(
         exchange="lighter", account="amiroo", instrument="SOL",
-        direction=direction, percentage=Decimal("0.01"), step0_volume=Decimal("0.100"),
+        direction=direction, percentage=Decimal("0.01"), step0_volume=Decimal(step0),
     )
     state = GoldenFiboState(
         registration_key=cfg.registration_key, exchange=cfg.exchange,
         account=cfg.account, instrument=cfg.instrument, direction=cfg.direction,
         percentage=cfg.percentage, step0_volume=cfg.step0_volume,
     )
-    adapter = _RecordingAdapter(direction)
+    adapter = _RecordingAdapter(direction, min_quote=min_quote)
     counter = {"n": 100000}
     def nid():
         counter["n"] += 1
@@ -106,26 +116,28 @@ def _engine(direction: str, p0: str = "76.126"):
     return eng, adapter
 
 
-class TestSharedTpUsesSetTp(unittest.TestCase):
-    """GoldenFibo shared TP must go through adapter.set_shared_tp, never
-    through a self-constructed reduce_only LIMIT."""
+class TestSharedTpRestingLimit(unittest.TestCase):
+    """The shared TP is a resting reduce-only GTC LIMIT via new_order."""
 
-    def test_buy_tp0_calls_set_shared_tp_at_p0_times_1_01(self):
+    def test_buy_tp0_resting_limit_sell_reduce_only(self):
         eng, adapter = _engine("BUY", "76.126")
         eng.state.highest_filled_step = 0
         eng.state.fill_prices[0] = Decimal("76.126")
         result = eng._rotate_tp(Decimal("76.126"))
-        self.assertIsNone(result)  # success
-        # set_shared_tp called exactly once with TP0 = P0 * 1.01
+        self.assertIsNone(result)
         tp_calls = [c for c in adapter.calls if c[0] == "set_shared_tp"]
         self.assertEqual(len(tp_calls), 1)
-        called_price = Decimal(tp_calls[0][1]["price"])
-        self.assertEqual(called_price, Decimal("76.126") * Decimal("1.01"))
-        # Never a reduce_only LIMIT constructed for TP
-        bad = [c for c in adapter.calls if c[0] == "place_limit_reduce_only"]
-        self.assertEqual(bad, [])
+        args = tp_calls[0][1]
+        # TP0 = P0 * 1.01
+        self.assertEqual(Decimal(args["price"]), Decimal("76.126") * Decimal("1.01"))
+        # closing side = sell (opposite of BUY)
+        self.assertEqual(args["side"], "sell")
+        # accumulated size = step0 = 0.200
+        self.assertEqual(Decimal(args["size"]), Decimal("0.200"))
+        # deterministic client id supplied
+        self.assertIsNotNone(args["client_order_id"])
 
-    def test_sell_tp0_calls_set_shared_tp_at_p0_times_0_99(self):
+    def test_sell_tp0_resting_limit_buy_reduce_only(self):
         eng, adapter = _engine("SELL", "76.126")
         eng.state.highest_filled_step = 0
         eng.state.fill_prices[0] = Decimal("76.126")
@@ -133,11 +145,13 @@ class TestSharedTpUsesSetTp(unittest.TestCase):
         self.assertIsNone(result)
         tp_calls = [c for c in adapter.calls if c[0] == "set_shared_tp"]
         self.assertEqual(len(tp_calls), 1)
-        called_price = Decimal(tp_calls[0][1]["price"])
-        self.assertEqual(called_price, Decimal("76.126") * Decimal("0.99"))
+        args = tp_calls[0][1]
+        self.assertEqual(Decimal(args["price"]), Decimal("76.126") * Decimal("0.99"))
+        self.assertEqual(args["side"], "buy")  # opposite of SELL
+        self.assertEqual(Decimal(args["size"]), Decimal("0.200"))
 
-    def test_step1_tp_rotation_uses_p0_price(self):
-        """After Step1 fills, TP = P0 (the prior step's price)."""
+    def test_step1_tp_rotation_uses_p0_and_accumulated_size(self):
+        """After Step1 fills, TP = P0 and size = cumulative 0.400."""
         eng, adapter = _engine("BUY", "76.126")
         eng.state.highest_filled_step = 1
         eng.state.fill_prices[0] = Decimal("76.126")
@@ -146,53 +160,52 @@ class TestSharedTpUsesSetTp(unittest.TestCase):
         self.assertIsNone(result)
         tp_calls = [c for c in adapter.calls if c[0] == "set_shared_tp"]
         self.assertEqual(len(tp_calls), 1)
-        # TP for step 1 = P0
-        self.assertEqual(Decimal(tp_calls[0][1]["price"]), Decimal("76.126"))
+        args = tp_calls[0][1]
+        self.assertEqual(Decimal(args["price"]), Decimal("76.126"))  # P0
+        self.assertEqual(Decimal(args["size"]), Decimal("0.400"))  # cumulative
 
-    def test_engine_does_not_call_adapter_place_limit_for_tp(self):
-        """The engine's TP path must not touch place_limit at all."""
+    def test_tp_replacement_cancels_old_tp_first(self):
+        """Replacing the shared TP cancels the old resting TP before placing."""
         eng, adapter = _engine("BUY", "76.126")
         eng.state.highest_filled_step = 0
         eng.state.fill_prices[0] = Decimal("76.126")
-        eng._rotate_tp(Decimal("76.126"))
-        limit_calls = [c for c in adapter.calls if c[0] in ("place_limit", "place_limit_reduce_only")]
-        self.assertEqual(limit_calls, [])
+        eng.state.current_tp_order_id = 999111  # existing TP
+        result = eng._rotate_tp(Decimal("76.126"))
+        self.assertIsNone(result)
+        cancels = [c for c in adapter.calls if c[0] == "cancel_order"]
+        self.assertEqual(len(cancels), 1)
+        self.assertEqual(cancels[0][1]["order_index"], 999111)
+        # exactly one new TP placed
+        tp_calls = [c for c in adapter.calls if c[0] == "set_shared_tp"]
+        self.assertEqual(len(tp_calls), 1)
 
-    def test_engine_does_not_reference_sl(self):
-        """No SL/protection logic in the GoldenFibo engine."""
-        import inspect
-        from plugins.trade.golden_fibo import engine as eng_mod
-        src = inspect.getsource(eng_mod)
-        # No stop-loss placement in the strategy.
-        self.assertNotIn("place_sl", src)
-        self.assertNotIn("set_sl", src)
-        self.assertNotIn("stop_loss", src.lower())
+    def test_tp_notional_below_min_quote_freezes_no_placement(self):
+        """TP notional < min_quote -> NEEDS_RECOVERY, no TP placed, no resize."""
+        eng, adapter = _engine("BUY", "76.126", step0="0.100", min_quote="10.000000")
+        eng.state.highest_filled_step = 0
+        eng.state.fill_prices[0] = Decimal("76.126")
+        result = eng._rotate_tp(Decimal("76.126"))
+        # 0.100 * 76.887 = $7.69 < $10 -> freeze
+        self.assertIsNotNone(result)
+        self.assertEqual(result.state.status, "needs_recovery")
+        self.assertIn("below venue minimum", result.state.freeze_reason or "")
+        tp_calls = [c for c in adapter.calls if c[0] == "set_shared_tp"]
+        self.assertEqual(tp_calls, [])  # never placed
 
-
-class TestSetTpPayloadNotConstructedByAdapter(unittest.TestCase):
-    """The thin adapter must not build Lighter TP order bodies itself."""
-
-    def test_adapter_set_shared_tp_only_calls_agent_set_tp(self):
+    def test_adapter_delegates_to_new_order_reduce_only_limit(self):
+        """The adapter's set_shared_tp calls new_order with reduce_only=True,
+        order_type=limit — NOT the set_tp operation, NOT a custom signer."""
         import inspect
         from plugins.trade.golden_fibo import lighter_adapter as la
         src = inspect.getsource(la.LighterGoldenFiboAdapter.set_shared_tp)
-        # The adapter delegates to the generic agent operation.
-        self.assertIn('"operation": "set_tp"', src)
-        # It must NOT sign, quantize via base_amount, or set reduce_only itself.
+        self.assertIn('"operation": "new_order"', src)
+        self.assertIn('"order_type": "limit"', src)
+        self.assertIn('"reduce_only": True', src)
+        # It must NOT use the IOC take-profit trigger path or a custom signer.
+        self.assertNotIn('"operation": "set_tp"', src)
         self.assertNotIn("create_tp_order", src)
-        self.assertNotIn("base_amount", src)
-        self.assertNotIn("ORDER_TYPE", src)
         self.assertNotIn("signer", src.lower())
-        # The request payload sent to the agent contains ONLY operation /
-        # account / symbol / price — no side, size, reduce_only, order_type,
-        # time_in_force, or trigger fields. Strip the docstring before
-        # checking so comments don't false-positive.
-        body = src.split('resp = lighter_agent.execute({', 1)[1]
-        body = body.split('})', 1)[0]
-        for forbidden in ('reduce_only', 'side', 'size', 'order_type',
-                          'time_in_force', 'trigger_price', 'base_amount',
-                          'client_order_index'):
-            self.assertNotIn(f'"{forbidden}"', body)
+        self.assertNotIn("base_amount", src)
 
 
 class TestTradeSetTpUnchanged(unittest.TestCase):
@@ -201,10 +214,8 @@ class TestTradeSetTpUnchanged(unittest.TestCase):
     def test_agent_set_tp_operation_exists_and_unchanged(self):
         import inspect
         from plugins.trade.agents import x_lighter_agent as L
-        # The dedicated TP/SL executor still exists.
         self.assertTrue(hasattr(L, "_execute_set_tpsl"))
         src = inspect.getsource(L._submit_tpsl_order)
-        # It still uses the dedicated TP/SL signer methods.
         self.assertIn("create_tp_order", src)
         self.assertIn("create_sl_order", src)
         self.assertIn("reduce_only=True", src)

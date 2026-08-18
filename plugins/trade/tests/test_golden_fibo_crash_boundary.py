@@ -167,7 +167,7 @@ class _CrashAdapter:
         }
 
 
-    def set_shared_tp(self, *, account, instrument, price) -> dict:
+    def set_shared_tp(self, *, account, instrument, price, side=None, size=None, client_order_id=None) -> dict:
         """Stub: mirrors x_lighter_agent set_tp. Registers a TP order so the
         durable tests can count submissions and simulate verify crashes."""
         from decimal import Decimal as _D
