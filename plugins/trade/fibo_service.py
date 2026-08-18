@@ -250,23 +250,40 @@ class PersistentFiboService:
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
         socket_timeout: float = _DEFAULT_SOCKET_TIMEOUT,
         start_thread: bool = True,
+        ledger: Optional[FiboCycleLedger] = None,
     ) -> None:
         # start_thread is accepted for backward compatibility with the
         # retired counter-cascade service. The GoldenFibo service does
         # not own a background poll thread — the daemon (fibo_daemon)
         # drives _tick_once() from its own poll loop. The flag is
         # therefore ignored.
+        # ledger is accepted for the same reason — if a constructed
+        # FiboCycleLedger is passed (the old daemon signature), use it;
+        # otherwise build one from ledger_path.
         self.state_path = Path(state_path or resolve_fibo_state_path())
         self.ledger_path = Path(ledger_path or resolve_fibo_ledger_path())
         self.event_log_path = Path(event_log_path or resolve_fibo_event_log_path())
         self.tradedesk = tradedesk or get_tradedesk()
         self.poll_seconds = float(poll_seconds)
         self.socket_timeout = float(socket_timeout)
+        if ledger is not None:
+            self.ledger = ledger
+            # Mirror the ledger's path back so self.ledger_path
+            # matches what the daemon passed (rather than falling
+            # back to resolve_fibo_ledger_path()).
+            try:
+                self.ledger_path = Path(ledger.path)
+            except Exception:
+                pass
+        else:
+            # Will be set after the path is established below.
+            self.ledger = None
 
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.ledger = FiboCycleLedger(self.ledger_path)
+        if self.ledger is None:
+            self.ledger = FiboCycleLedger(self.ledger_path)
         self._states: Dict[str, GoldenFiboState] = {}
         self._configs: Dict[str, GoldenFiboConfig] = {}
         self._adapters: Dict[str, LighterGoldenFiboAdapter] = {}
