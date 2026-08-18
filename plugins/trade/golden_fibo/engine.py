@@ -497,7 +497,19 @@ class GoldenFiboEngine:
         )
 
     def _handle_confirmed_fill(self, actions: List[str]) -> TickResult:
-        """Pending ladder order confirmed FILLED. Advance to next step."""
+        """Pending order confirmed FILLED. Advance to next step.
+
+        Handles both Step0 (ROLE_ENTRY) and ladder (ROLE_LADDER) fills.
+        Step0 fills are normally confirmed by the service via
+        _maybe_confirm_step0, but the engine may also observe the fill
+        directly during a tick (e.g., after restart reconciliation).
+        """
+        if self.state.pending_order_role == ROLE_ENTRY:
+            # Step0 fill observed during tick. The service's
+            # _maybe_confirm_step0 will promote P0 and place TP+Step1.
+            # Return without freezing — the service handles the rest.
+            actions.append("Step0 entry order observed FILLED; awaiting service confirm")
+            return TickResult(state=self.state, actions=actions)
         if self.state.pending_order_role != ROLE_LADDER:
             return self._freeze("confirmed fill in unexpected role")
         if self.state.pending_confirmed_price is None:
