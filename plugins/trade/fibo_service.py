@@ -478,22 +478,83 @@ class PersistentFiboService:
         because it is a pure state machine.
 
         We re-read get_order_state.actual_fill_price to confirm P0.
+        If pending_order_exchange_id is None (Lighter market orders may
+        return None), reconcile via position delta instead.
         """
         with self._lock:
             state = self._states.get(key)
             if state is None or state.pending_order_role != ROLE_ENTRY:
                 return
             exchange_order_id = state.pending_order_exchange_id
-        try:
-            order_state = self._adapter_for(key).get_order_state(
-                state.account, int(exchange_order_id)
-            )
-        except Exception as exc:
-            logger.warning("step0 get_order_state failed for %s: %s", key, exc)
-            return
+
+        # Path 1: if we have an exchange_order_id, use get_order_state.
+        order_state = None
+        if exchange_order_id is not None:
+            try:
+                order_state = self._adapter_for(key).get_order_state(
+                    state.account, int(exchange_order_id)
+                )
+            except Exception as exc:
+                logger.warning("step0 get_order_state failed for %s: %s", key, exc)
+                return
+
+        # Path 2: if no exchange_order_id or get_order_state returned
+        # nothing, reconcile via position delta.
         if not order_state:
-            # Order not found yet — try again next tick
+            try:
+                position = self._adapter_for(key).position_state(
+                    state.account, state.instrument
+                )
+            except Exception as exc:
+                logger.warning("step0 position_state failed for %s: %s", key, exc)
+                return
+            if not isinstance(position, dict):
+                return
+            live_size_raw = position.get("size")
+            try:
+                live_size = Decimal(str(live_size_raw or "0"))
+            except Exception:
+                live_size = Decimal("0")
+            expected_size = Decimal(str(state.step0_volume or "0"))
+            if live_size < expected_size:
+                # Position not yet established; wait
+                return
+            # Position established — treat as Step0 filled.
+            # Use position entry price as fallback for P0.
+            ep = position.get("entry_price")
+            if ep is not None:
+                try:
+                    p0 = Decimal(str(ep))
+                except Exception:
+                    p0 = None
+            else:
+                p0 = None
+            if p0 is None or p0 <= 0:
+                with self._lock:
+                    state.status = STATUS_NEEDS_RECOVERY
+                    state.freeze_reason = "could not establish Step0 fill price via position"
+                    self._save_state()
+                return
+            # Promote P0 and place TP + Step1
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
+                from .golden_fibo.engine import GoldenFiboEngine
+                cfg = self._config_for(key, state)
+                adapter = self._adapter_for(key)
+                engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
+                engine.confirm_step0_filled(p0)
+                result = engine.place_step0_tp_and_step1(p0)
+                self._states[key] = engine.state
+                self._save_state()
+                if result is not None:
+                    # Engine froze — propagate
+                    self._states[key] = result.state
+                    self._save_state()
             return
+
+        # Path 1 continued: order_state exists and is not empty.
         status = str(order_state.get("status") or "")
         taxonomy = str(order_state.get("taxonomy") or "")
         if taxonomy != "FILLED" and status != "filled":
