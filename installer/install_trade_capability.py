@@ -1,13 +1,7 @@
 """Capability-specific installer: TRADE.
 
 Installs ONLY the /trade capability:
-  - ``plugins/trade/tradedesk.py`` (TradeDesk dispatcher)
   - ``plugins/trade/wizard.py`` (/trade wizard)
-  - ``plugins/trade/__init__.py`` (plugin marker; capability-aware registration)
-  - Trade-specific patches (the ``trade:`` and ``/trade`` seams in
-    ``plugins/platforms/telegram/adapter.py`` and the slash-command menu
-    registration)
-  - ``~/.hermes/trade/`` (capability-owned state folder)
 
 Does NOT install:
   - fibo files (golden_fibo/, fibo_service.py, fibo_daemon.py, fibo_wizard.py)
@@ -15,15 +9,17 @@ Does NOT install:
   - fibo runtime state (~/.hermes/fibo/)
 
 Does NOT touch fibo.service or fibo files even if they exist (Decision 3).
+
+Takes EXPLICIT ``hermes_root`` (the installed app tree) and
+``hermes_home`` (the persistent state). The two are independent.
 """
 
 from __future__ import annotations
 
 import hashlib
-import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -45,36 +41,60 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def run(*, argv: List[str], hermes_home: Path, shared: Dict[str, Any]) -> Dict[str, Any]:
-    """Install the /trade capability. Idempotent."""
-    hermes_root = hermes_home.parent
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    shared: Dict[str, Any],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Install the /trade capability. Idempotent.
+
+    If ``dry_run`` is True, no bytes are written and no directory is
+    created.
+    """
     plugin_root = hermes_root / "plugins" / "trade"
     record: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "files": [],
         "ok": True,
+        "dry_run": dry_run,
+        "target_plugin_root": str(plugin_root),
     }
     for rel in TRADE_REL_PATHS:
         src = REPO_ROOT / rel
-        dst = plugin_root / rel.relative_to(Path("plugins") / "trade")
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        dst = plugin_root / rel_under_plugin_trade
+        entry: Dict[str, Any] = {"path": str(rel)}
         if not src.is_file():
             record["ok"] = False
-            record["files"].append({"path": str(rel), "action": "missing-source"})
+            entry["action"] = "missing-source"
+            record["files"].append(entry)
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        action = "copied"
         if dst.is_file() and _sha256_file(src) == _sha256_file(dst):
-            action = "unchanged"
+            entry["action"] = "unchanged"
         else:
-            shutil.copy2(src, dst)
-        record["files"].append({
-            "path": str(rel),
-            "src_sha256": _sha256_file(src),
-            "action": action,
-        })
-    # Ensure ~/.hermes/trade/ exists.
+            entry["src_sha256"] = _sha256_file(src)
+            if not dry_run:
+                if not dst.parent.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(src, dst)
+            entry["action"] = "copied" if not dry_run else "would-copy"
+        record["files"].append(entry)
+    # Ensure ~/.hermes/trade/ exists (owned state folder).
     own_dir = capability_dir(hermes_home, "trade")
-    own_dir.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        if not own_dir.is_dir():
+            record.setdefault("actions", []).append(f"would-mkdir {own_dir}")
+        else:
+            record.setdefault("actions", []).append(f"keep-exists {own_dir}")
+    else:
+        own_dir.mkdir(parents=True, exist_ok=True)
     record["owned_dir"] = str(own_dir)
     return record
 

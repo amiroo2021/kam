@@ -3,10 +3,6 @@
 Removes the /fibo capability:
   - removes fibo-specific plugin files from <hermes_root>/plugins/trade/
   - removes ~/.hermes/fibo/ (the owned state folder)
-  - stops and removes fibo.service (if --systemd-dir flag is honoured by the
-    service uninstall helper; out of scope for the initial cut -- the
-    installer writes the unit, the operator is responsible for stopping it
-    before uninstall, mirroring the proven monolithic installer behavior)
 
 NEVER touches:
   - trade files
@@ -19,7 +15,7 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -40,25 +36,47 @@ FIBO_REL_PATHS = [
 ]
 
 
-def run(*, argv, hermes_home: Path) -> Dict[str, Any]:
-    hermes_root = hermes_home.parent
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     plugin_root = hermes_root / "plugins" / "trade"
-    record: Dict[str, Any] = {"removed_files": [], "removed_dirs": []}
+    record: Dict[str, Any] = {
+        "removed_files": [],
+        "removed_dirs": [],
+        "dry_run": dry_run,
+    }
     for rel in FIBO_REL_PATHS:
-        dst = plugin_root / rel.relative_to(Path("plugins") / "trade")
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        dst = plugin_root / rel_under_plugin_trade
         if dst.is_file():
-            dst.unlink()
             record["removed_files"].append(str(rel))
+            if not dry_run:
+                dst.unlink()
     # Remove the now-empty golden_fibo/ directory.
     golden_fibo_dir = plugin_root / "golden_fibo"
-    if golden_fibo_dir.is_dir() and not any(golden_fibo_dir.iterdir()):
-        golden_fibo_dir.rmdir()
-        record["removed_dirs"].append(str(golden_fibo_dir))
+    if golden_fibo_dir.is_dir():
+        # Check if empty
+        try:
+            is_empty = not any(golden_fibo_dir.iterdir())
+        except OSError:
+            is_empty = False
+        if is_empty:
+            record["removed_dirs"].append(str(golden_fibo_dir))
+            if not dry_run:
+                golden_fibo_dir.rmdir()
     # Owned folder.
     own_dir = capability_dir(hermes_home, "fibo")
     if own_dir.is_dir():
-        shutil.rmtree(own_dir)
         record["removed_dirs"].append(str(own_dir))
+        if not dry_run:
+            shutil.rmtree(own_dir)
     return record
 
 

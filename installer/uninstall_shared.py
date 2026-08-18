@@ -5,12 +5,15 @@ The shared core consists of:
   - ``plugins/trade/agents/x_*_agent.py`` exchange agents
   - ``plugins/trade/agents/__init__.py``
   - ``plugins/trade/canonical.py``
+  - ``plugins/trade/tradedesk.py``
+  - ``plugins/trade/__init__.py`` (capability-aware plugin bootstrap)
   - ``~/.hermes/kam/`` authoritative manifest directory
 
-The function ``run`` is a no-op when at least one capability is still
+Takes EXPLICIT ``hermes_root`` and ``hermes_home`` arguments. The
+function ``run`` is a no-op when at least one capability is still
 installed; this is enforced by the dispatcher.
 
-NEVER touches ~/.hermes/trade/ or ~/.hermes/fibo/ — those belong to
+NEVER touches ~/.hermes/trade/ or ~/.hermes/fibo/ -- those belong to
 the per-capability uninstallers.
 """
 
@@ -19,15 +22,11 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from capabilities import (
-    KNOWN_CAPABILITIES,
-    install_state_path,
-    kam_root,
-)
+from capabilities import kam_root
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -49,26 +48,47 @@ SHARED_REL_PATHS = [
 ]
 
 
-def run(*, argv, hermes_home: Path) -> Dict[str, Any]:
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     """Remove shared core (idempotent; safe to call even when already removed)."""
-    hermes_root = hermes_home.parent
     plugin_root = hermes_root / "plugins" / "trade"
-    record: Dict[str, Any] = {"removed_files": [], "removed_dirs": []}
+    record: Dict[str, Any] = {
+        "removed_files": [],
+        "removed_dirs": [],
+        "dry_run": dry_run,
+    }
     for rel in SHARED_REL_PATHS:
-        dst = plugin_root / rel.relative_to(Path("plugins") / "trade")
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        dst = plugin_root / rel_under_plugin_trade
         if dst.is_file():
-            dst.unlink()
             record["removed_files"].append(str(rel))
+            if not dry_run:
+                dst.unlink()
     # Remove the now-empty agents/ directory.
     agents_dir = plugin_root / "agents"
-    if agents_dir.is_dir() and not any(agents_dir.iterdir()):
-        agents_dir.rmdir()
-        record["removed_dirs"].append(str(agents_dir))
+    if agents_dir.is_dir():
+        try:
+            is_empty = not any(agents_dir.iterdir())
+        except OSError:
+            is_empty = False
+        if is_empty:
+            record["removed_dirs"].append(str(agents_dir))
+            if not dry_run:
+                agents_dir.rmdir()
     # kam/ directory.
     kam_dir = kam_root(hermes_home)
     if kam_dir.is_dir():
-        shutil.rmtree(kam_dir)
         record["removed_dirs"].append(str(kam_dir))
+        if not dry_run:
+            shutil.rmtree(kam_dir)
     return record
 
 

@@ -1,7 +1,7 @@
 """Capability-aware KAM installer dispatcher.
 
-This module is the entry point for `./install.sh`, `./verify.sh`, and
-`./uninstall.sh`. It dispatches to per-capability installers based on the
+This module is the entry point for ./install.sh, ./verify.sh, and
+./uninstall.sh. It dispatches to per-capability installers based on the
 CLI flags:
 
   --trade            install/verify/uninstall only the /trade capability
@@ -10,15 +10,22 @@ CLI flags:
 
 No flags = TRADE ONLY (locked backward-compatibility policy, Decision 1).
 
-The dispatcher never mutates the live Hermes install directly. It
-delegates to capability-specific installer modules which:
-  - copy capability-specific plugin files
-  - ensure the capability's owned folder (~/.hermes/<cap>/) exists
-  - install/remove capability-specific services
-  - update ~/.hermes/kam/install_state.json atomically
+Critical contract: the dispatcher and capability installers MUST take
+explicit ``--hermes-root PATH`` and use ``HERMES_HOME`` for state. The two
+are conceptually independent. The Hermes root is the installed
+application tree (e.g. /usr/local/lib/hermes-agent); the Hermes home
+is the persistent user state (e.g. ~/.hermes).
 
-The shared core (shared agents, dependencies, patched seams) is
-installed once, regardless of which capabilities are selected.
+Argument handling:
+
+  --help            print usage, exit 0, ZERO mutation.
+  --dry-run         plan and print actions, ZERO mutation.
+  --hermes-root     explicit Hermes root override.
+  --hermes-home     explicit Hermes home override.
+  <unknown>         print error, exit non-zero, ZERO mutation.
+
+No-flag behavior: TRADE ONLY (Decision 1). Applies ONLY when genuinely
+no capability flag was provided, not when parsing failed.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -35,8 +42,10 @@ from capabilities import (  # noqa: E402
     INSTALLER_VERSION,
     KAM_VERSION,
     KNOWN_CAPABILITIES,
+    SCHEMA_VERSION,
     any_capability_installed,
     capability_dir,
+    capability_folder_consistent,
     install_state_path,
     is_installed,
     is_no_flag,
@@ -45,62 +54,193 @@ from capabilities import (  # noqa: E402
     migrate_legacy_kam_trade,
     parse_capability_flags,
     resolve_hermes_home,
+    resolve_hermes_root,
     save_manifest,
+    set_capability,
+    clear_capability,
 )
 
 
-def _print_banner(action: str, capabilities: List[str]) -> None:
-    label = ",".join(capabilities) if capabilities else "trade (legacy)"
-    print(f"KAM installer v{INSTALLER_VERSION} (kam {KAM_VERSION}) -- action={action} capabilities=[{label}]")
+# Recognized non-capability flags. Anything outside this set is rejected.
+RECOGNIZED_FLAGS = {
+    "--trade", "--fibo",
+    "--hermes-root", "--hermes-home",
+    "--dry-run", "--help", "-h",
+    "--systemd-dir",
+    "--no-restart", "--skip-deps", "--purge-state",
+    "--action",
+}
 
 
-def _resolve_capabilities(argv: List[str]) -> List[str]:
-    """Apply Decision 1: no-flag = TRADE ONLY."""
-    caps, _rest = parse_capability_flags(argv)
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv: List[str], action: str) -> argparse.Namespace:
+    """Parse CLI args with strict unknown-option rejection.
+
+    ``--help`` and ``-h`` are intercepted BEFORE argparse so we don't
+    print an argparse-generated usage and we can exit cleanly with 0.
+
+    ``--dry-run`` is a boolean flag we capture explicitly.
+
+    Unknown options raise SystemExit(2) with a clear error and perform
+    NO filesystem mutation. The capability flags are extracted BEFORE
+    the standard parser so we can also handle ``--hermes-root VALUE``
+    pairs and capability pairs without surprises.
+    """
+    # Pre-check: help flag short-circuit (exits with 0).
+    if "--help" in argv or "-h" in argv:
+        _print_usage(action)
+        raise SystemExit(0)
+    # Pre-check: any unknown flag → error + exit 2, zero mutation.
+    # We treat flags-with-values pairs (``--hermes-root PATH``,
+    # ``--hermes-home PATH``, ``--systemd-dir DIR``) as a single token.
+    # Iterate in pairs so that ``--hermes-root /path`` doesn't flag
+    # ``/path`` as an unknown option.
+    flags_with_value = {"--hermes-root", "--hermes-home", "--systemd-dir", "--action"}
+    skip_next = False
+    for a in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in RECOGNIZED_FLAGS:
+            if a in flags_with_value:
+                skip_next = True
+            continue
+        if "=" in a and a.split("=", 1)[0] in RECOGNIZED_FLAGS:
+            continue
+        if a in ("--capture", "--verbose", "-v", "-q"):
+            continue
+        print(f"ERROR: unknown option: {a!r}", file=sys.stderr)
+        print(f"Run '{Path(sys.argv[0]).name} --help' for usage.", file=sys.stderr)
+        raise SystemExit(2)
+    parser = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name if sys.argv else f"installer.{action}",
+        add_help=False,
+    )
+    parser.add_argument("--trade", action="store_true")
+    parser.add_argument("--fibo", action="store_true")
+    parser.add_argument("--hermes-root", default=None)
+    parser.add_argument("--hermes-home", default=None)
+    parser.add_argument("--systemd-dir", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-restart", action="store_true")
+    parser.add_argument("--skip-deps", action="store_true")
+    parser.add_argument("--purge-state", action="store_true")
+    parser.add_argument("--action", default=action)
+    return parser.parse_args(argv)
+
+
+def _print_usage(action: str) -> None:
+    print(f"KAM installer v{INSTALLER_VERSION} (kam {KAM_VERSION})")
+    print()
+    print(f"Usage: {Path(sys.argv[0]).name if sys.argv else f'installer.{action}'} [options]")
+    print()
+    print("Capabilities (at least one required for non-help invocations):")
+    print("  --trade              install/verify/uninstall the /trade capability")
+    print("  --fibo               install/verify/uninstall the /fibo capability")
+    print("  (no capability flag = TRADE ONLY, legacy compat)")
+    print()
+    print("Target paths:")
+    print("  --hermes-root PATH   installed application tree (default /usr/local/lib/hermes-agent)")
+    print("  --hermes-home PATH   persistent state directory (default ~/.hermes)")
+    print("  --systemd-dir DIR    systemd unit directory (default /etc/systemd/system)")
+    print()
+    print("Behavior:")
+    print("  --dry-run            plan only, zero mutation")
+    print("  --no-restart         install but don't start/restart services")
+    print("  --skip-deps          skip pip dependency install")
+    print("  --purge-state        uninstall: also remove capability-owned state")
+    print("  --help, -h           show this help and exit 0 (zero mutation)")
+    print()
+    print("Exit codes: 0=ok, 2=usage error, 1=action error.")
+
+
+def _resolve_capabilities(args: argparse.Namespace) -> List[str]:
+    """Apply Decision 1: no-flag = TRADE ONLY.
+
+    Requires that args has been validated (unknown flags rejected).
+    """
+    caps: List[str] = []
+    if args.trade:
+        caps.append("trade")
+    if args.fibo:
+        caps.append("fibo")
     if not caps:
-        caps = ["trade"]
+        caps = ["trade"]  # Decision 1: legacy no-flag = trade
     # Stable order: trade before fibo (legacy stable ordering).
-    ordered = [c for c in KNOWN_CAPABILITIES if c in caps]
-    return ordered
+    return [c for c in KNOWN_CAPABILITIES if c in caps]
 
 
-def _print_known_capabilities() -> None:
-    print(f"known capabilities: {', '.join(KNOWN_CAPABILITIES.keys())}")
+def _print_banner(action: str, capabilities: List[str], hermes_root: Path, hermes_home: Path, dry_run: bool) -> None:
+    label = ",".join(capabilities) if capabilities else "trade (legacy)"
+    suffix = " (DRY RUN, no mutations)" if dry_run else ""
+    print(f"KAM installer v{INSTALLER_VERSION} (kam {KAM_VERSION}) -- action={action} capabilities=[{label}]{suffix}")
+    print(f"  hermes_root: {hermes_root}")
+    print(f"  hermes_home: {hermes_home}")
 
 
-def cmd_install(argv: List[str]) -> int:
-    """Dispatch `./install.sh`."""
-    caps = _resolve_capabilities(argv)
-    _print_banner("install", caps)
-    hermes_home = resolve_hermes_home()
-    # Migrate legacy .kam-trade/ directory if present (once per install).
-    legacy_payload = migrate_legacy_kam_trade(hermes_home)
-    if legacy_payload is not None:
-        print(f"migrated legacy {legacy_trade_state_dir(hermes_home)} → retired")
+# ---------------------------------------------------------------------------
+# Action: install
+# ---------------------------------------------------------------------------
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Dispatch ./install.sh."""
+    caps = _resolve_capabilities(args)
+    hermes_root = resolve_hermes_root(args.hermes_root)
+    hermes_home = resolve_hermes_home() if args.hermes_home is None else Path(args.hermes_home).expanduser()
+    dry_run = bool(args.dry_run)
+    _print_banner("install", caps, hermes_root, hermes_home, dry_run)
+    print(f"  known capabilities: {', '.join(KNOWN_CAPABILITIES.keys())}")
+
     # Lazy imports (avoid pulling capability modules unless needed).
-    results: List[dict] = []
-    # Shared is installed once (when ANY capability needs it).
     from installer_shared import install_shared as _install_shared
     from install_trade_capability import run as run_trade
     from install_fibo_capability import run as run_fibo
-    _print_known_capabilities()
-    print(f"hermes_home: {hermes_home}")
+
+    # Migrate legacy .kam-trade/ directory if present (once per install).
+    if not dry_run:
+        legacy_payload = migrate_legacy_kam_trade(hermes_home)
+        if legacy_payload is not None:
+            print(f"migrated legacy {legacy_trade_state_dir(hermes_home)} → retired")
+    else:
+        legacy_dir = legacy_trade_state_dir(hermes_home)
+        if legacy_dir.is_dir():
+            print(f"DRY: would migrate legacy {legacy_dir} → retired")
+
     # Shared core (idempotent).
-    shared_record = _install_shared(argv=argv, hermes_home=hermes_home, capabilities=caps)
+    shared_record = _install_shared(
+        argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+        capabilities=caps, dry_run=dry_run,
+    )
     # Per-capability install.
+    results: List[dict] = []
     for cap in caps:
         if cap == "trade":
-            res = run_trade(argv=argv, hermes_home=hermes_home, shared=shared_record)
+            res = run_trade(
+                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                shared=shared_record, dry_run=dry_run,
+            )
         elif cap == "fibo":
-            res = run_fibo(argv=argv, hermes_home=hermes_home, shared=shared_record)
+            res = run_fibo(
+                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                shared=shared_record, dry_run=dry_run,
+            )
         else:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
+
+    if dry_run:
+        # Zero mutation. Just print the plan.
+        print()
+        print("DRY RUN COMPLETE -- zero mutations performed.")
+        return 0
+
     # Update combined manifest atomically.
     manifest = load_manifest(hermes_home)
     for cap, res in zip(caps, results):
-        manifest["capabilities"][cap] = True
-        manifest["by_capability"][cap] = res
+        set_capability(manifest, cap, res)
     manifest["shared"] = shared_record
     save_manifest(hermes_home, manifest)
     print(f"manifest: {install_state_path(hermes_home)}")
@@ -108,24 +248,34 @@ def cmd_install(argv: List[str]) -> int:
     return 0
 
 
-def cmd_verify(argv: List[str]) -> int:
-    """Dispatch `./verify.sh`."""
-    caps = _resolve_capabilities(argv)
-    _print_banner("verify", caps)
-    hermes_home = resolve_hermes_home()
+# ---------------------------------------------------------------------------
+# Action: verify
+# ---------------------------------------------------------------------------
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Dispatch ./verify.sh."""
+    caps = _resolve_capabilities(args)
+    hermes_root = resolve_hermes_root(args.hermes_root)
+    hermes_home = resolve_hermes_home() if args.hermes_home is None else Path(args.hermes_home).expanduser()
+    dry_run = bool(args.dry_run)
+    _print_banner("verify", caps, hermes_root, hermes_home, dry_run)
+
     from verify_shared import run as run_verify_shared
     from verify_trade_capability import run as verify_trade
     from verify_fibo_capability import run as verify_fibo
-    failed = []
-    # Verify shared.
-    shared_ok = run_verify_shared(argv=argv, hermes_home=hermes_home, capabilities=caps)
+
+    shared_ok = run_verify_shared(
+        argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+        capabilities=caps, dry_run=dry_run,
+    )
+    failed: List[str] = []
     if not shared_ok:
         failed.append("shared")
     for cap in caps:
         if cap == "trade":
-            ok = verify_trade(argv=argv, hermes_home=hermes_home)
+            ok = verify_trade(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
         elif cap == "fibo":
-            ok = verify_fibo(argv=argv, hermes_home=hermes_home)
+            ok = verify_fibo(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
         else:
             raise SystemExit(f"unknown capability: {cap}")
         if not ok:
@@ -137,65 +287,83 @@ def cmd_verify(argv: List[str]) -> int:
     return 0
 
 
-def cmd_uninstall(argv: List[str]) -> int:
-    """Dispatch `./uninstall.sh`."""
-    caps = _resolve_capabilities(argv)
-    _print_banner("uninstall", caps)
-    hermes_home = resolve_hermes_home()
+# ---------------------------------------------------------------------------
+# Action: uninstall
+# ---------------------------------------------------------------------------
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Dispatch ./uninstall.sh."""
+    caps = _resolve_capabilities(args)
+    hermes_root = resolve_hermes_root(args.hermes_root)
+    hermes_home = resolve_hermes_home() if args.hermes_home is None else Path(args.hermes_home).expanduser()
+    dry_run = bool(args.dry_run)
+    purge = bool(args.purge_state)
+    _print_banner("uninstall", caps, hermes_root, hermes_home, dry_run)
+
     from uninstall_trade_capability import run as uninstall_trade
     from uninstall_fibo_capability import run as uninstall_fibo
     from uninstall_shared import run as uninstall_shared
+
     results: List[dict] = []
-    # Uninstall capabilities in REVERSE order (fibo first if present).
     for cap in reversed(caps):
         if cap == "trade":
-            res = uninstall_trade(argv=argv, hermes_home=hermes_home)
+            res = uninstall_trade(
+                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                dry_run=dry_run,
+            )
         elif cap == "fibo":
-            res = uninstall_fibo(argv=argv, hermes_home=hermes_home)
+            res = uninstall_fibo(
+                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                dry_run=dry_run,
+            )
         else:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
-    # Update manifest: clear uninstalled capabilities.
+
+    if dry_run:
+        print()
+        print("DRY RUN COMPLETE -- zero mutations performed.")
+        return 0
+
     manifest = load_manifest(hermes_home)
     for cap in caps:
-        manifest["capabilities"][cap] = False
-        manifest["by_capability"][cap] = {}
-    # Save the cleared manifest BEFORE checking, so the disk reflects the
-    # post-clear state when any_capability_installed re-reads it.
+        clear_capability(manifest, cap)
     save_manifest(hermes_home, manifest)
-    # If no capabilities remain installed, remove shared too. The shared
-    # uninstall removes the kam/ directory entirely, so do NOT re-save the
-    # manifest after that (which would recreate the kam dir).
     if not any_capability_installed(hermes_home):
-        uninstall_shared(argv=argv, hermes_home=hermes_home)
-        # Don't save manifest — kam/ is gone.
+        uninstall_shared(
+            argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+            dry_run=False,
+        )
     print(f"manifest: {install_state_path(hermes_home)}")
     print(f"OK -- uninstalled: {', '.join(caps)}")
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main(argv: List[str]) -> int:
-    """Dispatch based on the script invocation (install/verify/uninstall)."""
-    # The action is encoded by which script invoked us. We detect it from
-    # the script path or argv[0].
+    """Dispatch based on the action (install/verify/uninstall)."""
     action = "install"
     script = Path(sys.argv[0]).name if sys.argv else ""
     if script.endswith("verify.sh") or "verify" in script:
         action = "verify"
     elif script.endswith("uninstall.sh") or "uninstall" in script:
         action = "uninstall"
-    # Allow --action override for testing.
     for i, a in enumerate(argv):
         if a == "--action" and i + 1 < len(argv):
             action = argv[i + 1]
+    args = _parse_args(argv, action)
     if action == "install":
-        return cmd_install(argv)
+        return cmd_install(args)
     elif action == "verify":
-        return cmd_verify(argv)
+        return cmd_verify(args)
     elif action == "uninstall":
-        return cmd_uninstall(argv)
+        return cmd_uninstall(args)
     else:
-        raise SystemExit(f"unknown action: {action}")
+        print(f"unknown action: {action}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

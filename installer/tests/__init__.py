@@ -1,0 +1,1 @@
+"""KAM installer unit tests."""

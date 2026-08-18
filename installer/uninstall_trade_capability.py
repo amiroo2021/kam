@@ -12,11 +12,10 @@ NEVER touches:
 
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -29,26 +28,39 @@ TRADE_REL_PATHS = [
 ]
 
 
-def run(*, argv, hermes_home: Path) -> Dict[str, Any]:
-    hermes_root = hermes_home.parent
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     plugin_root = hermes_root / "plugins" / "trade"
-    record: Dict[str, Any] = {"removed_files": [], "removed_dirs": []}
+    record: Dict[str, Any] = {
+        "removed_files": [],
+        "removed_dirs": [],
+        "dry_run": dry_run,
+    }
     for rel in TRADE_REL_PATHS:
-        dst = plugin_root / rel.relative_to(Path("plugins") / "trade")
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        dst = plugin_root / rel_under_plugin_trade
         if dst.is_file():
-            dst.unlink()
             record["removed_files"].append(str(rel))
+            if not dry_run:
+                dst.unlink()
     # Note: we do NOT remove plugins/trade/__init__.py because it is the
     # plugin marker that ALSO carries the fibo slash-command registration.
     # If fibo is still installed, /fibo must still route. Removing
     # __init__.py would break fibo registration.
-    # The __init__.py is updated by the SHARED/registry layer in a
-    # future change (out of scope for the initial cut).
     # Owned folder.
     own_dir = capability_dir(hermes_home, "trade")
     if own_dir.is_dir():
-        shutil.rmtree(own_dir)
         record["removed_dirs"].append(str(own_dir))
+        if not dry_run:
+            shutil.rmtree(own_dir)
     return record
 
 

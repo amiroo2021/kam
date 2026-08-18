@@ -59,7 +59,7 @@ KNOWN_CAPABILITIES: Dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Hermes home resolution
+# Hermes home resolution (persistent state directory)
 # ---------------------------------------------------------------------------
 
 def resolve_hermes_home() -> Path:
@@ -73,6 +73,34 @@ def resolve_hermes_home() -> Path:
     if env and env.strip():
         return Path(env).expanduser()
     return Path.home() / ".hermes"
+
+
+# ---------------------------------------------------------------------------
+# Hermes root resolution (installed application tree)
+# ---------------------------------------------------------------------------
+
+# Default Hermes root (the installed Python/application tree).
+DEFAULT_HERMES_ROOT = Path("/usr/local/lib/hermes-agent")
+
+
+def resolve_hermes_root(explicit_root: Optional[str] = None) -> Path:
+    """Return the Hermes root (the installed application tree).
+
+    Resolution order:
+      1. The ``explicit_root`` argument (typically from --hermes-root CLI).
+      2. The ``HERMES_ROOT`` environment variable if set and non-empty.
+      3. The DEFAULT_HERMES_ROOT (/usr/local/lib/hermes-agent).
+
+    The Hermes root is the directory containing the installed
+    ``plugins/`` tree. It is conceptually INDEPENDENT of the Hermes home
+    (persistent state). Do not derive one from the other.
+    """
+    if explicit_root and explicit_root.strip():
+        return Path(explicit_root).expanduser()
+    env = os.environ.get("HERMES_ROOT")
+    if env and env.strip():
+        return Path(env).expanduser()
+    return DEFAULT_HERMES_ROOT
 
 
 def kam_root(hermes_home: Path) -> Path:

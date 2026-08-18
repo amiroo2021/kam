@@ -2,19 +2,27 @@
 
 Installed once whenever ANY capability is installed.
 
-The shared core is:
-  - the ``plugins/trade/agents/x_*_agent.py`` exchange agents
+Takes EXPLICIT ``hermes_root`` and ``hermes_home`` arguments. NEVER
+derives one from the other (Decision: hermes_root and hermes_home are
+independent concepts). The hermes_root is the installed application tree
+(typically /usr/local/lib/hermes-agent); the hermes_home is the
+persistent user state directory (typically ~/.hermes).
+
+The shared core consists of:
+  - ``plugins/trade/agents/x_*_agent.py`` exchange agents
   - ``plugins/trade/canonical.py`` (canonical response models)
-  - ``plugins/trade/agents/__init__.py`` (agent discovery)
+  - ``plugins/trade/tradedesk.py`` (exchange/account dispatcher)
+  - ``plugins/trade/__init__.py`` (capability-aware plugin bootstrap)
 
 These files live under the ``plugins/trade/`` plugin tree so Hermes'
 existing discovery (``plugins.enabled``) keeps working, but they are
 **SHARED** — they MUST exist before any capability can run.
 
 Idempotency: each shared file is copied byte-for-byte; sha256 is checked
-before copy so unchanged files are skipped.
+before copy so unchanged files are skipped. No capability-specific files
+are touched by this module.
 
-No capability-specific files are touched by this module.
+``--dry-run`` mode: every copy is reported but ZERO bytes are written.
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import hashlib
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,7 +39,6 @@ from capabilities import (
     KNOWN_CAPABILITIES,
     SCHEMA_VERSION,
     capability_dir,
-    resolve_hermes_home,
 )
 
 
@@ -60,44 +67,58 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def install_shared(*, argv: List[str], hermes_home: Path, capabilities: List[str]) -> Dict[str, Any]:
+def _resolve_plugin_root(hermes_root: Path) -> Path:
+    """Return ``<hermes_root>/plugins/trade/`` for the shared plugin tree."""
+    return hermes_root / "plugins" / "trade"
+
+
+def install_shared(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    capabilities: List[str],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     """Copy the SHARED core files into the Hermes installation.
 
     Returns a record suitable for ``by_capability[*]['shared']``.
+
+    If ``dry_run`` is True, every copy is reported but no bytes are
+    written and no directory is created.
     """
-    # Locate hermes_root (the Hermes checkout containing plugins/trade/).
-    # Convention: hermes_home is the .hermes data dir; hermes_root is the
-    # source tree containing plugins/trade/. For now, install the shared
-    # core files relative to hermes_home/../plugins/trade/agents/ and
-    # hermes_home/../plugins/trade/canonical.py. This mirrors how the
-    # proven monolithic installer writes them under <HERMES_ROOT>/plugins/.
-    hermes_root_candidate = hermes_home.parent
-    hermes_root = hermes_root_candidate  # ~/<hermes-home-parent>/plugins/...
-    # Plugin target is hermes_root / "plugins" / "trade" / ...
-    plugin_root = hermes_root / "plugins" / "trade"
+    plugin_root = _resolve_plugin_root(hermes_root)
     record: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "files": [],
         "ok": True,
+        "dry_run": dry_run,
+        "target_plugin_root": str(plugin_root),
     }
     for rel in SHARED_REL_PATHS:
         src = REPO_ROOT / rel
-        dst = plugin_root / rel.relative_to(Path("plugins") / "trade")
+        # Strip "plugins/trade/" prefix; install under hermes_root/plugins/trade/.
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        dst = plugin_root / rel_under_plugin_trade
+        entry: Dict[str, Any] = {"path": str(rel)}
         if not src.is_file():
             record["ok"] = False
-            record["files"].append({"path": str(rel), "action": "missing-source"})
+            entry["action"] = "missing-source"
+            record["files"].append(entry)
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        action = "copied"
         if dst.is_file() and _sha256_file(src) == _sha256_file(dst):
-            action = "unchanged"
+            entry["action"] = "unchanged"
         else:
-            shutil.copy2(src, dst)
-        record["files"].append({
-            "path": str(rel),
-            "src_sha256": _sha256_file(src),
-            "action": action,
-        })
+            entry["src_sha256"] = _sha256_file(src)
+            if not dry_run:
+                if not dst.parent.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            entry["action"] = "copied" if not dry_run else "would-copy"
+        record["files"].append(entry)
     return record
 
 
