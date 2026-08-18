@@ -5361,7 +5361,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "cancel_order"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "cancel_order"}:
         return make_failure(
             operation=operation,
             exchange=name,
