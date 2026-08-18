@@ -72,6 +72,7 @@ class GoldenFiboEngine:
         self.state = state
         self.adapter = adapter
         self._next_client_id = client_order_id_factory
+        self._venue_constraints_cache: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -391,6 +392,31 @@ class GoldenFiboEngine:
         next_price = golden_fibo_next_ladder_price(self.config.direction, pk, tpk)
         next_size = self.config.volume(next_n)
 
+        # One-step-ahead venue validation at placement time: validate THIS
+        # next order (positive valid price, valid size, valid increment,
+        # notional >= venue minimum) right before placing it. On failure,
+        # freeze (NEEDS_RECOVERY) and do NOT place the order. Deeper steps
+        # are not speculated about.
+        venue = self._venue_constraints()
+        if venue is not None:
+            from .preflight import validate_next_ladder_step
+            check = validate_next_ladder_step(
+                direction=self.config.direction,
+                pk=pk,
+                tpk=tpk,
+                volume=next_size,
+                min_base_amount=venue["min_base_amount"],
+                min_quote_amount=venue["min_quote_amount"],
+                size_decimals=venue["size_decimals"],
+                price_decimals=venue["price_decimals"],
+                step_n=next_n,
+            )
+            if not check.ok:
+                return self._freeze(
+                    f"ladder step{next_n} failed venue validation: "
+                    f"{check.error}: {check.detail}"
+                )
+
         # Guard: never resubmit an already-attempted ladder for this step.
         if (
             self.state.submission_phase == SUBMISSION_ATTEMPTED
@@ -577,6 +603,33 @@ class GoldenFiboEngine:
     # ------------------------------------------------------------------
     # Recovery
     # ------------------------------------------------------------------
+    def _venue_constraints(self) -> Optional[Dict[str, Any]]:
+        """Lazily read + cache venue constraints via the thin adapter.
+
+        Returns None on read failure (fail-open: do not block placement on a
+        metadata read error). The adapter exposes get_venue_constraints.
+        """
+        if self._venue_constraints_cache is not None:
+            return self._venue_constraints_cache
+        try:
+            raw = self.adapter.get_venue_constraints(
+                self.config.account, self.config.instrument
+            )
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            self._venue_constraints_cache = {
+                "min_base_amount": Decimal(str(raw.get("min_base_amount") or "0")),
+                "min_quote_amount": Decimal(str(raw.get("min_quote_amount") or "0")),
+                "size_decimals": int(raw.get("size_decimals") or 0),
+                "price_decimals": int(raw.get("price_decimals") or 0),
+            }
+        except Exception:
+            return None
+        return self._venue_constraints_cache
+
     def _freeze(self, reason: str) -> TickResult:
         self.state.status = STATUS_NEEDS_RECOVERY
         self.state.freeze_reason = reason

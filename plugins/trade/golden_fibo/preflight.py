@@ -79,20 +79,21 @@ def golden_fibo_lighter_preflight(
     size_decimals: int,
     price_decimals: int,
 ) -> PreflightResult:
-    """Validate the full proposed GoldenFibo ladder against venue rules.
+    """ONE-STEP-AHEAD GoldenFibo Lighter preflight.
 
-    Checks, for every step n in 1..MAX_STEP:
-      - ladder price P(n) is positive and a valid price-increment
-      - volume V(n) meets min_base_amount
-      - notional V(n) * P(n) meets min_quote_amount
+    The robot operates sequentially like the MQ4 EA: start Step0, place
+    Step1, and only after each fill calculate/place the next step. START
+    preflight therefore only proves the IMMEDIATE initial sequence is valid:
 
-    Step0 is a MARKET order (no min-quote LIMIT check), but its base size
-    must meet min_base_amount.
+      1. Step0 MARKET volume meets min base size.
+      2. TP0 is a positive, valid venue price (set via x_lighter_agent
+         set_tp; the ordinary LIMIT min-quote rule is NOT applied to the TP).
+      3. Step1 LIMIT has positive valid price, valid size, valid price
+         increment, and notional >= venue minimum.
 
-    Returns a PreflightResult. On the FIRST failing step, ok=False with a
-    human-readable explanation and a computed safe_min_step0_volume (the
-    minimum volume that would make the failing step's notional valid,
-    rounded UP to the size increment).
+    Deeper hypothetical steps are NOT evaluated here; each is validated at
+    placement time (see validate_next_ladder_step). Never changes the
+    requested volume; either accepts or rejects with a reported safe minimum.
     """
     direction = str(direction).upper()
     percentage = Decimal(str(percentage))
@@ -101,14 +102,10 @@ def golden_fibo_lighter_preflight(
     min_base_amount = Decimal(str(min_base_amount or "0"))
     min_quote_amount = Decimal(str(min_quote_amount or "0"))
 
-    reports: List[Dict[str, Any]] = []
-
-    # Estimated TP0 / P1 for reporting (BUY/SELL handled by config math).
     estimated_tp0 = golden_fibo_tp_price(direction, estimated_p0, percentage)
-    # Step1 price uses the same recurrence: P1 = P0 + 1.618*(P0 - TP0)
     estimated_p1 = golden_fibo_next_ladder_price(direction, estimated_p0, estimated_tp0)
 
-    # --- Step0 base-size check (MARKET; no min-quote LIMIT rule) ---
+    # --- Step0 MARKET: base-size only (no min-quote LIMIT rule) ---
     if min_base_amount > 0 and step0_volume < min_base_amount:
         return PreflightResult(
             ok=False,
@@ -126,116 +123,71 @@ def golden_fibo_lighter_preflight(
             price_decimals=price_decimals,
         )
 
-    # --- Ladder steps 1..MAX_STEP ---
-    pk = estimated_p0
-    tpk = estimated_tp0
-    for n in range(1, MAX_STEP + 1):
-        v = step0_volume if n == 1 else step0_volume * (Decimal(2) ** (n - 1))
-        price = golden_fibo_next_ladder_price(direction, pk, tpk)
-        tpk_next = pk  # TP(n) = P(n-1)
+    # --- TP0: positive, valid venue price. TP uses set_tp, so the ordinary
+    # LIMIT min-quote rule is NOT applied here. ---
+    if estimated_tp0 <= 0:
+        return PreflightResult(
+            ok=False,
+            error="TP0_PRICE_NON_POSITIVE",
+            detail=f"TP0 would be {estimated_tp0} (non-positive).",
+            estimated_p0=estimated_p0,
+            estimated_tp0=estimated_tp0,
+            estimated_p1=estimated_p1,
+            min_quote_amount=min_quote_amount,
+            min_base_amount=min_base_amount,
+            size_decimals=size_decimals,
+            price_decimals=price_decimals,
+        )
+    quantized_tp0 = _quantize_down(estimated_tp0, price_decimals)
+    if quantized_tp0 <= 0:
+        return PreflightResult(
+            ok=False,
+            error="TP0_PRICE_BELOW_INCREMENT",
+            detail=(
+                f"TP0 price {estimated_tp0} quantizes to {quantized_tp0}, "
+                f"below the venue's minimum price increment."
+            ),
+            estimated_p0=estimated_p0,
+            estimated_tp0=estimated_tp0,
+            estimated_p1=estimated_p1,
+            min_quote_amount=min_quote_amount,
+            min_base_amount=min_base_amount,
+            size_decimals=size_decimals,
+            price_decimals=price_decimals,
+        )
 
-        # Price validity: must be positive and quantize to a valid increment.
-        # The robot is defined through Step20, so EVERY configured logical
-        # step must have a valid positive venue price before START. A
-        # non-positive calculated ladder price at any Step1..Step20 is a
-        # hard rejection — we do NOT assume mean reversion occurs first.
-        if price <= 0:
-            return PreflightResult(
-                ok=False,
-                error="LADDER_PRICE_NON_POSITIVE",
-                detail=(
-                    f"Step{n} ladder price would be {price} (non-positive). "
-                    f"Every configured step through Step20 must have a valid "
-                    f"positive venue price before START."
-                ),
-                estimated_p0=estimated_p0,
-                estimated_tp0=estimated_tp0,
-                estimated_p1=estimated_p1,
-                min_quote_amount=min_quote_amount,
-                min_base_amount=min_base_amount,
-                size_decimals=size_decimals,
-                price_decimals=price_decimals,
-                failing_step=n,
-                failing_raw_price=price,
-                percentage=percentage,
-                step_reports=reports,
-            )
-
-        quantized_price = _quantize_down(price, price_decimals)
-        if quantized_price <= 0:
-            return PreflightResult(
-                ok=False,
-                error="LADDER_PRICE_BELOW_INCREMENT",
-                detail=(
-                    f"Step{n} ladder price {price} quantizes to {quantized_price}, "
-                    f"below the venue's minimum price increment."
-                ),
-                estimated_p0=estimated_p0,
-                estimated_tp0=estimated_tp0,
-                estimated_p1=estimated_p1,
-                min_quote_amount=min_quote_amount,
-                min_base_amount=min_base_amount,
-                size_decimals=size_decimals,
-                price_decimals=price_decimals,
-                failing_step=n,
-                failing_raw_price=price,
-                percentage=percentage,
-                step_reports=reports,
-            )
-
-        # Base-size validity.
-        if min_base_amount > 0 and v < min_base_amount:
-            return PreflightResult(
-                ok=False,
-                error="LADDER_BELOW_MIN_BASE",
-                detail=(
-                    f"Step{n} volume {v} is below Lighter minimum base size "
-                    f"{min_base_amount}."
-                ),
-                estimated_p0=estimated_p0,
-                estimated_tp0=estimated_tp0,
-                estimated_p1=estimated_p1,
-                min_quote_amount=min_quote_amount,
-                min_base_amount=min_base_amount,
-                size_decimals=size_decimals,
-                price_decimals=price_decimals,
-                failing_step=n,
-                step_reports=reports,
-            )
-
-        # Minimum-quote validity for the resting LIMIT.
-        notional = v * quantized_price
-        reports.append({
-            "step": n,
-            "volume": str(v),
-            "price": str(quantized_price),
-            "notional": str(notional),
-            "meets_min_quote": notional >= min_quote_amount if min_quote_amount > 0 else True,
-        })
-        if min_quote_amount > 0 and notional < min_quote_amount:
-            safe_min = _ceil_to_increment(min_quote_amount / quantized_price, size_decimals)
-            return PreflightResult(
-                ok=False,
-                error="STEP1_BELOW_MIN_QUOTE" if n == 1 else "LADDER_BELOW_MIN_QUOTE",
-                detail=(
-                    f"Step{n} volume {v} at price {quantized_price} gives notional "
-                    f"{notional}, below Lighter minimum {min_quote_amount} for a "
-                    f"LIMIT order. Minimum Step0 volume at the current estimated "
-                    f"price is approximately {safe_min}."
-                ),
-                estimated_p0=estimated_p0,
-                estimated_tp0=estimated_tp0,
-                estimated_p1=estimated_p1,
-                min_quote_amount=min_quote_amount,
-                min_base_amount=min_base_amount,
-                size_decimals=size_decimals,
-                price_decimals=price_decimals,
-                safe_min_step0_volume=safe_min,
-                failing_step=n,
-                step_reports=reports,
-            )
-
-        pk, tpk = price, tpk_next
+    # --- Step1 LIMIT: positive valid price, valid size, valid increment,
+    #     notional >= venue minimum. ---
+    step1 = validate_next_ladder_step(
+        direction=direction,
+        pk=estimated_p0,
+        tpk=estimated_tp0,
+        volume=step0_volume,
+        min_base_amount=min_base_amount,
+        min_quote_amount=min_quote_amount,
+        size_decimals=size_decimals,
+        price_decimals=price_decimals,
+        step_n=1,
+    )
+    reports = [step1.report] if step1.report is not None else []
+    if not step1.ok:
+        return PreflightResult(
+            ok=False,
+            error=step1.error,
+            detail=step1.detail,
+            estimated_p0=estimated_p0,
+            estimated_tp0=estimated_tp0,
+            estimated_p1=estimated_p1,
+            min_quote_amount=min_quote_amount,
+            min_base_amount=min_base_amount,
+            size_decimals=size_decimals,
+            price_decimals=price_decimals,
+            safe_min_step0_volume=step1.safe_min_volume,
+            failing_step=1,
+            failing_raw_price=step1.raw_price,
+            percentage=percentage,
+            step_reports=reports,
+        )
 
     return PreflightResult(
         ok=True,
@@ -247,6 +199,128 @@ def golden_fibo_lighter_preflight(
         size_decimals=size_decimals,
         price_decimals=price_decimals,
         step_reports=reports,
+    )
+
+
+@dataclass
+class NextStepValidation:
+    ok: bool
+    error: Optional[str] = None
+    detail: Optional[str] = None
+    raw_price: Optional[Decimal] = None
+    quantized_price: Optional[Decimal] = None
+    volume: Optional[Decimal] = None
+    notional: Optional[Decimal] = None
+    safe_min_volume: Optional[Decimal] = None
+    report: Optional[Dict[str, Any]] = None
+
+
+def validate_next_ladder_step(
+    *,
+    direction: str,
+    pk: Decimal,
+    tpk: Decimal,
+    volume: Decimal,
+    min_base_amount: Decimal,
+    min_quote_amount: Decimal,
+    size_decimals: int,
+    price_decimals: int,
+    step_n: int,
+) -> NextStepValidation:
+    """Validate the NEXT ladder LIMIT order at placement time.
+
+    Used for Step1 at START preflight AND for each later Step(k+1) right
+    before it is placed. Checks positive valid price, valid size, valid
+    price increment, and notional >= venue minimum. Returns a clear failure
+    (do not place) rather than speculating about further steps.
+    """
+    direction = str(direction).upper()
+    pk = Decimal(str(pk))
+    tpk = Decimal(str(tpk))
+    volume = Decimal(str(volume))
+    min_base_amount = Decimal(str(min_base_amount or "0"))
+    min_quote_amount = Decimal(str(min_quote_amount or "0"))
+
+    raw_price = golden_fibo_next_ladder_price(direction, pk, tpk)
+    quantized_price = _quantize_down(raw_price, price_decimals)
+    notional = volume * quantized_price
+    report = {
+        "step": step_n,
+        "volume": str(volume),
+        "raw_price": str(raw_price),
+        "price": str(quantized_price),
+        "notional": str(notional),
+    }
+
+    if raw_price <= 0:
+        return NextStepValidation(
+            ok=False,
+            error="LADDER_PRICE_NON_POSITIVE",
+            detail=(
+                f"Step{step_n} ladder price would be {raw_price} (non-positive); "
+                f"not placing the order."
+            ),
+            raw_price=raw_price,
+            quantized_price=quantized_price,
+            volume=volume,
+            notional=notional,
+            report=report,
+        )
+    if quantized_price <= 0:
+        return NextStepValidation(
+            ok=False,
+            error="LADDER_PRICE_BELOW_INCREMENT",
+            detail=(
+                f"Step{step_n} ladder price {raw_price} quantizes to "
+                f"{quantized_price}, below the venue's minimum price increment."
+            ),
+            raw_price=raw_price,
+            quantized_price=quantized_price,
+            volume=volume,
+            notional=notional,
+            report=report,
+        )
+    if min_base_amount > 0 and volume < min_base_amount:
+        return NextStepValidation(
+            ok=False,
+            error="LADDER_BELOW_MIN_BASE",
+            detail=(
+                f"Step{step_n} volume {volume} is below Lighter minimum base "
+                f"size {min_base_amount}."
+            ),
+            raw_price=raw_price,
+            quantized_price=quantized_price,
+            volume=volume,
+            notional=notional,
+            report=report,
+        )
+    if min_quote_amount > 0 and notional < min_quote_amount:
+        safe_min = _ceil_to_increment(min_quote_amount / quantized_price, size_decimals)
+        err = "STEP1_BELOW_MIN_QUOTE" if step_n == 1 else "LADDER_BELOW_MIN_QUOTE"
+        return NextStepValidation(
+            ok=False,
+            error=err,
+            detail=(
+                f"Step{step_n} volume {volume} at price {quantized_price} gives "
+                f"notional {notional}, below Lighter minimum {min_quote_amount} "
+                f"for a LIMIT order. Minimum volume for this step at the current "
+                f"estimated price is approximately {safe_min}."
+            ),
+            raw_price=raw_price,
+            quantized_price=quantized_price,
+            volume=volume,
+            notional=notional,
+            safe_min_volume=safe_min,
+            report=report,
+        )
+    report["meets_min_quote"] = True
+    return NextStepValidation(
+        ok=True,
+        raw_price=raw_price,
+        quantized_price=quantized_price,
+        volume=volume,
+        notional=notional,
+        report=report,
     )
 
 

@@ -123,22 +123,18 @@ class TestPreflightMath(unittest.TestCase):
         # The safe minimum itself passes Step1.
         self.assertNotEqual(r.error, "STEP1_BELOW_MIN_QUOTE")
 
-    def test_buy_step8_nonpositive_hard_rejected(self):
-        """BUY configuration where Step8 becomes negative -> hard reject.
-        A non-positive calculated ladder price within Step1..Step20 must
-        reject START before Step0 (no mean-reversion assumption)."""
+    def test_buy_valid_step1_accepted_despite_hypothetical_step8(self):
+        """ONE-STEP-AHEAD: a BUY config with a valid Step1 is ACCEPTED even
+        though a hypothetical Step8 would go non-positive. Deeper steps are
+        validated at placement time, not at START. (0.136 SOL, 1%, valid
+        Step1 notional >= $10.)"""
         r = golden_fibo_lighter_preflight(
             direction="BUY", percentage=Decimal("0.01"),
             step0_volume=Decimal("0.136"), estimated_p0=Decimal("76.259"),
             min_base_amount=Decimal("0.100"), min_quote_amount=Decimal("10"),
             size_decimals=3, price_decimals=3,
         )
-        self.assertFalse(r.ok)
-        self.assertEqual(r.error, "LADDER_PRICE_NON_POSITIVE")
-        self.assertIsNotNone(r.failing_step)
-        self.assertIsNotNone(r.failing_raw_price)
-        self.assertLessEqual(r.failing_raw_price, 0)
-        self.assertEqual(r.percentage, Decimal("0.01"))
+        self.assertTrue(r.ok, f"expected ok, got {r.error}: {r.detail}")
 
     def test_buy_full_positive_ladder_through_step20_accepted(self):
         """A BUY ladder whose every Step1..20 price is positive is accepted.
@@ -295,8 +291,11 @@ class TestPreflightBlocksStart(unittest.TestCase):
             self.assertTrue(resp["ok"], resp)
             self.assertIn(key, svc._states)
 
-    def test_start_rejected_when_future_step_invalid(self):
-        """No market order sent when any future ladder step is invalid."""
+    def test_start_accepted_when_only_step1_valid(self):
+        """ONE-STEP-AHEAD: START is accepted when the immediate initial
+        sequence (Step0/TP0/Step1) is valid, even if a hypothetical future
+        step would be invalid. No market order is sent by the preflight
+        itself (START only registers; the engine ticks separately)."""
         with tempfile.TemporaryDirectory() as tmp:
             svc = self._svc(tmp)
             key = "lighter/amiroo/SOL/BUY"
@@ -307,12 +306,10 @@ class TestPreflightBlocksStart(unittest.TestCase):
                 "instrument": "SOL", "direction": "BUY",
                 "percentage": "0.01", "step0_volume": "0.136",
             })
-            self.assertFalse(resp["ok"])
-            self.assertEqual(resp["error"], "LADDER_PRICE_NON_POSITIVE")
-            self.assertIn("raw_price", resp)
-            self.assertIn("max_positive_percentage", resp)
+            self.assertTrue(resp["ok"], resp)
+            self.assertIn(key, svc._states)
+            # START itself sent no orders (registration only).
             self.assertEqual(adapter.mutations, [])
-            self.assertNotIn(key, svc._states)
 
     def test_start_rejected_sell_too(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,6 +344,115 @@ class TestUnchangedBehavior(unittest.TestCase):
         self.assertIn("place_limit", src)
         self.assertIn("reduce_only=False", src)
 
+# ---------------------------------------------------------------------------
+# Placement-time (one-step-ahead) next-ladder validation
+# ---------------------------------------------------------------------------
+class _PlacementAdapter:
+    """Adapter stub for engine placement-time validation tests."""
+
+    def __init__(self, *, min_quote="10.000000", size_dec=3, price_dec=3, min_base="0.100"):
+        self._c = {"min_base_amount": min_base, "min_quote_amount": min_quote,
+                   "size_decimals": size_dec, "price_decimals": price_dec}
+        self.limit_calls = []
+        self.position = {"symbol": "SOL", "side": "long", "size": "0.136", "sl": None, "tp": None}
+
+    def get_venue_constraints(self, account, instrument):
+        return dict(self._c)
+
+    def position_state(self, account, instrument):
+        return dict(self.position)
+
+    def place_limit(self, **kw):
+        self.limit_calls.append(kw)
+        return {"client_order_id": kw.get("client_order_id"), "exchange_order_id": 1,
+                "submitted_price": str(kw.get("price")), "submitted_volume": str(kw.get("size")),
+                "status": "submitted", "verified": True}
+
+    def cancel_order(self, *, account, order_index):
+        return True
+
+
+class TestPlacementTimeValidation(unittest.TestCase):
+    """The engine validates EACH next ladder order at placement time."""
+
+    def _engine(self, adapter):
+        from plugins.trade.golden_fibo.config import GoldenFiboConfig
+        from plugins.trade.golden_fibo.state import GoldenFiboState
+        from plugins.trade.golden_fibo.engine import GoldenFiboEngine
+        cfg = GoldenFiboConfig(
+            exchange="lighter", account="amiroo", instrument="SOL",
+            direction="BUY", percentage=Decimal("0.01"), step0_volume=Decimal("0.136"),
+        )
+        state = GoldenFiboState(
+            registration_key=cfg.registration_key, exchange=cfg.exchange,
+            account=cfg.account, instrument=cfg.instrument, direction=cfg.direction,
+            percentage=cfg.percentage, step0_volume=cfg.step0_volume,
+        )
+        state.highest_filled_step = 0
+        state.fill_prices[0] = Decimal("76.259")
+        state.next_step = 1
+        counter = {"n": 100000}
+        def nid():
+            counter["n"] += 1
+            return counter["n"]
+        return GoldenFiboEngine(cfg, state, adapter, nid)
+
+    def test_valid_step1_placed(self):
+        adapter = _PlacementAdapter()
+        eng = self._engine(adapter)
+        result = eng._place_next_ladder()
+        self.assertIsNone(result)  # success
+        self.assertEqual(len(adapter.limit_calls), 1)
+
+    def test_invalid_step1_below_min_quote_not_placed(self):
+        # Step0 volume tiny -> Step1 notional below min-quote -> not placed.
+        from plugins.trade.golden_fibo.config import GoldenFiboConfig
+        from plugins.trade.golden_fibo.state import GoldenFiboState
+        from plugins.trade.golden_fibo.engine import GoldenFiboEngine
+        adapter = _PlacementAdapter()
+        cfg = GoldenFiboConfig(
+            exchange="lighter", account="amiroo", instrument="SOL",
+            direction="BUY", percentage=Decimal("0.01"), step0_volume=Decimal("0.100"),
+        )
+        state = GoldenFiboState(
+            registration_key=cfg.registration_key, exchange=cfg.exchange,
+            account=cfg.account, instrument=cfg.instrument, direction=cfg.direction,
+            percentage=cfg.percentage, step0_volume=cfg.step0_volume,
+        )
+        state.highest_filled_step = 0
+        state.fill_prices[0] = Decimal("76.259")
+        state.next_step = 1
+        counter = {"n": 100000}
+        def nid():
+            counter["n"] += 1
+            return counter["n"]
+        eng = GoldenFiboEngine(cfg, state, adapter, nid)
+        result = eng._place_next_ladder()
+        # Frozen (NEEDS_RECOVERY), and the LIMIT was NOT placed.
+        self.assertIsNotNone(result)
+        self.assertEqual(result.state.status, "needs_recovery")
+        self.assertIn("failed venue validation", result.state.freeze_reason or "")
+        self.assertEqual(len(adapter.limit_calls), 0)
+
+    def test_nonpositive_step_price_not_placed(self):
+        # Force a config where the next ladder price computes non-positive:
+        # set fill_prices so P(k) - TP(k) is a large negative swing.
+        adapter = _PlacementAdapter()
+        eng = self._engine(adapter)
+        # Push P0 very high relative to TP0 by using a huge percentage effect:
+        # set next_step=2 with P1 very low and P0 high so P2 goes negative.
+        eng.state.highest_filled_step = 1
+        eng.state.fill_prices[0] = Decimal("76.259")
+        eng.state.fill_prices[1] = Decimal("1.0")
+        eng.state.next_step = 2
+        result = eng._place_next_ladder()
+        # P2 = P1 + 1.618*(P1 - TP1) where TP1 = P0 = 76.259 ->
+        # P2 = 1.0 + 1.618*(1.0 - 76.259) = very negative.
+        self.assertIsNotNone(result)
+        self.assertEqual(result.state.status, "needs_recovery")
+        self.assertEqual(len(adapter.limit_calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
