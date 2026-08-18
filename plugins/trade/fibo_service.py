@@ -249,7 +249,13 @@ class PersistentFiboService:
         tradedesk: Optional[TradeDesk] = None,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
         socket_timeout: float = _DEFAULT_SOCKET_TIMEOUT,
+        start_thread: bool = True,
     ) -> None:
+        # start_thread is accepted for backward compatibility with the
+        # retired counter-cascade service. The GoldenFibo service does
+        # not own a background poll thread — the daemon (fibo_daemon)
+        # drives _tick_once() from its own poll loop. The flag is
+        # therefore ignored.
         self.state_path = Path(state_path or resolve_fibo_state_path())
         self.ledger_path = Path(ledger_path or resolve_fibo_ledger_path())
         self.event_log_path = Path(event_log_path or resolve_fibo_event_log_path())
