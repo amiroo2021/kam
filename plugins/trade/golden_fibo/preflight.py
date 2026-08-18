@@ -59,6 +59,9 @@ class PreflightResult:
     price_decimals: int = 0
     safe_min_step0_volume: Optional[Decimal] = None
     failing_step: Optional[int] = None
+    failing_raw_price: Optional[Decimal] = None
+    percentage: Optional[Decimal] = None
+    max_positive_percentage: Optional[Decimal] = None
     step_reports: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -132,52 +135,53 @@ def golden_fibo_lighter_preflight(
         tpk_next = pk  # TP(n) = P(n-1)
 
         # Price validity: must be positive and quantize to a valid increment.
-        # Step1 is a hard venue constraint (the resting LIMIT placed right
-        # after Step0). Deeper steps that go non-positive are a property of
-        # the mean-reversion math at this step count, only reached after
-        # intermediate fills change the structure — record as a non-blocking
-        # warning instead of rejecting the whole configuration.
+        # The robot is defined through Step20, so EVERY configured logical
+        # step must have a valid positive venue price before START. A
+        # non-positive calculated ladder price at any Step1..Step20 is a
+        # hard rejection — we do NOT assume mean reversion occurs first.
         if price <= 0:
-            reports.append({
-                "step": n,
-                "volume": str(v),
-                "price": str(price),
-                "notional": None,
-                "meets_min_quote": None,
-                "warning": "non_positive_price",
-            })
-            # Stop the ladder walk here; deeper steps are not meaningful.
-            break
+            return PreflightResult(
+                ok=False,
+                error="LADDER_PRICE_NON_POSITIVE",
+                detail=(
+                    f"Step{n} ladder price would be {price} (non-positive). "
+                    f"Every configured step through Step20 must have a valid "
+                    f"positive venue price before START."
+                ),
+                estimated_p0=estimated_p0,
+                estimated_tp0=estimated_tp0,
+                estimated_p1=estimated_p1,
+                min_quote_amount=min_quote_amount,
+                min_base_amount=min_base_amount,
+                size_decimals=size_decimals,
+                price_decimals=price_decimals,
+                failing_step=n,
+                failing_raw_price=price,
+                percentage=percentage,
+                step_reports=reports,
+            )
 
         quantized_price = _quantize_down(price, price_decimals)
         if quantized_price <= 0:
-            if n == 1:
-                return PreflightResult(
-                    ok=False,
-                    error="LADDER_PRICE_BELOW_INCREMENT",
-                    detail=(
-                        f"Step1 ladder price {price} quantizes to {quantized_price}, "
-                        f"below the venue's minimum price increment."
-                    ),
-                    estimated_p0=estimated_p0,
-                    estimated_tp0=estimated_tp0,
-                    estimated_p1=estimated_p1,
-                    min_quote_amount=min_quote_amount,
-                    min_base_amount=min_base_amount,
-                    size_decimals=size_decimals,
-                    price_decimals=price_decimals,
-                    failing_step=n,
-                    step_reports=reports,
-                )
-            reports.append({
-                "step": n,
-                "volume": str(v),
-                "price": str(quantized_price),
-                "notional": None,
-                "meets_min_quote": None,
-                "warning": "below_price_increment",
-            })
-            break
+            return PreflightResult(
+                ok=False,
+                error="LADDER_PRICE_BELOW_INCREMENT",
+                detail=(
+                    f"Step{n} ladder price {price} quantizes to {quantized_price}, "
+                    f"below the venue's minimum price increment."
+                ),
+                estimated_p0=estimated_p0,
+                estimated_tp0=estimated_tp0,
+                estimated_p1=estimated_p1,
+                min_quote_amount=min_quote_amount,
+                min_base_amount=min_base_amount,
+                size_decimals=size_decimals,
+                price_decimals=price_decimals,
+                failing_step=n,
+                failing_raw_price=price,
+                percentage=percentage,
+                step_reports=reports,
+            )
 
         # Base-size validity.
         if min_base_amount > 0 and v < min_base_amount:
@@ -276,3 +280,45 @@ def compute_safe_min_step0_volume(
     raw_min = min_quote_amount / quantized_p1
     safe = _ceil_to_increment(raw_min * conservative_factor, size_decimals)
     return safe
+
+def compute_max_positive_ladder_percentage(
+    *,
+    direction: str,
+    estimated_p0: Decimal,
+    max_percentage: Decimal = Decimal("0.5"),
+    iterations: int = 60,
+) -> Decimal:
+    """Binary-search the maximum percentage whose full Step1..Step20 ladder
+    keeps every price positive for the given estimated P0.
+
+    Generic (any instrument/direction). For SELL the ladder price rises, so
+    the maximum is effectively unbounded within the search range; for BUY
+    the ladder price descends and the maximum can be very small.
+    """
+    direction = str(direction).upper()
+    estimated_p0 = Decimal(str(estimated_p0))
+
+    def _ladder_positive(pct: Decimal) -> bool:
+        tp = golden_fibo_tp_price(direction, estimated_p0, pct)
+        p = estimated_p0
+        for _n in range(1, MAX_STEP + 1):
+            p_next = p + FIBO_RATIO * (p - tp)
+            if p_next <= 0:
+                return False
+            tp = p
+            p = p_next
+        return True
+
+    lo = Decimal("0")
+    hi = Decimal(str(max_percentage))
+    if not _ladder_positive(hi):
+        # Narrow the bracket if even the upper bound fails.
+        pass
+    for _ in range(int(iterations)):
+        mid = (lo + hi) / 2
+        if _ladder_positive(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+

@@ -970,7 +970,7 @@ class PersistentFiboService:
         )
         if result.ok:
             return None
-        return {
+        rejection = {
             "error": result.error,
             "detail": result.detail,
             "estimated_p0": None if result.estimated_p0 is None else str(result.estimated_p0),
@@ -979,7 +979,22 @@ class PersistentFiboService:
             "min_quote_amount": None if result.min_quote_amount is None else str(result.min_quote_amount),
             "safe_min_step0_volume": None if result.safe_min_step0_volume is None else str(result.safe_min_step0_volume),
             "failing_step": result.failing_step,
+            "percentage": None if result.percentage is None else str(result.percentage),
         }
+        if result.failing_raw_price is not None:
+            rejection["raw_price"] = str(result.failing_raw_price)
+        # For non-positive ladder price, also report the maximum percentage
+        # that keeps the full Step1..20 ladder positive at the current price.
+        if result.error == "LADDER_PRICE_NON_POSITIVE":
+            try:
+                from .golden_fibo.preflight import compute_max_positive_ladder_percentage
+                max_pct = compute_max_positive_ladder_percentage(
+                    direction=direction, estimated_p0=est_p0
+                )
+                rejection["max_positive_percentage"] = str(max_pct)
+            except Exception:  # noqa: BLE001
+                pass
+        return rejection
 
     def _lane_preflight(
         self,

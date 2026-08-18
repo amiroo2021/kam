@@ -101,14 +101,12 @@ class TestPreflightMath(unittest.TestCase):
         self.assertEqual(safe, safe.quantize(Decimal("0.001")))
 
     def test_sufficiently_large_volume_passes_buy(self):
-        """A volume at/above the safe minimum passes preflight (BUY)."""
+        """A volume at/above the safe minimum passes Step1 min-quote (BUY).
+        Note: at 1% the BUY ladder still goes non-positive by Step8, so this
+        config is rejected for a different reason — Step1 min-quote is NOT
+        the cause."""
         r = _pf("BUY", "0.136")
-        # Either fully OK, or only fails at a deep degenerate step whose
-        # notional magnitude is huge. For the realistic SOL case it passes.
-        if not r.ok:
-            self.assertNotEqual(r.error, "STEP1_BELOW_MIN_QUOTE")
-        else:
-            self.assertTrue(r.ok)
+        self.assertNotEqual(r.error, "STEP1_BELOW_MIN_QUOTE")
 
     def test_sufficiently_large_volume_passes_sell(self):
         r = _pf("SELL", "0.132")
@@ -125,22 +123,65 @@ class TestPreflightMath(unittest.TestCase):
         # The safe minimum itself passes Step1.
         self.assertNotEqual(r.error, "STEP1_BELOW_MIN_QUOTE")
 
-    def test_buy_later_steps_go_nonpositive_as_warning(self):
-        """BUY ladder prices decline and eventually cross zero at deep steps.
-        Deep-step non-positive prices are recorded as non-blocking warnings
-        (the strategy exits long before via mean reversion), while Step1
-        min-quote remains a hard reject. This proves the preflight walks ALL
-        steps, not just Step1."""
+    def test_buy_step8_nonpositive_hard_rejected(self):
+        """BUY configuration where Step8 becomes negative -> hard reject.
+        A non-positive calculated ladder price within Step1..Step20 must
+        reject START before Step0 (no mean-reversion assumption)."""
         r = golden_fibo_lighter_preflight(
-            direction="BUY", percentage=Decimal("0.30"),
-            step0_volume=Decimal("1.0"), estimated_p0=Decimal("100"),
-            min_base_amount=Decimal("0"), min_quote_amount=Decimal("0"),
+            direction="BUY", percentage=Decimal("0.01"),
+            step0_volume=Decimal("0.136"), estimated_p0=Decimal("76.259"),
+            min_base_amount=Decimal("0.100"), min_quote_amount=Decimal("10"),
             size_decimals=3, price_decimals=3,
         )
-        # The walk stops at the first non-positive step and records a warning.
-        warnings = [rep for rep in r.step_reports if rep.get("warning")]
-        self.assertTrue(len(warnings) >= 1)
-        self.assertEqual(warnings[0]["warning"], "non_positive_price")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error, "LADDER_PRICE_NON_POSITIVE")
+        self.assertIsNotNone(r.failing_step)
+        self.assertIsNotNone(r.failing_raw_price)
+        self.assertLessEqual(r.failing_raw_price, 0)
+        self.assertEqual(r.percentage, Decimal("0.01"))
+
+    def test_buy_full_positive_ladder_through_step20_accepted(self):
+        """A BUY ladder whose every Step1..20 price is positive is accepted.
+        Uses a percentage small enough to keep the full ladder positive."""
+        # ~0.002% keeps all 20 steps positive at mark 76.259 (verified by
+        # compute_max_positive_ladder_percentage below).
+        tiny_pct = Decimal("0.00002")
+        r = golden_fibo_lighter_preflight(
+            direction="BUY", percentage=tiny_pct,
+            step0_volume=Decimal("0.136"), estimated_p0=Decimal("76.259"),
+            min_base_amount=Decimal("0.100"), min_quote_amount=Decimal("10"),
+            size_decimals=3, price_decimals=3,
+        )
+        self.assertTrue(r.ok, f"expected ok, got {r.error}: {r.detail}")
+
+    def test_max_positive_percentage_helper_buy(self):
+        """compute_max_positive_ladder_percentage returns a small positive
+        bound for BUY on SOL, and a config at/below it stays positive."""
+        from plugins.trade.golden_fibo.preflight import compute_max_positive_ladder_percentage
+        max_pct = compute_max_positive_ladder_percentage(
+            direction="BUY", estimated_p0=Decimal("76.259")
+        )
+        self.assertGreater(max_pct, 0)
+        # 1% exceeds the bound (Step8 non-positive).
+        self.assertLess(max_pct, Decimal("0.01"))
+        # A config at half the bound stays positive through Step20.
+        r = golden_fibo_lighter_preflight(
+            direction="BUY", percentage=max_pct / 2,
+            step0_volume=Decimal("0.136"), estimated_p0=Decimal("76.259"),
+            min_base_amount=Decimal("0.100"), min_quote_amount=Decimal("10"),
+            size_decimals=3, price_decimals=3,
+        )
+        self.assertTrue(r.ok, f"expected ok at half max_pct, got {r.error}")
+
+    def test_sell_full_ladder_remains_valid(self):
+        """SELL full ladder stays positive and valid at a normal percentage."""
+        r = golden_fibo_lighter_preflight(
+            direction="SELL", percentage=Decimal("0.01"),
+            step0_volume=Decimal("0.132"), estimated_p0=Decimal("76.259"),
+            min_base_amount=Decimal("0.100"), min_quote_amount=Decimal("10"),
+            size_decimals=3, price_decimals=3,
+        )
+        self.assertTrue(r.ok, f"expected ok, got {r.error}: {r.detail}")
 
     def test_sell_step1_implies_later_steps(self):
         """For SELL, prices rise and volumes double, so notional increases
@@ -245,13 +286,33 @@ class TestPreflightBlocksStart(unittest.TestCase):
             key = "lighter/amiroo/SOL/BUY"
             adapter = _PreflightAdapter("BUY")
             svc._adapters[key] = adapter
+            # Tiny percentage keeps the full BUY ladder positive through Step20.
+            resp = svc.execute_command({
+                "op": "start", "exchange": "lighter", "account": "amiroo",
+                "instrument": "SOL", "direction": "BUY",
+                "percentage": "0.00002", "step0_volume": "0.136",
+            })
+            self.assertTrue(resp["ok"], resp)
+            self.assertIn(key, svc._states)
+
+    def test_start_rejected_when_future_step_invalid(self):
+        """No market order sent when any future ladder step is invalid."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = self._svc(tmp)
+            key = "lighter/amiroo/SOL/BUY"
+            adapter = _PreflightAdapter("BUY")
+            svc._adapters[key] = adapter
             resp = svc.execute_command({
                 "op": "start", "exchange": "lighter", "account": "amiroo",
                 "instrument": "SOL", "direction": "BUY",
                 "percentage": "0.01", "step0_volume": "0.136",
             })
-            self.assertTrue(resp["ok"], resp)
-            self.assertIn(key, svc._states)
+            self.assertFalse(resp["ok"])
+            self.assertEqual(resp["error"], "LADDER_PRICE_NON_POSITIVE")
+            self.assertIn("raw_price", resp)
+            self.assertIn("max_positive_percentage", resp)
+            self.assertEqual(adapter.mutations, [])
+            self.assertNotIn(key, svc._states)
 
     def test_start_rejected_sell_too(self):
         with tempfile.TemporaryDirectory() as tmp:
