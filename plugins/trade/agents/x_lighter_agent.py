@@ -32,7 +32,9 @@ import requests
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -4543,11 +4545,19 @@ def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
         "min_base_amount": str(market.get("min_base_amount") or ""),
         "tick_size": str(market.get("tick_size") or ""),
     }
+    instrument_obj = CanonicalInstrument(
+        requested_symbol=requested_symbol,
+        symbol=payload.get("symbol") or requested_symbol,
+        display_name=payload.get("display_name") or "",
+        price_increment=payload.get("tick_size") or None,
+        size_increment=None,
+        minimum_size=payload.get("min_base_amount") or None,
+    )
     return make_success(
         operation="resolve_instrument",
         exchange=name,
         account=account_name,
-        instrument=payload,
+        instrument=instrument_obj,
     )
 
 
@@ -4666,11 +4676,18 @@ def _execute_market_price(request: Dict[str, Any]) -> CanonicalResponse:
                 message=f"Price unavailable for {requested_symbol}",
             )
         payload["symbol"] = requested_symbol
+        mp = CanonicalMarketPrice(
+            requested_symbol=requested_symbol,
+            market=requested_symbol,
+            mark_price=payload.get("mark") if isinstance(payload, dict) else None,
+            last_external_price=payload.get("last_trade") if isinstance(payload, dict) else None,
+            price=payload.get("mark") if isinstance(payload, dict) else None,
+        )
         return make_success(
             operation="market_price",
             exchange=name,
             account=account_name,
-            market_price=payload,
+            market_price=mp,
         )
     # Credential-less mode: try each public base URL.
     for base_url in (_LIGHTER_URL_ARBITRUM, _LIGHTER_URL_ROBINHOOD):
@@ -4804,11 +4821,22 @@ def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
             "sl": sl,
             "tp": tp,
         }
+    # Convert the matched dict into a CanonicalPosition for the
+    # canonical envelope (positions is a list of CanonicalPosition).
+    position_row = CanonicalPosition(
+        symbol=matched["symbol"],
+        side=matched["side"] or "",
+        size=matched["size"],
+        entry_price=matched["entry_price"] or "0",
+        pnl="0",  # PnL not exposed in this surface
+        tp=matched.get("tp"),
+        sl=matched.get("sl"),
+    )
     return make_success(
         operation="position_state",
         exchange=name,
         account=account_name,
-        position=matched,
+        positions=[position_row],
     )
 
 
