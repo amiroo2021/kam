@@ -5345,12 +5345,39 @@ def _execute_cancel_order(request: Dict[str, Any]) -> CanonicalResponse:
             code="ORDER_NOT_FOUND",
             message=f"order_index {order_index} not found in active orders.",
         )
+    # The SDK cancel_order requires market_index as well as order_index.
+    # Derive it from the target order record (found above).
     try:
-        def _submit() -> Any:
+        market_index = int(target.get("market_index") or target.get("market_id") or 0)
+    except (TypeError, ValueError):
+        market_index = 0
+    if market_index <= 0:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="MARKET_INDEX_UNAVAILABLE",
+            message=f"could not determine market_index for order_index {order_index}.",
+        )
+    try:
+        async def _do_cancel() -> Any:
+            # Build the signer INSIDE the coroutine so its aiohttp session
+            # binds to a running event loop (matches _submit_new_order).
             signer = _build_signer_client(credentials)
+            try:
+                return await signer.cancel_order(market_index, order_index)
+            finally:
+                api_client = getattr(signer, "api_client", None)
+                if api_client is not None and hasattr(api_client, "close"):
+                    try:
+                        await api_client.close()
+                    except Exception:
+                        pass
+
+        def _submit() -> Any:
             return _run_lighter_coro_blocking(
                 credentials,
-                lambda: signer.cancel_order(order_index=order_index),
+                _do_cancel,
                 thread_name=f"lighter-cancel-{order_index}",
                 max_retries=0,
             )
@@ -5393,10 +5420,12 @@ def _execute_cancel_order(request: Dict[str, Any]) -> CanonicalResponse:
         operation="cancel_order",
         exchange=name,
         account=account_name,
-        cancel_order={
+        order_state={
             "order_index": order_index,
+            "client_order_index": target.get("client_order_index"),
+            "status": "canceled",
+            "taxonomy": "CANCELED",
             "verified": True,
-            "status": "success",
         },
     )
 
