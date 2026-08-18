@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# KAM /trade offline verifier (thin wrapper).
+# KAM modular verifier dispatcher.
+#
+# Usage:
+#   ./verify.sh --trade
+#   ./verify.sh --fibo
+#   ./verify.sh --trade --fibo
+#   ./verify.sh                           # no-flag = --trade
 set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -26,4 +32,4 @@ pick_python() {
 }
 
 PY="$(pick_python "$@")"
-exec "$PY" "$REPO_DIR/installer/verify_trade.py" "$@"
+exec "$PY" "$REPO_DIR/installer/installer.py" --action verify "$@"

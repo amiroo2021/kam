@@ -58,3 +58,4 @@ Thumbs.db
 installer/manifest.json
 
 .backups/
+incident-2026-08-18-sol-step0-dup/service-events.log.bak

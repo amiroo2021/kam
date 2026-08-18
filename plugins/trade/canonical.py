@@ -433,6 +433,11 @@ class CanonicalResponse:
     ladder: Optional[CanonicalLadderResult] = None
     cancel_group: Optional[CanonicalCancelGroupResult] = None
     position_action: Optional[CanonicalPositionActionResult] = None
+    # Raw single-order state dict for operations that return one
+    # order's metadata (e.g. Lighter get_order_state). Free-form;
+    # callers use it via get_order_state() on the agent and the
+    # canonical helpers extract fields defensively.
+    order_state: Optional[Dict[str, Any]] = None
     error: Optional[CanonicalError] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -464,6 +469,8 @@ class CanonicalResponse:
             data["cancel_group"] = self.cancel_group.to_dict()
         if self.position_action is not None:
             data["position_action"] = self.position_action.to_dict()
+        if self.order_state is not None:
+            data["order_state"] = self.order_state
         if self.error is not None:
             data["error"] = self.error.to_dict()
         return data
@@ -484,6 +491,7 @@ def make_success(
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
     position_action: Optional[CanonicalPositionActionResult] = None,
+    order_state: Optional[Dict[str, Any]] = None,
 ) -> CanonicalResponse:
     return CanonicalResponse(
         success=True,
@@ -501,6 +509,7 @@ def make_success(
         ladder=ladder,
         cancel_group=cancel_group,
         position_action=position_action,
+        order_state=order_state,
         error=None,
     )
 

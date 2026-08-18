@@ -31,6 +31,9 @@ class EdgeXAgentTests(unittest.TestCase):
 
     def setUp(self):
         self.old={k:v for k,v in os.environ.items() if k.startswith('EDGEX_')}
+        # Preserve HERMES_HOME so other test files in the discover are
+        # not affected by this class's tmpdir substitution.
+        self._saved_hermes_home = os.environ.get("HERMES_HOME")
         for k in list(os.environ):
             if k.startswith('EDGEX_'): os.environ.pop(k)
         self.home=tempfile.mkdtemp(); os.environ['HERMES_HOME']=self.home
@@ -39,6 +42,10 @@ class EdgeXAgentTests(unittest.TestCase):
         for k in list(os.environ):
             if k.startswith('EDGEX_'): os.environ.pop(k)
         os.environ.update(self.old)
+        if self._saved_hermes_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._saved_hermes_home
     def set_account(self):
         for s,v in {'ACCOUNTID':'123','APIKEY':'key','APISECRET':'secret','APIPASSPHRASE':'pass','SIGNERKEY':'signer'}.items():
             os.environ[f'EDGEX_MAIN_{s}']=v

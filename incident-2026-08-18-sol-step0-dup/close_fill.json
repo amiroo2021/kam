@@ -1,0 +1,11 @@
+{
+  "order_id": "844426023833758",
+  "client_order_index": 235802565116593,
+  "side": "sell",
+  "initial_base_amount": "0.700",
+  "filled_base_amount": "0.700",
+  "price": "72.243",
+  "created_at": 1787038955,
+  "status": "filled",
+  "note": "single close_position for the full 0.700 SOL GoldenFibo-owned long"
+}

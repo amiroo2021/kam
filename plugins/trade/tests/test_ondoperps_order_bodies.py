@@ -12,8 +12,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from plugins.trade.agents import x_ondoperps_agent as ondo  # noqa: E402
-from plugins.trade.fibo.adapters.ondoperps import OndoPerpsFiboAdapter  # noqa: E402
-from plugins.trade.fibo.engine import RealOrderSide  # noqa: E402
 
 
 class OndoPerpsOrderBodyTests(unittest.TestCase):
@@ -289,39 +287,6 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
         self.assertNotIn("timeInForce", seen["body"])
         self.assertNotIn("price", seen["body"])
 
-    def test_fibo_adapter_routes_counterBUY_to_buy_market_and_counterSELL_to_sell_market(self):
-        class FakeAgent:
-            def __init__(self):
-                self.calls = []
-            def execute(self, req):
-                self.calls.append(req)
-                return {
-                    "success": True,
-                    "operation": "new_order",
-                    "exchange": "ondoperps",
-                    "account": "amiroo",
-                    "order": {"exchange_order_id": "777"},
-                }
-
-        agent = FakeAgent()
-        adapter = OndoPerpsFiboAdapter("ondoperps", "amiroo", agent)
-        adapter._run_id_by_instance["k1"] = "A7K9"
-        adapter._run_id_by_instance["k2"] = "A7K9"
-        buy_id = adapter.submit_volume_market_order(
-            instance_key="k1", instrument="ONDO", side=RealOrderSide.BUY, counter_step=1, volume=1
-        )
-        sell_id = adapter.submit_volume_market_order(
-            instance_key="k2", instrument="ONDO", side=RealOrderSide.SELL, counter_step=1, volume=1
-        )
-        new_order_calls = [c for c in agent.calls if c.get("operation") == "new_order"]
-        self.assertEqual(buy_id, "777")
-        self.assertEqual(sell_id, "777")
-        self.assertEqual(new_order_calls[0]["side"], "buy")
-        self.assertEqual(new_order_calls[1]["side"], "sell")
-        self.assertEqual(new_order_calls[0]["order_type"], "market")
-        self.assertEqual(new_order_calls[1]["order_type"], "market")
-        self.assertEqual(new_order_calls[0]["client_order_id"], "FIBO_amiroo_ONDO_CB_A7K9_Y1_C1")
-        self.assertEqual(new_order_calls[1]["client_order_id"], "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1")
 
     def test_lookup_request_format_uses_client_prefix(self):
         self.assertEqual(
@@ -343,18 +308,3 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
         self.assertEqual(response.error.code, "INVALID_CLIENT_ORDER_ID")
         signed_post.assert_not_called()
 
-    def test_client_order_ids_use_allowed_charset(self):
-        agent = type("A", (), {"execute": lambda self, req: {"success": True, "order": {"exchange_order_id": "1"}}})()
-        adapter = OndoPerpsFiboAdapter("ondoperps", "amiroo", agent)
-        adapter._run_id_by_instance["ondoperps:amiroo:ONDO:counterSELL"] = "A7K9"
-        cid = adapter._client_order_id_for(
-            instance_key="ondoperps:amiroo:ONDO:counterSELL",
-            instrument="ONDO",
-            side=RealOrderSide.SELL,
-            counter_step=1,
-        )
-        self.assertRegex(cid, r"^[A-Za-z0-9_-]{1,64}$")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)

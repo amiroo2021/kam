@@ -23,24 +23,35 @@ _REPO_ROOT = _HERE.parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-_PRESERVED_ENV: Dict[str, str] = {}
+# Module-level env state preservation for HYPERLIQUID_* keys.
+# Pop HYPERLIQUID_* env vars only at module import time, and restore
+# them at module teardown. The atexit hook was insufficient because
+# it never fires between tests inside one unittest process.
+_MODULE_PRESERVED_HYPERLIQUID_ENV: Dict[str, str] = {}
 for _k in list(os.environ.keys()):
     if _k.startswith("HYPERLIQUID_"):
-        _PRESERVED_ENV[_k] = os.environ[_k]
-        os.environ.pop(_k, None)
+        _MODULE_PRESERVED_HYPERLIQUID_ENV[_k] = os.environ[_k]
 
 
 def _restore_env() -> None:
-    for k in list(os.environ.keys()):
-        if k.startswith("HYPERLIQUID_") and k not in _PRESERVED_ENV:
-            os.environ.pop(k, None)
-    for k, v in _PRESERVED_ENV.items():
-        os.environ[k] = v
+    """Backward-compat no-op. Real restoration lives in tearDownModule."""
+    pass
 
 
-import atexit
+def setUpModule() -> None:
+    for _k in list(os.environ.keys()):
+        if _k.startswith("HYPERLIQUID_") and _k not in _MODULE_PRESERVED_HYPERLIQUID_ENV:
+            _MODULE_PRESERVED_HYPERLIQUID_ENV[_k] = os.environ[_k]
 
-atexit.register(_restore_env)
+
+def tearDownModule() -> None:
+    for _k in list(os.environ.keys()):
+        if _k.startswith("HYPERLIQUID_") and _k not in _MODULE_PRESERVED_HYPERLIQUID_ENV:
+            os.environ.pop(_k, None)
+    for _k, _v in _MODULE_PRESERVED_HYPERLIQUID_ENV.items():
+        os.environ[_k] = _v
+
+
 
 from plugins.trade.canonical import CanonicalOrderGroup, CanonicalPosition, CanonicalPositionActionResult, make_success  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
