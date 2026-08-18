@@ -113,32 +113,43 @@ class GoldenFiboEngine:
                     f"position size shrunk unexpectedly: live={live_size} expected>={expected}"
                 )
 
-        # TP liveness monitoring: while a position is open and a shared TP is
-        # expected (current_tp_order_id set), the TP order must remain ACTIVE.
-        # If it unexpectedly disappears/cancels WITHOUT a corresponding
-        # position close, the position is unprotected -> NEEDS_RECOVERY.
+        # TP liveness + volume synchronization: while a position is open and a
+        # shared TP is expected (current_tp_order_id set), the TP order must
+        # remain ACTIVE and its volume must equal the ACTUAL live position
+        # volume (independent of logical-step completion).
+        #
+        # A FILLED TP is the legitimate exit (position closing); it is NOT a
+        # freeze. Only a genuine CANCELED/REJECTED/missing-without-fill TP
+        # while the position remains open means "unprotected" -> NEEDS_RECOVERY.
         # We do NOT silently continue and we do NOT auto re-arm a new TP.
         if has_position and self.state.current_tp_order_id is not None:
-            try:
-                tp_state = self.adapter.get_order_state(
-                    self.config.account,
-                    int(self.state.current_tp_order_id),
-                )
-            except Exception as exc:
-                return self._freeze(f"get_order_state(TP) failed: {exc}")
+            tp_state = self._read_tp_state()
             tp_taxonomy = str(tp_state.get("taxonomy") or "")
             actions.append(
                 f"tp oid={self.state.current_tp_order_id} taxonomy={tp_taxonomy}"
             )
             if tp_taxonomy == "ACTIVE":
-                pass  # TP healthy
+                # TP healthy. Synchronize TP VOLUME to the live position size
+                # at the SAME TP price (partial ladder fills grow the position;
+                # the TP must cover the full live exposure). Price/step/ladder
+                # are NOT altered by a volume sync.
+                live_tp_size = self._decimal_or_none(tp_state.get("requested_size"))
+                if live_tp_size is not None and live_tp_size != live_size:
+                    sync = self._sync_tp_volume(live_size, actions)
+                    if sync is not None:
+                        return sync
             elif tp_taxonomy == "FILLED":
-                # TP filled but position still open -> partial TP fill or a
-                # residual; treat as unexpected and reconcile.
-                return self._freeze(
-                    f"shared TP oid={self.state.current_tp_order_id} FILLED but "
-                    f"position still open (size={live_size}); reconcile exchange state"
+                # TP filled but the position read still shows exposure. This is
+                # either (a) the position read lagging the fill (normal exit in
+                # progress) or (b) a genuine partial TP fill. Either way, do NOT
+                # freeze and do NOT mutate the ladder this tick; the next tick's
+                # position-close path (Case B orphan / cycle-end) reconciles once
+                # the position reads flat. Treat as exit-in-progress.
+                actions.append(
+                    f"shared TP oid={self.state.current_tp_order_id} FILLED; "
+                    f"exit in progress (position read size={live_size}); awaiting flat read"
                 )
+                return TickResult(state=self.state, actions=actions)
             else:
                 # CANCELED / REJECTED / EXPIRED / missing -> unprotected position.
                 return self._freeze(
@@ -240,6 +251,7 @@ class GoldenFiboEngine:
         self.state.fill_prices = {}
         self.state.expected_cumulative_size = Decimal("0")
         self.state.current_tp_price = None
+        self.state.current_tp_size = None
         self.state.current_tp_order_id = None
         self.state.current_tp_client_id = None
         self.state.current_tp_role = None
@@ -446,13 +458,14 @@ class GoldenFiboEngine:
         )
 
         self.state.current_tp_price = Decimal(str(submit.get("submitted_price") or tp_price))
+        self.state.current_tp_size = Decimal(str(submit.get("submitted_volume") or tp_size))
         self.state.current_tp_client_id = tp_client_id
         self.state.current_tp_order_id = (
             int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
         )
         self.state.current_tp_role = ROLE_TP
         actions.append(
-            f"shared TP set price={self.state.current_tp_price} size={submit.get('submitted_volume') or tp_size} oid={self.state.current_tp_order_id}"
+            f"shared TP set price={self.state.current_tp_price} size={self.state.current_tp_size} oid={self.state.current_tp_order_id}"
         )
         return None
 
@@ -688,6 +701,7 @@ class GoldenFiboEngine:
         self.state.current_tp_order_id = None
         self.state.current_tp_role = None
         self.state.current_tp_price = None
+        self.state.current_tp_size = None
         self.state.highest_filled_step = -1
         self.state.fill_prices = {}
         self.state.expected_cumulative_size = Decimal("0")
@@ -702,6 +716,129 @@ class GoldenFiboEngine:
     # ------------------------------------------------------------------
     # Recovery
     # ------------------------------------------------------------------
+    @staticmethod
+    def _decimal_or_none(value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+    def _read_tp_state(self) -> Dict[str, Any]:
+        """Read the shared TP order state, tolerating the single-order lookup's
+        inability to see FILLED orders on some accounts.
+
+        Tries get_order_state(order_index) first; if that returns an empty
+        record (order not found in active OR the inactive search failed), falls
+        back to get_order_state_by_client_id(client_id), which uses the bounded
+        paging surface that DOES see filled orders. Returns {} only when both
+        lookups find nothing.
+        """
+        oid = self.state.current_tp_order_id
+        if oid is None:
+            return {}
+        try:
+            st = self.adapter.get_order_state(self.config.account, int(oid))
+        except Exception:
+            st = {}
+        if st:
+            return st
+        # Fallback: client-id lookup sees filled orders.
+        cid = self.state.current_tp_client_id
+        if cid is not None:
+            try:
+                st = self.adapter.get_order_state_by_client_id(
+                    self.config.account, self.config.instrument, int(cid)
+                )
+            except Exception:
+                st = {}
+            if st:
+                return st
+        return {}
+
+    def _sync_tp_volume(self, live_size: Decimal, actions: List[str]) -> Optional[TickResult]:
+        """Synchronize the shared TP VOLUME to the live position size at the
+        SAME TP price. Used when a partial ladder fill grows the position: the
+        TP must cover the full live exposure. Does NOT alter the logical step,
+        fill_prices, highest_filled_step, TP price, or the pending ladder.
+
+        Safe sequence: cancel exact old TP -> verify -> place exactly ONE new
+        resting reduce-only GTC LIMIT TP at the same price for live_size ->
+        verify -> persist new identity/size. On any failure -> NEEDS_RECOVERY
+        (no duplicate TP, durable state preserved).
+        """
+        tp_price = self.state.current_tp_price
+        old_oid = self.state.current_tp_order_id
+        if tp_price is None or old_oid is None:
+            return self._freeze("TP volume sync requested with no current TP")
+
+        tp_side = "sell" if self.config.direction.upper() == "BUY" else "buy"
+
+        # Notional guard (do not silently resize below venue minimum).
+        vc = self._venue_constraints()
+        if vc is not None:
+            min_quote = vc.get("min_quote_amount") or Decimal("0")
+            notional = Decimal(live_size) * Decimal(tp_price)
+            if min_quote > 0 and notional < min_quote:
+                return self._freeze(
+                    f"TP volume sync notional {notional} below venue minimum {min_quote} "
+                    f"(size={live_size} price={tp_price}); reconcile before resubmission."
+                )
+
+        # Cancel the exact old TP.
+        try:
+            canceled = self.adapter.cancel_order(
+                account=self.config.account, order_index=int(old_oid)
+            )
+        except Exception as exc:
+            return self._freeze(f"TP volume sync: cancel old TP oid={old_oid} failed: {exc}")
+        if not canceled:
+            return self._freeze(f"TP volume sync: cancel old TP oid={old_oid} returned False")
+        actions.append(f"TP volume sync: canceled old TP oid={old_oid}")
+
+        # Place exactly ONE new TP at the same price for live_size.
+        tp_client_id = self._next_client_id()
+        self.state.submission_phase = SUBMISSION_PREPARED
+        self.state.submission_client_id = tp_client_id
+        self.state.submission_step = self.state.highest_filled_step
+        self.state.submission_role = ROLE_TP
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
+        self.state.submission_phase = SUBMISSION_ATTEMPTED
+        self.state.submission_attempted_at = time.time()
+        try:
+            submit = self.adapter.set_shared_tp(
+                account=self.config.account,
+                instrument=self.config.instrument,
+                price=tp_price,
+                side=tp_side,
+                size=live_size,
+                client_order_id=tp_client_id,
+            )
+        except Exception as exc:
+            self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
+            return self._freeze(
+                f"TP volume sync: new TP placement attempted but result unknown: {exc}. "
+                "Reconcile exchange before any resubmission."
+            )
+        self.state.submission_phase = SUBMISSION_CONFIRMED
+        self.state.submission_exchange_order_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
+        self.state.current_tp_client_id = tp_client_id
+        self.state.current_tp_order_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
+        self.state.current_tp_size = Decimal(str(submit.get("submitted_volume") or live_size))
+        # TP price unchanged.
+        self.state.current_tp_role = ROLE_TP
+        actions.append(
+            f"TP volume sync: new TP oid={self.state.current_tp_order_id} "
+            f"price={self.state.current_tp_price} size={self.state.current_tp_size}"
+        )
+        return None
+
     def _venue_constraints(self) -> Optional[Dict[str, Any]]:
         """Lazily read + cache venue constraints via the thin adapter.
 

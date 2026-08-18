@@ -66,6 +66,7 @@ class GoldenFiboState:
 
     # current shared TP
     current_tp_price: Optional[Decimal] = None
+    current_tp_size: Optional[Decimal] = None  # TP volume, synced to live position
     current_tp_order_id: Optional[int] = None
     current_tp_client_id: Optional[int] = None
     current_tp_role: Optional[str] = None  # ROLE_TP
@@ -122,6 +123,7 @@ class GoldenFiboState:
             "fill_prices": {str(k): str(v) for k, v in self.fill_prices.items()},
             "expected_cumulative_size": str(self.expected_cumulative_size),
             "current_tp_price": None if self.current_tp_price is None else str(self.current_tp_price),
+            "current_tp_size": None if self.current_tp_size is None else str(self.current_tp_size),
             "current_tp_order_id": self.current_tp_order_id,
             "current_tp_client_id": self.current_tp_client_id,
             "current_tp_role": self.current_tp_role,
@@ -165,6 +167,7 @@ class GoldenFiboState:
             fill_prices={int(k): Decimal(v) for k, v in (data.get("fill_prices") or {}).items()},
             expected_cumulative_size=Decimal(str(data.get("expected_cumulative_size", "0"))),
             current_tp_price=None if data.get("current_tp_price") is None else Decimal(str(data.get("current_tp_price"))),
+            current_tp_size=None if data.get("current_tp_size") is None else Decimal(str(data.get("current_tp_size"))),
             current_tp_order_id=None if data.get("current_tp_order_id") is None else int(data.get("current_tp_order_id") or 0),
             current_tp_client_id=None if data.get("current_tp_client_id") is None else int(data.get("current_tp_client_id") or 0),
             current_tp_role=data.get("current_tp_role"),
