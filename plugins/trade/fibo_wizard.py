@@ -645,3 +645,115 @@ class FiboWizard:
 def get_fibo_wizard() -> FiboWizard:
     """Module-level singleton accessor."""
     return FiboWizard()
+
+
+
+# ---------------------------------------------------------------------------
+# Module-level dispatcher entry points used by the Telegram adapter.
+#
+# The adapter calls these by name (handle_fibo_command / _callback / _text).
+# They delegate to the FiboWizard class singleton. The text dispatcher
+# only handles wizard states that explicitly await free-text input;
+# other states return False so the adapter falls through to normal
+# message dispatch.
+# ---------------------------------------------------------------------------
+_TEXT_HANDLING_STATES = frozenset({
+    "account",
+    "instrument_input",
+    "percentage",
+    "step0_volume",
+})
+
+
+def _chat_key(msg_or_query: Any) -> Tuple[Any, ...]:
+    """Derive a stable chat key from a Telegram message or callback query.
+
+    Uses (chat_id, message_thread_id) when available so topic-aware
+    Telegram conversations are isolated from one another.
+    """
+    chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
+    if chat_id is None:
+        chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+    thread_id = getattr(msg_or_query, "message_thread_id", None)
+    return (chat_id,) if thread_id is None else (chat_id, thread_id)
+
+
+async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
+    chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
+    if chat_id is None:
+        chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+    await adapter.send_inline_keyboard(
+        chat_id=chat_id,
+        text=screen.text,
+        buttons=screen.buttons,
+        callback_prefix="fibo",
+        metadata={"state": screen.state},
+    )
+
+
+async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
+    """Open the Fibo wizard for the chat that issued /fibo.
+
+    Called by the Telegram adapter's command dispatch BEFORE generic
+    command handling. Returns True if the message was a /fibo
+    invocation and was consumed by the wizard, False otherwise (in
+    which case the adapter should continue with normal dispatch).
+    """
+    text = str(getattr(msg, "text", "") or "").strip()
+    if not text.startswith("/fibo"):
+        return False
+    parts = text.split(maxsplit=1)
+    if not parts or parts[0] != "/fibo":
+        return False
+    wizard = get_fibo_wizard()
+    chat_key = _chat_key(msg)
+    screen = wizard.open(chat_key)
+    await _send_screen(adapter, msg, screen)
+    return True
+
+
+async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> bool:
+    """Handle a ``fibo:`` prefixed callback query.
+
+    The adapter has already routed the call here because
+    ``data.startswith("fibo:")``. This function strips the ``fibo:``
+    prefix, runs the wizard one step, edits the originating message
+    in place to the next screen, and acknowledges the query.
+    """
+    raw = str(data or "")
+    if not raw.startswith("fibo:"):
+        return False
+    payload = raw.split(":", 1)[1] if ":" in raw else ""
+    wizard = get_fibo_wizard()
+    chat_key = _chat_key(getattr(query, "message", query))
+    screen = wizard.handle_callback(chat_key, payload)
+    await _send_screen(adapter, query, screen)
+    return True
+
+
+async def handle_fibo_text(adapter: Any, msg: Any) -> bool:
+    """Handle free-text input for wizard states that explicitly await it.
+
+    Returns False if the current wizard state is not in
+    ``_TEXT_HANDLING_STATES`` so the adapter falls through to normal
+    message handling.
+    """
+    wizard = get_fibo_wizard()
+    chat_key = _chat_key(msg)
+    state = wizard._state_for(chat_key)  # noqa: SLF001
+    if state.state not in _TEXT_HANDLING_STATES:
+        return False
+    screen = wizard.handle_text(chat_key, str(getattr(msg, "text", "") or ""))
+    await _send_screen(adapter, msg, screen)
+    return True
+
+
+__all__ = [
+    "FiboWizard",
+    "Screen",
+    "WizardState",
+    "get_fibo_wizard",
+    "handle_fibo_command",
+    "handle_fibo_callback",
+    "handle_fibo_text",
+]

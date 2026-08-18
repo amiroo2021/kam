@@ -16,7 +16,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
-import plugins.trade.agents.x_lighter_agent as lighter_agent
+from plugins.trade.agents import x_lighter_agent as lighter_agent
 from plugins.trade.canonical import make_success
 
 
