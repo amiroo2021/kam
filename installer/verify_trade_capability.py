@@ -4,18 +4,20 @@ Verifies that the /trade capability is correctly installed:
 
   - manifest says trade=true
   - ~/.hermes/trade/ folder exists
-  - tradedesk.py and wizard.py import cleanly
-  - TradeDesk lists at least one exchange agent
+  - tradedesk.py and wizard.py AST-parse cleanly
+
+Takes EXPLICIT ``hermes_root`` and ``hermes_home``. The two are
+independent.
 
 If any of these fail, returns False and prints a clear report.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import ast
 import sys
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,11 +28,15 @@ from capabilities import (
 )
 
 
-def run(*, argv: List[str], hermes_home: Path) -> bool:
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+) -> bool:
     repo_root = Path(__file__).resolve().parent.parent
     ok = True
     print("==> verify trade")
-    # Manifest consistency.
     if is_installed(hermes_home, "trade"):
         print("    [ok] manifest trade=true")
     else:
@@ -42,14 +48,12 @@ def run(*, argv: List[str], hermes_home: Path) -> bool:
     else:
         print(f"    [FAIL] {msg}")
         ok = False
-    # TradeDesk + wizard import check.
     for rel in ["plugins/trade/tradedesk.py", "plugins/trade/wizard.py"]:
         path = repo_root / rel
         if not path.is_file():
             print(f"    [FAIL] missing source: {rel}")
             ok = False
             continue
-        import ast
         try:
             ast.parse(path.read_text(encoding="utf-8"))
             print(f"    [ok] {rel} parses cleanly")

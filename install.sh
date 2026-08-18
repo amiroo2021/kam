@@ -8,11 +8,13 @@
 #   ./install.sh                          # no-flag = TRADE ONLY (legacy compat)
 #
 # Optional flags (forwarded):
-#   --hermes-root PATH
+#   --hermes-root PATH    installed application tree (default /usr/local/lib/hermes-agent)
+#   --hermes-home PATH    persistent state directory (default ~/.hermes)
 #   --systemd-dir DIR
-#   --dry-run
+#   --dry-run             plan only, zero mutation
 #   --no-restart
 #   --skip-deps
+#   --help, -h            show usage and exit 0
 #
 # Implementation lives in installer/installer.py (capability-aware).
 set -euo pipefail
@@ -20,6 +22,7 @@ set -euo pipefail
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 pick_python() {
+  # Prefer the Hermes gateway venv when --hermes-root is supplied.
   local root=""
   local prev=""
   for arg in "$@"; do

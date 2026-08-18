@@ -4,19 +4,21 @@ Verifies that the /fibo capability is correctly installed:
 
   - manifest says fibo=true
   - ~/.hermes/fibo/ folder exists
-  - fibo_service.py, fibo_daemon.py, fibo_wizard.py import cleanly
-  - all golden_fibo/* modules import cleanly
+  - fibo_service.py, fibo_daemon.py, fibo_wizard.py AST-parse cleanly
+  - all golden_fibo/* modules AST-parse cleanly
   - the fibo.service template is present in the repo
   - no requirement that /trade exists
 
-If any of these fail, returns False and prints a clear report.
+Takes EXPLICIT ``hermes_root`` and ``hermes_home``. The two are
+independent.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import ast
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -41,14 +43,10 @@ FIBO_IMPORT_PROBES = [
 def _try_import(module_name: str, repo_root: Path) -> bool:
     """Read-only verification probe.
 
-    We do NOT execute the module body — GoldenFibo modules use relative
-    imports (``from .state import ...``) which require the full
-    ``plugins/trade/golden_fibo`` package to be importable in the host
-    sys.path. The verification done by this installer is a byte-correct
-    file-presence + AST-parse check; live module execution is the
-    job of the existing ``verify_trade.py`` runner which is invoked by
-    the proven monolithic installer and runs under the Hermes venv where
-    the full plugin tree is importable.
+    AST-parse only (does not execute the module body). The full module
+    execution check is the job of the existing ``verify_trade.py`` runner
+    which is invoked by the proven monolithic installer and runs under the
+    Hermes venv where the full plugin tree is importable.
 
     Returns True iff the file exists and parses as valid Python.
     """
@@ -61,7 +59,6 @@ def _try_import(module_name: str, repo_root: Path) -> bool:
     path = repo_root.joinpath(*parts).with_suffix(".py")
     if not path.is_file():
         return False
-    import ast
     try:
         ast.parse(path.read_text(encoding="utf-8"))
         return True
@@ -69,11 +66,15 @@ def _try_import(module_name: str, repo_root: Path) -> bool:
         return False
 
 
-def run(*, argv, hermes_home: Path) -> bool:
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+) -> bool:
     repo_root = Path(__file__).resolve().parent.parent
     ok = True
     print("==> verify fibo")
-    # Manifest consistency.
     if is_installed(hermes_home, "fibo"):
         print("    [ok] manifest fibo=true")
     else:
@@ -85,14 +86,12 @@ def run(*, argv, hermes_home: Path) -> bool:
     else:
         print(f"    [FAIL] {msg}")
         ok = False
-    # Module imports.
     for probe in FIBO_IMPORT_PROBES:
         if _try_import(probe, repo_root):
             print(f"    [ok] import: {probe}")
         else:
             print(f"    [FAIL] import: {probe}")
             ok = False
-    # fibo.service template presence.
     template = repo_root / "installer" / "fibo.service.template"
     if template.is_file():
         print(f"    [ok] fibo.service.template present: {template}")

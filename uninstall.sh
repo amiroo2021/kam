@@ -9,7 +9,9 @@
 #
 # Optional flags (forwarded):
 #   --hermes-root PATH
+#   --hermes-home PATH
 #   --purge-state                        # for capability-owned state (legacy compat)
+#   --dry-run
 set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
