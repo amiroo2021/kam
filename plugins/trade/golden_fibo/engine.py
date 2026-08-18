@@ -46,6 +46,14 @@ from plugins.trade.golden_fibo.state import (
 )
 
 
+# Bounded reconciliation window for a FILLED TP whose position read has not
+# yet gone flat. The venue's position read can lag the TP fill by a poll or
+# two; we allow this many polls before declaring the exit stuck
+# (TP_PARTIAL_EXIT_NOT_FLAT) and freezing. Never continue indefinitely with
+# no active TP.
+TP_EXIT_MAX_POLLS = 4
+
+
 OrderIdentity = Tuple[Optional[int], Optional[int]]  # (client_order_id, exchange_order_id)
 
 
@@ -105,8 +113,20 @@ class GoldenFiboEngine:
                     f"position direction mismatch: live={live_side} config={self.config.direction}"
                 )
 
-        # Validate accumulated size
-        if self.state.highest_filled_step >= 0:
+        # Read the shared TP state up front (needed to distinguish a legitimate
+        # TP exit from unexpected position shrinkage below).
+        tp_state: Dict[str, Any] = {}
+        tp_taxonomy = ""
+        if has_position and self.state.current_tp_order_id is not None:
+            tp_state = self._read_tp_state()
+            tp_taxonomy = str(tp_state.get("taxonomy") or "")
+
+        # Validate accumulated size. This guards against unexpected position
+        # shrinkage DURING normal operation. It must NOT fire when the shared
+        # TP has legitimately FILLED (a TP exit intentionally reduces the
+        # position below the accumulated size); that case is handled by the
+        # TP-exit reconciliation below.
+        if self.state.highest_filled_step >= 0 and tp_taxonomy != "FILLED":
             expected = self.config.cumulative_volume(self.state.highest_filled_step)
             if has_position and live_size < expected:
                 return self._freeze(
@@ -123,12 +143,12 @@ class GoldenFiboEngine:
         # while the position remains open means "unprotected" -> NEEDS_RECOVERY.
         # We do NOT silently continue and we do NOT auto re-arm a new TP.
         if has_position and self.state.current_tp_order_id is not None:
-            tp_state = self._read_tp_state()
-            tp_taxonomy = str(tp_state.get("taxonomy") or "")
             actions.append(
                 f"tp oid={self.state.current_tp_order_id} taxonomy={tp_taxonomy}"
             )
             if tp_taxonomy == "ACTIVE":
+                # TP healthy. Reset any prior exit-reconciliation counter.
+                self.state.tp_exit_attempts = 0
                 # TP healthy. Synchronize TP VOLUME to the live position size
                 # at the SAME TP price (partial ladder fills grow the position;
                 # the TP must cover the full live exposure). Price/step/ladder
@@ -141,14 +161,24 @@ class GoldenFiboEngine:
             elif tp_taxonomy == "FILLED":
                 # TP filled but the position read still shows exposure. This is
                 # either (a) the position read lagging the fill (normal exit in
-                # progress) or (b) a genuine partial TP fill. Either way, do NOT
-                # freeze and do NOT mutate the ladder this tick; the next tick's
-                # position-close path (Case B orphan / cycle-end) reconciles once
-                # the position reads flat. Treat as exit-in-progress.
+                # progress) or (b) a genuine partial TP fill. Allow a BOUNDED
+                # number of reconciliation polls for the position to read flat;
+                # do NOT freeze and do NOT mutate the ladder during the window.
+                # If the position is still not flat after the bound, the exit is
+                # stuck -> NEEDS_RECOVERY (never silently continue forever with
+                # no active TP).
+                self.state.tp_exit_attempts = int(self.state.tp_exit_attempts or 0) + 1
                 actions.append(
                     f"shared TP oid={self.state.current_tp_order_id} FILLED; "
-                    f"exit in progress (position read size={live_size}); awaiting flat read"
+                    f"exit in progress (position read size={live_size}); "
+                    f"reconciliation poll {self.state.tp_exit_attempts}/{TP_EXIT_MAX_POLLS}"
                 )
+                if self.state.tp_exit_attempts >= TP_EXIT_MAX_POLLS:
+                    return self._freeze(
+                        f"shared TP oid={self.state.current_tp_order_id} FILLED but "
+                        f"position still not flat after {TP_EXIT_MAX_POLLS} polls "
+                        f"(size={live_size}); TP_PARTIAL_EXIT_NOT_FLAT. Reconcile exchange state."
+                    )
                 return TickResult(state=self.state, actions=actions)
             else:
                 # CANCELED / REJECTED / EXPIRED / missing -> unprotected position.
@@ -255,6 +285,7 @@ class GoldenFiboEngine:
         self.state.current_tp_order_id = None
         self.state.current_tp_client_id = None
         self.state.current_tp_role = None
+        self.state.tp_exit_attempts = 0
         self.state.pending_order_client_id = client_id
         self.state.pending_order_exchange_id = None
         self.state.pending_requested_price = None
@@ -702,6 +733,7 @@ class GoldenFiboEngine:
         self.state.current_tp_role = None
         self.state.current_tp_price = None
         self.state.current_tp_size = None
+        self.state.tp_exit_attempts = 0
         self.state.highest_filled_step = -1
         self.state.fill_prices = {}
         self.state.expected_cumulative_size = Decimal("0")

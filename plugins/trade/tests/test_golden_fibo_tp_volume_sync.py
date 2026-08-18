@@ -327,6 +327,68 @@ class TestTpVolumeSync(unittest.TestCase):
         ladders = [s for s in adapter.submit_log if s.get("role") == "ladder"]
         self.assertEqual(len(ladders), 1)  # only Step1, no Step2
 
+class TestBoundedTpExitReconciliation(unittest.TestCase):
+    """Bounded rule: a FILLED TP whose position read stays >0 must NOT wait
+    forever. After TP_EXIT_MAX_POLLS it freezes TP_PARTIAL_EXIT_NOT_FLAT."""
+
+    def _filled_tp_residual(self):
+        eng, adapter = _setup()
+        tp_oid = eng.state.current_tp_order_id
+        rec = adapter.orders[tp_oid]
+        rec["status"] = "filled"; rec["taxonomy"] = "FILLED"
+        adapter.position["size"] = "0.100"  # residual position, not flat
+        return eng, adapter, tp_oid
+
+    def test_within_bound_no_freeze_no_ladder_mutation(self):
+        eng, adapter, tp_oid = self._filled_tp_residual()
+        from plugins.trade.golden_fibo.engine import TP_EXIT_MAX_POLLS
+        # Poll fewer than the bound: no freeze, no Step2.
+        for i in range(TP_EXIT_MAX_POLLS - 1):
+            result = eng.tick()
+            self.assertNotEqual(result.state.status, "needs_recovery",
+                                f"poll {i+1} should not freeze within bound")
+        ladders = [s for s in adapter.submit_log if s.get("role") == "ladder"]
+        self.assertEqual(len(ladders), 1)  # only Step1
+        self.assertEqual(eng.state.tp_exit_attempts, TP_EXIT_MAX_POLLS - 1)
+
+    def test_at_bound_freezes_tp_partial_exit_not_flat(self):
+        eng, adapter, tp_oid = self._filled_tp_residual()
+        from plugins.trade.golden_fibo.engine import TP_EXIT_MAX_POLLS
+        result = None
+        for i in range(TP_EXIT_MAX_POLLS):
+            result = eng.tick()
+        self.assertEqual(result.state.status, "needs_recovery")
+        self.assertIn("TP_PARTIAL_EXIT_NOT_FLAT", result.state.freeze_reason or "")
+        self.assertEqual(eng.state.tp_exit_attempts, TP_EXIT_MAX_POLLS)
+
+    def test_position_goes_flat_within_bound_normal_cleanup(self):
+        eng, adapter = _setup()
+        tp_oid = eng.state.current_tp_order_id
+        step1_oid = eng.state.pending_order_exchange_id
+        rec = adapter.orders[tp_oid]
+        rec["status"] = "filled"; rec["taxonomy"] = "FILLED"
+        adapter.position["size"] = "0.100"  # lagging read
+        # First poll: exit in progress.
+        r1 = eng.tick()
+        self.assertNotEqual(r1.state.status, "needs_recovery")
+        self.assertEqual(eng.state.tp_exit_attempts, 1)
+        # Position now reads flat.
+        adapter.position["size"] = "0"
+        adapter.position["side"] = None
+        r2 = eng.tick()
+        # Orphan Step1 canceled, cycle reset, counter reset.
+        self.assertIn(int(step1_oid), adapter.cancel_log)
+        self.assertEqual(eng.state.highest_filled_step, -1)
+        self.assertEqual(eng.state.tp_exit_attempts, 0)
+
+    def test_counter_resets_on_healthy_tp(self):
+        eng, adapter = _setup()
+        eng.state.tp_exit_attempts = 2  # stale counter
+        result = eng.tick()  # TP is ACTIVE/healthy
+        self.assertEqual(result.state.status, "running")
+        self.assertEqual(eng.state.tp_exit_attempts, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

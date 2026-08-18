@@ -70,6 +70,9 @@ class GoldenFiboState:
     current_tp_order_id: Optional[int] = None
     current_tp_client_id: Optional[int] = None
     current_tp_role: Optional[str] = None  # ROLE_TP
+    # Bounded reconciliation counter for a FILLED TP whose position read has
+    # not yet gone flat. Not a logical-step field; reset on flat/normal tick.
+    tp_exit_attempts: int = 0
 
     # next pending ladder order
     next_step: int = 0
@@ -127,6 +130,7 @@ class GoldenFiboState:
             "current_tp_order_id": self.current_tp_order_id,
             "current_tp_client_id": self.current_tp_client_id,
             "current_tp_role": self.current_tp_role,
+            "tp_exit_attempts": self.tp_exit_attempts,
             "next_step": self.next_step,
             "pending_order_client_id": self.pending_order_client_id,
             "pending_order_exchange_id": self.pending_order_exchange_id,
@@ -171,6 +175,7 @@ class GoldenFiboState:
             current_tp_order_id=None if data.get("current_tp_order_id") is None else int(data.get("current_tp_order_id") or 0),
             current_tp_client_id=None if data.get("current_tp_client_id") is None else int(data.get("current_tp_client_id") or 0),
             current_tp_role=data.get("current_tp_role"),
+            tp_exit_attempts=int(data.get("tp_exit_attempts", 0) or 0),
             next_step=int(data.get("next_step", 0) or 0),
             pending_order_client_id=None if data.get("pending_order_client_id") is None else int(data.get("pending_order_client_id") or 0),
             pending_order_exchange_id=None if data.get("pending_order_exchange_id") is None else int(data.get("pending_order_exchange_id") or 0),
