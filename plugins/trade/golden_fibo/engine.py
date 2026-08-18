@@ -260,7 +260,22 @@ class GoldenFiboEngine:
     # ------------------------------------------------------------------
     def confirm_step0_filled(self, p0: Decimal) -> None:
         """Called by the service after observing the live venue state
-        shows the Step0 market FILLED and the position established."""
+        shows the Step0 market FILLED and the position established.
+
+        Preserves the Step0 ENTRY order identity in step_orders[0] BEFORE
+        clearing the generic pending/submission fields, so the identity of
+        the order that created Step0 is never lost."""
+        # Capture the Step0 ENTRY identity before clearing the generic fields.
+        entry_client_id = self.state.pending_order_client_id or self.state.submission_client_id
+        entry_exchange_oid = self.state.pending_order_exchange_id or self.state.submission_exchange_order_id
+        self.state.step_orders[0] = {
+            "role": ROLE_ENTRY,
+            "client_id": entry_client_id,
+            "exchange_order_id": entry_exchange_oid,
+            "status": "filled",
+            "price": str(p0),
+            "size": str(self.config.step0_volume),
+        }
         self.state.fill_prices[0] = Decimal(p0)
         self.state.highest_filled_step = 0
         self.state.expected_cumulative_size = self.config.cumulative_volume(0)
@@ -532,6 +547,19 @@ class GoldenFiboEngine:
 
         step_n = self.state.next_step
         promoted_pk = Decimal(self.state.pending_confirmed_price)
+
+        # Preserve the filled Step(n) LADDER order identity in step_orders
+        # BEFORE clearing the generic pending fields, so the identity of the
+        # order that advanced the ladder is never lost.
+        self.state.step_orders[step_n] = {
+            "role": ROLE_LADDER,
+            "client_id": self.state.pending_order_client_id,
+            "exchange_order_id": self.state.pending_order_exchange_id,
+            "status": "filled",
+            "price": str(promoted_pk),
+            "size": str(self.config.volume(step_n)),
+        }
+
         self.state.fill_prices[step_n] = promoted_pk
         self.state.highest_filled_step = step_n
         self.state.expected_cumulative_size = self.config.cumulative_volume(step_n)

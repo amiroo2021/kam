@@ -80,6 +80,16 @@ class GoldenFiboState:
     pending_confirmed_size: Optional[Decimal] = None
     pending_order_role: Optional[str] = None  # ROLE_LADDER or ROLE_ENTRY
 
+    # Per-step durable order history. Maps logical step number -> the
+    # confirmed order identity that created/advanced that step. This
+    # preserves Step0 ENTRY ownership, Step1 LADDER identity, etc., so a
+    # generic "current submission" field can never erase historical
+    # ownership. Entry example:
+    #   step_orders[0] = {"role": "entry", "client_id": ..., "exchange_order_id": ...,
+    #                     "status": "filled", "price": "76.370"}
+    # Keys are ints in memory; serialized as strings in JSON.
+    step_orders: Dict[int, Dict[str, object]] = field(default_factory=dict)
+
     # Durable submission tracking. Written BEFORE the venue call so a
     # crash mid-submission can never silently retry the same logical
     # order. submission_client_id is deterministic per
@@ -123,6 +133,7 @@ class GoldenFiboState:
             "pending_confirmed_price": None if self.pending_confirmed_price is None else str(self.pending_confirmed_price),
             "pending_confirmed_size": None if self.pending_confirmed_size is None else str(self.pending_confirmed_size),
             "pending_order_role": self.pending_order_role,
+            "step_orders": {str(k): v for k, v in self.step_orders.items()},
             "submission_phase": self.submission_phase,
             "submission_client_id": self.submission_client_id,
             "submission_step": self.submission_step,
@@ -161,6 +172,7 @@ class GoldenFiboState:
             pending_confirmed_price=None if data.get("pending_confirmed_price") is None else Decimal(str(data.get("pending_confirmed_price"))),
             pending_confirmed_size=None if data.get("pending_confirmed_size") is None else Decimal(str(data.get("pending_confirmed_size"))),
             pending_order_role=data.get("pending_order_role"),
+            step_orders={int(k): v for k, v in (data.get("step_orders") or {}).items()},
             submission_phase=str(data.get("submission_phase", SUBMISSION_NOT_SUBMITTED)),
             submission_client_id=None if data.get("submission_client_id") is None else int(data.get("submission_client_id") or 0),
             submission_step=None if data.get("submission_step") is None else int(data.get("submission_step") or 0),
