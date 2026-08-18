@@ -113,6 +113,33 @@ class GoldenFiboEngine:
                     f"position direction mismatch: live={live_side} config={self.config.direction}"
                 )
 
+        # Read the pending-ladder state up front (fallback-aware). If the
+        # pending Step(n) is FILLED, the full-step transition handles the TP
+        # replacement + next step in one shot, so the TP-volume-sync at the
+        # OLD price must NOT also fire on this tick. This enforces the locked
+        # ordering: read pending -> decide (partial vs full) -> act.
+        pending_filled: bool = False
+        pending_state: Dict[str, Any] = {}
+        if self.state.pending_order_exchange_id is not None:
+            pending_state = self._read_pending_order_state()
+            pending_status = str(pending_state.get("status") or "")
+            pending_taxonomy = str(pending_state.get("taxonomy") or "")
+            actions.append(
+                f"pending oid={self.state.pending_order_exchange_id} status={pending_status} taxonomy={pending_taxonomy}"
+            )
+            if pending_taxonomy == "ACTIVE":
+                pass  # partial: TP-volume sync applies below
+            elif pending_taxonomy == "FILLED":
+                # Full fill: route to the full-step transition. The TP-volume
+                # sync at the OLD price must NOT fire; _handle_confirmed_fill
+                # replaces the TP ONCE at the NEW logical TP price + full live
+                # position size.
+                pending_filled = True
+            elif pending_taxonomy in ("CANCELED", "REJECTED", "EXPIRED"):
+                return self._freeze(
+                    f"pending order unexpectedly {pending_taxonomy.lower()}"
+                )
+
         # Read the shared TP state up front (needed to distinguish a legitimate
         # TP exit from unexpected position shrinkage below).
         tp_state: Dict[str, Any] = {}
@@ -149,15 +176,17 @@ class GoldenFiboEngine:
             if tp_taxonomy == "ACTIVE":
                 # TP healthy. Reset any prior exit-reconciliation counter.
                 self.state.tp_exit_attempts = 0
-                # TP healthy. Synchronize TP VOLUME to the live position size
-                # at the SAME TP price (partial ladder fills grow the position;
-                # the TP must cover the full live exposure). Price/step/ladder
-                # are NOT altered by a volume sync.
-                live_tp_size = self._decimal_or_none(tp_state.get("requested_size"))
-                if live_tp_size is not None and live_tp_size != live_size:
-                    sync = self._sync_tp_volume(live_size, actions)
-                    if sync is not None:
-                        return sync
+                # PARTIAL-fill TP-volume sync (same price, full live size).
+                # Skip when the pending ladder is FILLED on this tick — the
+                # full-step transition (_handle_confirmed_fill -> _rotate_tp)
+                # replaces the TP once at the NEW logical TP price + full live
+                # size, so the at-old-price sync must NOT also fire.
+                if not pending_filled:
+                    live_tp_size = self._decimal_or_none(tp_state.get("requested_size"))
+                    if live_tp_size is not None and live_tp_size != live_size:
+                        sync = self._sync_tp_volume(live_size, actions)
+                        if sync is not None:
+                            return sync
             elif tp_taxonomy == "FILLED":
                 # TP filled but the position read still shows exposure. This is
                 # either (a) the position read lagging the fill (normal exit in
@@ -188,27 +217,19 @@ class GoldenFiboEngine:
                     "position is unprotected. Reconcile exchange state before any resubmission."
                 )
 
-        # Check pending order state
+        # Check pending order state for Case B/cycle-end branching. The
+# fallback-aware read already happened above; pending_state / pending_filled
+# are populated. If the pending order is FILLED, the full-step transition
+# handles it here (cancel old TP once, place new TP at logical P(n-1) for
+# live size, then place Step(n+1)).
         pending_alive = False
-        pending_state: Dict[str, Any] = {}
+        if pending_filled:
+            return self._handle_confirmed_fill(actions)
         if self.state.pending_order_exchange_id is not None:
-            try:
-                pending_state = self.adapter.get_order_state(
-                    self.config.account,
-                    int(self.state.pending_order_exchange_id),
-                )
-            except Exception as exc:
-                return self._freeze(f"get_order_state failed: {exc}")
             pending_status = str(pending_state.get("status") or "")
             pending_taxonomy = str(pending_state.get("taxonomy") or "")
-            actions.append(
-                f"pending oid={self.state.pending_order_exchange_id} status={pending_status} taxonomy={pending_taxonomy}"
-            )
             if pending_taxonomy == "ACTIVE":
                 pending_alive = True
-            elif pending_taxonomy == "FILLED":
-                # Confirmed fill via get_order_state
-                return self._handle_confirmed_fill(actions)
             elif pending_taxonomy in ("CANCELED", "REJECTED", "EXPIRED"):
                 return self._freeze(
                     f"pending order unexpectedly {pending_taxonomy.lower()}"
@@ -741,6 +762,79 @@ class GoldenFiboEngine:
         self.state.cycle_id += 1
         return TickResult(state=self.state, actions=actions)
 
+    def reconcile_needs_recovery_pending_fill(self, actions: List[str]) -> TickResult:
+        """Explicit recovery path for a NEEDS_RECOVERY registration whose
+        pending logical ladder order is proven FILLED on the venue via the
+        fallback-aware lookup.
+
+        Steps:
+          1. Read live position via adapter.position_state.
+          2. Fallback-aware read of pending order state.
+          3. Confirm FILLED taxonomy + identity (client id / side / size).
+          4. Call _handle_confirmed_fill (promote Step(n), preserve identity in
+             step_orders, set fill_prices[n], update expected cumulative,
+             cancel old TP once, place new TP at NEW logical price + full live
+             position size, place Step(n+1)).
+          5. Set status back to RUNNING.
+
+        If the pending is NOT confirmed FILLED (still ACTIVE / missing /
+        CANCELLED / REJECTED), the registration stays NEEDS_RECOVERY and
+        returns a TickResult indicating "still needs recovery, pending not
+        proven filled" (no mutations).
+
+        Must NOT send START, must NOT create Step0, must NOT delete the
+        registration.
+        """
+        if self.state.pending_order_exchange_id is None:
+            return TickResult(state=self.state, actions=actions)
+        try:
+            position = self.adapter.position_state(
+                self.config.account, self.config.instrument
+            )
+        except Exception as exc:
+            return self._freeze(f"reconcile: position_state failed: {exc}")
+        live_size = _parse_size(position.get("size"))
+        if live_size <= 0 or position.get("side") not in ("long", "short"):
+            return TickResult(state=self.state, actions=actions)
+        pending_state = self._read_pending_order_state()
+        pending_taxonomy = str(pending_state.get("taxonomy") or "")
+        if pending_taxonomy != "FILLED":
+            return TickResult(state=self.state, actions=actions)
+        actions.append(
+            f"reconcile_needs_recovery: pending oid={self.state.pending_order_exchange_id} "
+            f"taxonomy=FILLED size={live_size}"
+        )
+        # Remember the pre-existing freeze markers so we can distinguish a
+        # freeze freshly set by the confirmed-fill handler from the prior
+        # placeholder.
+        pre_status = self.state.status
+        pre_freeze_reason = self.state.freeze_reason
+        result = self._handle_confirmed_fill(actions)
+        if result is None:
+            result = TickResult(state=self.state, actions=actions)
+        # Fresh freeze detection: the handler is considered to have frozen
+        # only if freeze_reason changed (or was set anew) during the call.
+        new_freeze = result.state.freeze_reason
+        new_status = result.state.status
+        handler_froze = (
+            new_status == STATUS_NEEDS_RECOVERY
+            and (new_freeze is not None)
+            and (new_freeze != pre_freeze_reason)
+        )
+        if handler_froze:
+            return result  # propagate fresh freeze
+        # Success: clear the pre-existing freeze placeholder and mark running.
+        result.state.status = STATUS_RUNNING
+        result.state.freeze_reason = None
+        # Pre-existing marker to record what we recovered (audit only).
+        if pre_status == STATUS_NEEDS_RECOVERY and pre_freeze_reason:
+            actions.append(
+                "reconcile_needs_recovery: cleared prior NEEDS_RECOVERY "
+                f"({pre_freeze_reason[:80]})"
+            )
+        actions.append("reconcile_needs_recovery: status -> RUNNING")
+        return result
+
     def _handle_cycle_end(self, actions: List[str]) -> TickResult:
         # Already flat and no pending — start fresh cycle
         return self._start_fresh_cycle(actions)
@@ -788,6 +882,65 @@ class GoldenFiboEngine:
             if st:
                 return st
         return {}
+
+    def _read_pending_order_state(self) -> Dict[str, Any]:
+        """Read the current pending ladder order state, tolerating the
+        single-order lookup's inability to see FILLED orders on some accounts.
+
+        Tries get_order_state(exchange_order_id) first. If that returns a
+        useful record, use it. If empty/unavailable and a persisted
+        pending_order_client_id exists, fall back to
+        get_order_state_by_client_id(client_id), which uses the bounded paging
+        surface that DOES see filled orders.
+
+        Identity validation on the fallback record: the returned order must
+        match the persisted client id, the expected strategy side, the
+        instrument, and the requested size. A mismatched record is NEVER
+        adopted (treated as not-found, so the caller reconciles rather than
+        promoting the wrong order).
+
+        Returns {} only when no usable record is found.
+        """
+        oid = self.state.pending_order_exchange_id
+        if oid is None:
+            return {}
+        try:
+            st = self.adapter.get_order_state(self.config.account, int(oid))
+        except Exception:
+            st = {}
+        if st:
+            return st
+        # Fallback: client-id lookup sees filled orders.
+        cid = self.state.pending_order_client_id
+        if cid is None:
+            return {}
+        try:
+            st = self.adapter.get_order_state_by_client_id(
+                self.config.account, self.config.instrument, int(cid)
+            )
+        except Exception:
+            return {}
+        if not st:
+            return {}
+        # Identity validation before adopting the fallback record.
+        expected_side = self.config.direction.lower()
+        rec_cid = st.get("client_order_index") or st.get("client_order_id")
+        try:
+            rec_cid_int = int(rec_cid) if rec_cid is not None else None
+        except (TypeError, ValueError):
+            rec_cid_int = None
+        if rec_cid_int != int(cid):
+            return {}
+        rec_side = str(st.get("side") or "").lower()
+        if rec_side and rec_side != expected_side:
+            return {}
+        # Requested size must match the persisted pending requested size.
+        expected_size = self.state.pending_requested_size
+        rec_size = self._decimal_or_none(st.get("requested_size") or st.get("size"))
+        if expected_size is not None and rec_size is not None:
+            if Decimal(str(expected_size)) != rec_size:
+                return {}
+        return st
 
     def _sync_tp_volume(self, live_size: Decimal, actions: List[str]) -> Optional[TickResult]:
         """Synchronize the shared TP VOLUME to the live position size at the

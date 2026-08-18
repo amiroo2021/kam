@@ -431,8 +431,6 @@ class PersistentFiboService:
                 return
             if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
                 return
-            if state.status != STATUS_RUNNING:
-                return
             cfg = self._config_for(key, state)
             adapter = self._adapter_for(key)
             from .golden_fibo.engine import GoldenFiboEngine
@@ -442,8 +440,17 @@ class PersistentFiboService:
                 adapter,
                 self._client_id_factory(key),
             )
+            pre_reconcile_status = state.status
+
         # Run the tick OUTSIDE the lock so callers can read/list concurrently.
-        result = engine.tick()
+        if pre_reconcile_status == STATUS_NEEDS_RECOVERY:
+            # Explicit recovery path: only when the pending logical ladder
+            # order is still persisted with a durable identity AND the
+            # fallback-aware venue lookup proves it FILLED. No normal tick
+            # mutations, no START, no Step0 creation.
+            result = engine.reconcile_needs_recovery_pending_fill([])
+        else:
+            result = engine.tick()
         with self._lock:
             # The engine mutates state in place; persist.
             self._states[key] = result.state
