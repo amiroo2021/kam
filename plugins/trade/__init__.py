@@ -1,37 +1,35 @@
-"""Hermes /trade plugin package.
+"""Hermes KAM trade plugin package — capability-aware bootstrap.
 
-This package provides the Telegram trading wizard (Phase 1):
-exchange-agnostic wizard + TradeDesk + x_<exchange>_agent.py
-exchange agents.
+This package is SHARED. It is installed whenever ANY KAM capability is
+installed (because both /trade and /fibo are Python packages whose
+modules live under ``plugins.trade.*``). The package marker itself is
+not capability-specific.
 
-The wizard's Telegram wiring lives in:
+Capability-aware slash-command registration:
 
-    plugins/trade/wizard.py        — exchange-agnostic state machine
-    plugins/trade/tradedesk.py     — exchange-agnostic dispatcher
-    plugins/trade/agents/          — per-exchange agent modules
-        x_hyperliquid_agent.py    — Hyperliquid agent (Phase 1)
+  --trade installed  -> /trade registered, /fibo NOT registered
+  --fibo installed   -> /fibo registered, /trade NOT registered
+  both installed     -> both registered
 
-The integration with the Telegram adapter is **direct** — the
-adapter imports ``plugins.trade.wizard.handle_trade_command`` and
-``handle_trade_callback`` from its own dispatch paths.
+The authoritative source is ``~/.hermes/kam/install_state.json``'s
+``capabilities`` map. This package's ``register`` function reads that
+manifest at registration time and registers only the commands for
+currently-installed capabilities.
 
-In addition, this plugin registers ``/trade`` as a slash command via
-``PluginContext.register_command`` so that the command appears in
-Telegram's native slash-command menu (the menu is built from
-``hermes_cli.commands._iter_plugin_command_entries``).  Telegram
-routing itself still goes through the adapter's direct dispatch, so
-the registered handler is only consulted on non-Telegram surfaces
-(CLI / other platforms), where it returns a short pointer to the
-Telegram wizard.
+This means a /fibo-only installation will NOT register /trade, and a
+/trade-only installation will NOT register /fibo — at the actual
+handler-registration layer, not just in Telegram's menu presentation.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# Slash-command handler (non-Telegram surfaces only)
+# Slash-command handlers (non-Telegram surfaces only)
 # ---------------------------------------------------------------------------
 
 
@@ -59,8 +57,8 @@ def _handle_trade_slash(raw_args: str) -> str:
 def _handle_fibo_slash(raw_args: str) -> str:
     """Non-Telegram fallback for ``/fibo``.
 
-    Mirrors ``/trade``: the real wizard lives on Telegram and is routed by the
-    Telegram adapter directly.
+    Mirrors ``/trade``: the real wizard lives on Telegram and is routed by
+    the Telegram adapter directly.
     """
     suffix = (raw_args or "").strip()
     if suffix:
@@ -75,40 +73,127 @@ def _handle_fibo_slash(raw_args: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Plugin registration
+# Capability manifest resolution (read-only)
 # ---------------------------------------------------------------------------
+
+
+def _resolve_hermes_home() -> Path:
+    """Resolve the Hermes home directory from environment or default."""
+    env = os.environ.get("HERMES_HOME")
+    if env and env.strip():
+        return Path(env).expanduser()
+    return Path.home() / ".hermes"
+
+
+def _load_installed_capabilities(hermes_home: Path) -> Dict[str, bool]:
+    """Read the authoritative install_state.json and return its capabilities.
+
+    Returns an empty mapping on any failure (missing file, malformed
+    JSON, or wrong schema). The caller treats missing-as-empty as
+    "no capabilities installed" and registers no commands.
+    """
+    try:
+        import json
+        path = Path(hermes_home) / "kam" / "install_state.json"
+        if not path.is_file():
+            return {}
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    caps = data.get("capabilities")
+    if not isinstance(caps, dict):
+        return {}
+    return {str(k): bool(v) for k, v in caps.items()}
+
+
+def _installed_capabilities() -> Dict[str, bool]:
+    """Read installed capabilities from the authoritative manifest."""
+    return _load_installed_capabilities(_resolve_hermes_home())
+
+
+# ---------------------------------------------------------------------------
+# Capability-aware registration
+# ---------------------------------------------------------------------------
+
+
+def _try_register_command(ctx: Any, name: str, handler: Any, description: str) -> bool:
+    """Register a slash command on the plugin context, if supported."""
+    register_cmd = getattr(ctx, "register_command", None)
+    if not callable(register_cmd):
+        return False
+    try:
+        register_cmd(
+            name,
+            handler=handler,
+            description=description,
+            args_hint="",
+        )
+    except Exception:
+        return False
+    return True
 
 
 def register(ctx: Any) -> None:
     """Register the plugin with the Hermes plugin manager.
 
-    Two side effects:
+    Capability-aware slash-command registration:
 
-    1. Discovers and enables this plugin so it appears in
-       ``hermes plugins list``.
-    2. Registers the ``/trade`` slash command so it surfaces in
-       Telegram's native slash-command menu.  The actual command
-       routing on Telegram continues to happen via the adapter's
-       direct dispatch path; this registration is purely so the
-       command is discoverable in the Telegram ``/`` menu.
+      - if ``capabilities.trade`` is True, register /trade.
+      - if ``capabilities.fibo`` is True, register /fibo.
+      - never register the other capability's command if it isn't installed.
+
+    This is the actual handler-registration layer (not just a menu
+    presentation). A /fibo-only installation does NOT register /trade,
+    and a /trade-only installation does NOT register /fibo.
+
+    If the install manifest is missing or unreadable, NO commands are
+    registered (the conservative-safe choice: don't expose a command
+    that hasn't been installed).
     """
-    register_cmd = getattr(ctx, "register_command", None)
-    if callable(register_cmd):
-        # Plugin API: name, handler, description, args_hint.
-        # No exchange names here — the wizard is exchange-agnostic and
-        # discovers ``x_<exchange>_agent.py`` modules at runtime.
-        register_cmd(
+    caps = _installed_capabilities()
+    if caps.get("trade"):
+        _try_register_command(
+            ctx,
             "trade",
             handler=_handle_trade_slash,
             description="Open the trading wizard",
-            args_hint="",
         )
-        register_cmd(
+    if caps.get("fibo"):
+        _try_register_command(
+            ctx,
             "fibo",
             handler=_handle_fibo_slash,
             description="Open the Fibo wizard",
-            args_hint="",
         )
 
 
-__all__ = ["register", "_handle_trade_slash", "_handle_fibo_slash"]
+# ---------------------------------------------------------------------------
+# Capability-aware registration for tests
+# ---------------------------------------------------------------------------
+
+
+def registered_commands() -> List[str]:
+    """Return the list of slash commands this installation would register.
+
+    Used by the modular installer tests to verify capability-aware
+    registration behavior without requiring a live Hermes gateway.
+    Returns an empty list if no capabilities are installed.
+    """
+    caps = _installed_capabilities()
+    out: List[str] = []
+    if caps.get("trade"):
+        out.append("trade")
+    if caps.get("fibo"):
+        out.append("fibo")
+    return out
+
+
+__all__ = [
+    "register",
+    "registered_commands",
+    "_handle_trade_slash",
+    "_handle_fibo_slash",
+]

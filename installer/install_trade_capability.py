@@ -35,8 +35,6 @@ from capabilities import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRADE_REL_PATHS = [
-    Path("plugins") / "trade" / "__init__.py",
-    Path("plugins") / "trade" / "tradedesk.py",
     Path("plugins") / "trade" / "wizard.py",
 ]
 

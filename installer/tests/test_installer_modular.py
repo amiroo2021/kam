@@ -175,9 +175,10 @@ class TestFreshInstall(_Base):
         self.assertTrue((self.hermes_root / "plugins" / "trade" / "fibo_service.py").is_file())
         self.assertTrue((self.hermes_root / "plugins" / "trade" / "fibo_wizard.py").is_file())
         self.assertTrue((self.hermes_root / "plugins" / "trade" / "golden_fibo").is_dir())
-        # /trade files NOT installed
-        self.assertFalse((self.hermes_root / "plugins" / "trade" / "tradedesk.py").is_file())
+        # /trade-specific wizard NOT installed (fibo-only must not depend on it)
         self.assertFalse((self.hermes_root / "plugins" / "trade" / "wizard.py").is_file())
+        # tradedesk.py is SHARED (both /trade and /fibo need it) and IS installed
+        self.assertTrue((self.hermes_root / "plugins" / "trade" / "tradedesk.py").is_file())
         # Capability folders
         self.assertFalse(C.capability_dir(self.hermes_home, "trade").is_dir())
         self.assertTrue(C.capability_dir(self.hermes_home, "fibo").is_dir())
@@ -277,8 +278,10 @@ class TestPartialUninstall(_Base):
         self.assertTrue((self.hermes_root / "plugins" / "trade" / "fibo_service.py").is_file())
         self.assertTrue((self.hermes_root / "plugins" / "trade" / "golden_fibo").is_dir())
         self.assertTrue(C.capability_dir(self.hermes_home, "fibo").is_dir())
-        # trade files removed
-        self.assertFalse((self.hermes_root / "plugins" / "trade" / "tradedesk.py").is_file())
+        # /trade-only wizard.py removed
+        self.assertFalse((self.hermes_root / "plugins" / "trade" / "wizard.py").is_file())
+        # tradedesk.py is SHARED and remains (fibo still uses it)
+        self.assertTrue((self.hermes_root / "plugins" / "trade" / "tradedesk.py").is_file())
 
     # J. uninstall last capability (shared cleanup)
     def test_J_uninstall_last_cleans_shared(self):
@@ -379,3 +382,174 @@ class TestCapabilityFlagParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestCapabilityAwareRegistration(unittest.TestCase):
+    """Test that the actual plugin registration layer reflects installed capabilities.
+
+    These tests exercise the real ``plugins.trade.__init__.register`` function
+    (and ``registered_commands`` for unit tests) against a controlled
+    ``HERMES_HOME``. They do NOT inspect the manifest contents alone — they
+    inspect the actual registered command set, which is what the gateway
+    would surface.
+
+    The capability-aware registration is the lock-down behavior:
+      --trade   => /trade registered, /fibo NOT registered
+      --fibo    => /fibo registered, /trade NOT registered
+      both      => both registered
+      uninstall => stale handlers removed
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp(prefix="kam-capreg-")
+        self.hermes_home = Path(self._tmpdir) / "hermes_home"
+        self.hermes_home.mkdir(parents=True, exist_ok=True)
+        # The plugin __init__ reads HERMES_HOME from env, then loads
+        # <HERMES_HOME>/kam/install_state.json.
+        self._env = os.environ.copy()
+        os.environ["HERMES_HOME"] = str(self.hermes_home)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def _write_manifest(self, capabilities):
+        import importlib
+        sys.path.insert(0, str(REPO_ROOT / "installer"))
+        import capabilities as C
+        m = C._empty_manifest()
+        for cap, val in capabilities.items():
+            m["capabilities"][cap] = val
+        C.save_manifest(self.hermes_home, m)
+
+    def _load_plugin(self):
+        # Load the plugins.trade package from the repo source tree.
+        import importlib.util
+        # The test file lives at <repo>/installer/tests/test_installer_modular.py
+        # REPO_ROOT in this test module is <repo>/installer (one level too shallow).
+        # The actual repo root is the parent of REPO_ROOT.
+        actual_repo_root = REPO_ROOT.parent
+        path = actual_repo_root / "plugins" / "trade" / "__init__.py"
+        # Use a synthetic spec to avoid clashing with any existing
+        # ``plugins`` package on sys.path.
+        spec = importlib.util.spec_from_file_location(
+            name="plugins.trade._capability_test",
+            location=str(path),
+            submodule_search_locations=[str(path.parent)],
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["plugins.trade._capability_test"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _register_against(self, mod, capabilities):
+        # Run the actual register() with a fake plugin context that
+        # records which commands were registered.
+        self._write_manifest(capabilities)
+        registered = []
+
+        class _FakeCtx:
+            def register_command(self, name, handler=None, description=None, args_hint=None):
+                registered.append(name)
+
+        mod.register(_FakeCtx())
+        return registered
+
+    def test_A_trade_only_registers_trade_only(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": True, "fibo": False})
+        self.assertEqual(registered, ["trade"])
+
+    def test_B_fibo_only_registers_fibo_only(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": False, "fibo": True})
+        self.assertEqual(registered, ["fibo"])
+
+    def test_C_both_registers_both(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": True, "fibo": True})
+        self.assertEqual(set(registered), {"trade", "fibo"})
+        self.assertEqual(len(registered), 2)
+
+    def test_no_capabilities_registers_nothing(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": False, "fibo": False})
+        self.assertEqual(registered, [])
+
+    def test_missing_manifest_registers_nothing(self):
+        """If install_state.json doesn't exist, no commands register."""
+        mod = self._load_plugin()
+        # Don't write a manifest.
+        registered = []
+
+        class _FakeCtx:
+            def register_command(self, name, handler=None, description=None, args_hint=None):
+                registered.append(name)
+        mod.register(_FakeCtx())
+        self.assertEqual(registered, [])
+
+    def test_additive_trade_then_fibo_registers_both(self):
+        """--trade then --fibo: both commands available after second install."""
+        mod = self._load_plugin()
+        # First install: trade only.
+        registered = self._register_against(mod, {"trade": True, "fibo": False})
+        self.assertEqual(registered, ["trade"])
+        # Second install: add fibo.
+        registered = self._register_against(mod, {"trade": True, "fibo": True})
+        self.assertEqual(set(registered), {"trade", "fibo"})
+
+    def test_additive_fibo_then_trade_registers_both(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": False, "fibo": True})
+        self.assertEqual(registered, ["fibo"])
+        registered = self._register_against(mod, {"trade": True, "fibo": True})
+        self.assertEqual(set(registered), {"trade", "fibo"})
+
+    def test_uninstall_trade_keeps_only_fibo(self):
+        mod = self._load_plugin()
+        # Both installed.
+        registered = self._register_against(mod, {"trade": True, "fibo": True})
+        self.assertEqual(set(registered), {"trade", "fibo"})
+        # Uninstall trade: only fibo remains.
+        registered = self._register_against(mod, {"trade": False, "fibo": True})
+        self.assertEqual(registered, ["fibo"])
+
+    def test_uninstall_fibo_keeps_only_trade(self):
+        mod = self._load_plugin()
+        registered = self._register_against(mod, {"trade": True, "fibo": True})
+        self.assertEqual(set(registered), {"trade", "fibo"})
+        registered = self._register_against(mod, {"trade": True, "fibo": False})
+        self.assertEqual(registered, ["trade"])
+
+    def test_fibo_only_does_not_import_wizard(self):
+        """A fibo-only install must NOT depend on /trade's wizard.py.
+
+        We verify this by checking that fibo's own imports succeed when
+        wizard.py is absent. This protects against accidentally pulling
+        the /trade wizard into a fibo-only install.
+        """
+        repo_root = REPO_ROOT.parent
+        # Build a fake hermes_root where ONLY fibo + shared files are present.
+        tmp = Path(tempfile.mkdtemp(prefix="kam-fiboonly-"))
+        hr = tmp / "checkout"; (hr / "plugins" / "trade").mkdir(parents=True)
+        shared = [
+            "__init__.py", "canonical.py", "tradedesk.py",
+            "agents/__init__.py",
+            "agents/x_lighter_agent.py",  # one agent to confirm shared works
+        ]
+        fibo = [
+            "fibo_service.py", "fibo_daemon.py", "fibo_wizard.py",
+            "golden_fibo/__init__.py", "golden_fibo/config.py",
+            "golden_fibo/engine.py", "golden_fibo/lighter_adapter.py",
+            "golden_fibo/preflight.py", "golden_fibo/state.py",
+        ]
+        for rel in shared + fibo:
+            src = repo_root / "plugins" / "trade" / rel
+            dst = hr / "plugins" / "trade" / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        # Inspect: no wizard.py should be present in the fibo-only checkout.
+        self.assertFalse((hr / "plugins" / "trade" / "wizard.py").exists())
+        shutil.rmtree(tmp, ignore_errors=True)

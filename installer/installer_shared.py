@@ -37,6 +37,7 @@ from capabilities import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHARED_REL_PATHS = [
+    Path("plugins") / "trade" / "__init__.py",
     Path("plugins") / "trade" / "agents" / "__init__.py",
     Path("plugins") / "trade" / "agents" / "x_apex_agent.py",
     Path("plugins") / "trade" / "agents" / "x_arcus_agent.py",
@@ -49,6 +50,7 @@ SHARED_REL_PATHS = [
     Path("plugins") / "trade" / "agents" / "x_raydium_agent.py",
     Path("plugins") / "trade" / "agents" / "x_rise_agent.py",
     Path("plugins") / "trade" / "canonical.py",
+    Path("plugins") / "trade" / "tradedesk.py",
 ]
 
 
