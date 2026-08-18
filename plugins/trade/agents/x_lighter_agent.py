@@ -3757,7 +3757,7 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
                     "client_order_index": submit_result.get("client_order_index"),
                     "market_index": int(market["market_id"]),
                     "symbol": requested_symbol,
-                    "is_ask": side == "sell",
+                    "is_ask": requested_side == "sell",
                     "filled_base_amount": str(_to_scaled_int(post_size, size_decimals)),
                     # No submitted price (market). The actual fill price
                     # is recovered later via get_order_state from the

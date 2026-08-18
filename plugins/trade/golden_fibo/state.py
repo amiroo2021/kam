@@ -23,6 +23,16 @@ ROLE_ENTRY = "entry"
 ROLE_LADDER = "ladder"
 ROLE_TP = "tp"
 
+# Durable submission phases. Once SUBMISSION_ATTEMPTED is persisted,
+# an exception/timeout/unknown response MUST NOT permit automatic
+# resubmission of the same logical order. The exchange must be
+# reconciled first.
+SUBMISSION_NOT_SUBMITTED = "not_submitted"
+SUBMISSION_PREPARED = "submission_prepared"
+SUBMISSION_ATTEMPTED = "submission_attempted"
+SUBMISSION_CONFIRMED = "confirmed"
+SUBMISSION_NEEDS_RECOVERY = "needs_recovery"
+
 
 @dataclass
 class GoldenFiboState:
@@ -70,6 +80,18 @@ class GoldenFiboState:
     pending_confirmed_size: Optional[Decimal] = None
     pending_order_role: Optional[str] = None  # ROLE_LADDER or ROLE_ENTRY
 
+    # Durable submission tracking. Written BEFORE the venue call so a
+    # crash mid-submission can never silently retry the same logical
+    # order. submission_client_id is deterministic per
+    # (registration_key, cycle_id, step, role) and persisted BEFORE
+    # the venue call.
+    submission_phase: str = SUBMISSION_NOT_SUBMITTED
+    submission_client_id: Optional[int] = None
+    submission_step: Optional[int] = None
+    submission_role: Optional[str] = None
+    submission_attempted_at: Optional[float] = None
+    submission_exchange_order_id: Optional[int] = None
+
     # status
     status: str = STATUS_NEVER_STARTED
     freeze_reason: Optional[str] = None
@@ -101,6 +123,12 @@ class GoldenFiboState:
             "pending_confirmed_price": None if self.pending_confirmed_price is None else str(self.pending_confirmed_price),
             "pending_confirmed_size": None if self.pending_confirmed_size is None else str(self.pending_confirmed_size),
             "pending_order_role": self.pending_order_role,
+            "submission_phase": self.submission_phase,
+            "submission_client_id": self.submission_client_id,
+            "submission_step": self.submission_step,
+            "submission_role": self.submission_role,
+            "submission_attempted_at": self.submission_attempted_at,
+            "submission_exchange_order_id": self.submission_exchange_order_id,
             "status": self.status,
             "freeze_reason": self.freeze_reason,
         }
@@ -133,6 +161,12 @@ class GoldenFiboState:
             pending_confirmed_price=None if data.get("pending_confirmed_price") is None else Decimal(str(data.get("pending_confirmed_price"))),
             pending_confirmed_size=None if data.get("pending_confirmed_size") is None else Decimal(str(data.get("pending_confirmed_size"))),
             pending_order_role=data.get("pending_order_role"),
+            submission_phase=str(data.get("submission_phase", SUBMISSION_NOT_SUBMITTED)),
+            submission_client_id=None if data.get("submission_client_id") is None else int(data.get("submission_client_id") or 0),
+            submission_step=None if data.get("submission_step") is None else int(data.get("submission_step") or 0),
+            submission_role=data.get("submission_role"),
+            submission_attempted_at=None if data.get("submission_attempted_at") is None else float(data.get("submission_attempted_at") or 0.0),
+            submission_exchange_order_id=None if data.get("submission_exchange_order_id") is None else int(data.get("submission_exchange_order_id") or 0),
             status=str(data.get("status", STATUS_NEVER_STARTED)),
             freeze_reason=data.get("freeze_reason"),
         )

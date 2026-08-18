@@ -54,6 +54,11 @@ from .golden_fibo.state import (
     STATUS_RUNNING,
     STATUS_STOPPING,
     STRATEGY_GOLDENFIBO,
+    SUBMISSION_ATTEMPTED,
+    SUBMISSION_CONFIRMED,
+    SUBMISSION_NEEDS_RECOVERY,
+    SUBMISSION_NOT_SUBMITTED,
+    SUBMISSION_PREPARED,
     GoldenFiboState,
 )
 from .golden_fibo.lighter_adapter import LighterGoldenFiboAdapter
@@ -252,11 +257,12 @@ class PersistentFiboService:
         start_thread: bool = True,
         ledger: Optional[FiboCycleLedger] = None,
     ) -> None:
-        # start_thread is accepted for backward compatibility with the
-        # retired counter-cascade service. The GoldenFibo service does
-        # not own a background poll thread — the daemon (fibo_daemon)
-        # drives _tick_once() from its own poll loop. The flag is
-        # therefore ignored.
+        # start_thread (default True) means the daemon expects the
+        # service to own and start its own background poll thread.
+        # fibo_daemon does not run its own poll loop — it constructs
+        # the service and then serves IPC. When start_thread is True,
+        # we start the poll thread automatically so the engine ticks
+        # without requiring the daemon to do anything special.
         # ledger is accepted for the same reason — if a constructed
         # FiboCycleLedger is passed (the old daemon signature), use it;
         # otherwise build one from ledger_path.
@@ -293,6 +299,11 @@ class PersistentFiboService:
 
         # Load persisted state on construction
         self._load_state()
+
+        # Auto-start the poll thread if requested. The daemon does not
+        # run its own poll loop, so the service must own ticking.
+        if start_thread:
+            self.start_polling()
 
     # ------------------------------------------------------------------
     # State IO
@@ -606,8 +617,20 @@ class PersistentFiboService:
                     raise _OppositeDirectionActive(opposite_key)
             if key in self._states:
                 state = self._states[key]
-                if state.status != STATUS_QUARANTINED_OLD_STRATEGY:
+                if state.status == STATUS_RUNNING:
                     return {"ok": False, "error": "DUPLICATE_REGISTRATION", "registration_key": key}
+                # STOPPING / NEEDS_RECOVERY / other non-quarantined records
+                # fall through to the lane preflight so the durable
+                # ownership record blocks the new START properly.
+
+        # Lane-not-flat preflight: before ANY fresh Step0, check the
+        # live venue lane + durable tombstones. If a prior tombstone
+        # exists on this lane, START must reconcile before creating a
+        # new registration. If the live venue shows a position on this
+        # lane, START is rejected.
+        preflight_error = self._lane_preflight(exchange, account, instrument, direction, key)
+        if preflight_error is not None:
+            return {"ok": False, **preflight_error}
 
         # Validate venue-level constraints via resolve_instrument
         try:
@@ -618,7 +641,17 @@ class PersistentFiboService:
             raise _InvalidInputs(f"instrument {instrument!r} not resolvable on {exchange}")
 
         # Check size constraints
-        min_size_raw = (instrument_meta or {}).get("min_base_amount")
+        # instrument_meta is a dict (flattened from CanonicalInstrument
+        # via the adapter's _get_payload helper). The CanonicalInstrument
+        # field is named "minimum_size" on the source side; legacy
+        # agents may surface "min_base_amount" instead. Accept both.
+        min_size_raw = (
+            (instrument_meta or {}).get("minimum_size")
+            if isinstance(instrument_meta, dict)
+            else None
+        )
+        if min_size_raw is None and isinstance(instrument_meta, dict):
+            min_size_raw = instrument_meta.get("min_base_amount")
         if min_size_raw is not None:
             try:
                 min_size = Decimal(str(min_size_raw))
@@ -688,13 +721,139 @@ class PersistentFiboService:
                 return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
             if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
                 return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION", "registration_key": key}
-            # Mark STOPPING and remove from active state.
-            # Per the spec: stop means stop robot operation. Do NOT
-            # auto-close the position. The user can manually close the
-            # position if they want.
+
+            # Determine whether this registration has unresolved ownership.
+            # A tombstone is required when any of the following is true:
+            #   - live owned position (expected_cumulative_size > 0)
+            #   - unresolved submission (submission_phase == ATTEMPTED)
+            #   - owned pending ladder (pending_order_exchange_id is not None)
+            #   - owned TP (current_tp_order_id is not None)
+            #   - NEEDS_RECOVERY status
+            has_position = Decimal(str(state.expected_cumulative_size or "0")) > 0
+            has_unresolved_submission = state.submission_phase == SUBMISSION_ATTEMPTED
+            has_owned_pending = state.pending_order_exchange_id is not None
+            has_owned_tp = state.current_tp_order_id is not None
+            is_needs_recovery = state.status == STATUS_NEEDS_RECOVERY
+
+            unresolved = (
+                has_position
+                or has_unresolved_submission
+                or has_owned_pending
+                or has_owned_tp
+                or is_needs_recovery
+            )
+
+            if unresolved:
+                # Preserve a durable tombstone so a later START on the
+                # same lane reconciles instead of blindly resubmitting.
+                # The record is marked STATUS_STOPPING so the engine
+                # cannot tick it further, but the ownership metadata
+                # is kept.
+                state.status = STATUS_STOPPING
+                state.freeze_reason = (
+                    f"tombstone_preserved: "
+                    f"has_position={has_position} "
+                    f"has_unresolved_submission={has_unresolved_submission} "
+                    f"has_owned_pending={has_owned_pending} "
+                    f"has_owned_tp={has_owned_tp} "
+                    f"needs_recovery={is_needs_recovery}"
+                )
+                self._save_state()
+                return {
+                    "ok": True,
+                    "registration_key": key,
+                    "status": "stopped_with_tombstone",
+                    "tombstone": True,
+                    "has_position": has_position,
+                    "has_unresolved_submission": has_unresolved_submission,
+                    "has_owned_pending": has_owned_pending,
+                    "has_owned_tp": has_owned_tp,
+                    "needs_recovery": is_needs_recovery,
+                }
+
+            # Truly flat/no-order registration can be cleanly removed.
             self._states.pop(key, None)
             self._save_state()
         return {"ok": True, "registration_key": key, "status": "stopped"}
+
+    def _lane_preflight(
+        self,
+        exchange: str,
+        account: str,
+        instrument: str,
+        direction: str,
+        key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Preflight before any fresh Step0.
+
+        Rejects when:
+        - A tombstone (stopped-with-tombstone) exists on this lane.
+        - A prior non-quarantined record on this lane has unresolved
+          ownership (submission attempted / owned pending / owned TP /
+          needs_recovery).
+        - The live venue shows a position on this lane (read via
+          position_state).
+
+        Returns None when the lane is clear, otherwise an error dict.
+        """
+        # Tombstone check: prior STOP left a tombstone on this lane.
+        with self._lock:
+            for existing_key, existing_state in list(self._states.items()):
+                same_lane = (
+                    existing_state.exchange == exchange
+                    and existing_state.account == account
+                    and existing_state.instrument == instrument
+                )
+                if not same_lane:
+                    continue
+                if existing_state.status == STATUS_STOPPING:
+                    return {
+                        "error": "LANE_TOMBSTONE",
+                        "registration_key": existing_key,
+                        "detail": (
+                            "A prior stopped registration left a tombstone on this lane. "
+                            "Reconcile before starting a new registration."
+                        ),
+                    }
+                # Unresolved ownership on a same-direction lane record.
+                if existing_key == key and existing_state.status != STATUS_QUARANTINED_OLD_STRATEGY:
+                    has_position = Decimal(str(existing_state.expected_cumulative_size or "0")) > 0
+                    has_unresolved = existing_state.submission_phase == SUBMISSION_ATTEMPTED
+                    has_owned_pending = existing_state.pending_order_exchange_id is not None
+                    has_owned_tp = existing_state.current_tp_order_id is not None
+                    is_needs_recovery = existing_state.status == STATUS_NEEDS_RECOVERY
+                    if has_position or has_unresolved or has_owned_pending or has_owned_tp or is_needs_recovery:
+                        return {
+                            "error": "LANE_NOT_FLAT",
+                            "registration_key": existing_key,
+                            "has_position": has_position,
+                            "has_unresolved_submission": has_unresolved,
+                            "has_owned_pending": has_owned_pending,
+                            "has_owned_tp": has_owned_tp,
+                            "needs_recovery": is_needs_recovery,
+                        }
+
+        # Live venue check: read position_state for the lane.
+        try:
+            position = self._adapter_for(key).position_state(account, instrument)
+        except Exception:
+            position = None
+        if isinstance(position, dict):
+            live_size_raw = position.get("size")
+            try:
+                live_size = Decimal(str(live_size_raw or "0"))
+            except Exception:
+                live_size = Decimal("0")
+            if live_size > 0:
+                return {
+                    "error": "LANE_NOT_FLAT",
+                    "registration_key": key,
+                    "detail": (
+                        f"Live venue shows position size {live_size} on {exchange}/{account}/{instrument}. "
+                        "START rejected; reconcile before creating a new registration."
+                    ),
+                }
+        return None
 
     def _cmd_preview(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Return the derived V0..V20 + cumulative exposure for a step0."""

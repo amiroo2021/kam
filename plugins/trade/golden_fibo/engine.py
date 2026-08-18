@@ -18,6 +18,8 @@ service does this).
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,6 +37,11 @@ from plugins.trade.golden_fibo.state import (
     ROLE_TP,
     STATUS_NEEDS_RECOVERY,
     STATUS_RUNNING,
+    SUBMISSION_ATTEMPTED,
+    SUBMISSION_CONFIRMED,
+    SUBMISSION_NEEDS_RECOVERY,
+    SUBMISSION_NOT_SUBMITTED,
+    SUBMISSION_PREPARED,
     GoldenFiboState,
 )
 
@@ -167,31 +174,61 @@ class GoldenFiboEngine:
     # Case A: start a new cycle
     # ------------------------------------------------------------------
     def _start_fresh_cycle(self, actions: List[str]) -> TickResult:
-        # Issue market Step0
-        size = self.config.step0_volume
-        client_id = self._next_client_id()
-        order_side = self.config.direction.lower()  # "buy" or "sell"
-        try:
-            # Snap, then write state, then submit
-            self.state.cycle_id += 1
-            self.state.next_step = 0
-            self.state.highest_filled_step = -1
-            self.state.fill_prices = {}
-            self.state.expected_cumulative_size = Decimal("0")
-            self.state.current_tp_price = None
-            self.state.current_tp_order_id = None
-            self.state.current_tp_client_id = None
-            self.state.current_tp_role = None
-            self.state.pending_order_client_id = client_id
-            self.state.pending_order_exchange_id = None
-            self.state.pending_requested_price = None
-            self.state.pending_requested_size = size
-            self.state.pending_confirmed_price = None
-            self.state.pending_confirmed_size = None
-            self.state.pending_order_role = ROLE_ENTRY
-            self.state.status = STATUS_RUNNING
-            self.state.freeze_reason = None
+        """Issue market Step0 with durable submission tracking.
 
+        Invariant: once SUBMISSION_ATTEMPTED is persisted, an exception
+        or unknown response MUST NOT permit automatic resubmission of
+        the same logical Step0. The exchange must be reconciled first.
+
+        If we re-enter this path with a prior SUBMISSION_ATTEMPTED
+        still unresolved, we freeze instead of resubmitting.
+        """
+        # Guard: never resubmit an already-attempted Step0.
+        if self.state.submission_phase == SUBMISSION_ATTEMPTED:
+            return self._freeze(
+                "Step0 already attempted (submission_attempted persisted); "
+                "reconcile exchange state before any resubmission"
+            )
+
+        size = self.config.step0_volume
+        order_side = self.config.direction.lower()  # "buy" or "sell"
+
+        # Deterministic client identity per (registration, cycle, step, role).
+        # Computed ONCE per logical Step0 and persisted BEFORE the venue call.
+        # Never regenerated on retry/recovery for the same logical order.
+        client_id = self._next_client_id()
+
+        # PREPARE: persist everything BEFORE the venue call.
+        self.state.cycle_id += 1
+        self.state.next_step = 0
+        self.state.highest_filled_step = -1
+        self.state.fill_prices = {}
+        self.state.expected_cumulative_size = Decimal("0")
+        self.state.current_tp_price = None
+        self.state.current_tp_order_id = None
+        self.state.current_tp_client_id = None
+        self.state.current_tp_role = None
+        self.state.pending_order_client_id = client_id
+        self.state.pending_order_exchange_id = None
+        self.state.pending_requested_price = None
+        self.state.pending_requested_size = size
+        self.state.pending_confirmed_price = None
+        self.state.pending_confirmed_size = None
+        self.state.pending_order_role = ROLE_ENTRY
+        self.state.status = STATUS_RUNNING
+        self.state.freeze_reason = None
+        self.state.submission_phase = SUBMISSION_PREPARED
+        self.state.submission_client_id = client_id
+        self.state.submission_step = 0
+        self.state.submission_role = ROLE_ENTRY
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
+
+        # ATTEMPT: persist immediately before dispatch.
+        self.state.submission_phase = SUBMISSION_ATTEMPTED
+        self.state.submission_attempted_at = time.time()
+
+        try:
             submit = self.adapter.place_market(
                 account=self.config.account,
                 instrument=self.config.instrument,
@@ -200,12 +237,20 @@ class GoldenFiboEngine:
                 client_order_id=client_id,
             )
         except Exception as exc:
-            return self._freeze(f"place_market Step0 failed: {exc}")
+            # Submission was attempted; result unknown. NEVER auto-retry.
+            self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
+            return self._freeze(
+                f"place_market Step0 attempted but result unknown: {exc}. "
+                f"Reconcile exchange before any resubmission."
+            )
 
+        # CONFIRMED: submission accepted by venue.
+        self.state.submission_phase = SUBMISSION_CONFIRMED
         actions.append(f"Step0 MARKET submit={submit}")
         exchange_oid = submit.get("exchange_order_id")
         if exchange_oid is not None:
             self.state.pending_order_exchange_id = int(exchange_oid)
+            self.state.submission_exchange_order_id = int(exchange_oid)
         self.state.pending_confirmed_size = submit.get("submitted_volume") or str(size)
         return TickResult(state=self.state, actions=actions)
 
@@ -226,6 +271,14 @@ class GoldenFiboEngine:
         self.state.pending_requested_size = None
         self.state.pending_confirmed_price = None
         self.state.pending_confirmed_size = None
+        # Step0 confirmed; clear durable submission tracking so the
+        # next logical order (TP, ladder) gets its own fresh record.
+        self.state.submission_phase = SUBMISSION_NOT_SUBMITTED
+        self.state.submission_client_id = None
+        self.state.submission_step = None
+        self.state.submission_role = None
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
 
     def place_step0_tp_and_step1(self, p0: Decimal) -> Optional[TickResult]:
         """Place the shared TP0 and the Step1 LIMIT. Returns TickResult
@@ -258,6 +311,18 @@ class GoldenFiboEngine:
         tp_size = self.config.cumulative_volume(self.state.highest_filled_step)
         # tp is opposite side, reduce_only
         opposite = "sell" if self.config.direction == "BUY" else "buy"
+
+        # Guard: never resubmit an already-attempted TP for this step.
+        if (
+            self.state.submission_phase == SUBMISSION_ATTEMPTED
+            and self.state.submission_role == ROLE_TP
+            and self.state.submission_step == self.state.highest_filled_step
+        ):
+            return self._freeze(
+                f"TP for step {self.state.highest_filled_step} already attempted; "
+                "reconcile exchange state before any resubmission"
+            )
+
         tp_client_id = self._next_client_id()
 
         # Cancel old TP first (if any)
@@ -274,6 +339,16 @@ class GoldenFiboEngine:
             self.state.current_tp_client_id = None
             self.state.current_tp_role = None
 
+        # PREPARE + ATTEMPT durable record for the TP submission.
+        self.state.submission_phase = SUBMISSION_PREPARED
+        self.state.submission_client_id = tp_client_id
+        self.state.submission_step = self.state.highest_filled_step
+        self.state.submission_role = ROLE_TP
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
+        self.state.submission_phase = SUBMISSION_ATTEMPTED
+        self.state.submission_attempted_at = time.time()
+
         try:
             submit = self.adapter.place_limit(
                 account=self.config.account,
@@ -285,7 +360,16 @@ class GoldenFiboEngine:
                 reduce_only=True,
             )
         except Exception as exc:
-            return self._freeze(f"place TP failed: {exc}")
+            self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
+            return self._freeze(
+                f"place TP attempted but result unknown: {exc}. "
+                f"Reconcile exchange before any resubmission."
+            )
+
+        self.state.submission_phase = SUBMISSION_CONFIRMED
+        self.state.submission_exchange_order_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
 
         self.state.current_tp_price = tp_price
         self.state.current_tp_client_id = tp_client_id
@@ -318,8 +402,30 @@ class GoldenFiboEngine:
         next_price = golden_fibo_next_ladder_price(self.config.direction, pk, tpk)
         next_size = self.config.volume(next_n)
 
+        # Guard: never resubmit an already-attempted ladder for this step.
+        if (
+            self.state.submission_phase == SUBMISSION_ATTEMPTED
+            and self.state.submission_role == ROLE_LADDER
+            and self.state.submission_step == next_n
+        ):
+            return self._freeze(
+                f"ladder step{next_n} already attempted; "
+                "reconcile exchange state before any resubmission"
+            )
+
         client_id = self._next_client_id()
         order_side = self.config.direction.lower()
+
+        # PREPARE + ATTEMPT durable record for the ladder submission.
+        self.state.submission_phase = SUBMISSION_PREPARED
+        self.state.submission_client_id = client_id
+        self.state.submission_step = next_n
+        self.state.submission_role = ROLE_LADDER
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
+        self.state.submission_phase = SUBMISSION_ATTEMPTED
+        self.state.submission_attempted_at = time.time()
+
         try:
             submit = self.adapter.place_limit(
                 account=self.config.account,
@@ -331,7 +437,16 @@ class GoldenFiboEngine:
                 reduce_only=False,
             )
         except Exception as exc:
-            return self._freeze(f"place ladder step{next_n} failed: {exc}")
+            self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
+            return self._freeze(
+                f"place ladder step{next_n} attempted but result unknown: {exc}. "
+                f"Reconcile exchange before any resubmission."
+            )
+
+        self.state.submission_phase = SUBMISSION_CONFIRMED
+        self.state.submission_exchange_order_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
 
         self.state.pending_order_client_id = client_id
         self.state.pending_order_exchange_id = (

@@ -25,12 +25,59 @@ def _is_success(resp: Any) -> bool:
 
 
 def _get_payload(resp: Any) -> Dict[str, Any]:
-    """Best-effort payload extraction from the canonical response."""
+    """Best-effort payload extraction from the canonical response.
+
+    The canonical response stores payload fields directly on the
+    response object (instrument, order, position, etc.). This helper
+    returns a dict with the keys callers expect, populated from the
+    response attributes when present.
+
+    Objects that expose a ``to_dict()`` method are flattened into a
+    dict (preserving nested structure) so callers can use uniform
+    dict-style access. Lists (positions, order_groups, order_states)
+    are similarly flattened element-wise.
+    """
+    if resp is None:
+        return {}
+    out: Dict[str, Any] = {}
+
+    def _flatten(value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+            try:
+                return value.to_dict()
+            except Exception:
+                return None
+        if isinstance(value, list):
+            return [_flatten(v) for v in value]
+        return value
+
+    for key in (
+        "instrument",
+        "market_price",
+        "order",
+        "position",
+        "order_state",
+        "order_history",
+        "order_states",
+        "ladder",
+        "cancel_group",
+        "balance",
+        "portfolio_summary",
+        "positions",
+        "order_groups",
+    ):
+        val = getattr(resp, key, None)
+        if val is None:
+            continue
+        flat = _flatten(val)
+        if flat is not None:
+            out[key] = flat
     payload = getattr(resp, "payload", None)
     if isinstance(payload, dict):
-        return payload
-    # Fallback: look on the response object for matching attributes
-    return {}
+        out.update(payload)
+    return out
 
 
 class LighterGoldenFiboAdapter:
@@ -67,7 +114,8 @@ class LighterGoldenFiboAdapter:
             raise RuntimeError(
                 f"position_state failed: {getattr(resp, 'error', None)}"
             )
-        return _get_payload(resp).get("position") or {}
+        positions = _get_payload(resp).get("positions") or []
+        return positions[0] if positions else {}
 
     def get_order_state(self, account: str, order_index: int) -> Dict[str, Any]:
         resp = lighter_agent.execute({
@@ -78,7 +126,7 @@ class LighterGoldenFiboAdapter:
         if not _is_success(resp):
             # Treat missing order as empty state
             return {}
-        return _get_payload(resp).get("order_state") or {}
+        return _get_payload(resp).get("order_state") or _get_payload(resp).get("order") or {}
 
     # ------------------------------------------------------------------
     # Order placement
