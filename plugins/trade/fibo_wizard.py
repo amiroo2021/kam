@@ -1,22 +1,46 @@
-"""Telegram /fibo wizard/controller.
+"""Telegram /fibo wizard — GoldenFibo v1.
 
-This module is UI only. It sends standardized commands to the persistent
-Fibo service and renders responses. It does not discover Linux processes,
-launch shell commands, or implement strategy/exchange logic.
+Wizard flow:
+  ▶️ Start Fibo
+  → Exchange (Lighter only for v1)
+  → Account (discovered from the configured x_<exchange>_agent.py)
+  → Instrument (selection or manual input)
+  → BUY / SELL
+  → Percentage
+  → Step0 Volume (default 0.01)
+  → Review (showing V0..V20 + cumulative exposure)
+  → START
+  🔵 Running Fibo  → LIST / DETAIL
+  🛑 STOP Fibo     → STOP a single registration
+
+The wizard is purely UI. Strategy math lives in `plugins.trade.golden_fibo.config`.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 from urllib.parse import quote, unquote
 
 from .tradedesk import TradeDesk, get_tradedesk
-from .fibo_service import FiboServiceProtocol, get_fibo_service
+from .fibo_service import (
+    FiboServiceProtocol,
+    SUPPORTED_EXCHANGES,
+    get_fibo_service,
+)
+from .golden_fibo.config import (
+    golden_fibo_cumulative_volume,
+    golden_fibo_volume,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Button labels
+# ---------------------------------------------------------------------------
 BUTTON_EXIT = ("✕ Exit", "exit")
 BUTTON_BACK = ("◀️ Back", "back")
 BUTTON_REFRESH = ("🔄 Refresh", "refresh")
@@ -24,24 +48,25 @@ BUTTON_START = ("▶️ Start Fibo", "menu:start")
 BUTTON_RUNNING = ("🔵 Running Fibo", "menu:running")
 BUTTON_STOP = ("🛑 STOP Fibo", "menu:stop")
 BUTTON_CONFIRM_START = ("▶️ Start Fibo", "confirm_start")
-BUTTON_CONFIRM_STOP_CLOSE = ("🛑 STOP & CLOSE", "confirm_stop_close")
 BUTTON_CANCEL = ("Cancel", "back")
-BUTTON_SYMBOL_BTC = ("BTC", "symbol:BTC")
-BUTTON_SYMBOL_ETH = ("ETH", "symbol:ETH")
-BUTTON_SYMBOL_XAU = ("XAU", "symbol:XAU")
-BUTTON_SYMBOL_ONDO = ("ONDO", "symbol:ONDO")
-BUTTON_OTHER_SYMBOL = ("Other...", "symbol:other")
-BUTTON_COUNTER_BUY = ("Counter BUY", "counter_side:counterBUY")
-BUTTON_COUNTER_SELL = ("Counter SELL", "counter_side:counterSELL")
+BUTTON_BUY = ("BUY", "direction:BUY")
+BUTTON_SELL = ("SELL", "direction:SELL")
+BUTTON_OTHER_SYMBOL = ("Other instrument...", "instrument:other")
+BUTTON_DEFAULT_STEP0 = ("0.01", "step0:0.01")
+BUTTON_DEFAULT_STEP0_BTC = ("0.0001", "step0:0.0001")
 
-_DEFAULT_DIVIDE_PERCENT = 100.0
-_DEFAULT_COUNTER1 = 1.3
-_DEFAULT_COUNTER2 = 0.8
-_DEFAULT_COUNTER3 = 0.5
-_DEFAULT_COUNTER4 = 0.3
-_DEFAULT_POLL_SECONDS = 2.0
+_DEFAULT_PERCENTAGE = "0.01"
+_DEFAULT_STEP0_VOLUME = "0.01"
+_DEFAULT_BTC_STEP0_VOLUME = "0.0001"
+
+# Common instruments that the user can pick quickly. Lighter typically
+# supports these; the wizard also allows manual input.
+_QUICK_INSTRUMENTS = ("BTC", "ETH", "SOL", "HYPE", "ONDO")
 
 
+# ---------------------------------------------------------------------------
+# Screen + state
+# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Screen:
     text: str
@@ -55,19 +80,100 @@ class WizardState:
     exchange: Optional[str] = None
     account: Optional[str] = None
     instrument: Optional[str] = None
-    counter_side: Optional[str] = None
+    direction: Optional[str] = None
+    percentage: Optional[str] = None
+    step0_volume: Optional[str] = None
     registration_key: Optional[str] = None
-    start_params: Dict[str, Any] = field(default_factory=dict)
 
 
 class TelegramAdapter(Protocol):
     async def send_inline_keyboard(self, *, chat_id, text, buttons, callback_prefix, metadata=None): ...
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _button(label: str, data: str) -> Dict[str, str]:
+    return {"text": label, "callback_data": data}
+
+
+def _percent_label(p: str) -> str:
+    try:
+        return f"{Decimal(p) * 100:.2f}%"
+    except Exception:
+        return p
+
+
+def _vol_label(v: str) -> str:
+    try:
+        return f"{Decimal(v):.4f}".rstrip("0").rstrip(".")
+    except Exception:
+        return v
+
+
+def _validate_percentage(s: str) -> Optional[str]:
+    try:
+        d = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+    if d <= 0:
+        return None
+    return str(d)
+
+
+def _validate_step0_volume(s: str) -> Optional[str]:
+    try:
+        d = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+    if d <= 0:
+        return None
+    return str(d)
+
+
+def _validate_direction(s: str) -> Optional[str]:
+    s = s.strip().upper()
+    if s in ("BUY", "SELL"):
+        return s
+    return None
+
+
+def _account_aliases_for_exchange(tradedesk: TradeDesk, exchange: str) -> List[str]:
+    """Discover configured account aliases for the given exchange."""
+    try:
+        names = tradedesk.list_accounts(exchange=exchange) or []
+    except Exception:
+        names = []
+    if not names:
+        prefix = f"{exchange.upper()}_"
+        seen = []
+        for k in sorted(__import__("os").environ.keys()):
+            ks = str(k)
+            if ks.startswith(prefix) and "_CHAIN" in ks:
+                rest = ks[len(prefix):]
+                alias = rest.split("_")[0]
+                if alias and alias not in seen:
+                    seen.append(alias)
+        names = seen
+    return [str(n) for n in names]
+
+
+def _supported_exchanges(tradedesk: TradeDesk) -> List[str]:
+    """Return the exchanges that support GoldenFibo. v1: Lighter only."""
+    return list(SUPPORTED_EXCHANGES)
+
+
+# ---------------------------------------------------------------------------
+# Wizard
+# ---------------------------------------------------------------------------
 class FiboWizard:
     CALLBACK_SEP = ":"
 
-    def __init__(self, tradedesk: Optional[TradeDesk] = None, service: Optional[FiboServiceProtocol] = None) -> None:
+    def __init__(
+        self,
+        tradedesk: Optional[TradeDesk] = None,
+        service: Optional[FiboServiceProtocol] = None,
+    ) -> None:
         self._desk = tradedesk or get_tradedesk()
         self._service = service or get_fibo_service()
         self._states: Dict[Tuple[Any, ...], WizardState] = {}
@@ -75,584 +181,467 @@ class FiboWizard:
     def reset(self, chat_key: Tuple[Any, ...]) -> None:
         self._states.pop(chat_key, None)
 
+    def _state_for(self, chat_key: Tuple[Any, ...]) -> WizardState:
+        s = self._states.get(chat_key)
+        if s is None:
+            s = WizardState()
+            self._states[chat_key] = s
+        return s
+
+    def _set_state(self, s: WizardState, screen: Screen) -> Screen:
+        """Update the wizard state to match the screen state.
+
+        Every render/on-handler must call this so the wizard's
+        WizardState stays in sync with the latest navigated screen.
+        """
+        s.state = screen.state
+        return screen
+
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
     def open(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "main_menu"
+        s = self._state_for(chat_key)
+        s.state = "main_menu"
+        for k in (
+            "exchange", "account", "instrument", "direction",
+            "percentage", "step0_volume",
+        ):
+            setattr(s, k, None)
         return Screen(
-            text="🧬 Fibo Robot",
+            text="🧬 GoldenFibo Robot\n\nChoose an action:",
             buttons=[
                 [_button(*BUTTON_START)],
                 [_button(*BUTTON_RUNNING)],
                 [_button(*BUTTON_STOP)],
                 [_button(*BUTTON_EXIT)],
             ],
-            state=state.state,
+            state=s.state,
         )
 
     def handle_callback(self, chat_key: Tuple[Any, ...], data: str) -> Screen:
-        state = self._state_for(chat_key)
+        s = self._state_for(chat_key)
         raw = str(data or "")
         if raw == "exit":
             self.reset(chat_key)
-            return Screen(text="Fibo closed.", buttons=[], state="closed")
-        if raw == "refresh" and state.state == "running_detail":
-            return self._render_running_detail(chat_key)
-        if state.state == "main_menu":
-            return self._handle_main_menu(chat_key, raw)
-        if state.state == "select_exchange":
-            return self._handle_select_exchange(chat_key, raw)
-        if state.state == "select_account":
-            return self._handle_select_account(chat_key, raw)
-        if state.state == "select_instrument":
-            return self._handle_select_instrument(chat_key, raw)
-        if state.state == "awaiting_instrument":
-            return self._render_message("Type Instrument", state.state)
-        if state.state == "select_counter_side":
-            return self._handle_select_counter_side(chat_key, raw)
-        if state.state in {
-            "awaiting_divide_percent",
-            "awaiting_counter1",
-            "awaiting_counter2",
-            "awaiting_counter3",
-            "awaiting_counter4",
-        }:
-            return self._handle_numeric_callback(chat_key, raw)
-        if state.state == "review_start":
-            return self._handle_review(chat_key, raw)
-        if state.state == "running_list":
-            return self._handle_running_list(chat_key, raw)
-        if state.state == "running_detail":
-            if raw == "back":
-                return self._render_running_list(chat_key)
-            return self._render_running_detail(chat_key)
-        if state.state == "stop_list":
-            return self._handle_stop_list(chat_key, raw)
-        if state.state == "stop_confirm":
-            return self._handle_stop_confirm(chat_key, raw)
+            return Screen(text="GoldenFibo closed.", buttons=[], state="closed")
+        if raw == "back":
+            return self._set_state(s, self._back(chat_key, s))
+        if raw == "menu:start":
+            return self._set_state(s, self._render_exchange(chat_key, s))
+        if raw == "menu:running":
+            return self._set_state(s, self._render_running(chat_key, s))
+        if raw == "menu:stop":
+            return self._set_state(s, self._render_stop_pick(chat_key, s))
+        if raw.startswith("refresh") and s.state == "running_detail":
+            return self._set_state(s, self._render_running_detail(chat_key, s, reg_key=s.registration_key))
+        if raw.startswith("exchange:"):
+            return self._set_state(s, self._on_exchange(chat_key, s, raw.split(":", 1)[1]))
+        if raw.startswith("account:"):
+            return self._set_state(s, self._on_account(chat_key, s, raw.split(":", 1)[1]))
+        if raw.startswith("instrument:"):
+            return self._set_state(s, self._on_instrument(chat_key, s, raw.split(":", 1)[1]))
+        if raw.startswith("direction:"):
+            return self._set_state(s, self._on_direction(chat_key, s, raw.split(":", 1)[1]))
+        if raw.startswith("step0:"):
+            return self._set_state(s, self._on_step0_pick(chat_key, s, raw.split(":", 1)[1]))
+        if raw == "confirm_start":
+            return self._set_state(s, self._on_confirm_start(chat_key, s))
+        if raw.startswith("start_detail:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_running_detail(chat_key, s, reg_key=reg))
+        if raw.startswith("stop_pick:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_stop_confirm(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_stop:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._on_stop(chat_key, s, reg_key=reg))
         return self.open(chat_key)
 
     def handle_text(self, chat_key: Tuple[Any, ...], text: str) -> Screen:
-        state = self._state_for(chat_key)
-        cleaned = str(text or "").strip()
-        if state.state == "awaiting_instrument":
-            if not cleaned:
-                return self._render_message("Invalid instrument.", state.state)
-            state.instrument = cleaned.upper()
-            return self._render_counter_side(chat_key)
-        if state.state in {
-            "awaiting_divide_percent",
-            "awaiting_counter1",
-            "awaiting_counter2",
-            "awaiting_counter3",
-            "awaiting_counter4",
-        }:
-            try:
-                value = float(cleaned)
-            except ValueError:
-                return self._render_message("Invalid number. Please enter a numeric value.", state.state)
-            if value < 0:
-                return self._render_message("Value must be >= 0.", state.state)
-            field_name = {
-                "awaiting_divide_percent": "divide_percent",
-                "awaiting_counter1": "counter1",
-                "awaiting_counter2": "counter2",
-                "awaiting_counter3": "counter3",
-                "awaiting_counter4": "counter4",
-            }[state.state]
-            state.start_params[field_name] = value
-            return self._advance_after_numeric(chat_key, field_name)
+        s = self._state_for(chat_key)
+        value = (text or "").strip()
+        if s.state == "main_menu":
+            return self._set_state(s, self.open(chat_key))
+        if s.state == "exchange":
+            return self._set_state(s, self._on_exchange(chat_key, s, value))
+        if s.state == "account":
+            return self._set_state(s, self._on_account(chat_key, s, value))
+        if s.state == "instrument":
+            if value.lower() == "other":
+                return self._set_state(s, self._render_instrument_input(chat_key, s))
+            return self._set_state(s, self._on_instrument(chat_key, s, value))
+        if s.state == "instrument_input":
+            return self._set_state(s, self._on_instrument(chat_key, s, value))
+        if s.state == "direction":
+            return self._set_state(s, self._on_direction(chat_key, s, value))
+        if s.state == "percentage":
+            return self._set_state(s, self._on_percentage(chat_key, s, value))
+        if s.state == "step0_volume":
+            return self._set_state(s, self._on_step0_volume(chat_key, s, value))
+        if s.state == "review":
+            return self._set_state(s, self._on_review_text(chat_key, s, value))
         return self.open(chat_key)
 
-    def _handle_main_menu(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "menu:start":
-            return self._render_exchange_select(chat_key)
-        if suffix == "menu:running":
-            return self._render_running_list(chat_key)
-        if suffix == "menu:stop":
-            return self._render_stop_list(chat_key)
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+    def _back(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        if s.state == "review":
+            return self._render_step0_volume(chat_key, s)
+        if s.state == "step0_volume":
+            return self._render_percentage(chat_key, s)
+        if s.state == "percentage":
+            return self._render_direction(chat_key, s)
+        if s.state == "direction":
+            return self._render_instrument(chat_key, s)
+        if s.state == "instrument_input":
+            return self._render_instrument(chat_key, s)
+        if s.state == "instrument":
+            return self._render_account(chat_key, s)
+        if s.state == "account":
+            return self._render_exchange(chat_key, s)
+        if s.state in ("running_detail", "stop_confirm"):
+            return self._render_running(chat_key, s)
         return self.open(chat_key)
 
-    def _render_exchange_select(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "select_exchange"
-        rows = [[_button(self._pretty_exchange(ex), f"exchange:{ex}")] for ex in self._desk.list_exchanges()]
-        rows.append([_button(*BUTTON_BACK), _button(*BUTTON_EXIT)])
-        return Screen(text="🧬 Start Fibo\n\nSelect Exchange", buttons=rows, state=state.state)
-
-    def _handle_select_exchange(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self.open(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "exchange" or not value:
-            return self._render_exchange_select(chat_key)
-        state = self._state_for(chat_key)
-        state.exchange = value
-        state.state = "select_account"
-        rows = [[_button(str(acc), f"account:{acc}")] for acc in self._desk.list_accounts(value)]
-        rows.append([_button(*BUTTON_BACK), _button(*BUTTON_EXIT)])
+    # ------------------------------------------------------------------
+    # Renderers
+    # ------------------------------------------------------------------
+    def _render_exchange(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        options = _supported_exchanges(self._desk)
+        buttons = [[_button(ex.upper(), f"exchange:{ex}")] for ex in options]
+        buttons.append([_button(*BUTTON_BACK)])
         return Screen(
-            text=f"🧬 Start Fibo\n\nExchange: {self._pretty_exchange(value)}\n\nSelect Account",
-            buttons=rows,
-            state=state.state,
+            text="Select exchange (GoldenFibo v1):",
+            buttons=buttons,
+            state="exchange",
         )
 
-    def _handle_select_account(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        state = self._state_for(chat_key)
-        if suffix == "back":
-            return self._render_exchange_select(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "account" or not value:
-            return self._handle_select_exchange(chat_key, f"exchange:{state.exchange or ''}")
-        state.account = value
-        return self._render_instrument_select(chat_key)
+    def _on_exchange(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        value = value.strip().lower()
+        if value not in _supported_exchanges(self._desk):
+            return self._render_exchange(chat_key, s)
+        s.exchange = value
+        return self._render_account(chat_key, s)
 
-    def _render_instrument_select(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "select_instrument"
-        return Screen(
-            text="🧬 Start Fibo\n\nSelect / Enter Instrument",
-            buttons=[
-                [_button(*BUTTON_SYMBOL_BTC), _button(*BUTTON_SYMBOL_ETH)],
-                [_button(*BUTTON_SYMBOL_XAU), _button(*BUTTON_SYMBOL_ONDO)],
-                [_button(*BUTTON_OTHER_SYMBOL)],
-                [_button(*BUTTON_BACK), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
-        )
-
-    def _handle_select_instrument(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        state = self._state_for(chat_key)
-        if suffix == "back":
-            return self._handle_select_exchange(chat_key, f"exchange:{state.exchange or ''}")
-        if suffix == "symbol:other":
-            state.state = "awaiting_instrument"
-            return Screen(
-                text="🧬 Start Fibo\n\nType Instrument",
-                buttons=[[_button(*BUTTON_BACK), _button(*BUTTON_EXIT)]],
-                state=state.state,
-            )
-        prefix, value = _split_callback(suffix)
-        if prefix != "symbol" or not value:
-            return self._render_instrument_select(chat_key)
-        state.instrument = value.upper()
-        return self._render_counter_side(chat_key)
-
-    def _render_counter_side(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "select_counter_side"
-        return Screen(
-            text="🧬 Start Fibo\n\nSelect Counter Type",
-            buttons=[
-                [_button(*BUTTON_COUNTER_BUY)],
-                [_button(*BUTTON_COUNTER_SELL)],
-                [_button(*BUTTON_BACK), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
-        )
-
-    def _handle_select_counter_side(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        state = self._state_for(chat_key)
-        if suffix == "back":
-            return self._render_instrument_select(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "counter_side" or value not in {"counterBUY", "counterSELL"}:
-            return self._render_counter_side(chat_key)
-        state.counter_side = value
-        return self._render_numeric_prompt(chat_key, "divide_percent")
-
-    def _handle_numeric_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self._numeric_back(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "default":
-            return self._render_message("Please enter a value or choose the default button.", self._state_for(chat_key).state)
-        defaults = {
-            "divide_percent": _DEFAULT_DIVIDE_PERCENT,
-            "counter1": _DEFAULT_COUNTER1,
-            "counter2": _DEFAULT_COUNTER2,
-            "counter3": _DEFAULT_COUNTER3,
-            "counter4": _DEFAULT_COUNTER4,
-        }
-        if value not in defaults:
-            return self._render_message("Unknown default.", self._state_for(chat_key).state)
-        state = self._state_for(chat_key)
-        state.start_params[value] = defaults[value]
-        return self._advance_after_numeric(chat_key, value)
-
-    def _advance_after_numeric(self, chat_key: Tuple[Any, ...], field_name: str) -> Screen:
-        order = ["divide_percent", "counter1", "counter2", "counter3", "counter4"]
-        idx = order.index(field_name)
-        if idx == len(order) - 1:
-            return self._render_start_review(chat_key)
-        return self._render_numeric_prompt(chat_key, order[idx + 1])
-
-    def _numeric_back(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        order = ["awaiting_divide_percent", "awaiting_counter1", "awaiting_counter2", "awaiting_counter3", "awaiting_counter4"]
-        current = state.state
-        idx = order.index(current)
-        if idx == 0:
-            return self._render_counter_side(chat_key)
-        field = ["divide_percent", "counter1", "counter2", "counter3", "counter4"][idx - 1]
-        return self._render_numeric_prompt(chat_key, field)
-
-    def _render_numeric_prompt(self, chat_key: Tuple[Any, ...], field_name: str) -> Screen:
-        state = self._state_for(chat_key)
-        prompts = {
-            "divide_percent": ("awaiting_divide_percent", "Divide Percent?", "Default: 100"),
-            "counter1": ("awaiting_counter1", "Counter 1 Volume?", "Default: 1.3"),
-            "counter2": ("awaiting_counter2", "Counter 2 Volume?", "Default: 0.8"),
-            "counter3": ("awaiting_counter3", "Counter 3 Volume?", "Default: 0.5"),
-            "counter4": ("awaiting_counter4", "Counter 4 Volume?", "Default: 0.3"),
-        }
-        state_name, prompt, default_label = prompts[field_name]
-        state.state = state_name
-        return Screen(
-            text=f"🧬 Start Fibo\n\n{prompt}",
-            buttons=[
-                [_button(default_label, f"default:{field_name}")],
-                [_button(*BUTTON_BACK), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
-        )
-
-    def _render_start_review(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "review_start"
-        p = state.start_params
+    def _render_account(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        aliases = _account_aliases_for_exchange(self._desk, s.exchange or "")
+        if aliases:
+            buttons = [[_button(a, f"account:{a}")] for a in aliases]
+        else:
+            buttons = []
+        buttons.append([_button(*BUTTON_BACK)])
         text = (
-            "🧬 Start Fibo\n\n"
-            f"Exchange: {self._pretty_exchange(state.exchange)}\n"
-            f"Account: {state.account}\n"
-            f"Instrument: {state.instrument}\n"
-            f"Counter Type: {state.counter_side}\n\n"
-            f"Divide Percent: {self._format_num(p.get('divide_percent'))}\n\n"
-            f"C1: {self._format_num(p.get('counter1'))}\n"
-            f"C2: {self._format_num(p.get('counter2'))}\n"
-            f"C3: {self._format_num(p.get('counter3'))}\n"
-            f"C4: {self._format_num(p.get('counter4'))}"
+            f"Exchange: {s.exchange.upper()}\n"
+            "Select account:"
         )
+        if not aliases:
+            text += "\n\nNo configured accounts discovered — type the account alias when prompted."
+        return Screen(text=text, buttons=buttons, state="account")
+
+    def _on_account(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        value = value.strip()
+        if not value:
+            return self._render_account(chat_key, s)
+        s.account = value
+        return self._render_instrument(chat_key, s)
+
+    def _render_instrument(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        buttons = [[_button(sym, f"instrument:{sym}")] for sym in _QUICK_INSTRUMENTS]
+        buttons.append([_button(*BUTTON_OTHER_SYMBOL)])
+        buttons.append([_button(*BUTTON_BACK)])
         return Screen(
-            text=text,
-            buttons=[
-                [_button(*BUTTON_CONFIRM_START)],
-                [_button(*BUTTON_CANCEL), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
+            text=(
+                f"Exchange: {s.exchange.upper()}\n"
+                f"Account: {s.account}\n"
+                "Select instrument:"
+            ),
+            buttons=buttons,
+            state="instrument",
         )
 
-    def _handle_review(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self._render_numeric_prompt(chat_key, "counter4")
-        if suffix != "confirm_start":
-            return self._render_start_review(chat_key)
-        state = self._state_for(chat_key)
-        command = {
+    def _render_instrument_input(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        return Screen(
+            text=(
+                f"Exchange: {s.exchange.upper()}\n"
+                f"Account: {s.account}\n"
+                "Type the instrument symbol (e.g. BTC):"
+            ),
+            buttons=[[_button(*BUTTON_BACK)]],
+            state="instrument_input",
+        )
+
+    def _on_instrument(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        value = value.strip().upper()
+        if not value:
+            return self._render_instrument(chat_key, s)
+        s.instrument = value
+        return self._render_direction(chat_key, s)
+
+    def _render_direction(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        buttons = [
+            [_button(*BUTTON_BUY)],
+            [_button(*BUTTON_SELL)],
+            [_button(*BUTTON_BACK)],
+        ]
+        return Screen(
+            text=(
+                f"Exchange: {s.exchange.upper()}\n"
+                f"Account: {s.account}\n"
+                f"Instrument: {s.instrument}\n"
+                "Select direction:"
+            ),
+            buttons=buttons,
+            state="direction",
+        )
+
+    def _on_direction(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        v = _validate_direction(value)
+        if v is None:
+            return self._render_direction(chat_key, s)
+        s.direction = v
+        return self._render_percentage(chat_key, s)
+
+    def _render_percentage(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        return Screen(
+            text=(
+                f"Exchange: {s.exchange.upper()}\n"
+                f"Account: {s.account}\n"
+                f"Instrument: {s.instrument}\n"
+                f"Direction: {s.direction}\n"
+                f"Enter percentage (e.g. 0.01 for 1%). Default: 0.01"
+            ),
+            buttons=[[_button(*BUTTON_BACK)]],
+            state="percentage",
+        )
+
+    def _on_percentage(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        v = _validate_percentage(value)
+        if v is None:
+            return self._render_percentage(chat_key, s)
+        s.percentage = v
+        return self._render_step0_volume(chat_key, s)
+
+    def _render_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        buttons = [
+            [_button(*BUTTON_DEFAULT_STEP0)],
+            [_button(*BUTTON_DEFAULT_STEP0_BTC)],
+            [_button(*BUTTON_BACK)],
+        ]
+        return Screen(
+            text=(
+                f"Exchange: {s.exchange.upper()}\n"
+                f"Account: {s.account}\n"
+                f"Instrument: {s.instrument}\n"
+                f"Direction: {s.direction}\n"
+                f"Percentage: {_percent_label(s.percentage or _DEFAULT_PERCENTAGE)}\n"
+                "Enter Step0 volume (default 0.01 for SOL, 0.0001 for BTC-like):"
+            ),
+            buttons=buttons,
+            state="step0_volume",
+        )
+
+    def _on_step0_pick(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        v = _validate_step0_volume(value)
+        if v is None:
+            return self._render_step0_volume(chat_key, s)
+        s.step0_volume = v
+        return self._render_review(chat_key, s)
+
+    def _on_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        return self._on_step0_pick(chat_key, s, value)
+
+    def _render_review(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        try:
+            step0 = Decimal(s.step0_volume or "0")
+        except Exception:
+            step0 = Decimal("0")
+        ladder = []
+        cum = Decimal("0")
+        for n in range(21):
+            v = golden_fibo_volume(step0, n)
+            cum += v
+            ladder.append(f"Step{n:<2} = {v}")
+        cumulative = golden_fibo_cumulative_volume(step0, 20)
+        text = (
+            f"Review:\n"
+            f"Exchange: {s.exchange}\n"
+            f"Account: {s.account}\n"
+            f"Instrument: {s.instrument}\n"
+            f"Direction: {s.direction}\n"
+            f"Percentage: {_percent_label(s.percentage or '0')}\n"
+            f"Step0 volume: {_vol_label(s.step0_volume or '0')}\n\n"
+            f"Ladder (V0..V20):\n" + "\n".join(ladder) + "\n\n"
+            f"Cumulative through Step20: {cumulative}\n\n"
+            "Press ▶️ Start Fibo to register."
+        )
+        buttons = [
+            [_button(*BUTTON_CONFIRM_START)],
+            [_button(*BUTTON_BACK)],
+        ]
+        return Screen(text=text, buttons=buttons, state="review")
+
+    def _on_review_text(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
+        if value.lower() in ("", "ok", "yes", "start", "go"):
+            return self._on_confirm_start(chat_key, s)
+        return self._render_review(chat_key, s)
+
+    def _on_confirm_start(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        cmd = {
             "op": "start",
-            "exchange": state.exchange,
-            "account": state.account,
-            "instrument": state.instrument,
-            "counter_side": state.counter_side,
-            "divide_percent": float(state.start_params["divide_percent"]),
-            "counter1": float(state.start_params["counter1"]),
-            "counter2": float(state.start_params["counter2"]),
-            "counter3": float(state.start_params["counter3"]),
-            "counter4": float(state.start_params["counter4"]),
-            "poll_seconds": _DEFAULT_POLL_SECONDS,
+            "exchange": s.exchange,
+            "account": s.account,
+            "instrument": s.instrument,
+            "direction": s.direction,
+            "percentage": s.percentage,
+            "step0_volume": s.step0_volume,
         }
-        result = self._service.execute_command(command)
-        if not result.get("ok"):
-            message = str(result.get("message") or result.get("error") or "Failed to start Fibo")
+        resp = self._service.execute_command(cmd)
+        if not resp.get("ok"):
+            err = resp.get("error", "INTERNAL")
+            text = f"❌ Start failed: {err}\n\n"
+            if err == "OPPOSITE_DIRECTION_ACTIVE":
+                existing = resp.get("existing_registration_key", "?")
+                text += f"An opposite-direction registration is already active: {existing}"
+            elif err == "DUPLICATE_REGISTRATION":
+                text += f"Registration already exists: {resp.get('registration_key', '?')}"
+            else:
+                detail = resp.get("detail", "")
+                if detail:
+                    text += detail
             return Screen(
-                text=f"Start failed.\n\n{message}",
+                text=text,
                 buttons=[[_button(*BUTTON_START)], [_button(*BUTTON_EXIT)]],
-                state="main_menu",
+                state="start_failed",
             )
-        state.registration_key = str(result.get("registration_key") or "")
-        return Screen(
-            text=f"Fibo started.\n\nRegistration: {state.registration_key}",
-            buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
-            state="main_menu",
-        )
-
-    def _render_running_list(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "running_list"
-        response = self._service.execute_command({"op": "list"})
-        regs = list(response.get("registrations") or [])
-        lines = ["🔵 Running Fibo", ""]
-        rows: List[List[Dict[str, str]]] = []
-        if not regs:
-            lines.append("No running registrations.")
-        for reg in regs:
-            label = self._registration_label(reg)
-            lines.append(label)
-            rows.append([_button(label, f"registration:{quote(str(reg['registration_key']), safe='')}")])
-        rows.append([_button(*BUTTON_BACK), _button(*BUTTON_EXIT)])
-        return Screen(text="\n".join(lines), buttons=rows, state=state.state)
-
-    def _handle_running_list(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self.open(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "registration" or not value:
-            return self._render_running_list(chat_key)
-        state = self._state_for(chat_key)
-        state.registration_key = unquote(value)
-        return self._render_running_detail(chat_key)
-
-    def _render_running_detail(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "running_detail"
-        detail_response = self._service.execute_command({"op": "detail", "registration_key": state.registration_key})
-        detail = dict(detail_response.get("detail") or {})
+        s.registration_key = resp.get("registration_key")
         text = (
-            f"Status: {detail.get('status')}\n"
-            f"Exchange: {self._pretty_exchange(detail.get('exchange'))}\n"
-            f"Account: {detail.get('account')}\n"
-            f"Instrument: {detail.get('instrument')}\n"
-            f"Counter Side: {self._pretty_counter_side(detail.get('counter_side'))}\n"
-            f"Current Mark Price: {self._format_num(detail.get('current_mark_price'))}\n"
-            f"Step0: {self._format_num(detail.get('step0'))}\n"
-            f"Step0TP: {self._format_num(detail.get('step0tp'))}\n"
-            f"Step1: {self._format_num(detail.get('step1'))}\n"
-            f"Step2: {self._format_num(detail.get('step2'))}\n"
-            f"Step3: {self._format_num(detail.get('step3'))}\n"
-            f"Step4: {self._format_num(detail.get('step4'))}\n"
-            f"Step5: {self._format_num(detail.get('step5'))}\n"
-            f"Highest Activated Level: {detail.get('highest_activated_level')}\n"
-            f"Activated Levels: {detail.get('activated_levels')}\n"
-            f"Configured C1-C4: {self._format_num(detail.get('configured_c1'))}, {self._format_num(detail.get('configured_c2'))}, {self._format_num(detail.get('configured_c3'))}, {self._format_num(detail.get('configured_c4'))}\n"
-            f"Cumulative Real Volume: {self._format_num(detail.get('cumulative_real_volume'))}\n"
-            f"Current Position Side/Size: {detail.get('position_side')} / {self._format_num(detail.get('position_size'))}\n"
-            f"Average Entry Price: {self._format_num(detail.get('average_entry_price'))}\n"
-            f"Current Strategy Raw SL: {self._format_num(detail.get('current_strategy_raw_sl'))}\n"
-            f"Actual Exchange SL: {self._format_num(detail.get('actual_exchange_sl'))}\n"
-            f"Current Strategy Raw TP: {self._format_num(detail.get('current_strategy_raw_tp'))}\n"
-            f"Actual Exchange TP: {self._format_num(detail.get('actual_exchange_tp'))}\n"
-            f"Frozen Reason/Error: {detail.get('frozen_reason') or '—'}\n"
-            f"Completed Fibo Cycles: {self._format_num(detail.get('completed_cycles'))}\n"
-            f"Profitable Cycles: {self._format_num(detail.get('profitable_cycles'))}\n"
-            f"Losing Cycles: {self._format_num(detail.get('losing_cycles'))}\n"
-            f"Total Realized P&L: {self._format_num(detail.get('total_realized_pnl'))}\n"
-            f"Fees: {self._format_num(detail.get('fees'))}"
+            f"✅ Started GoldenFibo registration\n\n"
+            f"{s.exchange}/{s.account}/{s.instrument}/{s.direction}\n\n"
+            "Use 🔵 Running Fibo to view status."
         )
         return Screen(
             text=text,
-            buttons=[
-                [_button(*BUTTON_REFRESH)],
-                [_button(*BUTTON_BACK), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
-        )
-
-    def _render_stop_list(self, chat_key: Tuple[Any, ...]) -> Screen:
-        state = self._state_for(chat_key)
-        state.state = "stop_list"
-        response = self._service.execute_command({"op": "list"})
-        regs = list(response.get("registrations") or [])
-        lines = ["🛑 STOP Fibo", ""]
-        rows: List[List[Dict[str, str]]] = []
-        if not regs:
-            lines.append("No running registrations.")
-        for reg in regs:
-            label = self._registration_label(reg)
-            lines.append(label)
-            rows.append([_button(label, f"registration:{quote(str(reg['registration_key']), safe='')}")])
-        rows.append([_button(*BUTTON_BACK), _button(*BUTTON_EXIT)])
-        return Screen(text="\n".join(lines), buttons=rows, state=state.state)
-
-    def _handle_stop_list(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self.open(chat_key)
-        prefix, value = _split_callback(suffix)
-        if prefix != "registration" or not value:
-            return self._render_stop_list(chat_key)
-        state = self._state_for(chat_key)
-        state.registration_key = unquote(value)
-        state.state = "stop_confirm"
-        label = self._registration_label_from_key(state.registration_key)
-        return Screen(
-            text=(
-                "STOP & CLOSE will:\n\n"
-                f"{label}\n\n"
-                "- stop that Fibo registration\n"
-                "- stop further quote/cascade processing\n"
-                "- prevent new Fibo orders/protection updates\n"
-                "- close the current position for that account/instrument\n"
-                "- remove its TP\n"
-                "- remove its SL\n"
-                "- verify the lane is flat and clean"
-            ),
-            buttons=[
-                [_button(*BUTTON_CONFIRM_STOP_CLOSE)],
-                [_button(*BUTTON_CANCEL), _button(*BUTTON_EXIT)],
-            ],
-            state=state.state,
-        )
-
-    def _handle_stop_confirm(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
-        if suffix == "back":
-            return self._render_stop_list(chat_key)
-        if suffix != "confirm_stop_close":
-            return self._render_stop_list(chat_key)
-        state = self._state_for(chat_key)
-        result = self._service.execute_command({"op": "stop_close", "registration_key": state.registration_key})
-        if not result.get("ok"):
-            message = str(result.get("message") or result.get("error") or "STOP & CLOSE failed")
-            return Screen(
-                text=f"STOP & CLOSE failed.\n\n{message}",
-                buttons=[[_button(*BUTTON_STOP)], [_button(*BUTTON_EXIT)]],
-                state="main_menu",
-            )
-        return Screen(
-            text=(
-                f"STOP & CLOSE completed for {state.registration_key}.\n\n"
-                f"Verified clean: {bool(result.get('verified_clean'))}"
-            ),
             buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
-            state="main_menu",
+            state="started",
         )
 
-    def _state_for(self, chat_key: Tuple[Any, ...]) -> WizardState:
-        state = self._states.get(chat_key)
-        if state is None:
-            state = WizardState()
-            self._states[chat_key] = state
-        return state
+    # ------------------------------------------------------------------
+    # Running list / detail
+    # ------------------------------------------------------------------
+    def _render_running(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        resp = self._service.execute_command({"op": "list"})
+        if not resp.get("ok"):
+            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="running_list")
+        active = resp.get("registrations") or []
+        quarantined = resp.get("quarantined") or []
+        if not active:
+            text = "No active GoldenFibo registrations."
+            buttons = [[_button(*BUTTON_START)], [_button(*BUTTON_BACK)]]
+        else:
+            lines = ["Active GoldenFibo registrations:"]
+            for r in active:
+                key = r.get("registration_key", "?")
+                lines.append(f"  • {key}")
+            text = "\n".join(lines)
+            buttons = [[_button(r.get("registration_key", "?"), f"start_detail:{r.get('registration_key', '?')}")] for r in active]
+            buttons.append([_button(*BUTTON_REFRESH)])
+            buttons.append([_button(*BUTTON_BACK)])
+        if quarantined:
+            text += "\n\nQuarantined old-strategy records:"
+            for q in quarantined:
+                text += f"\n  • {q.get('registration_key', '?')} (status={q.get('status')})"
+        return Screen(text=text, buttons=buttons, state="running_list")
 
-    @staticmethod
-    def _pretty_exchange(value: Any) -> str:
-        text = str(value or "")
-        return "Ondoperps" if text.lower() == "ondoperps" else text
+    def _render_running_detail(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        resp = self._service.execute_command({"op": "detail", "registration_key": reg_key})
+        if not resp.get("ok"):
+            return Screen(text=f"Detail failed: {resp.get('error')}", buttons=[[_button(*BUTTON_BACK)]], state="running_detail")
+        r = resp.get("registration") or {}
+        text = (
+            f"Registration: {r.get('registration_key')}\n"
+            f"Exchange: {r.get('exchange')}\n"
+            f"Account: {r.get('account')}\n"
+            f"Instrument: {r.get('instrument')}\n"
+            f"Direction: {r.get('direction')}\n"
+            f"Cycle: {r.get('cycle_id')}\n"
+            f"Highest filled step: {r.get('highest_filled_step')}\n"
+            f"Expected cumulative size: {r.get('expected_cumulative_size')}\n"
+            f"Current TP price: {r.get('current_tp_price')}\n"
+            f"Next step: {r.get('next_step')}\n"
+            f"Status: {r.get('status')}\n"
+            f"Freeze reason: {r.get('freeze_reason')}\n"
+        )
+        buttons = [
+            [_button("🛑 STOP", f"stop_pick:{reg_key}")],
+            [_button(*BUTTON_REFRESH)],
+            [_button(*BUTTON_BACK)],
+        ]
+        return Screen(text=text, buttons=buttons, state="running_detail")
 
-    @staticmethod
-    def _pretty_counter_side(value: Any) -> str:
-        text = str(value or "")
-        return {
-            "counterBUY": "Counter BUY",
-            "counterSELL": "Counter SELL",
-        }.get(text, text)
-
-    def _registration_label(self, detail: Dict[str, Any]) -> str:
-        return (
-            f"{self._pretty_exchange(detail.get('exchange'))} / {detail.get('account')} / "
-            f"{detail.get('instrument')} / {self._pretty_counter_side(detail.get('counter_side'))}"
+    # ------------------------------------------------------------------
+    # Stop
+    # ------------------------------------------------------------------
+    def _render_stop_pick(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
+        resp = self._service.execute_command({"op": "list"})
+        if not resp.get("ok"):
+            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="stop_pick")
+        active = resp.get("registrations") or []
+        if not active:
+            return Screen(
+                text="No active GoldenFibo registrations to stop.",
+                buttons=[[_button(*BUTTON_START)], [_button(*BUTTON_BACK)]],
+                state="stop_pick",
+            )
+        buttons = [[_button(r.get("registration_key", "?"), f"stop_pick:{r.get('registration_key', '?')}")] for r in active]
+        buttons.append([_button(*BUTTON_BACK)])
+        return Screen(
+            text="Select a registration to STOP:",
+            buttons=buttons,
+            state="stop_pick",
         )
 
-    def _registration_label_from_key(self, key: Optional[str]) -> str:
-        if not key:
-            return "Unknown registration"
-        parts = str(key).split(":", 3)
-        if len(parts) != 4:
-            return key
-        exchange, account, instrument, counter = parts
-        return f"{self._pretty_exchange(exchange)} / {account} / {instrument} / {self._pretty_counter_side(counter)}"
+    def _render_stop_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        return Screen(
+            text=(
+                f"STOP GoldenFibo for {reg_key}?\n\n"
+                "This stops further robot operation for this registration.\n"
+                "It does NOT auto-close the live position or any unrelated orders."
+            ),
+            buttons=[
+                [_button("🛑 Confirm STOP", f"confirm_stop:{reg_key}")],
+                [_button(*BUTTON_CANCEL)],
+            ],
+            state="stop_confirm",
+        )
 
-    @staticmethod
-    def _format_num(value: Any) -> str:
-        if value is None:
-            return "—"
-        text = str(value)
-        if text.endswith(".0"):
-            return text[:-2]
-        return text
-
-    @staticmethod
-    def _render_message(text: str, state: str) -> Screen:
-        return Screen(text=text, buttons=[[_button(*BUTTON_BACK), _button(*BUTTON_EXIT)]], state=state)
-
-
-def _split_callback(data: str) -> Tuple[str, str]:
-    text = str(data or "")
-    if ":" not in text:
-        return text, text
-    prefix, _, suffix = text.partition(":")
-    return prefix, suffix
-
-
-def _button(text: str, callback_data: str) -> Dict[str, str]:
-    return {"text": str(text), "callback_data": str(callback_data)}
-
-
-_WIZARD: Optional[FiboWizard] = None
+    def _on_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        resp = self._service.execute_command({"op": "stop", "registration_key": reg_key})
+        if not resp.get("ok"):
+            err = resp.get("error", "INTERNAL")
+            if err == "OLD_STRATEGY_REGISTRATION":
+                text = (
+                    f"❌ {reg_key} is an old-strategy quarantined record. "
+                    "It cannot be stopped through /fibo. Decommission it manually."
+                )
+            else:
+                text = f"❌ Stop failed: {err}"
+            return Screen(
+                text=text,
+                buttons=[[_button(*BUTTON_BACK)], [_button(*BUTTON_EXIT)]],
+                state="stop_done",
+            )
+        text = f"✅ Stopped GoldenFibo for {reg_key}.\n\nThe live position and any pending orders are untouched."
+        return Screen(
+            text=text,
+            buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
+            state="stop_done",
+        )
 
 
 def get_fibo_wizard() -> FiboWizard:
-    global _WIZARD
-    if _WIZARD is None:
-        _WIZARD = FiboWizard()
-    return _WIZARD
-
-
-async def _send_screen(adapter: TelegramAdapter, msg_or_query: Any, screen: Screen) -> None:
-    chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
-    if chat_id is None:
-        chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
-    await adapter.send_inline_keyboard(
-        chat_id=chat_id,
-        text=screen.text,
-        buttons=screen.buttons,
-        callback_prefix="fibo",
-        metadata={"state": screen.state},
-    )
-
-
-async def handle_fibo_command(adapter: TelegramAdapter, msg: Any) -> bool:
-    text = str(getattr(msg, "text", "") or "").strip()
-    if not text.startswith("/fibo"):
-        return False
-    parts = text.split(maxsplit=1)
-    if parts[0] != "/fibo":
-        return False
-    wizard = get_fibo_wizard()
-    chat_key = _chat_key(msg)
-    screen = wizard.open(chat_key)
-    await _send_screen(adapter, msg, screen)
-    return True
-
-
-async def handle_fibo_callback(adapter: TelegramAdapter, query: Any, data: str) -> bool:
-    if not str(data or "").startswith("fibo:"):
-        return False
-    payload = str(data).split(":", 1)[1] if ":" in str(data) else ""
-    wizard = get_fibo_wizard()
-    chat_key = _chat_key(getattr(query, "message", query))
-    screen = wizard.handle_callback(chat_key, payload)
-    await _send_screen(adapter, query, screen)
-    return True
-
-
-async def handle_fibo_text(adapter: TelegramAdapter, msg: Any) -> bool:
-    wizard = get_fibo_wizard()
-    chat_key = _chat_key(msg)
-    state = wizard._state_for(chat_key)  # noqa: SLF001
-    if state.state not in {
-        "awaiting_instrument",
-        "awaiting_divide_percent",
-        "awaiting_counter1",
-        "awaiting_counter2",
-        "awaiting_counter3",
-        "awaiting_counter4",
-    }:
-        return False
-    screen = wizard.handle_text(chat_key, str(getattr(msg, "text", "") or ""))
-    await _send_screen(adapter, msg, screen)
-    return True
-
-
-def _chat_key(msg: Any) -> Tuple[Any, ...]:
-    chat_id = getattr(getattr(msg, "chat", None), "id", None)
-    thread_id = getattr(msg, "message_thread_id", None)
-    return (chat_id,) if thread_id is None else (chat_id, thread_id)
-
-
-__all__ = [
-    "FiboWizard",
-    "Screen",
-    "WizardState",
-    "get_fibo_wizard",
-    "handle_fibo_command",
-    "handle_fibo_callback",
-    "handle_fibo_text",
-]
+    """Module-level singleton accessor."""
+    return FiboWizard()

@@ -1,0 +1,476 @@
+"""GoldenFibo v1 polling engine.
+
+The engine is a pure state machine. It is given:
+- a config (GoldenFiboConfig)
+- a state (GoldenFiboState)
+- an adapter (LighterFiboAdapter)
+- a deterministic client_order_id factory
+
+The engine advances the state through Cases A/B/C/D per the locked
+spec. It never assumes fills; it never infers FILLED from absence
+alone; it ALWAYS correlates pending disappearance with the live
+position size to safely advance a step.
+
+Persistence: the engine mutates state in place. The caller is
+responsible for persisting state.to_dict() after each tick (the
+service does this).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from plugins.trade.golden_fibo.config import (
+    GoldenFiboConfig,
+    MAX_STEP,
+    golden_fibo_next_ladder_price,
+    golden_fibo_tp_price,
+    golden_fibo_volume,
+)
+from plugins.trade.golden_fibo.state import (
+    ROLE_ENTRY,
+    ROLE_LADDER,
+    ROLE_TP,
+    STATUS_NEEDS_RECOVERY,
+    STATUS_RUNNING,
+    GoldenFiboState,
+)
+
+
+OrderIdentity = Tuple[Optional[int], Optional[int]]  # (client_order_id, exchange_order_id)
+
+
+@dataclass
+class TickResult:
+    """Outcome of one engine tick."""
+
+    state: GoldenFiboState
+    actions: List[str]  # human-readable summary of what happened
+
+
+class GoldenFiboEngine:
+    """Stateless-ish state machine: holds the current state and the
+    static config, drives state through one tick at a time."""
+
+    def __init__(
+        self,
+        config: GoldenFiboConfig,
+        state: GoldenFiboState,
+        adapter: Any,
+        client_order_id_factory: Callable[[], int],
+    ) -> None:
+        self.config = config
+        self.state = state
+        self.adapter = adapter
+        self._next_client_id = client_order_id_factory
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def tick(self) -> TickResult:
+        """Run one polling cycle. Returns updated state and an action log.
+
+        The engine never assumes a fill. It must observe the live
+        venue state, then choose a single safe action.
+        """
+        actions: List[str] = []
+
+        # Read live state
+        try:
+            position = self.adapter.position_state(
+                self.config.account, self.config.instrument
+            )
+        except Exception as exc:
+            return self._freeze(f"position_state failed: {exc}")
+
+        live_size = _parse_size(position.get("size"))
+        live_side = position.get("side")  # "long", "short", or None
+        has_position = live_size > 0 and live_side in ("long", "short")
+
+        # Validate live direction matches our configured direction
+        if has_position:
+            live_direction = "BUY" if live_side == "long" else "SELL"
+            if live_direction != self.config.direction:
+                return self._freeze(
+                    f"position direction mismatch: live={live_side} config={self.config.direction}"
+                )
+
+        # Validate accumulated size
+        if self.state.highest_filled_step >= 0:
+            expected = self.config.cumulative_volume(self.state.highest_filled_step)
+            if has_position and live_size < expected:
+                return self._freeze(
+                    f"position size shrunk unexpectedly: live={live_size} expected>={expected}"
+                )
+
+        # Check pending order state
+        pending_alive = False
+        pending_state: Dict[str, Any] = {}
+        if self.state.pending_order_exchange_id is not None:
+            try:
+                pending_state = self.adapter.get_order_state(
+                    self.config.account,
+                    int(self.state.pending_order_exchange_id),
+                )
+            except Exception as exc:
+                return self._freeze(f"get_order_state failed: {exc}")
+            pending_status = str(pending_state.get("status") or "")
+            pending_taxonomy = str(pending_state.get("taxonomy") or "")
+            actions.append(
+                f"pending oid={self.state.pending_order_exchange_id} status={pending_status} taxonomy={pending_taxonomy}"
+            )
+            if pending_taxonomy == "ACTIVE":
+                pending_alive = True
+            elif pending_taxonomy == "FILLED":
+                # Confirmed fill via get_order_state
+                return self._handle_confirmed_fill(actions)
+            elif pending_taxonomy in ("CANCELED", "REJECTED", "EXPIRED"):
+                return self._freeze(
+                    f"pending order unexpectedly {pending_taxonomy.lower()}"
+                )
+
+        # Determine state-match case
+        if not has_position:
+            if self.state.pending_order_exchange_id is not None and pending_alive:
+                # Case B: TP closed position while ladder pending
+                return self._handle_orphan_pending(actions)
+            if self.state.highest_filled_step >= 0 or self.state.next_step > 0:
+                # Case B: cycle ended, no orphan (already cleared)
+                pass
+            # Case A possible: position=0, no pending, no progress
+            if (
+                self.state.highest_filled_step < 0
+                and self.state.next_step == 0
+                and self.state.pending_order_exchange_id is None
+            ):
+                return self._start_fresh_cycle(actions)
+            # Already past Step0 but position is now 0 — TP exit
+            return self._handle_cycle_end(actions)
+
+        # has_position
+        if self.state.pending_order_exchange_id is None:
+            # Case C: position exists but expected pending ladder is absent
+            return self._handle_missing_pending(position, live_size, actions)
+
+        if not pending_alive:
+            # Pending not in active surface and not from get_order_state
+            # Either filled or otherwise gone. Use position delta.
+            return self._handle_missing_pending(position, live_size, actions)
+
+        # Case D: healthy waiting state
+        actions.append("healthy waiting")
+        return TickResult(state=self.state, actions=actions)
+
+    # ------------------------------------------------------------------
+    # Case A: start a new cycle
+    # ------------------------------------------------------------------
+    def _start_fresh_cycle(self, actions: List[str]) -> TickResult:
+        # Issue market Step0
+        size = self.config.step0_volume
+        client_id = self._next_client_id()
+        order_side = self.config.direction.lower()  # "buy" or "sell"
+        try:
+            # Snap, then write state, then submit
+            self.state.cycle_id += 1
+            self.state.next_step = 0
+            self.state.highest_filled_step = -1
+            self.state.fill_prices = {}
+            self.state.expected_cumulative_size = Decimal("0")
+            self.state.current_tp_price = None
+            self.state.current_tp_order_id = None
+            self.state.current_tp_client_id = None
+            self.state.current_tp_role = None
+            self.state.pending_order_client_id = client_id
+            self.state.pending_order_exchange_id = None
+            self.state.pending_requested_price = None
+            self.state.pending_requested_size = size
+            self.state.pending_confirmed_price = None
+            self.state.pending_confirmed_size = None
+            self.state.pending_order_role = ROLE_ENTRY
+            self.state.status = STATUS_RUNNING
+            self.state.freeze_reason = None
+
+            submit = self.adapter.place_market(
+                account=self.config.account,
+                instrument=self.config.instrument,
+                side=order_side,
+                size=size,
+                client_order_id=client_id,
+            )
+        except Exception as exc:
+            return self._freeze(f"place_market Step0 failed: {exc}")
+
+        actions.append(f"Step0 MARKET submit={submit}")
+        exchange_oid = submit.get("exchange_order_id")
+        if exchange_oid is not None:
+            self.state.pending_order_exchange_id = int(exchange_oid)
+        self.state.pending_confirmed_size = submit.get("submitted_volume") or str(size)
+        return TickResult(state=self.state, actions=actions)
+
+    # ------------------------------------------------------------------
+    # Case A continues: confirm Step0 filled, persist P0, set TP, place Step1
+    # ------------------------------------------------------------------
+    def confirm_step0_filled(self, p0: Decimal) -> None:
+        """Called by the service after observing the live venue state
+        shows the Step0 market FILLED and the position established."""
+        self.state.fill_prices[0] = Decimal(p0)
+        self.state.highest_filled_step = 0
+        self.state.expected_cumulative_size = self.config.cumulative_volume(0)
+        self.state.next_step = 1
+        self.state.pending_order_role = None
+        self.state.pending_order_client_id = None
+        self.state.pending_order_exchange_id = None
+        self.state.pending_requested_price = None
+        self.state.pending_requested_size = None
+        self.state.pending_confirmed_price = None
+        self.state.pending_confirmed_size = None
+
+    def place_step0_tp_and_step1(self, p0: Decimal) -> Optional[TickResult]:
+        """Place the shared TP0 and the Step1 LIMIT. Returns TickResult
+        on failure, or None on success (the caller persists state)."""
+        result = self._rotate_tp(p0)
+        if result is not None:
+            return result
+        return self._place_next_ladder()
+
+    def _rotate_tp(self, pk: Decimal) -> Optional[TickResult]:
+        """Set the shared TP for the current accumulated position.
+
+        For k=0 tpPrice = TP0 = P0 * (1 ± percentage).
+        For k>=1 tpPrice = P(k-1).
+        """
+        actions: List[str] = []
+        # Determine tp price
+        if self.state.highest_filled_step == 0:
+            tp_price = golden_fibo_tp_price(self.config.direction, pk, self.config.percentage)
+        else:
+            # TPk = P(k-1)
+            prev_step = self.state.highest_filled_step - 1
+            prev_pk = self.state.fill_prices.get(prev_step)
+            if prev_pk is None:
+                return self._freeze(
+                    f"missing fill_prices[{prev_step}] for TP rotation"
+                )
+            tp_price = Decimal(prev_pk)
+
+        tp_size = self.config.cumulative_volume(self.state.highest_filled_step)
+        # tp is opposite side, reduce_only
+        opposite = "sell" if self.config.direction == "BUY" else "buy"
+        tp_client_id = self._next_client_id()
+
+        # Cancel old TP first (if any)
+        if self.state.current_tp_order_id is not None:
+            try:
+                self.adapter.cancel_order(
+                    account=self.config.account,
+                    order_index=int(self.state.current_tp_order_id),
+                )
+                actions.append(f"cancel old TP oid={self.state.current_tp_order_id}")
+            except Exception as exc:
+                return self._freeze(f"cancel old TP failed: {exc}")
+            self.state.current_tp_order_id = None
+            self.state.current_tp_client_id = None
+            self.state.current_tp_role = None
+
+        try:
+            submit = self.adapter.place_limit(
+                account=self.config.account,
+                instrument=self.config.instrument,
+                side=opposite,
+                size=tp_size,
+                price=tp_price,
+                client_order_id=tp_client_id,
+                reduce_only=True,
+            )
+        except Exception as exc:
+            return self._freeze(f"place TP failed: {exc}")
+
+        self.state.current_tp_price = tp_price
+        self.state.current_tp_client_id = tp_client_id
+        self.state.current_tp_order_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
+        self.state.current_tp_role = ROLE_TP
+        actions.append(f"new TP price={tp_price} size={tp_size} oid={self.state.current_tp_order_id}")
+        return None
+
+    def _place_next_ladder(self) -> Optional[TickResult]:
+        """Place the next ladder LIMIT. Returns TickResult on failure."""
+        actions: List[str] = []
+        if self.state.next_step > MAX_STEP:
+            # Step20 already placed; nothing to do
+            return None
+        next_n = self.state.next_step
+        pk = self.state.fill_prices.get(next_n - 1)
+        if pk is None:
+            return self._freeze(
+                f"missing P{next_n - 1} for next ladder placement"
+            )
+        # TPk for the new step
+        if next_n == 1:
+            tpk = golden_fibo_tp_price(self.config.direction, pk, self.config.percentage)
+        else:
+            tpk = Decimal(self.state.fill_prices.get(next_n - 2))  # P(k-1) for k>=1
+        if tpk is None:
+            return self._freeze(f"missing TP{next_n} level")
+        next_price = golden_fibo_next_ladder_price(self.config.direction, pk, tpk)
+        next_size = self.config.volume(next_n)
+
+        client_id = self._next_client_id()
+        order_side = self.config.direction.lower()
+        try:
+            submit = self.adapter.place_limit(
+                account=self.config.account,
+                instrument=self.config.instrument,
+                side=order_side,
+                size=next_size,
+                price=next_price,
+                client_order_id=client_id,
+                reduce_only=False,
+            )
+        except Exception as exc:
+            return self._freeze(f"place ladder step{next_n} failed: {exc}")
+
+        self.state.pending_order_client_id = client_id
+        self.state.pending_order_exchange_id = (
+            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        )
+        self.state.pending_requested_price = next_price
+        self.state.pending_requested_size = next_size
+        self.state.pending_confirmed_price = (
+            Decimal(submit["submitted_price"]) if submit.get("submitted_price") is not None else next_price
+        )
+        self.state.pending_confirmed_size = (
+            Decimal(submit["submitted_volume"]) if submit.get("submitted_volume") is not None else next_size
+        )
+        self.state.pending_order_role = ROLE_LADDER
+        actions.append(
+            f"place step{next_n} LIMIT price={next_price} confirmed={self.state.pending_confirmed_price} size={next_size} oid={self.state.pending_order_exchange_id}"
+        )
+        return None
+
+    # ------------------------------------------------------------------
+    # Case C: missing pending order
+    # ------------------------------------------------------------------
+    def _handle_missing_pending(
+        self, position: Dict[str, Any], live_size: Decimal, actions: List[str]
+    ) -> TickResult:
+        # If next_step is 0 and we have a pending entry, the Step0 just
+        # got FILLED. The caller is responsible for confirming P0 via
+        # get_order_state actual_fill_price.
+        if self.state.pending_order_role == ROLE_ENTRY and self.state.next_step == 0:
+            actions.append("entry order missing; assume Step0 filled, awaiting P0 confirm")
+            return TickResult(state=self.state, actions=actions)
+
+        # If pending is a ladder, check position delta
+        if self.state.pending_order_role == ROLE_LADDER:
+            expected_size = self.config.cumulative_volume(self.state.next_step)
+            previous_expected = self.state.expected_cumulative_size
+            delta = expected_size - previous_expected
+            if live_size >= expected_size and delta > 0:
+                # Position increased by expected delta — treat as filled
+                return self._handle_confirmed_fill(actions)
+            return self._freeze(
+                f"pending ladder disappeared without expected position delta "
+                f"(live={live_size} expected={expected_size})"
+            )
+
+        return self._freeze(
+            "pending order missing in unexpected state"
+        )
+
+    def _handle_confirmed_fill(self, actions: List[str]) -> TickResult:
+        """Pending ladder order confirmed FILLED. Advance to next step."""
+        if self.state.pending_order_role != ROLE_LADDER:
+            return self._freeze("confirmed fill in unexpected role")
+        if self.state.pending_confirmed_price is None:
+            return self._freeze("missing pending_confirmed_price")
+
+        step_n = self.state.next_step
+        promoted_pk = Decimal(self.state.pending_confirmed_price)
+        self.state.fill_prices[step_n] = promoted_pk
+        self.state.highest_filled_step = step_n
+        self.state.expected_cumulative_size = self.config.cumulative_volume(step_n)
+        actions.append(f"step{step_n} FILLED P{step_n}={promoted_pk}")
+
+        # Clear pending
+        self.state.pending_order_role = None
+        self.state.pending_order_client_id = None
+        self.state.pending_order_exchange_id = None
+        self.state.pending_requested_price = None
+        self.state.pending_requested_size = None
+        self.state.pending_confirmed_price = None
+        self.state.pending_confirmed_size = None
+
+        # Rotate TP
+        result = self._rotate_tp(promoted_pk)
+        if result is not None:
+            return result
+
+        # Place next ladder if not at Step20
+        if step_n < MAX_STEP:
+            self.state.next_step = step_n + 1
+            result = self._place_next_ladder()
+            if result is not None:
+                return result
+        else:
+            actions.append("step20 reached; no Step21")
+
+        return TickResult(state=self.state, actions=actions)
+
+    # ------------------------------------------------------------------
+    # Case B: cycle ended (TP closed position) but pending ladder remains
+    # ------------------------------------------------------------------
+    def _handle_orphan_pending(self, actions: List[str]) -> TickResult:
+        if self.state.pending_order_exchange_id is None:
+            return self._freeze("orphan pending with no order_id")
+        try:
+            self.adapter.cancel_order(
+                account=self.config.account,
+                order_index=int(self.state.pending_order_exchange_id),
+            )
+            actions.append(f"cancel orphan pending oid={self.state.pending_order_exchange_id}")
+        except Exception as exc:
+            return self._freeze(f"cancel orphan failed: {exc}")
+
+        # Reset cycle state
+        self.state.pending_order_role = None
+        self.state.pending_order_client_id = None
+        self.state.pending_order_exchange_id = None
+        self.state.pending_requested_price = None
+        self.state.pending_requested_size = None
+        self.state.pending_confirmed_price = None
+        self.state.pending_confirmed_size = None
+        self.state.current_tp_client_id = None
+        self.state.current_tp_order_id = None
+        self.state.current_tp_role = None
+        self.state.current_tp_price = None
+        self.state.highest_filled_step = -1
+        self.state.fill_prices = {}
+        self.state.expected_cumulative_size = Decimal("0")
+        self.state.next_step = 0
+        self.state.cycle_id += 1
+        return TickResult(state=self.state, actions=actions)
+
+    def _handle_cycle_end(self, actions: List[str]) -> TickResult:
+        # Already flat and no pending — start fresh cycle
+        return self._start_fresh_cycle(actions)
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+    def _freeze(self, reason: str) -> TickResult:
+        self.state.status = STATUS_NEEDS_RECOVERY
+        self.state.freeze_reason = reason
+        return TickResult(state=self.state, actions=[f"NEEDS_RECOVERY: {reason}"])
+
+
+def _parse_size(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return Decimal("0")

@@ -1,3 +1,29 @@
+"""GoldenFibo v1 service — replaces the legacy counter-cascade service.
+
+External API preserved (so fibo_daemon.py / installer stay unchanged):
+  - PersistentFiboService
+  - FiboSocketServiceHost
+  - FiboServiceProtocol
+  - FiboCycleLedger
+  - RegistrationContext
+  - resolve_fibo_state_path / resolve_fibo_ledger_path /
+    resolve_fibo_event_log_path / resolve_fibo_socket_path /
+    resolve_fibo_runtime_dir / resolve_hermes_home
+
+Internal IPC ops supported:
+  - start     begin a new GoldenFibo registration
+  - list      enumerate registrations (active + quarantined)
+  - detail    one registration detail
+  - stop      stop a single registration (no auto-close)
+
+Old-strategy quarantine:
+  Any persisted record whose key is not in the new
+  ``exchange/account/instrument/BUY|SELL`` shape, or whose persisted
+  strategy is not ``golden_fibo``, is loaded as a quarantined entry
+  with status=STATUS_QUARANTINED_OLD_STRATEGY. Such records are NEVER
+  loaded into a GoldenFiboEngine and produce ZERO exchange mutations.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,18 +36,36 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from .tradedesk import TradeDesk, get_tradedesk
-from .fibo.engine import CounterType, FiboInstance, FiboManager, step0_tp, step_price
-from .fibo.runner import FiboLiveRunner, JsonlLogSink, RegistrationSpec, RuntimeBundle, default_runtime_registry
+
+from .golden_fibo.config import (
+    GoldenFiboConfig,
+    golden_fibo_cumulative_volume,
+    golden_fibo_volume,
+)
+from .golden_fibo.state import (
+    ROLE_ENTRY,
+    ROLE_LADDER,
+    ROLE_TP,
+    STATUS_NEEDS_RECOVERY,
+    STATUS_QUARANTINED_OLD_STRATEGY,
+    STATUS_RUNNING,
+    STATUS_STOPPING,
+    STRATEGY_GOLDENFIBO,
+    GoldenFiboState,
+)
+from .golden_fibo.lighter_adapter import LighterGoldenFiboAdapter
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_SECONDS = 2.0
 _DEFAULT_SOCKET_TIMEOUT = 15.0
 
-
+# ---------------------------------------------------------------------------
+# Path resolvers (kept identical to the legacy service for installer parity)
+# ---------------------------------------------------------------------------
 def resolve_hermes_home() -> Path:
     raw = os.environ.get("HERMES_HOME")
     if raw:
@@ -49,14 +93,55 @@ def resolve_fibo_socket_path() -> Path:
     return resolve_fibo_runtime_dir() / "service.sock"
 
 
+# ---------------------------------------------------------------------------
+# Legacy protocol placeholder (kept for installer parity)
+# ---------------------------------------------------------------------------
 class FiboServiceProtocol(Protocol):
     def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]: ...
 
 
+# ---------------------------------------------------------------------------
+# Direction validation
+# ---------------------------------------------------------------------------
+VALID_DIRECTIONS = ("BUY", "SELL")
+SUPPORTED_EXCHANGES = ("lighter",)
+
+
+def _is_valid_registration_key(key: str) -> bool:
+    """A GoldenFibo registration key looks like:
+
+        exchange/account/instrument/BUY
+
+    or  exchange/account/instrument/SELL
+
+    Anything else is rejected (or quarantined if loaded from old state).
+    """
+    if not key or "/" not in key:
+        return False
+    parts = key.split("/")
+    if len(parts) != 4:
+        return False
+    exchange, account, instrument, direction = parts
+    if not exchange or not account or not instrument:
+        return False
+    if direction not in VALID_DIRECTIONS:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Registration context (kept for installer/legacy compat)
+# ---------------------------------------------------------------------------
 @dataclass
 class RegistrationContext:
-    spec: RegistrationSpec
-    bundle: RuntimeBundle
+    """Legacy-compatible registration container.
+
+    For GoldenFibo, the actual state is the GoldenFiboState. This
+    dataclass only exists so legacy wiring (state.json IO, daemon
+    boot summary) keeps compiling.
+    """
+    spec: Dict[str, Any]
+    bundle: Dict[str, Any]
     started_at: float
     preflight: Dict[str, Any] = field(default_factory=dict)
     service_status: str = "running"
@@ -66,12 +151,11 @@ class RegistrationContext:
     last_known_cumulative_volume: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# Ledger (kept for installer parity)
+# ---------------------------------------------------------------------------
 class FiboCycleLedger:
-    """Best-effort cycle/performance ledger.
-
-    Ledger/reporting must never interrupt engine processing. It persists raw
-    event rows plus small in-memory summaries keyed by registration.
-    """
+    """Best-effort cycle/performance ledger (kept for parity)."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path or resolve_fibo_ledger_path())
@@ -83,807 +167,637 @@ class FiboCycleLedger:
         if not self.path.exists():
             return
         try:
-            with self.path.open("r", encoding="utf-8") as fh:
-                for line in fh:
+            with self.path.open("r", encoding="utf-8") as f:
+                for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        row = json.loads(line)
+                        rec = json.loads(line)
                     except Exception:
                         continue
-                    self._ingest_loaded_row(row)
+                    if isinstance(rec, dict):
+                        self._summaries[rec.get("registration_key") or rec.get("key") or "?"] = rec
         except Exception:
-            logger.exception("Failed loading Fibo ledger")
+            pass
 
-    def _summary_for(self, registration_key: str) -> Dict[str, Any]:
-        return self._summaries.setdefault(
-            registration_key,
-            {
-                "completed_cycles": 0,
-                "profitable_cycles": 0,
-                "losing_cycles": 0,
-                "total_realized_pnl": None,
-                "fees": None,
-                "last_run_id": None,
-                "last_cycle": None,
-            },
-        )
-
-    def _extract_cycle_info(self, row: Dict[str, Any]) -> tuple[Optional[str], Optional[int]]:
-        client_order_id = str(row.get("client_order_id") or "").strip()
-        if not client_order_id:
-            return None, None
-        run_id = None
-        cycle = None
-        parts = client_order_id.split("_")
-        for part in parts:
-            if len(part) == 4 and part.isalnum() and part.isupper():
-                run_id = part
-            if part.startswith("Y") and part[1:].isdigit():
-                cycle = int(part[1:])
-        return run_id, cycle
-
-    def _ingest_loaded_row(self, row: Dict[str, Any]) -> None:
-        key = str(row.get("registration_key") or "").strip()
-        if not key:
-            return
-        summary = self._summary_for(key)
-        event = str(row.get("event") or "")
-        run_id, cycle = self._extract_cycle_info(row)
-        if run_id:
-            summary["last_run_id"] = run_id
-        if cycle is not None:
-            summary["last_cycle"] = cycle
-        if event == "cycle_completed":
-            summary["completed_cycles"] = max(summary["completed_cycles"], int(row.get("completed_cycles") or 0))
-        if event == "performance_snapshot":
-            summary["profitable_cycles"] = int(row.get("profitable_cycles") or 0)
-            summary["losing_cycles"] = int(row.get("losing_cycles") or 0)
-            summary["total_realized_pnl"] = row.get("total_realized_pnl")
-            summary["fees"] = row.get("fees")
+    def note_cycle_cleanup(self, key: str) -> None:
+        try:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"event": "cycle_cleanup", "registration_key": key, "ts": time.time()}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def record_event(self, row: Dict[str, Any]) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-            self._ingest_loaded_row(row)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception:
-            logger.exception("Fibo ledger write failed")
+            pass
 
-    def note_cycle_cleanup(self, registration_key: str) -> None:
-        summary = self._summary_for(registration_key)
-        summary["completed_cycles"] += 1
-        self.record_event(
-            {
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "event": "cycle_completed",
-                "registration_key": registration_key,
-                "completed_cycles": summary["completed_cycles"],
-            }
-        )
 
-    def summary(self, registration_key: str) -> Dict[str, Any]:
-        return dict(self._summary_for(registration_key))
+# ---------------------------------------------------------------------------
+# Persistent GoldenFibo service
+# ---------------------------------------------------------------------------
+class _OppositeDirectionActive(Exception):
+    """Raised when the opposite direction is already active."""
+
+    def __init__(self, existing_key: str):
+        self.existing_key = existing_key
+        super().__init__(f"opposite direction already active: {existing_key}")
+
+
+class _InvalidRegistrationKey(Exception):
+    pass
+
+
+class _InvalidInputs(Exception):
+    pass
+
+
+class _LighterOnly(Exception):
+    pass
+
+
+def _make_state_from_dict(data: Dict[str, Any]) -> GoldenFiboState:
+    """Load a GoldenFiboState from persisted dict.
+
+    Falls back to fields from the legacy state format if present
+    (legacy fields: counter1..4, divide_percent, etc.) — those are
+    simply ignored because the new state dataclass does not have them.
+    """
+    return GoldenFiboState.from_dict(data)
+
+
+def _serialize_state(state: GoldenFiboState) -> Dict[str, Any]:
+    return state.to_dict()
 
 
 class PersistentFiboService:
+    """Persistent GoldenFibo service.
+
+    Maintains a dict of GoldenFiboState instances keyed by registration
+    key. Persists to JSON. Each tick (poll) drives the engine for each
+    active registration.
+    """
+
     def __init__(
         self,
-        *,
+        state_path: Optional[Path] = None,
+        ledger_path: Optional[Path] = None,
+        event_log_path: Optional[Path] = None,
         tradedesk: Optional[TradeDesk] = None,
-        runner: Optional[FiboLiveRunner] = None,
-        runtime_registry: Optional[Dict[str, Callable[[RegistrationSpec], RuntimeBundle]]] = None,
-        state_path: Path | None = None,
-        ledger: Optional[FiboCycleLedger] = None,
-        event_log_path: Path | None = None,
-        start_thread: bool = True,
+        poll_seconds: float = _DEFAULT_POLL_SECONDS,
+        socket_timeout: float = _DEFAULT_SOCKET_TIMEOUT,
     ) -> None:
-        self._desk = tradedesk or get_tradedesk()
-        self._state_path = Path(state_path or resolve_fibo_state_path())
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ledger = ledger or FiboCycleLedger()
-        self._event_log = JsonlLogSink(Path(event_log_path or resolve_fibo_event_log_path()))
+        self.state_path = Path(state_path or resolve_fibo_state_path())
+        self.ledger_path = Path(ledger_path or resolve_fibo_ledger_path())
+        self.event_log_path = Path(event_log_path or resolve_fibo_event_log_path())
+        self.tradedesk = tradedesk or get_tradedesk()
+        self.poll_seconds = float(poll_seconds)
+        self.socket_timeout = float(socket_timeout)
+
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.ledger = FiboCycleLedger(self.ledger_path)
+        self._states: Dict[str, GoldenFiboState] = {}
+        self._configs: Dict[str, GoldenFiboConfig] = {}
+        self._adapters: Dict[str, LighterGoldenFiboAdapter] = {}
         self._lock = threading.RLock()
-        self._runtime_registry = runtime_registry or default_runtime_registry()
-        self._runner = runner or FiboLiveRunner(
-            manager=FiboManager(event_sink=self._safe_event_sink),
-            runtime_registry=self._runtime_registry,
-            poll_seconds=_DEFAULT_POLL_SECONDS,
-            log_sink=self._event_log,
-        )
-        if runner is not None:
-            self._runner.manager._event_sink = self._safe_event_sink  # type: ignore[attr-defined]
-        self._contexts: Dict[str, RegistrationContext] = {}
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._shutdown = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+
+        # Load persisted state on construction
         self._load_state()
-        if start_thread:
-            self._ensure_thread()
 
-    def _ensure_thread(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._poll_loop, name="fibo-service", daemon=True)
-        self._thread.start()
-
-    def shutdown(self) -> None:
-        self._stop_event.set()
-        self._runner.stop_requested = True
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=1)
-
-    def _poll_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                with self._lock:
-                    self._runner.manager.poll_once()
-                    for instance in self._runner.manager.list_running():
-                        self._runner._log(  # noqa: SLF001
-                            "poll_state",
-                            registration_key=instance.key,
-                            step0_raw=instance.cascade.step0_price,
-                            highest_step=instance.cascade.highest_step,
-                            cumulative_volume=str(instance.cumulative_volume),
-                            sl_raw=instance.protection.sl_price,
-                            tp_raw=instance.protection.tp_price,
-                            frozen=instance.frozen,
-                            frozen_reason=instance.frozen_reason,
-                            pending_unprotected=instance.pending_unprotected,
-                        )
-            except Exception:
-                logger.exception("Fibo service poll loop failure")
-            time.sleep(_DEFAULT_POLL_SECONDS)
-
-    def _safe_event_sink(self, payload: Dict[str, Any]) -> None:
-        try:
-            self._runner._log(**payload)  # noqa: SLF001
-        except Exception:
-            logger.exception("Fibo service event log failure")
-        try:
-            if payload.get("event") == "cycle_cleanup":
-                key = str(payload.get("registration_key") or "")
-                if key:
-                    self._ledger.note_cycle_cleanup(key)
-            else:
-                row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-                row.update(payload)
-                self._ledger.record_event(row)
-        except Exception:
-            logger.exception("Fibo service ledger failure")
-
+    # ------------------------------------------------------------------
+    # State IO
+    # ------------------------------------------------------------------
     def _load_state(self) -> None:
-        if not self._state_path.exists():
+        if not self.state_path.exists():
             return
         try:
-            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            with self.state_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
         except Exception:
-            logger.exception("Failed to read fibo service state")
             return
-        for row in list(payload.get("registrations") or []):
+        if not isinstance(payload, dict):
+            return
+        regs = payload.get("registrations") or []
+        for entry in regs:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("registration_key") or entry.get("key") or ""
+            if not isinstance(key, str):
+                continue
+            # Old-strategy records: tagged differently, missing BUYSELL, etc.
+            if not _is_valid_registration_key(key):
+                # Quarantine: load as a quarantine entry
+                state = GoldenFiboState.from_dict({
+                    "registration_key": key,
+                    "status": STATUS_QUARANTINED_OLD_STRATEGY,
+                    "strategy": entry.get("strategy", "fibonacci_counter_cascade"),
+                    "schema_version": 0,
+                })
+                self._states[key] = state
+                continue
+            # New-style: try to load as GoldenFiboState
             try:
-                spec = RegistrationSpec(
-                    exchange=str(row["exchange"]),
-                    account=str(row["account"]),
-                    instrument=str(row["instrument"]).upper(),
-                    counter_type=CounterType(str(row["counter_side"])),
-                    divide_percent=float(row["divide_percent"]),
-                    counter1=float(row["counter1"]),
-                    counter2=float(row["counter2"]),
-                    counter3=float(row["counter3"]),
-                    counter4=float(row["counter4"]),
-                )
-                bundle = self._runner._resolve_runtime(spec)  # noqa: SLF001
-                self._runner._attach_runtime_event_sink(bundle)  # noqa: SLF001
-                persisted_status = str(row.get("service_status") or "running").strip().lower()
-                if persisted_status in {"running", "stopping"}:
-                    persisted_status = "needs_recovery"
-                self._contexts[spec.key] = RegistrationContext(
-                    spec=spec,
-                    bundle=bundle,
-                    started_at=float(row.get("started_at") or time.time()),
-                    preflight=dict(row.get("preflight") or {}),
-                    service_status=persisted_status or "needs_recovery",
-                    status_reason=str(row.get("status_reason") or "Recovered from fibo.service state; manual recovery required."),
-                    cleanup_details=dict(row.get("cleanup_details") or {}),
-                    stop_requested_at=float(row["stop_requested_at"]) if row.get("stop_requested_at") is not None else None,
-                    last_known_cumulative_volume=float(row.get("last_known_cumulative_volume") or 0.0),
-                )
+                state = GoldenFiboState.from_dict(entry)
             except Exception:
-                logger.exception("Failed to restore fibo registration metadata")
+                state = GoldenFiboState(
+                    registration_key=key,
+                    status=STATUS_QUARANTINED_OLD_STRATEGY,
+                    strategy="fibonacci_counter_cascade",
+                )
+                self._states[key] = state
+                continue
+            # Backwards-compat: legacy records may not have strategy="golden_fibo"
+            if not state.strategy or state.strategy == "fibonacci_counter_cascade":
+                state.strategy = STRATEGY_GOLDENFIBO
+            self._states[key] = state
 
     def _save_state(self) -> None:
+        data: Dict[str, Any] = {
+            "schema_version": 1,
+            "strategy": STRATEGY_GOLDENFIBO,
+            "registrations": [state.to_dict() for state in self._states.values()],
+        }
+        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         try:
-            payload = {
-                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "registrations": [
-                    {
-                        "registration_key": key,
-                        "exchange": ctx.spec.exchange,
-                        "account": ctx.spec.account,
-                        "instrument": ctx.spec.instrument,
-                        "counter_side": ctx.spec.counter_type.value,
-                        "divide_percent": ctx.spec.divide_percent,
-                        "counter1": ctx.spec.counter1,
-                        "counter2": ctx.spec.counter2,
-                        "counter3": ctx.spec.counter3,
-                        "counter4": ctx.spec.counter4,
-                        "started_at": ctx.started_at,
-                        "preflight": ctx.preflight,
-                        "service_status": self._status_for(key, ctx, self._instance_for(key)),
-                        "status_reason": ctx.status_reason,
-                        "cleanup_details": ctx.cleanup_details,
-                        "stop_requested_at": ctx.stop_requested_at,
-                        "last_known_cumulative_volume": self._last_known_cumulative_volume(key, ctx),
-                    }
-                    for key, ctx in sorted(self._contexts.items())
-                ],
-            }
-            self._state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to save fibo service state")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(self.state_path)
+        except Exception as exc:
+            logger.warning("save_state failed: %s", exc)
 
-    def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        op = str(command.get("op") or "").strip().lower()
+    # ------------------------------------------------------------------
+    # Engine construction
+    # ------------------------------------------------------------------
+    def _adapter_for(self, key: str) -> LighterGoldenFiboAdapter:
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = LighterGoldenFiboAdapter()
+            self._adapters[key] = adapter
+        return adapter
+
+    def _config_for(self, key: str, state: GoldenFiboState) -> GoldenFiboConfig:
+        cfg = self._configs.get(key)
+        if cfg is not None:
+            return cfg
+        cfg = GoldenFiboConfig(
+            exchange=state.exchange,
+            account=state.account,
+            instrument=state.instrument,
+            direction=state.direction,
+            percentage=state.percentage,
+            step0_volume=state.step0_volume,
+        )
+        self._configs[key] = cfg
+        return cfg
+
+    def _client_id_factory(self, key: str) -> Callable[[], int]:
+        # Deterministic monotonic per key (no time-based) so restart safety is
+        # preserved across crashes.
+        counter = {"n": self._states[key].cycle_id * 1000000 + 100000}  # noqa: F841
+
+        def _next() -> int:
+            counter["n"] += 1
+            return counter["n"]
+
+        return _next
+
+    # ------------------------------------------------------------------
+    # Engine tick (one per active registration)
+    # ------------------------------------------------------------------
+    def _tick_once(self) -> None:
         with self._lock:
-            if op == "start":
-                return self._command_start(command)
-            if op == "list":
-                return self._command_list()
-            if op == "detail":
-                return self._command_detail(command)
-            if op == "stop_close":
-                return self._command_stop_close(command)
-            return {"ok": False, "error": "UNKNOWN_COMMAND", "message": f"Unknown Fibo service op: {op}"}
-
-    def _command_start(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        spec = RegistrationSpec(
-            exchange=str(command["exchange"]),
-            account=str(command["account"]),
-            instrument=str(command["instrument"]).upper(),
-            counter_type=CounterType(str(command["counter_side"])),
-            divide_percent=float(command["divide_percent"]),
-            counter1=float(command["counter1"]),
-            counter2=float(command["counter2"]),
-            counter3=float(command["counter3"]),
-            counter4=float(command["counter4"]),
-        )
-        if spec.key in self._contexts or self._runner.manager.is_running(spec.key):
-            return {
-                "ok": False,
-                "error": "DUPLICATE_REGISTRATION",
-                "message": f"Duplicate active registration: {spec.key}",
-                "registration_key": spec.key,
-            }
-        snapshot = self._runner.preflight_registration(spec)
-        bundle = self._runner._resolve_runtime(spec)  # noqa: SLF001
-        self._runner._attach_runtime_event_sink(bundle)  # noqa: SLF001
-        self._runner.manager.start(spec.to_fibo_config(), bundle.adapter, bundle.quote_source)
-        self._runner._started_specs[spec.key] = spec  # noqa: SLF001
-        self._contexts[spec.key] = RegistrationContext(
-            spec=spec,
-            bundle=bundle,
-            started_at=time.time(),
-            preflight={
-                "market": snapshot.market,
-                "mark_price_raw": snapshot.mark_price_raw,
-                "position_count": snapshot.position_count,
-                "open_order_count": snapshot.open_order_count,
-                "tp": snapshot.tp,
-                "sl": snapshot.sl,
-                "is_clean": snapshot.is_clean,
-            },
-            service_status="running",
-            last_known_cumulative_volume=float(spec.counter1),
-        )
-        self._runner._log("registration_started", registration_key=spec.key, poll_seconds=_DEFAULT_POLL_SECONDS)  # noqa: SLF001
-        self._save_state()
-        return {"ok": True, "registration_key": spec.key}
-
-    def _command_list(self) -> Dict[str, Any]:
-        rows: List[Dict[str, Any]] = []
-        for key, ctx in sorted(self._contexts.items()):
-            instance = self._instance_for(key)
-            rows.append(
-                {
-                    "registration_key": key,
-                    "exchange": ctx.spec.exchange,
-                    "account": ctx.spec.account,
-                    "instrument": ctx.spec.instrument,
-                    "counter_side": ctx.spec.counter_type.value,
-                    "status": self._status_for(key, ctx, instance),
-                    "frozen": bool(instance.frozen) if instance is not None else False,
-                }
-            )
-        return {"ok": True, "registrations": rows}
-
-    def _command_detail(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        key = str(command["registration_key"])
-        ctx = self._contexts.get(key)
-        if ctx is None:
-            return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
-        instance = self._instance_for(key)
-        exchange_state = self._read_exchange_state(ctx)
-        metrics = self._ledger.summary(key)
-        detail = self._build_detail_payload(ctx, instance, exchange_state, metrics)
-        return {"ok": True, "detail": detail}
-
-    def _command_stop_close(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        key = str(command["registration_key"])
-        ctx = self._contexts.get(key)
-        instance = self._instance_for(key)
-        if ctx is None:
-            return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
-        if ctx.service_status == "stopping":
-            return {
-                "ok": False,
-                "error": "STOP_ALREADY_IN_PROGRESS",
-                "registration_key": key,
-                "message": "STOP_CLOSE is already in progress for this registration.",
-            }
-        exchange_state = self._read_exchange_state(ctx)
-        safety = self._assess_stop_close_safety(ctx, instance, exchange_state)
-        if not safety["ok"]:
-            return {
-                "ok": False,
-                "error": safety["error"],
-                "message": safety["message"],
-                "registration_key": key,
-            }
-        self._mark_stopping(key, ctx, instance)
-        try:
-            result = self._execute_stop_close_cleanup(ctx, exchange_state)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("STOP_CLOSE cleanup failure")
-            result = {
-                "ok": False,
-                "error": "CLEANUP_FAILED",
-                "message": f"STOP_CLOSE cleanup raised: {exc}",
-            }
-        result.setdefault("registration_key", key)
-        result.setdefault("status", "stopped_clean" if result.get("ok") else "stop_error")
-        if result.get("ok"):
-            self._finalize_stopped_clean(key)
-        else:
-            self._mark_stop_error(key, ctx, result)
-        return result
-
-    def _instance_for(self, key: str) -> Optional[FiboInstance]:
-        engine = self._runner.manager._engines.get(key)  # noqa: SLF001
-        return None if engine is None else engine.instance
-
-    def _last_known_cumulative_volume(self, key: str, ctx: RegistrationContext) -> float:
-        instance = self._instance_for(key)
-        if instance is not None:
+            keys = list(self._states.keys())
+        for key in keys:
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    continue
+                if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                    continue
+                if state.status == STATUS_STOPPING:
+                    continue
             try:
-                ctx.last_known_cumulative_volume = float(instance.cumulative_volume)
+                self._drive_one(key)
+            except Exception as exc:
+                logger.warning("tick for %s failed: %s", key, exc)
+
+    def _drive_one(self, key: str) -> None:
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return
+            if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                return
+            if state.status != STATUS_RUNNING:
+                return
+            cfg = self._config_for(key, state)
+            adapter = self._adapter_for(key)
+            from .golden_fibo.engine import GoldenFiboEngine
+            engine = GoldenFiboEngine(
+                cfg,
+                state,
+                adapter,
+                self._client_id_factory(key),
+            )
+        # Run the tick OUTSIDE the lock so callers can read/list concurrently.
+        result = engine.tick()
+        with self._lock:
+            # The engine mutates state in place; persist.
+            self._states[key] = result.state
+            self._save_state()
+            # Read through-after-mutation fields.
+            s = self._states[key]
+            # If Step0 (entry) is FILLED and we have a position, the
+            # service must call confirm_step0_filled with the actual
+            # fill price (read from the venue via resolve_instrument /
+            # position_state) BEFORE the next tick.
+            if (
+                s.pending_order_role == ROLE_ENTRY
+                and s.next_step == 0
+                and s.pending_order_exchange_id is not None
+            ):
+                # Snapshot: don't recurse infinitely. The next tick
+                # will pick up the confirmed state.
+                self._maybe_confirm_step0(key)
+            if (
+                s.pending_order_role == ROLE_LADDER
+                and s.pending_order_exchange_id is not None
+                and s.pending_confirmed_price is None
+            ):
+                # Should not happen but be defensive
+                pass
+
+    def _maybe_confirm_step0(self, key: str) -> None:
+        """For Step0 MARKET: confirm fill via the live venue, persist P0.
+
+        The service is the only place with adapter access. The engine
+        cannot query the adapter directly from inside _handle_confirmed_fill
+        because it is a pure state machine.
+
+        We re-read get_order_state.actual_fill_price to confirm P0.
+        """
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.pending_order_role != ROLE_ENTRY:
+                return
+            exchange_order_id = state.pending_order_exchange_id
+        try:
+            order_state = self._adapter_for(key).get_order_state(
+                state.account, int(exchange_order_id)
+            )
+        except Exception as exc:
+            logger.warning("step0 get_order_state failed for %s: %s", key, exc)
+            return
+        if not order_state:
+            # Order not found yet — try again next tick
+            return
+        status = str(order_state.get("status") or "")
+        taxonomy = str(order_state.get("taxonomy") or "")
+        if taxonomy != "FILLED" and status != "filled":
+            # Not yet filled; wait
+            return
+        # Fill price: try actual_fill_price first, fall back to position entry
+        p0: Optional[Decimal] = None
+        afp = order_state.get("actual_fill_price")
+        if afp is not None:
+            try:
+                p0 = Decimal(str(afp))
+            except Exception:
+                p0 = None
+        if p0 is None or p0 <= 0:
+            # Fall back to position entry (per the simplified spec)
+            try:
+                position = self._adapter_for(key).position_state(
+                    state.account, state.instrument
+                )
+            except Exception:
+                position = None
+            if isinstance(position, dict):
+                ep = position.get("entry_price")
+                if ep is not None:
+                    try:
+                        p0 = Decimal(str(ep))
+                    except Exception:
+                        p0 = None
+        if p0 is None or p0 <= 0:
+            # Cannot establish P0 yet — freeze
+            with self._lock:
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = "could not establish Step0 fill price"
+                self._save_state()
+            return
+        # Now promote P0 and place TP + Step1
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return
+            from .golden_fibo.engine import GoldenFiboEngine
+            cfg = self._config_for(key, state)
+            adapter = self._adapter_for(key)
+            engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
+            engine.confirm_step0_filled(p0)
+            result = engine.place_step0_tp_and_step1(p0)
+            self._states[key] = engine.state
+            self._save_state()
+            if result is not None:
+                # Engine froze — propagate
+                self._states[key] = result.state
+                self._save_state()
+
+    # ------------------------------------------------------------------
+    # Public IPC commands
+    # ------------------------------------------------------------------
+    def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            op = str(command.get("op") or "").strip()
+        try:
+            if op == "start":
+                return self._cmd_start(command)
+            if op == "list":
+                return self._cmd_list(command)
+            if op == "detail":
+                return self._cmd_detail(command)
+            if op == "stop":
+                return self._cmd_stop(command)
+            if op == "preview":
+                return self._cmd_preview(command)
+            return {"ok": False, "error": f"unknown op: {op!r}"}
+        except _OppositeDirectionActive as exc:
+            return {"ok": False, "error": "OPPOSITE_DIRECTION_ACTIVE", "existing_registration_key": exc.existing_key}
+        except _InvalidRegistrationKey as exc:
+            return {"ok": False, "error": "INVALID_REGISTRATION_KEY", "detail": str(exc)}
+        except _InvalidInputs as exc:
+            return {"ok": False, "error": "INVALID_INPUTS", "detail": str(exc)}
+        except _LighterOnly as exc:
+            return {"ok": False, "error": "GOLDENFIBO_NOT_SUPPORTED", "detail": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": "INTERNAL", "detail": str(exc)}
+
+    def _cmd_start(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        exchange = str(command.get("exchange") or "").strip().lower()
+        account = str(command.get("account") or "").strip()
+        instrument = str(command.get("instrument") or "").strip()
+        direction = str(command.get("direction") or "").strip().upper()
+        percentage = command.get("percentage")
+        step0_volume = command.get("step0_volume")
+
+        if exchange not in SUPPORTED_EXCHANGES:
+            raise _LighterOnly(f"exchange {exchange!r} not supported (v1: lighter only)")
+        if direction not in VALID_DIRECTIONS:
+            raise _InvalidInputs(f"direction must be one of {VALID_DIRECTIONS}")
+        if not account:
+            raise _InvalidInputs("account required")
+        if not instrument:
+            raise _InvalidInputs("instrument required")
+        try:
+            pct = Decimal(str(percentage))
+        except Exception:
+            raise _InvalidInputs("percentage must be a positive decimal")
+        if pct <= 0:
+            raise _InvalidInputs("percentage must be positive")
+        try:
+            v0 = Decimal(str(step0_volume))
+        except Exception:
+            raise _InvalidInputs("step0_volume must be a positive decimal")
+        if v0 <= 0:
+            raise _InvalidInputs("step0_volume must be positive")
+
+        key = f"{exchange}/{account}/{instrument}/{direction}"
+
+        # Opposite-direction rejection FIRST — before any network call.
+        with self._lock:
+            opposite = "SELL" if direction == "BUY" else "BUY"
+            opposite_key = f"{exchange}/{account}/{instrument}/{opposite}"
+            if opposite_key in self._states:
+                state = self._states[opposite_key]
+                if state.status != STATUS_QUARANTINED_OLD_STRATEGY:
+                    raise _OppositeDirectionActive(opposite_key)
+            if key in self._states:
+                state = self._states[key]
+                if state.status != STATUS_QUARANTINED_OLD_STRATEGY:
+                    return {"ok": False, "error": "DUPLICATE_REGISTRATION", "registration_key": key}
+
+        # Validate venue-level constraints via resolve_instrument
+        try:
+            instrument_meta = self._adapter_for(key).resolve_instrument(account, instrument)
+        except Exception as exc:
+            raise _InvalidInputs(f"resolve_instrument failed: {exc}")
+        if not instrument_meta:
+            raise _InvalidInputs(f"instrument {instrument!r} not resolvable on {exchange}")
+
+        # Check size constraints
+        min_size_raw = (instrument_meta or {}).get("min_base_amount")
+        if min_size_raw is not None:
+            try:
+                min_size = Decimal(str(min_size_raw))
+                if v0 < min_size:
+                    raise _InvalidInputs(
+                        f"step0_volume {v0} below venue minimum {min_size}"
+                    )
             except Exception:
                 pass
-        return float(ctx.last_known_cumulative_volume or 0.0)
 
-    def _status_for(self, key: str, ctx: RegistrationContext, instance: Optional[FiboInstance]) -> str:
-        if ctx.service_status in {"needs_recovery", "stopping", "stop_error"}:
-            return ctx.service_status
-        if instance is None:
-            return ctx.service_status or "needs_recovery"
-        if instance.frozen:
-            return "frozen"
-        if not instance.running:
-            return ctx.service_status or "stopped"
-        return "running"
-
-    def _mark_stopping(self, key: str, ctx: RegistrationContext, instance: Optional[FiboInstance]) -> None:
-        ctx.service_status = "stopping"
-        ctx.status_reason = "STOP_CLOSE in progress. Strategy halted pending transactional cleanup."
-        ctx.stop_requested_at = time.time()
-        ctx.cleanup_details = {}
-        if instance is not None:
-            instance.running = False
-        self._runner._log("registration_stopping", registration_key=key)  # noqa: SLF001
-        self._save_state()
-
-    def _mark_stop_error(self, key: str, ctx: RegistrationContext, result: Dict[str, Any]) -> None:
-        ctx.service_status = "stop_error"
-        ctx.status_reason = str(result.get("error") or "CLEANUP_FAILED")
-        ctx.cleanup_details = dict(result)
-        self._save_state()
-
-    def _finalize_stopped_clean(self, key: str) -> None:
-        self._runner.manager.stop(key)
-        self._runner._started_specs.pop(key, None)  # noqa: SLF001
-        self._contexts.pop(key, None)
-        self._save_state()
-
-    def _build_detail_payload(
-        self,
-        ctx: RegistrationContext,
-        instance: Optional[FiboInstance],
-        exchange_state: Dict[str, Any],
-        metrics: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        step0 = instance.cascade.step0_price if instance is not None and instance.cascade.active else None
-        is_buy = ctx.spec.counter_type == CounterType.COUNTER_BUY
-        steps: Dict[str, Any] = {f"step{i}": None for i in range(1, 6)}
-        step0tp = None
-        if step0 is not None:
-            step0tp = step0_tp(step0, is_buy_cascade=is_buy, divide_percent=ctx.spec.divide_percent)
-            for idx in range(1, 6):
-                steps[f"step{idx}"] = step_price(step0, idx, is_buy_cascade=is_buy, divide_percent=ctx.spec.divide_percent)
-        status = self._status_for(ctx.spec.key, ctx, instance)
-        highest_step = instance.cascade.highest_step if instance is not None else None
-        activated_levels = sorted(getattr(instance, "_activated_levels", set())) if instance is not None else []
-        cumulative_real_volume = (
-            float(instance.cumulative_volume) if instance is not None else float(ctx.last_known_cumulative_volume or 0.0)
-        )
-        current_strategy_raw_sl = instance.protection.sl_price if instance is not None else None
-        current_strategy_raw_tp = instance.protection.tp_price if instance is not None else None
-        frozen_reason = instance.frozen_reason if instance is not None else ""
-        return {
-            "registration_key": ctx.spec.key,
-            "status": status,
-            "exchange": ctx.spec.exchange,
-            "account": ctx.spec.account,
-            "instrument": ctx.spec.instrument,
-            "counter_side": ctx.spec.counter_type.value,
-            "current_mark_price": exchange_state.get("mark_price"),
-            "step0": step0,
-            "step0tp": step0tp,
-            **steps,
-            "highest_activated_level": highest_step,
-            "activated_levels": activated_levels,
-            "configured_c1": ctx.spec.counter1,
-            "configured_c2": ctx.spec.counter2,
-            "configured_c3": ctx.spec.counter3,
-            "configured_c4": ctx.spec.counter4,
-            "cumulative_real_volume": cumulative_real_volume,
-            "position_side": exchange_state.get("position_side"),
-            "position_size": exchange_state.get("position_size"),
-            "average_entry_price": exchange_state.get("entry_price"),
-            "current_strategy_raw_sl": current_strategy_raw_sl,
-            "actual_exchange_sl": exchange_state.get("sl"),
-            "current_strategy_raw_tp": current_strategy_raw_tp,
-            "actual_exchange_tp": exchange_state.get("tp"),
-            "frozen_reason": frozen_reason,
-            "status_reason": ctx.status_reason,
-            "cleanup_details": ctx.cleanup_details,
-            "completed_cycles": metrics.get("completed_cycles"),
-            "profitable_cycles": metrics.get("profitable_cycles"),
-            "losing_cycles": metrics.get("losing_cycles"),
-            "total_realized_pnl": metrics.get("total_realized_pnl"),
-            "fees": metrics.get("fees"),
-        }
-
-    def _read_exchange_state(self, ctx: RegistrationContext) -> Dict[str, Any]:
-        agent = ctx.bundle.agent
-        pos = agent.execute(
-            {
-                "operation": "position_state",
-                "exchange": ctx.spec.exchange,
-                "account": ctx.spec.account,
-                "symbol": ctx.spec.instrument,
-            }
-        )
-        price = agent.execute(
-            {
-                "operation": "market_price",
-                "exchange": ctx.spec.exchange,
-                "account": ctx.spec.account,
-                "symbol": ctx.spec.instrument,
-            }
-        )
-        orders = agent.execute(
-            {
-                "operation": "positions_orders",
-                "exchange": ctx.spec.exchange,
-                "account": ctx.spec.account,
-            }
-        )
-        positions = list(getattr(pos, "positions", None) or []) if not isinstance(pos, dict) else list(pos.get("positions") or [])
-        groups = list(getattr(orders, "order_groups", None) or []) if not isinstance(orders, dict) else list(orders.get("order_groups") or [])
-        lane_positions = [p for p in positions if str(self._field(p, "symbol") or "").upper() == ctx.spec.instrument.upper()]
-        lane_group_count = 0
-        for group in groups:
-            if str(self._field(group, "symbol") or "").upper() == ctx.spec.instrument.upper():
-                lane_group_count += int(self._field(group, "order_count") or 0)
-        market_price = None
-        if isinstance(price, dict):
-            mp = price.get("market_price") or {}
-        else:
-            mp = getattr(price, "market_price", None)
-        if mp is not None:
-            market_price = self._field(mp, "mark_price") or self._field(mp, "markPrice") or self._field(mp, "price")
-        lane_pos = lane_positions[0] if lane_positions else None
-        stop_rows = self._read_stop_rows(ctx)
-        return {
-            "position_count": len(lane_positions),
-            "position_side": self._field(lane_pos, "side"),
-            "position_size": self._as_float_or_none(self._field(lane_pos, "size")),
-            "entry_price": self._as_float_or_none(self._field(lane_pos, "entry_price")),
-            "mark_price": self._as_float_or_none(market_price),
-            "sl": self._as_float_or_none(self._field(lane_pos, "sl")) or self._as_float_or_none(stop_rows.get("sl")),
-            "tp": self._as_float_or_none(self._field(lane_pos, "tp")) or self._as_float_or_none(stop_rows.get("tp")),
-            "open_orders": lane_group_count,
-            "stop_rows": stop_rows,
-        }
-
-    def _read_stop_rows(self, ctx: RegistrationContext) -> Dict[str, Any]:
-        agent = ctx.bundle.agent
-        creds_getter = getattr(agent, "_lookup_credentials", None)
-        if not callable(creds_getter):
-            return {"sl": None, "tp": None, "rows": []}
-        try:
-            creds = creds_getter(ctx.spec.account)
-            if not creds:
-                return {"sl": None, "tp": None, "rows": []}
-            raw = agent._signed_get(creds, "/v1/perps/stop_order")
-        except Exception:
-            return {"sl": None, "tp": None, "rows": []}
-        market_prefix = f"{ctx.spec.instrument.upper()}-"
-        sl = None
-        tp = None
-        rows = []
-        for row in list(raw or []):
-            if str(row.get("market") or "").upper().startswith(market_prefix):
-                rows.append(row)
-                if row.get("type") == "stopLoss":
-                    sl = row.get("triggerPrice")
-                elif row.get("type") == "takeProfit":
-                    tp = row.get("triggerPrice")
-                else:
-                    sl = sl or row.get("stopLoss")
-                    tp = tp or row.get("takeProfit")
-        return {"sl": sl, "tp": tp, "rows": rows}
-
-    def _assess_stop_close_safety(self, ctx: RegistrationContext, instance: Optional[FiboInstance], exchange_state: Dict[str, Any]) -> Dict[str, Any]:
-        expected_side = "long" if ctx.spec.counter_type == CounterType.COUNTER_BUY else "short"
-        expected_size = float(instance.cumulative_volume) if instance is not None else float(ctx.last_known_cumulative_volume or 0.0)
-        ctx.last_known_cumulative_volume = expected_size
-        actual_count = int(exchange_state.get("position_count") or 0)
-        actual_side = str(exchange_state.get("position_side") or "")
-        actual_size = exchange_state.get("position_size")
-        actual_sl = exchange_state.get("sl")
-        actual_tp = exchange_state.get("tp")
-        open_orders = int(exchange_state.get("open_orders") or 0)
-        if actual_count == 0:
-            if actual_sl is None and actual_tp is None and open_orders == 0:
-                return {"ok": True}
-            if expected_size <= 0:
-                return {
-                    "ok": False,
-                    "error": "OWNERSHIP_MISMATCH",
-                    "message": "Refusing STOP & CLOSE: lane ownership is ambiguous for a flat zero-volume registration with leftover protection or orders.",
-                }
-            return {"ok": True}
-        if expected_size <= 0:
-            return {
-                "ok": False,
-                "error": "OWNERSHIP_MISMATCH",
-                "message": "Refusing STOP & CLOSE: lane ownership is ambiguous for a zero-volume Fibo registration.",
-            }
-        if actual_count != 1:
-            return {
-                "ok": False,
-                "error": "OWNERSHIP_MISMATCH",
-                "message": "Refusing STOP & CLOSE: expected exactly one matching position row.",
-            }
-        if actual_side != expected_side:
-            return {
-                "ok": False,
-                "error": "OWNERSHIP_MISMATCH",
-                "message": "Refusing STOP & CLOSE: exchange position side does not match Fibo ownership.",
-            }
-        if actual_size is None or abs(float(actual_size) - float(expected_size)) > 1e-9:
-            return {
-                "ok": False,
-                "error": "OWNERSHIP_MISMATCH",
-                "message": "Refusing STOP & CLOSE: exchange position size does not match engine cumulative volume.",
-            }
-        return {"ok": True}
-
-    def _execute_stop_close_cleanup(self, ctx: RegistrationContext, exchange_state: Dict[str, Any]) -> Dict[str, Any]:
-        agent = ctx.bundle.agent
-        if exchange_state.get("position_count"):
-            agent.execute(
-                {
-                    "operation": "close_position",
-                    "exchange": ctx.spec.exchange,
-                    "account": ctx.spec.account,
-                    "symbol": ctx.spec.instrument,
-                }
+        with self._lock:
+            state = GoldenFiboState(
+                strategy=STRATEGY_GOLDENFIBO,
+                schema_version=1,
+                registration_key=key,
+                cycle_id=0,
+                exchange=exchange,
+                account=account,
+                instrument=instrument,
+                direction=direction,
+                percentage=pct,
+                step0_volume=v0,
+                status=STATUS_RUNNING,
             )
-        agent.execute(
-            {
-                "operation": "set_tp",
-                "exchange": ctx.spec.exchange,
-                "account": ctx.spec.account,
-                "symbol": ctx.spec.instrument,
-                "price": "0",
-            }
-        )
-        agent.execute(
-            {
-                "operation": "set_sl",
-                "exchange": ctx.spec.exchange,
-                "account": ctx.spec.account,
-                "symbol": ctx.spec.instrument,
-                "price": "0",
-            }
-        )
-        final_state = self._read_exchange_state(ctx)
-        verified_clean = (
-            int(final_state.get("position_count") or 0) == 0
-            and int(final_state.get("open_orders") or 0) == 0
-            and final_state.get("sl") is None
-            and final_state.get("tp") is None
-        )
-        result = {
-            "ok": verified_clean,
-            "verified_clean": verified_clean,
-            "position_count": final_state.get("position_count"),
-            "open_orders": final_state.get("open_orders"),
-            "sl": final_state.get("sl"),
-            "tp": final_state.get("tp"),
-            "message": "STOP & CLOSE completed and verified clean." if verified_clean else "STOP_CLOSE cleanup verification failed; registration remains tracked.",
-        }
-        if not verified_clean:
-            result["error"] = "CLEANUP_FAILED"
-        return result
+            self._states[key] = state
+            self._save_state()
+        return {"ok": True, "registration_key": key, "status": STATUS_RUNNING}
 
-    @staticmethod
-    def _field(obj: Any, name: str) -> Any:
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            return obj.get(name)
-        return getattr(obj, name, None)
+    def _cmd_list(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            active = []
+            quarantined = []
+            for key, state in self._states.items():
+                entry = {
+                    "registration_key": key,
+                    "exchange": state.exchange,
+                    "account": state.account,
+                    "instrument": state.instrument,
+                    "direction": state.direction,
+                    "cycle_id": state.cycle_id,
+                    "highest_filled_step": state.highest_filled_step,
+                    "expected_cumulative_size": str(state.expected_cumulative_size),
+                    "current_tp_price": None if state.current_tp_price is None else str(state.current_tp_price),
+                    "next_step": state.next_step,
+                    "status": state.status,
+                    "freeze_reason": state.freeze_reason,
+                }
+                if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                    quarantined.append(entry)
+                else:
+                    active.append(entry)
+        return {"ok": True, "registrations": active, "quarantined": quarantined, "registrations_count": len(active), "quarantined_count": len(quarantined)}
 
-    @staticmethod
-    def _as_float_or_none(value: Any) -> Optional[float]:
-        if value in (None, ""):
-            return None
+    def _cmd_detail(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(command.get("registration_key") or "").strip()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            return {"ok": True, "registration": state.to_dict()}
+
+    def _cmd_stop(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(command.get("registration_key") or "").strip()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION", "registration_key": key}
+            # Mark STOPPING and remove from active state.
+            # Per the spec: stop means stop robot operation. Do NOT
+            # auto-close the position. The user can manually close the
+            # position if they want.
+            self._states.pop(key, None)
+            self._save_state()
+        return {"ok": True, "registration_key": key, "status": "stopped"}
+
+    def _cmd_preview(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the derived V0..V20 + cumulative exposure for a step0."""
         try:
-            return float(str(value))
+            step0 = Decimal(str(command.get("step0_volume") or "0"))
         except Exception:
-            return None
+            return {"ok": False, "error": "INVALID_INPUTS"}
+        if step0 <= 0:
+            return {"ok": False, "error": "INVALID_INPUTS"}
+        ladder = []
+        cumulative = Decimal("0")
+        for n in range(21):
+            v = golden_fibo_volume(step0, n)
+            cumulative += v
+            ladder.append({"step": n, "size": str(v), "cumulative_through_step": str(cumulative)})
+        return {"ok": True, "step0_volume": str(step0), "ladder": ladder, "cumulative_through_step20": str(cumulative)}
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def start_polling(self) -> None:
+        """Start the background poll thread."""
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._shutdown.clear()
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, name="golden-fibo-poll", daemon=True
+        )
+        self._poll_thread.start()
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=5.0)
+            self._poll_thread = None
+
+    def _poll_loop(self) -> None:
+        while not self._shutdown.is_set():
+            try:
+                self._tick_once()
+            except Exception as exc:
+                logger.warning("poll tick failed: %s", exc)
+            self._shutdown.wait(self.poll_seconds)
 
 
-class SocketFiboServiceClient:
-    def __init__(self, socket_path: Path | None = None, timeout: float = _DEFAULT_SOCKET_TIMEOUT) -> None:
-        self.socket_path = Path(socket_path or resolve_fibo_socket_path())
-        self.timeout = float(timeout)
-
-    def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        payload = json.dumps(command, ensure_ascii=False).encode("utf-8") + b"\n"
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                sock.connect(str(self.socket_path))
-                sock.sendall(payload)
-                sock.shutdown(socket.SHUT_WR)
-                chunks: List[bytes] = []
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-        except FileNotFoundError:
-            return {
-                "ok": False,
-                "error": "SERVICE_UNAVAILABLE",
-                "message": f"Fibo service socket not found: {self.socket_path}",
-            }
-        except ConnectionRefusedError:
-            return {
-                "ok": False,
-                "error": "SERVICE_UNAVAILABLE",
-                "message": f"Fibo service refused connection: {self.socket_path}",
-            }
-        except OSError as exc:
-            return {
-                "ok": False,
-                "error": "SERVICE_UNAVAILABLE",
-                "message": f"Fibo service IPC failed: {exc}",
-            }
-        if not chunks:
-            return {"ok": False, "error": "SERVICE_EMPTY_RESPONSE", "message": "Fibo service returned no response."}
-        try:
-            return json.loads(b"".join(chunks).decode("utf-8"))
-        except Exception as exc:
-            return {"ok": False, "error": "SERVICE_BAD_RESPONSE", "message": f"Invalid Fibo service response: {exc}"}
-
-
-class _FiboSocketHandler(socketserver.StreamRequestHandler):
+# ---------------------------------------------------------------------------
+# Socket server
+# ---------------------------------------------------------------------------
+class _FiboCommandHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            raw = self.rfile.readline()
-            if not raw:
-                response = {"ok": False, "error": "EMPTY_REQUEST", "message": "No command payload received."}
-            else:
-                command = json.loads(raw.decode("utf-8"))
-                response = self.server.fibo_service.execute_command(command)  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Fibo socket handler failure")
-            response = {"ok": False, "error": "SERVICE_EXCEPTION", "message": str(exc)}
-        self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            payload = self.rfile.readline().decode("utf-8").strip()
+            if not payload:
+                return
+            command = json.loads(payload)
+            response = self.server.service.execute_command(command)  # type: ignore[attr-defined]
+            data = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+            self.wfile.write(data + b"\n")
+        except Exception as exc:
+            try:
+                data = json.dumps({"ok": False, "error": "BAD_REQUEST", "detail": str(exc)}, ensure_ascii=False).encode("utf-8")
+                self.wfile.write(data + b"\n")
+            except Exception:
+                pass
 
 
-class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
+class FiboSocketServiceHost(socketserver.ThreadingUnixStreamServer):
+    """Unix-socket IPC server for the persistent GoldenFibo service."""
 
-
-class FiboSocketServiceHost:
-    def __init__(self, service: Optional[PersistentFiboService] = None, socket_path: Path | None = None) -> None:
-        self.service = service or PersistentFiboService()
-        self.socket_path = Path(socket_path or resolve_fibo_socket_path())
+    def __init__(self, *, service: PersistentFiboService, socket_path: Path):
+        self.service = service
+        self.socket_path = Path(socket_path)
+        if self.socket_path.exists():
+            try:
+                self.socket_path.unlink()
+            except Exception:
+                pass
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._server: Optional[_ThreadingUnixServer] = None
+        super().__init__(str(self.socket_path), _FiboCommandHandler)
+        self._serving_thread: Optional[threading.Thread] = None
+        self._serving = True
 
     def serve_forever(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.socket_path.exists():
-            self.socket_path.unlink(missing_ok=True)
-        server = _ThreadingUnixServer(str(self.socket_path), _FiboSocketHandler)
-        server.fibo_service = self.service  # type: ignore[attr-defined]
-        self._server = server
         try:
-            server.serve_forever(poll_interval=0.5)
+            super().serve_forever()
         finally:
             self.shutdown()
 
     def shutdown(self) -> None:
-        server = self._server
-        self._server = None
-        if server is not None:
-            try:
-                server.shutdown()
-            except Exception:
-                pass
-            try:
-                server.server_close()
-            except Exception:
-                pass
         try:
-            self.service.shutdown()
+            super().shutdown()
         except Exception:
             pass
         if self.socket_path.exists():
-            self.socket_path.unlink(missing_ok=True)
+            try:
+                self.socket_path.unlink()
+            except Exception:
+                pass
 
 
-_LOCAL_SERVICE: Optional[PersistentFiboService] = None
-_CLIENT: Optional[SocketFiboServiceClient] = None
 
-
-def get_local_fibo_service() -> PersistentFiboService:
-    global _LOCAL_SERVICE
-    if _LOCAL_SERVICE is None:
-        _LOCAL_SERVICE = PersistentFiboService()
-    return _LOCAL_SERVICE
+# ---------------------------------------------------------------------------
+# Singleton accessor
+# ---------------------------------------------------------------------------
+_service_singleton: Optional[PersistentFiboService] = None
+_service_lock = threading.Lock()
 
 
 def get_fibo_service() -> FiboServiceProtocol:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = SocketFiboServiceClient()
-    return _CLIENT
+    """Return the singleton PersistentFiboService.
+
+    Tests can call ``_reset_fibo_service()`` to wipe the singleton.
+    """
+    global _service_singleton
+    with _service_lock:
+        if _service_singleton is None:
+            _service_singleton = PersistentFiboService()
+        return _service_singleton
 
 
-__all__ = [
-    "FiboServiceProtocol",
-    "FiboCycleLedger",
-    "PersistentFiboService",
-    "RegistrationContext",
-    "SocketFiboServiceClient",
-    "FiboSocketServiceHost",
-    "resolve_hermes_home",
-    "resolve_fibo_runtime_dir",
-    "resolve_fibo_state_path",
-    "resolve_fibo_ledger_path",
-    "resolve_fibo_event_log_path",
-    "resolve_fibo_socket_path",
-    "get_local_fibo_service",
-    "get_fibo_service",
-]
+def _reset_fibo_service() -> None:
+    global _service_singleton
+    with _service_lock:
+        if _service_singleton is not None:
+            try:
+                _service_singleton.shutdown()
+            except Exception:
+                pass
+        _service_singleton = None

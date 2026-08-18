@@ -3479,17 +3479,28 @@ def _submit_new_order(
             client_order_index = int(time.time_ns() % LIGHTER_MAX_CLIENT_ORDER_INDEX)
             if client_order_index <= 0:
                 client_order_index = 1
-            tx, api_response, error = await signer.create_order(
-                int(market["market_id"]),
-                client_order_index,
-                base_amount,
-                price_int,
-                side == "sell",
-                signer.ORDER_TYPE_LIMIT,
-                signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                reduce_only=reduce_only,
-                api_key_index=credentials["api_key_index"],
-            )
+            if order_type == "market":
+                tx, api_response, error = await signer.create_market_order_limited_slippage(
+                    int(market["market_id"]),
+                    client_order_index,
+                    base_amount,
+                    LIGHTER_CLOSE_MAX_SLIPPAGE,
+                    side == "sell",
+                    reduce_only=reduce_only,
+                    api_key_index=credentials["api_key_index"],
+                )
+            else:
+                tx, api_response, error = await signer.create_order(
+                    int(market["market_id"]),
+                    client_order_index,
+                    base_amount,
+                    price_int,
+                    side == "sell",
+                    signer.ORDER_TYPE_LIMIT,
+                    signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    reduce_only=reduce_only,
+                    api_key_index=credentials["api_key_index"],
+                )
             if error:
                 raise RuntimeError(f"Lighter order submission failed: {error}")
             # The Lighter SDK returns a successful tuple even when the
@@ -3557,12 +3568,12 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
         return make_failure(operation="new_order", exchange=name, account=account_name, code="MISSING_SYMBOL", message="Symbol is required.")
     if requested_side not in {"buy", "sell"}:
         return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_SIDE", message="Side must be buy or sell.")
-    if order_type != "limit":
-        return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_ORDER_TYPE", message="Only limit orders are currently supported for Lighter.")
+    if order_type not in {"limit", "market"}:
+        return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_ORDER_TYPE", message="Only limit and market orders are currently supported for Lighter.")
     if requested_volume is None or requested_volume <= 0:
         return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_VOLUME", message="Volume must be positive.")
-    if requested_price is None or requested_price <= 0:
-        return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_PRICE", message="Price must be positive.")
+    if order_type == "limit" and (requested_price is None or requested_price <= 0):
+        return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_PRICE", message="Price must be positive for limit orders.")
 
     market = _resolve_market(credentials["base_url"], requested_symbol)
     if market is None:
@@ -3571,7 +3582,40 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
     size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
     price_decimals = int(market.get("price_decimals") or market.get("supported_price_decimals") or 0)
     submitted_volume_decimal = _quantize_down(requested_volume, size_decimals)
-    submitted_price_decimal = _quantize_down(requested_price, price_decimals)
+    if order_type == "market":
+        # MARKET orders don't carry a price from the caller. Use the
+        # current mark as the reference for quantization; the actual
+        # fill price is recovered from the venue's pending/filled
+        # order records via get_order_state / accountInactiveOrders.
+        try:
+            mp_payload = _fetch_lighter_public_market_price(
+                credentials["base_url"], market
+            )
+        except Exception:
+            mp_payload = None
+        ref_price = None
+        if isinstance(mp_payload, dict):
+            for key in ("mark", "last_trade", "ask", "bid"):
+                raw = mp_payload.get(key)
+                if raw is not None:
+                    parsed = _decimal_or_none(raw)
+                    if parsed is not None and parsed > 0:
+                        ref_price = parsed
+                        break
+        if ref_price is None:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=account_name,
+                code="PRICE_UNAVAILABLE",
+                message=(
+                    f"Market order requires a reference price for quantization "
+                    f"({requested_symbol})."
+                ),
+            )
+        submitted_price_decimal = _quantize_down(ref_price, price_decimals)
+    else:
+        submitted_price_decimal = _quantize_down(requested_price, price_decimals)
     min_base_amount = _decimal_or_none(market.get("min_base_amount"))
     if submitted_volume_decimal <= 0:
         return make_failure(operation="new_order", exchange=name, account=account_name, code="INVALID_VOLUME", message="Volume must be positive after Lighter size quantization.")
@@ -3694,6 +3738,30 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
 
         if matched_order is not None:
             break
+        # For market orders, the order fills and is no longer in
+        # active orders. Verify by reading the position size delta.
+        if order_type == "market":
+            try:
+                post_size = _current_position_size(
+                    request,
+                    symbol=requested_symbol,
+                    side=requested_side,
+                )
+            except Exception:
+                post_size = Decimal("0")
+            if post_size >= submitted_volume_decimal:
+                matched_order = {
+                    "order_id": submit_result.get("exchange_order_id"),
+                    "client_order_index": submit_result.get("client_order_index"),
+                    "market_index": int(market["market_id"]),
+                    "symbol": requested_symbol,
+                    "is_ask": side == "sell",
+                    "filled_base_amount": str(_to_scaled_int(post_size, size_decimals)),
+                    # No submitted price (market). The actual fill price
+                    # is recovered later via get_order_state from the
+                    # inactive-orders record.
+                }
+                break
         # Not yet visible — back off and retry.
         if attempt + 1 < LIGHTER_VERIFY_ATTEMPTS:
             time.sleep(LIGHTER_VERIFY_DELAY_SECONDS * (attempt + 1))
@@ -4340,6 +4408,667 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
     return make_failure(operation='close_position', exchange=name, account=account_name, code='VERIFICATION_FAILED', message='Position close could not be verified.', position_action=action)
 
 
+# ---------------------------------------------------------------------------
+# GoldenFibo-required generic ops
+#
+# These are exchange-agnostic surfaces that any compliant perpetual-Dex
+# adapter must expose for the GoldenFibo strategy to be implementable.
+# GoldenFibo itself is not coded here — only the agent-level surface
+# used by GoldenFibo's engine.
+# ---------------------------------------------------------------------------
+
+# Status taxonomy for the get_order_state op. The GoldenFibo engine
+# uses these to decide whether to advance the cycle, hold (active),
+# freeze (terminal failure), or clear (filled and position flat).
+_LIGHTER_ORDER_STATUS_ACTIVE = "ACTIVE"
+_LIGHTER_ORDER_STATUS_FILLED = "FILLED"
+_LIGHTER_ORDER_STATUS_CANCELED = "CANCELED"
+_LIGHTER_ORDER_STATUS_REJECTED = "REJECTED"
+_LIGHTER_ORDER_STATUS_EXPIRED = "EXPIRED"
+_LIGHTER_ORDER_STATUS_UNKNOWN = "UNKNOWN"
+
+
+# State literals we use to interpret the venue's `status` field and
+# transform it into the GoldenFibo taxonomy. The mapping is conservative:
+# when the venue status is not in the known set, we fall back to
+# UNKNOWN rather than guessing.
+_LIGHTER_VENUE_STATUS_TO_TAXONOMY = {
+    "open": _LIGHTER_ORDER_STATUS_ACTIVE,
+    "active": _LIGHTER_ORDER_STATUS_ACTIVE,
+    "pending": _LIGHTER_ORDER_STATUS_ACTIVE,
+    "resting": _LIGHTER_ORDER_STATUS_ACTIVE,
+    "filled": _LIGHTER_ORDER_STATUS_FILLED,
+    "canceled": _LIGHTER_ORDER_STATUS_CANCELED,
+    "cancelled": _LIGHTER_ORDER_STATUS_CANCELED,
+    "rejected": _LIGHTER_ORDER_STATUS_REJECTED,
+    "expired": _LIGHTER_ORDER_STATUS_EXPIRED,
+    "expire": _LIGHTER_ORDER_STATUS_EXPIRED,
+}
+
+
+def _actual_fill_price(
+    order: Dict[str, Any],
+    *,
+    size_decimals: int,
+    price_decimals: int,
+) -> Optional[Decimal]:
+    """Compute the actual average fill price for a Lighter order.
+
+    Per the Lighter Order model (lighter/models/order.py), a filled
+    order carries ``filled_base_amount`` and ``filled_quote_amount``
+    as scaled integers. The actual average execution price is the
+    ratio of the two:
+
+        fill_price = (filled_quote_amount / 10**price_decimals)
+                    / (filled_base_amount  / 10**size_decimals)
+
+    For an unfilled (resting) order, both are zero and we return
+    None — the caller should use the order's submitted ``price`` for
+    a resting limit display purposes.
+
+    Never substitutes mark price, requested price, or position average
+    entry for a missing actual fill price.
+    """
+    filled_base = _decimal_or_none(order.get("filled_base_amount"))
+    filled_quote = _decimal_or_none(order.get("filled_quote_amount"))
+    if filled_base is None or filled_quote is None:
+        return None
+    if filled_base <= 0 or filled_quote <= 0:
+        return None
+    base_scale = Decimal(10) ** int(size_decimals)
+    quote_scale = Decimal(10) ** int(price_decimals)
+    base_dec = filled_base / base_scale
+    quote_dec = filled_quote / quote_scale
+    if base_dec == 0:
+        return None
+    return quote_dec / base_dec
+
+
+def _classify_order_status(order: Dict[str, Any]) -> str:
+    """Map a Lighter Order object to the GoldenFibo status taxonomy.
+
+    The mapping is intentionally conservative: any unrecognized status
+    returns UNKNOWN so the engine freezes rather than acting on a
+    guess. The caller should treat UNKNOWN as a freeze signal.
+    """
+    if not isinstance(order, dict):
+        return _LIGHTER_ORDER_STATUS_UNKNOWN
+    raw = str(order.get("status") or "").strip().lower()
+    if not raw:
+        return _LIGHTER_ORDER_STATUS_UNKNOWN
+    return _LIGHTER_VENUE_STATUS_TO_TAXONOMY.get(raw, _LIGHTER_ORDER_STATUS_UNKNOWN)
+
+
+# Public Lighter base URLs (also used by _execute_market_price for
+# credential-less price reads).
+_LIGHTER_URL_ARBITRUM = "https://mainnet.zklighter.elliot.ai"
+_LIGHTER_URL_ROBINHOOD = "https://robinhood.zklighter.elliot.ai"
+
+
+def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
+    """Resolve a symbol to its market metadata (size/price decimals)."""
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account_name,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Lighter account configuration",
+        )
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account_name,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    market = _resolve_market(credentials["base_url"], requested_symbol)
+    if market is None:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account_name,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    payload = {
+        "symbol": requested_symbol,
+        "market_id": market.get("market_id"),
+        "size_decimals": int(market.get("size_decimals") or 0),
+        "price_decimals": int(market.get("price_decimals") or 0),
+        "min_base_amount": str(market.get("min_base_amount") or ""),
+        "tick_size": str(market.get("tick_size") or ""),
+    }
+    return make_success(
+        operation="resolve_instrument",
+        exchange=name,
+        account=account_name,
+        instrument=payload,
+    )
+
+
+def _fetch_lighter_inactive_orders(
+    credentials: Dict[str, Any], auth_token: str
+) -> List[Dict[str, Any]]:
+    """Read paginated inactive orders for the Lighter account.
+
+    Used by _execute_get_order_state to locate orders that have left
+    the active list and to retrieve the actual fill price. Returns
+    the raw shape (lighter.models.order.Order as dict).
+    """
+    limiter = _get_lighter_limiter(credentials)
+    auth_token = str(auth_token or "")
+    out: List[Dict[str, Any]] = []
+    limit = 200
+    offset = 0
+    try:
+        while True:
+            limiter.acquire()
+            response = requests.get(
+                f"{credentials['base_url']}/api/v1/accountInactiveOrders",
+                params={
+                    "account_index": str(credentials["account_index"]),
+                    "limit": str(limit),
+                    "offset": str(offset),
+                },
+                headers={"Accept": "application/json", "authorization": auth_token},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            batch = payload.get("orders") or []
+            if not isinstance(batch, list):
+                break
+            out.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += len(batch)
+    except Exception as exc:  # noqa: BLE001
+        retry_after = _looks_like_lighter_429(exc)
+        if retry_after is not None:
+            limiter.record_failure(retry_after)
+        raise
+    return out
+
+
+def _fetch_lighter_public_market_price(
+    base_url: str, market: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Read best-bid / best-ask / mark for one Lighter market.
+
+    Returns a dict with ``mark``, ``last_trade``, ``bid``, ``ask``,
+    ``ts`` or ``None``. The caller MUST NOT substitute this for an
+    actual fill price.
+    """
+    market_id = market.get("market_id")
+    try:
+        response = requests.get(
+            f"{base_url}/api/v1/orderBookDetails",
+            params={"market_id": int(market_id)},
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception:  # noqa: BLE001
+        return None
+    payload = response.json() or {}
+    details = payload.get("order_book_details") or payload.get("orderBookDetails") or []
+    if not isinstance(details, list) or not details:
+        return None
+    first = details[0] if isinstance(details[0], dict) else {}
+    last_price = _decimal_or_none(first.get("last_trade_price") or first.get("lastTradePrice"))
+    mark_price = _decimal_or_none(first.get("mark_price") or first.get("markPrice"))
+    bid = _decimal_or_none(first.get("best_bid") or first.get("bestBid"))
+    ask = _decimal_or_none(first.get("best_ask") or first.get("bestAsk"))
+    return {
+        "mark": _decimal_text(mark_price) if mark_price is not None else None,
+        "last_trade": _decimal_text(last_price) if last_price is not None else None,
+        "bid": _decimal_text(bid) if bid is not None else None,
+        "ask": _decimal_text(ask) if ask is not None else None,
+        "ts": int(first.get("timestamp") or 0),
+    }
+
+
+def _execute_market_price(request: Dict[str, Any]) -> CanonicalResponse:
+    """Return the current mark price for the requested symbol."""
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account="",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name) if account_name else None
+    if credentials is not None:
+        market = _resolve_market(credentials["base_url"], requested_symbol)
+        if market is None:
+            return make_failure(
+                operation="market_price",
+                exchange=name,
+                account=account_name,
+                code="INSTRUMENT_NOT_FOUND",
+                message=f"Instrument not found: {requested_symbol}",
+            )
+        payload = _fetch_lighter_public_market_price(credentials["base_url"], market)
+        if payload is None:
+            return make_failure(
+                operation="market_price",
+                exchange=name,
+                account=account_name,
+                code="PRICE_UNAVAILABLE",
+                message=f"Price unavailable for {requested_symbol}",
+            )
+        payload["symbol"] = requested_symbol
+        return make_success(
+            operation="market_price",
+            exchange=name,
+            account=account_name,
+            market_price=payload,
+        )
+    # Credential-less mode: try each public base URL.
+    for base_url in (_LIGHTER_URL_ARBITRUM, _LIGHTER_URL_ROBINHOOD):
+        try:
+            market = _resolve_market(base_url, requested_symbol)
+            if market is None:
+                continue
+            payload = _fetch_lighter_public_market_price(base_url, market)
+            if payload is None:
+                continue
+            payload["symbol"] = requested_symbol
+            return make_success(
+                operation="market_price",
+                exchange=name,
+                account=account_name,
+                market_price=payload,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return make_failure(
+        operation="market_price",
+        exchange=name,
+        account=account_name,
+        code="INSTRUMENT_NOT_FOUND",
+        message=f"Instrument not found: {requested_symbol}",
+    )
+
+
+def _current_position_size(
+    request: Dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+) -> Decimal:
+    """Signed-position size for (symbol, side) on Lighter. Returns 0 when
+    flat or when the position is on the opposite side. Used by the
+    market-order verifier to confirm the order filled."""
+    expected_symbol = str(symbol or "").strip().upper()
+    want_sign = 1 if str(side or "").strip().lower() == "buy" else -1
+    fetched = _fetch_account_entry(request)
+    target = fetched.get("target") if isinstance(fetched, dict) else None
+    raw_positions = target.get("positions") if isinstance(target, dict) else None
+    if isinstance(raw_positions, list):
+        for item in raw_positions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("symbol") or "").strip().upper() != expected_symbol:
+                continue
+            size_value = _decimal_or_none(item.get("position")) or Decimal("0")
+            try:
+                sign_value = int(item.get("sign") or 0)
+            except Exception:  # noqa: BLE001
+                sign_value = 1 if size_value >= 0 else -1
+            item_sign = (1 if sign_value >= 0 else -1)
+            if item_sign == want_sign:
+                return abs(size_value)
+    return Decimal("0")
+
+
+def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
+    """Return the current signed position state for (account, symbol)."""
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account_name,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Lighter account configuration",
+        )
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account_name,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    fetched = _fetch_account_entry(request)
+    target = fetched.get("target")
+    auth_token = str(fetched.get("auth_token") or "")
+    active_orders = _fetch_active_orders(credentials, auth_token)
+    sl = None
+    tp = None
+    for order in active_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").strip().upper() != requested_symbol:
+            continue
+        trigger = _decimal_or_none(order.get("trigger_price"))
+        if trigger is None:
+            continue
+        text = _decimal_text(trigger)
+        label = str(order.get("type") or "").lower()
+        if "stop" in label or "sl" in label:
+            sl = text
+        elif "take" in label or "tp" in label:
+            tp = text
+    positions_raw = target.get("positions") if isinstance(target, dict) else None
+    matched = None
+    if isinstance(positions_raw, list):
+        for item in positions_raw:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("symbol") or "").strip().upper() != requested_symbol:
+                continue
+            size = _decimal_or_none(item.get("position")) or Decimal("0")
+            sign = int(item.get("sign") or 0)
+            if sign == 0 and size != 0:
+                sign = 1 if size > 0 else -1
+            if sign == 0:
+                continue
+            entry_price = _decimal_or_none(item.get("entry_quote"))
+            matched = {
+                "symbol": requested_symbol,
+                "side": "long" if sign > 0 else "short",
+                "size": str(abs(size)),
+                "entry_price": _decimal_text(entry_price) if entry_price is not None else None,
+                "sl": sl,
+                "tp": tp,
+            }
+            break
+    if matched is None:
+        matched = {
+            "symbol": requested_symbol,
+            "side": None,
+            "size": "0",
+            "entry_price": None,
+            "sl": sl,
+            "tp": tp,
+        }
+    return make_success(
+        operation="position_state",
+        exchange=name,
+        account=account_name,
+        position=matched,
+    )
+
+
+def _resolve_lighter_market_by_id(
+    base_url: str, market_id: int
+) -> Optional[Dict[str, Any]]:
+    """Resolve a market by integer market_id (used by get_order_state)."""
+    if not market_id:
+        return None
+    try:
+        sym_map = _fetch_market_symbol_map(base_url)
+    except Exception:  # noqa: BLE001
+        return None
+    return sym_map.get(int(market_id))
+
+
+def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
+    """Return the full state for an exact order_index.
+
+    Reads active + inactive orders, picks the matching record, and
+    surfaces the actual fill price (computed from filled_quote /
+    filled_base) when the order is FILLED. Classifies the status into
+    the GoldenFibo taxonomy.
+    """
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account_name,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Lighter account configuration",
+        )
+    order_index_raw = request.get("order_index")
+    if order_index_raw is None:
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account_name,
+            code="MISSING_ORDER_ID",
+            message="order_index is required.",
+        )
+    try:
+        order_index = int(order_index_raw)
+    except (TypeError, ValueError):
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account_name,
+            code="INVALID_ORDER_ID",
+            message="order_index must be an integer.",
+        )
+    auth_token = _mint_auth_token_cached(credentials)
+    matched = None
+    try:
+        for order in _fetch_active_orders(credentials, auth_token):
+            if not isinstance(order, dict):
+                continue
+            try:
+                if int(order.get("order_index") or order.get("order_id") or 0) == order_index:
+                    matched = order
+                    break
+            except (TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    if matched is None:
+        try:
+            for order in _fetch_lighter_inactive_orders(credentials, auth_token):
+                if not isinstance(order, dict):
+                    continue
+                try:
+                    if int(order.get("order_index") or order.get("order_id") or 0) == order_index:
+                        matched = order
+                        break
+                except (TypeError, ValueError):
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+    if matched is None:
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account_name,
+            code="ORDER_NOT_FOUND",
+            message=f"order_index {order_index} not found.",
+        )
+    try:
+        market_id = int(matched.get("market_index") or 0)
+    except (TypeError, ValueError):
+        market_id = 0
+    symbol = str(matched.get("symbol") or "").strip().upper()
+    size_decimals = 0
+    price_decimals = 0
+    if market_id and symbol:
+        market = _resolve_lighter_market_by_id(credentials["base_url"], market_id)
+        if market is not None:
+            size_decimals = int(market.get("size_decimals") or 0)
+            price_decimals = int(market.get("price_decimals") or 0)
+    fill_price = _actual_fill_price(
+        matched,
+        size_decimals=size_decimals,
+        price_decimals=price_decimals,
+    )
+    payload = {
+        "order_index": order_index,
+        "client_order_index": int(matched.get("client_order_index") or 0) or None,
+        "symbol": symbol,
+        "market_id": market_id,
+        "side": "sell" if bool(matched.get("is_ask")) else "buy",
+        "type": str(matched.get("type") or ""),
+        "status": str(matched.get("status") or ""),
+        "taxonomy": _classify_order_status(matched),
+        "requested_price": _decimal_text(_decimal_or_none(matched.get("price")))
+            if _decimal_or_none(matched.get("price")) is not None
+            else None,
+        "requested_size": _decimal_text(_decimal_or_none(matched.get("initial_base_amount")))
+            if _decimal_or_none(matched.get("initial_base_amount")) is not None
+            else None,
+        "filled_size": _decimal_text(_decimal_or_none(matched.get("filled_base_amount")))
+            if _decimal_or_none(matched.get("filled_base_amount")) is not None
+            else None,
+        "filled_quote": _decimal_text(_decimal_or_none(matched.get("filled_quote_amount")))
+            if _decimal_or_none(matched.get("filled_quote_amount")) is not None
+            else None,
+        "actual_fill_price": _decimal_text(fill_price) if fill_price is not None else None,
+        "reduce_only": bool(matched.get("reduce_only")),
+        "created_at": int(matched.get("created_at") or 0),
+        "updated_at": int(matched.get("updated_at") or 0),
+    }
+    return make_success(
+        operation="get_order_state",
+        exchange=name,
+        account=account_name,
+        order_state=payload,
+    )
+
+
+def _execute_cancel_order(request: Dict[str, Any]) -> CanonicalResponse:
+    """Cancel exactly one order by ``order_index``.
+
+    Used by GoldenFibo to cancel an orphan pending limit when a
+    shared TP closes the position out from under it. Verifies by
+    re-reading the active orders list.
+    """
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Lighter account configuration",
+        )
+    order_index_raw = request.get("order_index")
+    if order_index_raw is None:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="MISSING_ORDER_ID",
+            message="order_index is required.",
+        )
+    try:
+        order_index = int(order_index_raw)
+    except (TypeError, ValueError):
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="INVALID_ORDER_ID",
+            message="order_index must be an integer.",
+        )
+    auth_token = _mint_auth_token_cached(credentials)
+    try:
+        active_orders = _fetch_active_orders(credentials, auth_token)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="OPEN_ORDERS_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    target = None
+    for order in active_orders:
+        if not isinstance(order, dict):
+            continue
+        try:
+            if int(order.get("order_index") or order.get("order_id") or 0) == order_index:
+                target = order
+                break
+        except (TypeError, ValueError):
+            continue
+    if target is None:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="ORDER_NOT_FOUND",
+            message=f"order_index {order_index} not found in active orders.",
+        )
+    try:
+        def _submit() -> Any:
+            signer = _build_signer_client(credentials)
+            return _run_lighter_coro_blocking(
+                credentials,
+                lambda: signer.cancel_order(order_index=order_index),
+                thread_name=f"lighter-cancel-{order_index}",
+                max_retries=0,
+            )
+        _submit()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="CANCEL_ORDER_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    try:
+        post_active = _fetch_active_orders(credentials, auth_token)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="VERIFICATION_FAILED",
+            message=f"Cancel verification could not read active orders: {exc}",
+        )
+    post_oids = set()
+    for order in post_active:
+        if not isinstance(order, dict):
+            continue
+        try:
+            post_oids.add(int(order.get("order_index") or order.get("order_id") or 0))
+        except (TypeError, ValueError):
+            continue
+    if order_index in post_oids:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account_name,
+            code="VERIFICATION_FAILED",
+            message=f"order_index {order_index} still present after cancel.",
+        )
+    return make_success(
+        operation="cancel_order",
+        exchange=name,
+        account=account_name,
+        cancel_order={
+            "order_index": order_index,
+            "verified": True,
+            "status": "success",
+        },
+    )
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     operation = str(request.get("operation") or "").strip()
     account = str(request.get("account") or "").strip()
@@ -4351,7 +5080,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "cancel_order"}:
         return make_failure(
             operation=operation,
             exchange=name,
@@ -4384,6 +5113,16 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_new_order(request)
         if operation == "cancel_order_group":
             return _execute_cancel_order_group(request)
+        if operation == "resolve_instrument":
+            return _execute_resolve_instrument(request)
+        if operation == "market_price":
+            return _execute_market_price(request)
+        if operation == "position_state":
+            return _execute_position_state(request)
+        if operation == "get_order_state":
+            return _execute_get_order_state(request)
+        if operation == "cancel_order":
+            return _execute_cancel_order(request)
         return _execute_ladder(request)
     except requests.HTTPError as exc:
         return make_failure(

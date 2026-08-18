@@ -54,23 +54,35 @@ if str(_REPO_ROOT) not in sys.path:
 # Strip live HYPERLIQUID_* env vars so account-discovery tests
 # against the real agent get a deterministic baseline, then restore on
 # teardown.
-_PRESERVED_ENV: Dict[str, str] = {}
+# Module-level env state preservation for PACIFICA_* keys.
+# Pop PACIFICA_* env vars only at module import time, and restore
+# them at module teardown. The atexit hook was insufficient because
+# it never fires between tests inside one unittest process.
+_MODULE_PRESERVED_PACIFICA_ENV: Dict[str, str] = {}
 for _k in list(os.environ.keys()):
-    if _k.startswith("HYPERLIQUID_"):
-        _PRESERVED_ENV[_k] = os.environ[_k]
-        os.environ.pop(_k, None)
+    if _k.startswith("PACIFICA_"):
+        _MODULE_PRESERVED_PACIFICA_ENV[_k] = os.environ[_k]
 
 
-def _restore_env():
-    for k in list(os.environ.keys()):
-        if k.startswith("HYPERLIQUID_") and k not in _PRESERVED_ENV:
-            os.environ.pop(k, None)
-    for k, v in _PRESERVED_ENV.items():
-        os.environ[k] = v
+def _restore_env() -> None:
+    """Backward-compat no-op. Real restoration lives in tearDownModule."""
+    pass
 
 
-import atexit
-atexit.register(_restore_env)
+def setUpModule() -> None:
+    for _k in list(os.environ.keys()):
+        if _k.startswith("PACIFICA_") and _k not in _MODULE_PRESERVED_PACIFICA_ENV:
+            _MODULE_PRESERVED_PACIFICA_ENV[_k] = os.environ[_k]
+
+
+def tearDownModule() -> None:
+    for _k in list(os.environ.keys()):
+        if _k.startswith("PACIFICA_") and _k not in _MODULE_PRESERVED_PACIFICA_ENV:
+            os.environ.pop(_k, None)
+    for _k, _v in _MODULE_PRESERVED_PACIFICA_ENV.items():
+        os.environ[_k] = _v
+
+
 
 
 # ---------------------------------------------------------------------------
