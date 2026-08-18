@@ -4592,6 +4592,57 @@ def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
     )
 
 
+def _execute_market_constraints(request: Dict[str, Any]) -> CanonicalResponse:
+    """Generic read of full venue constraints for a symbol.
+
+    Not GoldenFibo-specific. Returns min_base_amount, min_quote_amount,
+    size_decimals, price_decimals, tick_size, market_id. Read-only.
+    """
+    account_name = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account_name)
+    if not credentials:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account_name,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Lighter account configuration",
+        )
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account_name,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    market = _resolve_market(credentials["base_url"], requested_symbol)
+    if market is None:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account_name,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    constraints = {
+        "symbol": requested_symbol,
+        "market_id": market.get("market_id"),
+        "size_decimals": int(market.get("size_decimals") or market.get("supported_size_decimals") or 0),
+        "price_decimals": int(market.get("price_decimals") or market.get("supported_price_decimals") or 0),
+        "min_base_amount": str(market.get("min_base_amount") or ""),
+        "min_quote_amount": str(market.get("min_quote_amount") or ""),
+        "tick_size": str(market.get("tick_size") or ""),
+    }
+    return make_success(
+        operation="market_constraints",
+        exchange=name,
+        account=account_name,
+        order_state=constraints,
+    )
+
+
 def _fetch_lighter_inactive_orders(
     credentials: Dict[str, Any], auth_token: str
 ) -> List[Dict[str, Any]]:
@@ -5361,7 +5412,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "cancel_order"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
         return make_failure(
             operation=operation,
             exchange=name,
@@ -5404,6 +5455,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_get_order_state(request)
         if operation == "get_order_state_by_client_id":
             return _execute_get_order_state_by_client_id(request)
+        if operation == "market_constraints":
+            return _execute_market_constraints(request)
         if operation == "cancel_order":
             return _execute_cancel_order(request)
         return _execute_ladder(request)

@@ -118,6 +118,21 @@ class LighterGoldenFiboAdapter:
         positions = _get_payload(resp).get("positions") or []
         return positions[0] if positions else {}
 
+    def get_venue_constraints(self, account: str, instrument: str) -> Dict[str, Any]:
+        """Thin read of full venue constraints for preflight validation.
+
+        Returns min_base_amount, min_quote_amount, size_decimals,
+        price_decimals, tick_size. Read-only.
+        """
+        resp = lighter_agent.execute({
+            "operation": "market_constraints",
+            "account": account,
+            "symbol": instrument,
+        })
+        if not _is_success(resp):
+            return {}
+        return _get_payload(resp).get("order_state") or {}
+
     def get_order_state(self, account: str, order_index: int) -> Dict[str, Any]:
         resp = lighter_agent.execute({
             "operation": "get_order_state",

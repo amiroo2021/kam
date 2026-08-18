@@ -785,6 +785,17 @@ class PersistentFiboService:
             except Exception:
                 pass
 
+        # ---- GoldenFibo Lighter preflight (BEFORE any exchange mutation) ----
+        # Validates the full proposed ladder (Step0 MARKET + Step1..Step20
+        # LIMIT) against venue base-size, price-increment, and minimum-quote
+        # constraints. Never changes the requested volume; either accepts or
+        # rejects with a reported safe minimum. Read-only venue calls only.
+        preflight_reject = self._golden_fibo_preflight(
+            exchange, account, instrument, direction, key, pct, v0
+        )
+        if preflight_reject is not None:
+            return {"ok": False, **preflight_reject}
+
         with self._lock:
             state = GoldenFiboState(
                 strategy=STRATEGY_GOLDENFIBO,
@@ -898,6 +909,77 @@ class PersistentFiboService:
             self._states.pop(key, None)
             self._save_state()
         return {"ok": True, "registration_key": key, "status": "stopped"}
+
+    def _golden_fibo_preflight(
+        self,
+        exchange: str,
+        account: str,
+        instrument: str,
+        direction: str,
+        key: str,
+        percentage: Decimal,
+        step0_volume: Decimal,
+    ) -> Optional[Dict[str, Any]]:
+        """GoldenFibo Lighter preflight. Read-only. Returns an error dict on
+        rejection, or None when the proposed ladder is venue-valid.
+
+        Validates Step0 base size plus the full Step1..Step20 ladder against
+        base-size, price-increment, and minimum-quote constraints. The TP
+        uses the dedicated set_tp primitive, so the ordinary LIMIT min-quote
+        rule is applied to the resting LIMIT ladder (Step1+), NOT to the TP.
+        """
+        from .golden_fibo.preflight import golden_fibo_lighter_preflight
+
+        adapter = self._adapter_for(key)
+        # Venue constraints (read-only).
+        try:
+            constraints = adapter.get_venue_constraints(account, instrument)
+        except Exception as exc:
+            logger.warning("golden-fibo preflight constraints read failed for %s: %s", key, exc)
+            return None  # fail-open: do not block START on a read failure
+        if not constraints:
+            return None
+        # Market price for the P0 estimate (read-only).
+        try:
+            mp = adapter.market_price(account, instrument)
+        except Exception as exc:
+            logger.warning("golden-fibo preflight market price read failed for %s: %s", key, exc)
+            return None
+        est_p0_raw = (mp or {}).get("mark_price") or (mp or {}).get("last_external_price")
+        try:
+            est_p0 = Decimal(str(est_p0_raw)) if est_p0_raw is not None else None
+        except Exception:
+            est_p0 = None
+        if est_p0 is None or est_p0 <= 0:
+            return None
+
+        min_base = Decimal(str(constraints.get("min_base_amount") or "0"))
+        min_quote = Decimal(str(constraints.get("min_quote_amount") or "0"))
+        size_dec = int(constraints.get("size_decimals") or 0)
+        price_dec = int(constraints.get("price_decimals") or 0)
+
+        result = golden_fibo_lighter_preflight(
+            direction=direction,
+            percentage=percentage,
+            step0_volume=step0_volume,
+            estimated_p0=est_p0,
+            min_base_amount=min_base,
+            min_quote_amount=min_quote,
+            size_decimals=size_dec,
+            price_decimals=price_dec,
+        )
+        if result.ok:
+            return None
+        return {
+            "error": result.error,
+            "detail": result.detail,
+            "estimated_p0": None if result.estimated_p0 is None else str(result.estimated_p0),
+            "estimated_tp0": None if result.estimated_tp0 is None else str(result.estimated_tp0),
+            "estimated_p1": None if result.estimated_p1 is None else str(result.estimated_p1),
+            "min_quote_amount": None if result.min_quote_amount is None else str(result.min_quote_amount),
+            "safe_min_step0_volume": None if result.safe_min_step0_volume is None else str(result.safe_min_step0_volume),
+            "failing_step": result.failing_step,
+        }
 
     def _lane_preflight(
         self,
