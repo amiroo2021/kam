@@ -309,8 +309,6 @@ class GoldenFiboEngine:
             tp_price = Decimal(prev_pk)
 
         tp_size = self.config.cumulative_volume(self.state.highest_filled_step)
-        # tp is opposite side, reduce_only
-        opposite = "sell" if self.config.direction == "BUY" else "buy"
 
         # Guard: never resubmit an already-attempted TP for this step.
         if (
@@ -323,21 +321,12 @@ class GoldenFiboEngine:
                 "reconcile exchange state before any resubmission"
             )
 
+        # GoldenFibo does NOT construct Lighter TP payloads. It asks the
+        # thin adapter to set/replace the ONE shared TP on the accumulated
+        # position via the generic x_lighter_agent set_tp operation. The
+        # agent derives position size, closing side, quantization,
+        # reduce_only, TP trigger semantics, replacement, and verification.
         tp_client_id = self._next_client_id()
-
-        # Cancel old TP first (if any)
-        if self.state.current_tp_order_id is not None:
-            try:
-                self.adapter.cancel_order(
-                    account=self.config.account,
-                    order_index=int(self.state.current_tp_order_id),
-                )
-                actions.append(f"cancel old TP oid={self.state.current_tp_order_id}")
-            except Exception as exc:
-                return self._freeze(f"cancel old TP failed: {exc}")
-            self.state.current_tp_order_id = None
-            self.state.current_tp_client_id = None
-            self.state.current_tp_role = None
 
         # PREPARE + ATTEMPT durable record for the TP submission.
         self.state.submission_phase = SUBMISSION_PREPARED
@@ -350,22 +339,20 @@ class GoldenFiboEngine:
         self.state.submission_attempted_at = time.time()
 
         try:
-            submit = self.adapter.place_limit(
+            submit = self.adapter.set_shared_tp(
                 account=self.config.account,
                 instrument=self.config.instrument,
-                side=opposite,
-                size=tp_size,
                 price=tp_price,
-                client_order_id=tp_client_id,
-                reduce_only=True,
             )
         except Exception as exc:
             self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
             return self._freeze(
-                f"place TP attempted but result unknown: {exc}. "
+                f"set shared TP attempted but result unknown: {exc}. "
                 f"Reconcile exchange before any resubmission."
             )
 
+        # set_tp verification is done inside the agent; verified=False is
+        # surfaced as an exception above (make_failure path raises).
         self.state.submission_phase = SUBMISSION_CONFIRMED
         self.state.submission_exchange_order_id = (
             int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
@@ -377,7 +364,9 @@ class GoldenFiboEngine:
             int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
         )
         self.state.current_tp_role = ROLE_TP
-        actions.append(f"new TP price={tp_price} size={tp_size} oid={self.state.current_tp_order_id}")
+        actions.append(
+            f"shared TP set price={tp_price} size={submit.get('current_size') or tp_size} oid={self.state.current_tp_order_id}"
+        )
         return None
 
     def _place_next_ladder(self) -> Optional[TickResult]:

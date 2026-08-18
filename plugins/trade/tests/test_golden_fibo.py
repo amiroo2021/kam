@@ -349,6 +349,47 @@ class FakeAdapter:
             "role": "tp" if reduce_only else "ladder",
         }
 
+    def set_shared_tp(self, *, account, instrument, price) -> Dict[str, object]:
+        """Stub for the thin adapter set_shared_tp. Mirrors x_lighter_agent
+        set_tp semantics: derives size from the live position, closing side
+        opposite to the position, and registers a TP order record so the
+        engine/tests can track and simulate it."""
+        from decimal import Decimal as _D
+        # Cancel any existing TP (set_tp replaces the existing TP).
+        for rec in list(self.orders.values()):
+            if rec.get("reduce_only") and rec.get("status") == "open" and rec.get("role_type") == "tp":
+                rec["status"] = "canceled"
+                rec["taxonomy"] = "CANCELED"
+        oid = self._gen_id()
+        quantized_price = _D(str(price)).quantize(_D("0.001"))
+        # TP is opposite side of the live position.
+        live_side = self.position.get("side")
+        closing = "sell" if live_side == "long" else "buy"
+        size = self.position.get("size") or "0"
+        rec = {
+            "exchange_order_id": oid,
+            "client_order_id": None,
+            "side": closing,
+            "type": "take-profit",
+            "role_type": "tp",
+            "size": str(size),
+            "price": str(quantized_price),
+            "status": "open",
+            "taxonomy": "ACTIVE",
+            "reduce_only": True,
+        }
+        self.orders[oid] = rec
+        self.submit_log.append(dict(rec, role="tp"))
+        self.position["tp"] = str(quantized_price)
+        return {
+            "verified": True,
+            "submitted_price": str(quantized_price),
+            "exchange_order_id": oid,
+            "current_side": live_side,
+            "current_size": str(size),
+            "role": "tp",
+        }
+
     def cancel_order(self, *, account, order_index: int) -> bool:
         rec = self.orders.get(int(order_index))
         if rec is None:

@@ -308,6 +308,38 @@ class _ClientIdAdapter:
             "role": "tp" if reduce_only else "ladder",
         }
 
+
+    def set_shared_tp(self, *, account, instrument, price) -> dict:
+        """Stub: mirrors x_lighter_agent set_tp for the recovery tests."""
+        from decimal import Decimal as _D
+        oid = 888001 + len(self.submit_log)
+        qp = _D(str(price)).quantize(_D("0.001"))
+        live_side = self.position.get("side")
+        closing = "sell" if live_side == "long" else "buy"
+        rec = {
+            "exchange_order_id": oid,
+            "client_order_id": None,
+            "side": closing,
+            "type": "take-profit",
+            "size": str(self.position.get("size") or "0"),
+            "price": str(qp),
+            "status": "open",
+            "taxonomy": "ACTIVE",
+            "reduce_only": True,
+            "role": "tp",
+        }
+        self._orders[oid] = rec
+        self.submit_log.append(rec)
+        self.position["tp"] = str(qp)
+        return {
+            "verified": True,
+            "submitted_price": str(qp),
+            "exchange_order_id": oid,
+            "current_side": live_side,
+            "current_size": str(self.position.get("size") or "0"),
+            "role": "tp",
+        }
+
     def cancel_order(self, *, account, order_index):
         return True
 

@@ -223,6 +223,63 @@ class _FakeAdapter:
             "role": "tp" if reduce_only else "ladder",
         }
 
+
+    def set_shared_tp(self, *, account, instrument, price) -> dict:
+        """Stub: mirrors x_lighter_agent set_tp. Registers a TP order so the
+        durable tests can count submissions and simulate verify crashes."""
+        from decimal import Decimal as _D
+        self._calls_tp = getattr(self, "_calls_tp", 0) + 1
+        # Simulate verify-crash-after-venue-accept when fail_after_venue is set
+        # and this is the TP placement the test is probing.
+        if getattr(self, "fail_after_venue", False) and getattr(self, "_fail_tp_once", True):
+            self._fail_tp_once = False
+            oid = self._gen_id()
+            qp = _D(str(price)).quantize(_D("0.001"))
+            live_side = self.position.get("side")
+            closing = "sell" if live_side == "long" else "buy"
+            rec = {
+                "exchange_order_id": oid,
+                "client_order_id": None,
+                "side": closing,
+                "type": "take-profit",
+                "size": str(self.position.get("size") or "0"),
+                "price": str(qp),
+                "status": "open",
+                "taxonomy": "ACTIVE",
+                "reduce_only": True,
+                "role": "tp",
+            }
+            self.orders[oid] = rec
+            self.submit_log.append(rec)
+            raise RuntimeError("verification after venue accept crashed (simulated)")
+        oid = self._gen_id()
+        qp = _D(str(price)).quantize(_D("0.001"))
+        live_side = self.position.get("side")
+        closing = "sell" if live_side == "long" else "buy"
+        rec = {
+            "exchange_order_id": oid,
+            "client_order_id": None,
+            "side": closing,
+            "type": "take-profit",
+            "size": str(self.position.get("size") or "0"),
+            "price": str(qp),
+            "status": "open",
+            "taxonomy": "ACTIVE",
+            "reduce_only": True,
+            "role": "tp",
+        }
+        self.orders[oid] = rec
+        self.submit_log.append(rec)
+        self.position["tp"] = str(qp)
+        return {
+            "verified": True,
+            "submitted_price": str(qp),
+            "exchange_order_id": oid,
+            "current_side": live_side,
+            "current_size": str(self.position.get("size") or "0"),
+            "role": "tp",
+        }
+
     def cancel_order(self, *, account, order_index: int) -> bool:
         rec = self.orders.get(int(order_index))
         if rec is None:

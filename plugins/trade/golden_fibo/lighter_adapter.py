@@ -67,6 +67,7 @@ def _get_payload(resp: Any) -> Dict[str, Any]:
         "portfolio_summary",
         "positions",
         "order_groups",
+        "position_action",
     ):
         val = getattr(resp, key, None)
         if val is None:
@@ -194,6 +195,41 @@ class LighterGoldenFiboAdapter:
             "client_order_id": int(client_order_id),
         })
         return self._parse_submit(resp, role="tp" if reduce_only else "ladder")
+
+    def set_shared_tp(
+        self,
+        *,
+        account: str,
+        instrument: str,
+        price: Decimal,
+    ) -> Dict[str, Any]:
+        """Set/replace the ONE shared TP on the accumulated position.
+
+        Thin wrapper over x_lighter_agent.execute(operation="set_tp").
+        The agent derives the position size, closing side, quantization,
+        reduce_only, TP trigger semantics, and verification itself —
+        the adapter never constructs Lighter TP payloads.
+        """
+        resp = lighter_agent.execute({
+            "operation": "set_tp",
+            "account": account,
+            "symbol": instrument,
+            "price": str(price),
+        })
+        state = _get_payload(resp).get("position_action") or {}
+        if not _is_success(resp):
+            raise RuntimeError(
+                f"set_shared_tp failed: {getattr(resp, 'error', None)}"
+            )
+        # Normalize the agent's verified result into the adapter shape.
+        return {
+            "verified": bool(state.get("verified")),
+            "submitted_price": state.get("price"),
+            "exchange_order_id": state.get("exchange_order_id"),
+            "current_side": state.get("current_side"),
+            "current_size": state.get("current_size"),
+            "role": "tp",
+        }
 
     def cancel_order(self, *, account: str, order_index: int) -> bool:
         resp = lighter_agent.execute({
