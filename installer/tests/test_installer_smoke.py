@@ -94,6 +94,13 @@ def _run_script(
     final_args = list(args)
     if script.name == "install.sh" and "--skip-deps" not in final_args:
         final_args.append("--skip-deps")
+    # Isolate systemd unit writes under the fixture root.
+    systemd_dir = hermes_root.parent / "systemd"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+    if "--systemd-dir" not in final_args:
+        final_args.extend(["--systemd-dir", str(systemd_dir)])
+    if script.name in ("install.sh", "uninstall.sh") and "--no-restart" not in final_args:
+        final_args.append("--no-restart")
     proc = subprocess.run(
         [str(script)] + final_args + ["--hermes-root", str(hermes_root), "--hermes-home", str(hermes_home)],
         capture_output=True,

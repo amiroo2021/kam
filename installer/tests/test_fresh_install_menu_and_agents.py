@@ -57,12 +57,17 @@ def _fresh() -> dict:
 
 def _install(caps: List[str], env: dict) -> int:
     argv = [f"--{c}" for c in caps]
+    systemd_dir = env["hermes_root"].parent / "systemd"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
     argv += [
         "--hermes-root",
         str(env["hermes_root"]),
         "--hermes-home",
         str(env["hermes_home"]),
+        "--systemd-dir",
+        str(systemd_dir),
         "--skip-deps",
+        "--no-restart",
         "--action",
         "install",
     ]
@@ -71,11 +76,14 @@ def _install(caps: List[str], env: dict) -> int:
 
 def _verify(caps: List[str], env: dict) -> int:
     argv = [f"--{c}" for c in caps]
+    systemd_dir = env["hermes_root"].parent / "systemd"
     argv += [
         "--hermes-root",
         str(env["hermes_root"]),
         "--hermes-home",
         str(env["hermes_home"]),
+        "--systemd-dir",
+        str(systemd_dir),
         "--action",
         "verify",
     ]

@@ -90,12 +90,22 @@ def run(
     hermes_home: Path,
     shared: Dict[str, Any],
     dry_run: bool = False,
+    systemd_dir: Optional[Path] = None,
+    no_restart: bool = False,
+    backup_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Install the /fibo capability. Idempotent.
 
     If ``dry_run`` is True, no bytes are written and no directory is
     created.
     """
+    from fibo_unit import (
+        DEFAULT_SYSTEMD_DIR,
+        activate_fibo_service,
+        install_fibo_service_unit,
+        resolve_python_exe,
+    )
+
     plugin_root = hermes_root / "plugins" / "trade"
     record: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -137,10 +147,28 @@ def run(
     else:
         own_dir.mkdir(parents=True, exist_ok=True)
     record["owned_dir"] = str(own_dir)
-    # Record fibo.service template presence (rendering is the operator's
-    # decision: --systemd-dir and --no-restart control when/whether the
-    # unit is actually written to /etc/systemd/system). For capability
-    # installation, we only ensure the template is present in the repo.
+
+    # Render + install fibo.service (required for /fibo IPC on fresh install).
+    sd = Path(systemd_dir) if systemd_dir is not None else DEFAULT_SYSTEMD_DIR
+    py = resolve_python_exe(hermes_root)
+    bk = backup_dir if backup_dir is not None else (hermes_home / "kam" / "backups")
+    try:
+        unit_rec = install_fibo_service_unit(
+            hermes_root=hermes_root,
+            hermes_home=hermes_home,
+            systemd_dir=sd,
+            dry_run=dry_run,
+            backup_dir=None if dry_run else bk,
+            python_exe=py,
+        )
+        record["service_unit"] = unit_rec
+        act_rec = activate_fibo_service(
+            systemd_dir=sd, dry_run=dry_run, no_restart=no_restart
+        )
+        record["service_activation"] = act_rec
+    except Exception as exc:  # noqa: BLE001
+        record["ok"] = False
+        record["service_error"] = str(exc)
     record["service_template"] = str(FIBO_SERVICE_TEMPLATE_PATH)
     return record
 

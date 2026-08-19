@@ -71,6 +71,7 @@ def run(
     argv: Sequence[str],
     hermes_root: Path,
     hermes_home: Path,
+    systemd_dir: Optional[Path] = None,
 ) -> bool:
     repo_root = Path(__file__).resolve().parent.parent
     ok = True
@@ -88,8 +89,6 @@ def run(
         ok = False
     for probe in FIBO_IMPORT_PROBES:
         # Prefer installed tree under hermes_root.
-        installed = hermes_root / Path(probe.replace(".", "/") if "." in probe and "/" not in probe else probe)
-        # FIBO_IMPORT_PROBES use slash form plugins/trade/...
         installed = hermes_root / probe
         if not installed.with_suffix(".py").is_file() and not installed.is_file():
             # fall back to repo AST probe
@@ -128,6 +127,21 @@ def run(
             else:
                 print(f"    [FAIL] adapter fibo {kind} seam missing")
                 ok = False
+
+    # Real systemd unit must exist (Lodo: template-only was insufficient).
+    from fibo_unit import DEFAULT_SYSTEMD_DIR, is_real_systemd_dir, verify_fibo_service_unit
+
+    sd = Path(systemd_dir) if systemd_dir is not None else DEFAULT_SYSTEMD_DIR
+    unit_ok, unit_msgs = verify_fibo_service_unit(
+        hermes_root=hermes_root,
+        hermes_home=hermes_home,
+        systemd_dir=sd,
+        require_active=is_real_systemd_dir(sd),
+    )
+    for m in unit_msgs:
+        print(f"    {m}")
+    if not unit_ok:
+        ok = False
     return ok
 
 

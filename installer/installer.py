@@ -244,6 +244,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     )
     # Per-capability install.
     results: List[dict] = []
+    systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
     for cap in caps:
         if cap == "trade":
             res = run_trade(
@@ -254,7 +255,18 @@ def cmd_install(args: argparse.Namespace) -> int:
             res = run_fibo(
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 shared=shared_record, dry_run=dry_run,
+                systemd_dir=systemd_dir,
+                no_restart=bool(args.no_restart),
+                backup_dir=hermes_home / "kam" / "backups",
             )
+            if not res.get("ok", True):
+                print(f"ERROR: fibo capability install failed: {res.get('service_error') or res}", file=sys.stderr)
+                if not dry_run:
+                    return 1
+            else:
+                unit = res.get("service_unit") or {}
+                act = res.get("service_activation") or {}
+                print(f"fibo.service: {unit.get('action')} -> {unit.get('path')}; activation={act.get('action')}")
         else:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
@@ -320,6 +332,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     from verify_fibo_capability import run as verify_fibo
     from adapter_wiring import verify_adapter_wiring
 
+    systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
+
     shared_ok = run_verify_shared(
         argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
         capabilities=caps, dry_run=dry_run,
@@ -331,7 +345,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if cap == "trade":
             ok = verify_trade(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
         elif cap == "fibo":
-            ok = verify_fibo(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
+            ok = verify_fibo(
+                argv=[],
+                hermes_root=hermes_root,
+                hermes_home=hermes_home,
+                systemd_dir=systemd_dir,
+            )
         else:
             raise SystemExit(f"unknown capability: {cap}")
         if not ok:
@@ -385,6 +404,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     from capabilities import is_installed as _is_installed
 
     results: List[dict] = []
+    systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
     for cap in reversed(caps):
         if cap == "trade":
             res = uninstall_trade(
@@ -395,6 +415,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             res = uninstall_fibo(
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 dry_run=dry_run,
+                systemd_dir=systemd_dir,
+                no_restart=bool(args.no_restart),
             )
         else:
             raise SystemExit(f"unknown capability: {cap}")

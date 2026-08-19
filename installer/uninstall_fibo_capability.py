@@ -42,7 +42,11 @@ def run(
     hermes_root: Path,
     hermes_home: Path,
     dry_run: bool = False,
+    systemd_dir: Optional[Path] = None,
+    no_restart: bool = False,
 ) -> Dict[str, Any]:
+    from fibo_unit import DEFAULT_SYSTEMD_DIR, remove_fibo_service_unit
+
     plugin_root = hermes_root / "plugins" / "trade"
     record: Dict[str, Any] = {
         "removed_files": [],
@@ -77,6 +81,11 @@ def run(
         record["removed_dirs"].append(str(own_dir))
         if not dry_run:
             shutil.rmtree(own_dir)
+    # systemd unit
+    sd = Path(systemd_dir) if systemd_dir is not None else DEFAULT_SYSTEMD_DIR
+    record["service_unit"] = remove_fibo_service_unit(
+        systemd_dir=sd, dry_run=dry_run, no_restart=no_restart
+    )
     return record
 
 

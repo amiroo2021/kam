@@ -62,13 +62,18 @@ def _run_install(caps: List[str], hermes_root: Path, hermes_home: Path) -> int:
     argv = []
     for c in caps:
         argv.append(f"--{c}")
+    systemd_dir = hermes_root.parent / "systemd"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
     argv.extend(
         [
             "--hermes-root",
             str(hermes_root),
             "--hermes-home",
             str(hermes_home),
+            "--systemd-dir",
+            str(systemd_dir),
             "--skip-deps",  # unit tests cover files/wiring; deps are separate
+            "--no-restart",
             "--action",
             "install",
         ]
@@ -80,12 +85,15 @@ def _run_verify(caps: List[str], hermes_root: Path, hermes_home: Path) -> int:
     argv = []
     for c in caps:
         argv.append(f"--{c}")
+    systemd_dir = hermes_root.parent / "systemd"
     argv.extend(
         [
             "--hermes-root",
             str(hermes_root),
             "--hermes-home",
             str(hermes_home),
+            "--systemd-dir",
+            str(systemd_dir),
             "--action",
             "verify",
         ]
@@ -97,12 +105,16 @@ def _run_uninstall(caps: List[str], hermes_root: Path, hermes_home: Path) -> int
     argv = []
     for c in caps:
         argv.append(f"--{c}")
+    systemd_dir = hermes_root.parent / "systemd"
     argv.extend(
         [
             "--hermes-root",
             str(hermes_root),
             "--hermes-home",
             str(hermes_home),
+            "--systemd-dir",
+            str(systemd_dir),
+            "--no-restart",
             "--action",
             "uninstall",
         ]
