@@ -669,10 +669,12 @@ class TestWizardFlow(unittest.TestCase):
             self.wizard.handle_text(("chat", 1), "0.01")
             self.wizard.handle_callback(("chat", 1), "step0:0.01")
             self.wizard.handle_callback(("chat", 1), "confirm_start")
-        # Stop only SOL
+        # Stop only SOL via Emergency STOP mode (explicit two-mode UI)
         s = self.wizard.handle_callback(("chat", 1), "stop_pick:lighter/amiroo/SOL/BUY")
-        self.assertEqual(s.state, "stop_confirm")
-        s = self.wizard.handle_callback(("chat", 1), "confirm_stop:lighter/amiroo/SOL/BUY")
+        self.assertEqual(s.state, "stop_mode")
+        s = self.wizard.handle_callback(("chat", 1), "emergency_confirm:lighter/amiroo/SOL/BUY")
+        self.assertEqual(s.state, "stop_emergency_confirm")
+        s = self.wizard.handle_callback(("chat", 1), "confirm_emergency:lighter/amiroo/SOL/BUY")
         sol_stop_calls = [k for k in self._stub_service.stop_calls if k == "lighter/amiroo/SOL/BUY"]
         eth_stop_calls = [k for k in self._stub_service.stop_calls if k == "lighter/amiroo/ETH/BUY"]
         self.assertEqual(len(sol_stop_calls), 1)
@@ -733,6 +735,28 @@ class _StubService:
                 return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION"}
             self._active.pop(key, None)
             return {"ok": True, "registration_key": key, "status": "stopped"}
+        if op == "emergency_stop":
+            self.stop_calls.append(command.get("registration_key"))
+            key = command.get("registration_key")
+            if key in self._quarantined:
+                return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION"}
+            self._active.pop(key, None)
+            return {
+                "ok": True,
+                "registration_key": key,
+                "status": "stopped",
+                "mode": "emergency",
+                "actions": ["deregistered"],
+            }
+        if op == "smooth_shutdown":
+            key = command.get("registration_key")
+            return {
+                "ok": True,
+                "registration_key": key,
+                "status": "smooth_shutdown",
+                "mode": "smooth",
+                "immediate": False,
+            }
         if op == "preview":
             return {"ok": True, "step0_volume": command.get("step0_volume"), "ladder": [{"step": n, "size": "0.01", "cumulative_through_step": "0.01"} for n in range(21)], "cumulative_through_step20": "0.01"}
         return {"ok": False, "error": "UNKNOWN"}

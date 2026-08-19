@@ -3,6 +3,8 @@
 Reproduces the live bug where get_fibo_wizard() returned a NEW instance
 per callback, dropping WizardState so LIGHTER → account screen lost the
 selected exchange.
+
+Also covers in-place edit for callbacks (🔄 Refresh etc.).
 """
 
 from __future__ import annotations
@@ -41,7 +43,9 @@ class _Msg:
 
 
 class _Query:
-    def __init__(self, chat_id: Any, data: str, thread_id=None):
+    """Callback query with edit_message_text (Telegram in-place edit)."""
+
+    def __init__(self, chat_id: Any, data: str, thread_id=None, edits: Optional[List] = None):
         self.data = data
         self.message = type(
             "M",
@@ -50,19 +54,38 @@ class _Query:
                 "chat": type("C", (), {"id": chat_id})(),
                 "chat_id": chat_id,
                 "message_thread_id": thread_id,
+                "message_id": 42,
             },
         )()
         self._answered = False
+        self._edits = edits if edits is not None else []
 
     async def answer(self, *a, **k):
         self._answered = True
 
+    async def edit_message_text(self, text=None, reply_markup=None, **kw):
+        # Capture keyboard labels/callbacks from markup
+        labels = []
+        cbs = []
+        if reply_markup is not None:
+            rows = getattr(reply_markup, "inline_keyboard", None) or []
+            for row in rows:
+                for btn in row:
+                    labels.append(getattr(btn, "text", None) or (btn.get("text") if isinstance(btn, dict) else None))
+                    cbs.append(
+                        getattr(btn, "callback_data", None)
+                        or (btn.get("callback_data") if isinstance(btn, dict) else None)
+                    )
+        self._edits.append({"text": text, "labels": labels, "cbs": cbs, "reply_markup": reply_markup})
+        return True
+
 
 class _Adapter:
-    """Mirrors telegram adapter prefixing of callback_data."""
+    """Mirrors telegram adapter prefixing of callback_data for NEW sends only."""
 
     def __init__(self):
         self.sent: List[Dict[str, Any]] = []
+        self.edits: List[Dict[str, Any]] = []
 
     async def send_inline_keyboard(self, **kw):
         prefix = kw.get("callback_prefix") or ""
@@ -129,30 +152,38 @@ class TestTelegramCallbackPathLighterAccounts(unittest.TestCase):
 
         Uses handle_fibo_command / handle_fibo_callback exactly as the
         Telegram adapter does (fresh get_fibo_wizard() each call).
+        Callbacks edit in place; command still sends a new message.
         """
         ad = _Adapter()
         chat = 64620303
+        edits: List[Dict[str, Any]] = []
 
         self.assertTrue(_run(handle_fibo_command(ad, _Msg(chat, "/fibo"))))
+        self.assertEqual(len(ad.sent), 1)  # open = new message
+
+        q_start = _Query(chat, "fibo:menu:start", edits=edits)
         self.assertTrue(
-            _run(handle_fibo_callback(ad, _Query(chat, "fibo:menu:start"), "fibo:menu:start"))
+            _run(handle_fibo_callback(ad, q_start, "fibo:menu:start"))
         )
+        self.assertEqual(len(ad.sent), 1)  # callback must NOT send new
+        self.assertEqual(len(edits), 1)
 
         # Exchange screen callbacks must be fibo:exchange:<name>
-        ex_screen = ad.sent[-1]
-        flat = [b["callback_data"] for r in ex_screen["buttons"] for b in r]
+        ex = edits[-1]
+        flat = list(ex["cbs"])
         self.assertIn("fibo:exchange:lighter", flat)
         self.assertIn("fibo:exchange:arcus", flat)
 
         # Click LIGHTER — the live bug path
-        q = _Query(chat, "fibo:exchange:lighter")
+        q = _Query(chat, "fibo:exchange:lighter", edits=edits)
         self.assertTrue(_run(handle_fibo_callback(ad, q, "fibo:exchange:lighter")))
         self.assertTrue(q._answered)
+        self.assertEqual(len(ad.sent), 1)  # still no new send
 
-        acc = ad.sent[-1]
+        acc = edits[-1]
         text = acc["text"]
-        labels = [b["text"] for r in acc["buttons"] for b in r]
-        cbs = [b["callback_data"] for r in acc["buttons"] for b in r]
+        labels = acc["labels"]
+        cbs = acc["cbs"]
 
         # Must NOT be the blank-exchange empty-accounts screen
         self.assertNotIn("No accounts are configured for this exchange", text)
@@ -172,25 +203,28 @@ class TestTelegramCallbackPathLighterAccounts(unittest.TestCase):
     def test_account_selection_retains_exchange_across_callbacks(self):
         ad = _Adapter()
         chat = 42
+        edits: List[Dict[str, Any]] = []
         _run(handle_fibo_command(ad, _Msg(chat)))
-        _run(handle_fibo_callback(ad, _Query(chat, "fibo:menu:start"), "fibo:menu:start"))
+        _run(handle_fibo_callback(ad, _Query(chat, "fibo:menu:start", edits=edits), "fibo:menu:start"))
         _run(
             handle_fibo_callback(
-                ad, _Query(chat, "fibo:exchange:lighter"), "fibo:exchange:lighter"
+                ad, _Query(chat, "fibo:exchange:lighter", edits=edits), "fibo:exchange:lighter"
             )
         )
         _run(
             handle_fibo_callback(
-                ad, _Query(chat, "fibo:account:amiroo"), "fibo:account:amiroo"
+                ad, _Query(chat, "fibo:account:amiroo", edits=edits), "fibo:account:amiroo"
             )
         )
-        final = ad.sent[-1]
+        final = edits[-1]
         self.assertIn("Exchange: LIGHTER", final["text"])
         self.assertIn("Account: amiroo", final["text"])
         self.assertIn("Select instrument", final["text"])
         # No service mutation on discovery path
         w = get_fibo_wizard()
         self.assertEqual(w._service_override.cmds, [])  # noqa: SLF001
+        # callbacks never stacked new messages
+        self.assertEqual(len(ad.sent), 1)
 
     def test_broken_non_singleton_would_blank_exchange_on_account_callback(self):
         """Document the failure mode: fresh wizard + account: cb → blank exchange."""

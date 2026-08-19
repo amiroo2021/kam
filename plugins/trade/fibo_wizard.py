@@ -302,10 +302,23 @@ class FiboWizard:
             return self._set_state(s, self._render_running_detail(chat_key, s, reg_key=reg))
         if raw.startswith("stop_pick:"):
             reg = raw.split(":", 1)[1]
-            return self._set_state(s, self._render_stop_confirm(chat_key, s, reg_key=reg))
-        if raw.startswith("confirm_stop:"):
+            return self._set_state(s, self._render_stop_mode(chat_key, s, reg_key=reg))
+        if raw.startswith("smooth_confirm:"):
             reg = raw.split(":", 1)[1]
-            return self._set_state(s, self._on_stop(chat_key, s, reg_key=reg))
+            return self._set_state(s, self._render_smooth_confirm(chat_key, s, reg_key=reg))
+        if raw.startswith("emergency_confirm:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_emergency_confirm(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_smooth:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._on_smooth_shutdown(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_emergency:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._on_emergency_stop(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_stop:"):
+            # Legacy callback → mode select (never silent-stop)
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_stop_mode(chat_key, s, reg_key=reg))
         return self.open(chat_key)
 
     def handle_text(self, chat_key: Tuple[Any, ...], text: str) -> Screen:
@@ -355,7 +368,18 @@ class FiboWizard:
         if s.state == "account":
             s.account = None
             return self._render_exchange(chat_key, s)
-        if s.state in ("running_detail", "stop_confirm"):
+        if s.state in (
+            "running_detail",
+            "stop_confirm",
+            "stop_mode",
+            "stop_smooth_confirm",
+            "stop_emergency_confirm",
+            "stop_pick",
+        ):
+            if s.state in ("stop_smooth_confirm", "stop_emergency_confirm") and s.registration_key:
+                return self._render_stop_mode(chat_key, s, s.registration_key)
+            if s.state == "stop_mode" and s.registration_key:
+                return self._render_stop_pick(chat_key, s)
             return self._render_running(chat_key, s)
         return self.open(chat_key)
 
@@ -699,6 +723,11 @@ class FiboWizard:
             f"Status: {r.get('status')}\n"
             f"Freeze reason: {r.get('freeze_reason')}\n"
         )
+        shutdown_mode = r.get("shutdown_mode") or ""
+        if str(r.get("status") or "") == "smooth_shutdown" or shutdown_mode == "smooth":
+            text += "Shutdown: Smooth — waiting for current cycle to finish\n"
+        elif shutdown_mode == "emergency" or str(r.get("status") or "") == "stopping":
+            text += "Shutdown: Emergency STOP in progress\n"
         buttons = [
             [_button("🛑 STOP", f"stop_pick:{reg_key}")],
             [_button(*BUTTON_REFRESH)],
@@ -738,48 +767,115 @@ class FiboWizard:
             state="stop_pick",
         )
 
-    def _render_stop_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+    def _render_stop_mode(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
         s.registration_key = reg_key
         return Screen(
             text=(
-                f"STOP GoldenFibo for {reg_key}?\n\n"
-                "This stops further robot operation for this registration.\n"
-                "It does NOT auto-close the live position or any unrelated orders."
+                f"Stop mode for {reg_key}:\n\n"
+                "Choose how to stop this GoldenFibo registration."
             ),
             buttons=[
-                [_button("🛑 Confirm STOP", f"confirm_stop:{reg_key}")],
-                [_button(*BUTTON_CANCEL)],
+                [_button("🟡 Smooth Shutdown", f"smooth_confirm:{reg_key}")],
+                [_button("🔴 Emergency STOP", f"emergency_confirm:{reg_key}")],
+                [_button(*BUTTON_BACK)],
             ],
-            state="stop_confirm",
+            state="stop_mode",
         )
 
-    def _on_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
-        resp = self._service.execute_command({"op": "stop", "registration_key": reg_key})
+    def _render_smooth_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        return Screen(
+            text=(
+                f"🟡 Smooth Shutdown for {reg_key}?\n\n"
+                "Finish the current GoldenFibo cycle normally.\n"
+                "The robot will continue managing the current position, TP, partial fills,\n"
+                "and ladder until the current cycle closes.\n"
+                "No new cycle will start afterward."
+            ),
+            buttons=[
+                [_button("🟡 Confirm Smooth Shutdown", f"confirm_smooth:{reg_key}")],
+                [_button(*BUTTON_CANCEL)],
+            ],
+            state="stop_smooth_confirm",
+        )
+
+    def _render_emergency_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        return Screen(
+            text=(
+                f"🔴 Emergency STOP for {reg_key}?\n\n"
+                "Immediately stop this GoldenFibo registration.\n"
+                "Cancel its pending ladder, close its open position, remove its TP,\n"
+                "verify clean, then deregister."
+            ),
+            buttons=[
+                [_button("🔴 Confirm Emergency STOP", f"confirm_emergency:{reg_key}")],
+                [_button(*BUTTON_CANCEL)],
+            ],
+            state="stop_emergency_confirm",
+        )
+
+    def _render_stop_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        # Backward-compatible entry: route to mode selection.
+        return self._render_stop_mode(chat_key, s, reg_key)
+
+    def _on_smooth_shutdown(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        resp = self._service.execute_command({"op": "smooth_shutdown", "registration_key": reg_key})
         if not resp.get("ok"):
             err = resp.get("error", "INTERNAL")
-            if err == "SERVICE_UNAVAILABLE":
-                text = (
-                    f"❌ STOP failed: fibo.service unavailable.\n\n"
-                    f"{resp.get('detail') or ''}"
-                )
-            elif err == "OLD_STRATEGY_REGISTRATION":
-                text = (
-                    f"❌ {reg_key} is an old-strategy quarantined record. "
-                    "It cannot be stopped through /fibo. Decommission it manually."
-                )
-            else:
-                text = f"❌ Stop failed: {err}"
+            detail = resp.get("detail") or ""
+            text = f"❌ Smooth Shutdown failed: {err}\n\n{detail}"
             return Screen(
                 text=text,
                 buttons=[[_button(*BUTTON_BACK)], [_button(*BUTTON_EXIT)]],
                 state="stop_done",
             )
-        text = f"✅ Stopped GoldenFibo for {reg_key}.\n\nThe live position and any pending orders are untouched."
+        if resp.get("immediate"):
+            text = (
+                f"✅ Smooth Shutdown complete for {reg_key}.\n\n"
+                f"{resp.get('detail') or 'Deregistered (already clean).'}"
+            )
+        else:
+            text = (
+                f"✅ Smooth Shutdown armed for {reg_key}.\n\n"
+                f"{resp.get('detail') or ''}\n\n"
+                "Status will show SMOOTH_SHUTDOWN until the current cycle finishes."
+            )
         return Screen(
             text=text,
             buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
             state="stop_done",
         )
+
+    def _on_emergency_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        resp = self._service.execute_command({"op": "emergency_stop", "registration_key": reg_key})
+        if not resp.get("ok"):
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            text = f"❌ Emergency STOP failed: {err}\n\n{detail}"
+            return Screen(
+                text=text,
+                buttons=[[_button(*BUTTON_BACK)], [_button(*BUTTON_EXIT)]],
+                state="stop_done",
+            )
+        actions = resp.get("actions") or []
+        text = (
+            f"✅ Emergency STOP complete for {reg_key}.\n\n"
+            "Owned pending/TP canceled, position closed when present, "
+            "lane verified clean, registration deregistered."
+        )
+        if actions:
+            text += "\n\nActions:\n- " + "\n- ".join(str(a) for a in actions[:12])
+        return Screen(
+            text=text,
+            buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
+            state="stop_done",
+        )
+
+    def _on_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        # Legacy single STOP path kept for old callbacks — prefer emergency? No:
+        # route to mode select so user always chooses explicitly.
+        return self._render_stop_mode(chat_key, s, reg_key)
 
 
 _FIBO_WIZARD: Optional["FiboWizard"] = None
@@ -846,6 +942,11 @@ def _chat_key(msg_or_query: Any) -> Tuple[Any, ...]:
 
 
 async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
+    """Send a NEW wizard screen message (commands / free-text only).
+
+    Callbacks must use ``_edit_screen`` so buttons like 🔄 Refresh update
+    the existing Telegram card in place instead of stacking duplicates.
+    """
     chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
     if chat_id is None:
         chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
@@ -864,6 +965,83 @@ async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
         callback_prefix="fibo",
         metadata=metadata,
     )
+
+
+def _is_message_not_modified_error(exc: BaseException) -> bool:
+    """Telegram no-op when edit content is identical to the current message."""
+    text = str(exc or "").lower()
+    return (
+        "message is not modified" in text
+        or "message_not_modified" in text
+    )
+
+
+def _build_fibo_inline_keyboard(screen: Screen) -> Any:
+    """Build InlineKeyboardMarkup with ``fibo:`` callback prefix (mirror /trade)."""
+    try:
+        from plugins.platforms.telegram.adapter import (
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+        )
+    except Exception:
+        # Minimal stand-in for unit tests without telegram adapter import.
+        class InlineKeyboardButton:  # type: ignore[no-redef]
+            def __init__(self, text: str, callback_data: str = ""):
+                self.text = text
+                self.callback_data = callback_data
+
+        class InlineKeyboardMarkup:  # type: ignore[no-redef]
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+
+    rows = []
+    for row in screen.buttons or []:
+        button_row = []
+        for btn in row:
+            if not isinstance(btn, dict):
+                continue
+            label = str(btn.get("text", "") or "")
+            suffix = str(btn.get("callback_data", "") or "")
+            if not label or not suffix:
+                continue
+            if not suffix.startswith("fibo:"):
+                cb = f"fibo:{suffix}"
+            else:
+                cb = suffix
+            button_row.append(InlineKeyboardButton(label, callback_data=cb))
+        if button_row:
+            rows.append(button_row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _edit_screen(query: Any, screen: Screen) -> str:
+    """Edit the callback's originating Telegram message in place.
+
+    Returns:
+      - ``\"edited\"`` — message text/markup updated
+      - ``\"noop\"`` — Telegram reported message-not-modified (success)
+      - ``\"failed\"`` — edit could not be performed (no duplicate send)
+
+    Does NOT fall back to send_inline_keyboard (avoids duplicate status cards).
+    """
+    keyboard = _build_fibo_inline_keyboard(screen)
+    edit = getattr(query, "edit_message_text", None)
+    if not callable(edit):
+        logger.warning(
+            "fibo wizard: callback query has no edit_message_text; cannot update in place"
+        )
+        return "failed"
+    try:
+        await edit(text=screen.text, reply_markup=keyboard)
+        return "edited"
+    except Exception as exc:  # noqa: BLE001
+        if _is_message_not_modified_error(exc):
+            return "noop"
+        logger.warning(
+            "fibo wizard: edit_message_text failed (no duplicate send): %s",
+            exc,
+        )
+        return "failed"
 
 
 async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
@@ -890,10 +1068,10 @@ async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
 async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> bool:
     """Handle a ``fibo:`` prefixed callback query.
 
-    The adapter has already routed the call here because
-    ``data.startswith("fibo:")``. This function strips the ``fibo:``
-    prefix (same boundary contract as /trade), runs the wizard one
-    step on the **singleton** wizard, and renders the next screen.
+    Mirrors /trade: strip the ``fibo:`` prefix, advance the singleton
+    wizard, and **edit the originating message in place**. This is what
+    makes 🔄 Refresh update the same registration-detail card instead of
+    stacking new messages.
     """
     raw = str(data or "")
     if not raw.startswith("fibo:"):
@@ -905,7 +1083,7 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> bool:
     query_message = getattr(query, "message", None)
     chat_key = _chat_key(query_message if query_message is not None else query)
     screen = wizard.handle_callback(chat_key, payload)
-    await _send_screen(adapter, query, screen)
+    await _edit_screen(query, screen)
     try:
         await query.answer()
     except Exception:
@@ -939,4 +1117,6 @@ __all__ = [
     "handle_fibo_callback",
     "handle_fibo_text",
     "_reset_fibo_wizard_for_tests",
+    "_edit_screen",
+    "_is_message_not_modified_error",
 ]

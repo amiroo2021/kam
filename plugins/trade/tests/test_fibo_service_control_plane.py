@@ -306,8 +306,14 @@ class TestServiceUpIpcPath(unittest.TestCase):
 
         def fake_exec(command):
             seen.append(dict(command))
-            if command.get("op") == "stop":
-                return {"ok": True, "registration_key": command.get("registration_key")}
+            if command.get("op") in ("stop", "emergency_stop", "smooth_shutdown"):
+                return {
+                    "ok": True,
+                    "registration_key": command.get("registration_key"),
+                    "status": "stopped",
+                    "mode": command.get("op"),
+                    "actions": ["deregistered"],
+                }
             if command.get("op") == "list":
                 return {
                     "ok": True,
@@ -326,15 +332,23 @@ class TestServiceUpIpcPath(unittest.TestCase):
             screen = wizard.handle_callback(("x",), "menu:stop")
             self.assertEqual(screen.state, "stop_pick")
             self.assertIn("lighter/amiroo/SOL/BUY", screen.text + str(screen.buttons))
-            # confirm stop
+            # mode → emergency confirm → confirm
             screen = wizard.handle_callback(
-                ("x",), "confirm_stop:lighter/amiroo/SOL/BUY"
+                ("x",), "stop_pick:lighter/amiroo/SOL/BUY"
+            )
+            self.assertEqual(screen.state, "stop_mode")
+            screen = wizard.handle_callback(
+                ("x",), "emergency_confirm:lighter/amiroo/SOL/BUY"
+            )
+            self.assertEqual(screen.state, "stop_emergency_confirm")
+            screen = wizard.handle_callback(
+                ("x",), "confirm_emergency:lighter/amiroo/SOL/BUY"
             )
             ops = [c.get("op") for c in seen]
-            self.assertIn("stop", ops)
+            self.assertIn("emergency_stop", ops)
             self.assertTrue(
                 any(
-                    c.get("op") == "stop"
+                    c.get("op") == "emergency_stop"
                     and c.get("registration_key") == "lighter/amiroo/SOL/BUY"
                     for c in seen
                 )

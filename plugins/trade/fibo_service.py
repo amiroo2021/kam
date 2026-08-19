@@ -11,10 +11,12 @@ External API preserved (so fibo_daemon.py / installer stay unchanged):
     resolve_fibo_runtime_dir / resolve_hermes_home
 
 Internal IPC ops supported:
-  - start     begin a new GoldenFibo registration
-  - list      enumerate registrations (active + quarantined)
-  - detail    one registration detail
-  - stop      stop a single registration (no auto-close)
+  - start              begin a new GoldenFibo registration
+  - list               enumerate registrations (active + quarantined)
+  - detail             one registration detail
+  - stop               legacy soft-stop (tombstone / remove if flat; no close)
+  - smooth_shutdown    finish current cycle then deregister (no new Step0)
+  - emergency_stop     cancel owned ladder/TP, close owned position, deregister
 
 Old-strategy quarantine:
   Any persisted record whose key is not in the new
@@ -49,9 +51,14 @@ from .golden_fibo.state import (
     ROLE_ENTRY,
     ROLE_LADDER,
     ROLE_TP,
+    SHUTDOWN_MODE_EMERGENCY,
+    SHUTDOWN_MODE_NONE,
+    SHUTDOWN_MODE_SMOOTH,
+    STATUS_COMPLETED,
     STATUS_NEEDS_RECOVERY,
     STATUS_QUARANTINED_OLD_STRATEGY,
     STATUS_RUNNING,
+    STATUS_SMOOTH_SHUTDOWN,
     STATUS_STOPPING,
     STRATEGY_GOLDENFIBO,
     SUBMISSION_ATTEMPTED,
@@ -418,6 +425,12 @@ class PersistentFiboService:
                 if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
                     continue
                 if state.status == STATUS_STOPPING:
+                    # Emergency STOP in progress or tombstone — no tick mutations
+                    continue
+                if state.status == STATUS_COMPLETED:
+                    # Should have been popped; defensive cleanup
+                    self._states.pop(key, None)
+                    self._save_state()
                     continue
             try:
                 self._drive_one(key)
@@ -454,9 +467,17 @@ class PersistentFiboService:
         with self._lock:
             # The engine mutates state in place; persist.
             self._states[key] = result.state
+            # Smooth shutdown finished: deregister after this tick.
+            if result.state.status == STATUS_COMPLETED:
+                self._states.pop(key, None)
+                self._save_state()
+                logger.info("smooth_shutdown complete; deregistered %s", key)
+                return
             self._save_state()
             # Read through-after-mutation fields.
-            s = self._states[key]
+            s = self._states.get(key)
+            if s is None:
+                return
             # If Step0 (entry) is FILLED and we have a position, the
             # service must call confirm_step0_filled with the actual
             # fill price (read from the venue via resolve_instrument /
@@ -692,6 +713,10 @@ class PersistentFiboService:
                 return self._cmd_detail(command)
             if op == "stop":
                 return self._cmd_stop(command)
+            if op == "smooth_shutdown":
+                return self._cmd_smooth_shutdown(command)
+            if op == "emergency_stop":
+                return self._cmd_emergency_stop(command)
             if op == "preview":
                 return self._cmd_preview(command)
             return {"ok": False, "error": f"unknown op: {op!r}"}
@@ -839,6 +864,7 @@ class PersistentFiboService:
                     "next_step": state.next_step,
                     "status": state.status,
                     "freeze_reason": state.freeze_reason,
+                    "shutdown_mode": getattr(state, "shutdown_mode", "") or "",
                 }
                 if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
                     quarantined.append(entry)
@@ -916,6 +942,355 @@ class PersistentFiboService:
             self._states.pop(key, None)
             self._save_state()
         return {"ok": True, "registration_key": key, "status": "stopped"}
+
+    def _cmd_smooth_shutdown(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Finish the CURRENT cycle normally; never start a new Step0 afterward.
+
+        Durable: sets status=smooth_shutdown + shutdown_mode=smooth so restarts
+        resume management and still refuse a fresh cycle after TP exit.
+        """
+        key = str(command.get("registration_key") or "").strip()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION", "registration_key": key}
+            if state.status == STATUS_STOPPING and (getattr(state, "shutdown_mode", "") or "") == SHUTDOWN_MODE_EMERGENCY:
+                return {
+                    "ok": False,
+                    "error": "EMERGENCY_STOP_IN_PROGRESS",
+                    "registration_key": key,
+                }
+
+            adapter = self._adapter_for(key)
+            # Snapshot venue (read-only) for already-flat special case
+            try:
+                position = adapter.position_state(state.account, state.instrument)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "VENUE_READ_FAILED",
+                    "detail": str(exc),
+                    "registration_key": key,
+                }
+            live_size = Decimal(str(position.get("size") or "0"))
+            live_side = position.get("side")
+            has_position = live_size > 0 and live_side in ("long", "short")
+            has_pending = state.pending_order_exchange_id is not None
+            has_tp = state.current_tp_order_id is not None
+
+            if not has_position and not has_pending and not has_tp:
+                # Already clean — immediate deregister, no Step0
+                self._states.pop(key, None)
+                self._save_state()
+                return {
+                    "ok": True,
+                    "registration_key": key,
+                    "status": "stopped",
+                    "mode": "smooth",
+                    "immediate": True,
+                    "detail": "already flat and order-free; deregistered without new Step0",
+                }
+
+            if not has_position and has_pending:
+                # Flat + orphan pending → cancel owned pending, then deregister
+                try:
+                    adapter.cancel_order(
+                        account=state.account,
+                        order_index=int(state.pending_order_exchange_id),
+                    )
+                except Exception as exc:
+                    state.status = STATUS_NEEDS_RECOVERY
+                    state.freeze_reason = f"smooth_shutdown orphan cancel failed: {exc}"
+                    self._save_state()
+                    return {
+                        "ok": False,
+                        "error": "NEEDS_RECOVERY",
+                        "detail": state.freeze_reason,
+                        "registration_key": key,
+                    }
+                # Best-effort TP cancel if any residual identity
+                if state.current_tp_order_id is not None:
+                    try:
+                        adapter.cancel_order(
+                            account=state.account,
+                            order_index=int(state.current_tp_order_id),
+                        )
+                    except Exception:
+                        pass
+                self._states.pop(key, None)
+                self._save_state()
+                return {
+                    "ok": True,
+                    "registration_key": key,
+                    "status": "stopped",
+                    "mode": "smooth",
+                    "immediate": True,
+                    "detail": "flat with orphan pending canceled; deregistered",
+                }
+
+            # Live cycle in progress — mark durable smooth intent; engine continues
+            state.shutdown_mode = SHUTDOWN_MODE_SMOOTH
+            state.status = STATUS_SMOOTH_SHUTDOWN
+            state.freeze_reason = None
+            self._save_state()
+        return {
+            "ok": True,
+            "registration_key": key,
+            "status": STATUS_SMOOTH_SHUTDOWN,
+            "mode": "smooth",
+            "immediate": False,
+            "detail": (
+                "Smooth Shutdown armed. Current cycle continues until TP closes "
+                "the position; no new Step0 will start afterward."
+            ),
+        }
+
+    def _cmd_emergency_stop(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Immediately stop strategy progression and clean owned venue exposure.
+
+        Ownership-gated: only cancels tracked pending/TP IDs and closes a
+        position whose side matches the registration direction. On ambiguity
+        freezes NEEDS_RECOVERY without guessing.
+        """
+        key = str(command.get("registration_key") or "").strip()
+        actions: List[str] = []
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            if state.status == STATUS_QUARANTINED_OLD_STRATEGY:
+                return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION", "registration_key": key}
+
+            # 1) Stop progression first
+            state.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
+            state.status = STATUS_STOPPING
+            state.freeze_reason = "emergency_stop_in_progress"
+            self._save_state()
+            adapter = self._adapter_for(key)
+            account = state.account
+            instrument = state.instrument
+            direction = state.direction
+            pending_oid = state.pending_order_exchange_id
+            tp_oid = state.current_tp_order_id
+            expected_side = "long" if direction == "BUY" else "short"
+
+        # Work outside lock for venue I/O
+        try:
+            position = adapter.position_state(account, instrument)
+        except Exception as exc:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = f"emergency_stop position_state failed: {exc}"
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "NEEDS_RECOVERY",
+                "detail": f"position_state failed: {exc}",
+                "registration_key": key,
+            }
+
+        live_size = Decimal(str(position.get("size") or "0"))
+        live_side = position.get("side")
+        has_position = live_size > 0 and live_side in ("long", "short")
+
+        if has_position and live_side != expected_side:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = (
+                        f"OWNERSHIP_MISMATCH: live side={live_side} "
+                        f"registration direction={direction}"
+                    )
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "OWNERSHIP_MISMATCH",
+                "detail": f"live side {live_side} != expected {expected_side}",
+                "registration_key": key,
+            }
+
+        # 3) Cancel owned pending ladder (remaining qty on partial fills)
+        if pending_oid is not None:
+            try:
+                ok = adapter.cancel_order(account=account, order_index=int(pending_oid))
+                actions.append(f"cancel_pending oid={pending_oid} ok={ok}")
+            except Exception as exc:
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None:
+                        st.status = STATUS_NEEDS_RECOVERY
+                        st.freeze_reason = f"emergency_stop cancel pending failed: {exc}"
+                        self._save_state()
+                return {
+                    "ok": False,
+                    "error": "NEEDS_RECOVERY",
+                    "detail": f"cancel pending failed: {exc}",
+                    "registration_key": key,
+                    "actions": actions,
+                }
+
+        # Re-read position after cancel (partial fill may have left size)
+        try:
+            position = adapter.position_state(account, instrument)
+        except Exception as exc:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = f"emergency_stop re-read position failed: {exc}"
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "NEEDS_RECOVERY",
+                "detail": str(exc),
+                "registration_key": key,
+                "actions": actions,
+            }
+        live_size = Decimal(str(position.get("size") or "0"))
+        live_side = position.get("side")
+        has_position = live_size > 0 and live_side in ("long", "short")
+
+        if has_position and live_side != expected_side:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = (
+                        f"OWNERSHIP_MISMATCH after cancel: live side={live_side}"
+                    )
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "OWNERSHIP_MISMATCH",
+                "registration_key": key,
+                "actions": actions,
+            }
+
+        # 4) Close owned position at actual live size
+        if has_position:
+            try:
+                close_res = adapter.close_position(account=account, instrument=instrument)
+                actions.append(f"close_position result={close_res}")
+                if not close_res.get("success") and not close_res.get("verified"):
+                    # POSITION_NOT_FOUND is ok if already flat
+                    if close_res.get("error") not in ("POSITION_NOT_FOUND",):
+                        with self._lock:
+                            st = self._states.get(key)
+                            if st is not None:
+                                st.status = STATUS_NEEDS_RECOVERY
+                                st.freeze_reason = f"emergency_stop close failed: {close_res}"
+                                self._save_state()
+                        return {
+                            "ok": False,
+                            "error": "NEEDS_RECOVERY",
+                            "detail": f"close_position failed: {close_res}",
+                            "registration_key": key,
+                            "actions": actions,
+                        }
+            except Exception as exc:
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None:
+                        st.status = STATUS_NEEDS_RECOVERY
+                        st.freeze_reason = f"emergency_stop close exception: {exc}"
+                        self._save_state()
+                return {
+                    "ok": False,
+                    "error": "NEEDS_RECOVERY",
+                    "detail": str(exc),
+                    "registration_key": key,
+                    "actions": actions,
+                }
+
+        # 5) Cancel owned TP if still present
+        if tp_oid is not None:
+            try:
+                ok = adapter.cancel_order(account=account, order_index=int(tp_oid))
+                actions.append(f"cancel_tp oid={tp_oid} ok={ok}")
+            except Exception as exc:
+                actions.append(f"cancel_tp failed: {exc}")
+                # Continue to verify — TP may already be gone after close
+
+        # 6) Verify clean
+        try:
+            position = adapter.position_state(account, instrument)
+        except Exception as exc:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = f"emergency_stop verify position failed: {exc}"
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "NEEDS_RECOVERY",
+                "detail": str(exc),
+                "registration_key": key,
+                "actions": actions,
+            }
+        live_size = Decimal(str(position.get("size") or "0"))
+        live_side = position.get("side")
+        still_open = live_size > 0 and live_side in ("long", "short")
+        if still_open:
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.freeze_reason = (
+                        f"emergency_stop incomplete: position still open size={live_size}"
+                    )
+                    self._save_state()
+            return {
+                "ok": False,
+                "error": "NEEDS_RECOVERY",
+                "detail": f"position still open size={live_size}",
+                "registration_key": key,
+                "actions": actions,
+            }
+
+        # Verify tracked orders gone (best-effort)
+        for label, oid in (("pending", pending_oid), ("tp", tp_oid)):
+            if oid is None:
+                continue
+            try:
+                st_ord = adapter.get_order_state(account, int(oid))
+            except Exception:
+                st_ord = {}
+            tax = str((st_ord or {}).get("taxonomy") or "").upper()
+            if tax == "ACTIVE":
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None:
+                        st.status = STATUS_NEEDS_RECOVERY
+                        st.freeze_reason = (
+                            f"emergency_stop incomplete: {label} oid={oid} still ACTIVE"
+                        )
+                        self._save_state()
+                return {
+                    "ok": False,
+                    "error": "NEEDS_RECOVERY",
+                    "detail": f"{label} still ACTIVE",
+                    "registration_key": key,
+                    "actions": actions,
+                }
+
+        # 7) Deregister
+        with self._lock:
+            self._states.pop(key, None)
+            self._save_state()
+        actions.append("deregistered")
+        return {
+            "ok": True,
+            "registration_key": key,
+            "status": "stopped",
+            "mode": "emergency",
+            "actions": actions,
+        }
 
     def _golden_fibo_preflight(
         self,
