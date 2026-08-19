@@ -210,8 +210,18 @@ class FiboWizard:
         service: Optional[FiboServiceProtocol] = None,
     ) -> None:
         self._desk = tradedesk or get_tradedesk()
-        self._service = service or get_fibo_service()
+        # Do NOT call get_fibo_service() here — that constructs
+        # PersistentFiboService(start_thread=True) and would start a
+        # golden-fibo-poll thread inside the Telegram gateway process
+        # on every /fibo open. Service is resolved lazily on start/list/stop.
+        self._service_override = service
         self._states: Dict[Tuple[Any, ...], WizardState] = {}
+
+    @property
+    def _service(self) -> FiboServiceProtocol:
+        if self._service_override is not None:
+            return self._service_override
+        return get_fibo_service()
 
     def reset(self, chat_key: Tuple[Any, ...]) -> None:
         self._states.pop(chat_key, None)
@@ -729,10 +739,26 @@ class FiboWizard:
         )
 
 
-def get_fibo_wizard() -> FiboWizard:
-    """Module-level singleton accessor."""
-    return FiboWizard()
+_FIBO_WIZARD: Optional["FiboWizard"] = None
 
+
+def get_fibo_wizard() -> FiboWizard:
+    """Return the process-wide FiboWizard singleton.
+
+    MUST match /trade's ``_WIZARD = TradeWizard()`` pattern. Returning a
+    new instance per call drops in-memory ``WizardState`` between Telegram
+    callbacks, so exchange/account selections vanish on the next click.
+    """
+    global _FIBO_WIZARD
+    if _FIBO_WIZARD is None:
+        _FIBO_WIZARD = FiboWizard()
+    return _FIBO_WIZARD
+
+
+def _reset_fibo_wizard_for_tests() -> None:
+    """Test-only: drop the singleton so the next get_fibo_wizard() is fresh."""
+    global _FIBO_WIZARD
+    _FIBO_WIZARD = None
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +771,6 @@ def get_fibo_wizard() -> FiboWizard:
 # message dispatch.
 # ---------------------------------------------------------------------------
 _TEXT_HANDLING_STATES = frozenset({
-    "account",
     "instrument_input",
     "percentage",
     "step0_volume",
@@ -755,26 +780,46 @@ _TEXT_HANDLING_STATES = frozenset({
 def _chat_key(msg_or_query: Any) -> Tuple[Any, ...]:
     """Derive a stable chat key from a Telegram message or callback query.
 
-    Uses (chat_id, message_thread_id) when available so topic-aware
-    Telegram conversations are isolated from one another.
+    Aligned with /trade's ``_chat_key_from_message``:
+    - chat_id coerced to str
+    - optional message_thread_id for topic isolation
     """
     chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
     if chat_id is None:
-        chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+        chat_id = getattr(
+            getattr(getattr(msg_or_query, "message", None), "chat", None),
+            "id",
+            None,
+        )
+    if chat_id is None:
+        return ("unknown",)
     thread_id = getattr(msg_or_query, "message_thread_id", None)
-    return (chat_id,) if thread_id is None else (chat_id, thread_id)
+    if thread_id is None:
+        # Callback queries: thread lives on query.message
+        thread_id = getattr(
+            getattr(msg_or_query, "message", None), "message_thread_id", None
+        )
+    return (str(chat_id), thread_id) if thread_id is not None else (str(chat_id),)
 
 
 async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
     chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
     if chat_id is None:
         chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+    metadata = None
+    thread_id = getattr(msg_or_query, "message_thread_id", None)
+    if thread_id is None:
+        thread_id = getattr(
+            getattr(msg_or_query, "message", None), "message_thread_id", None
+        )
+    if thread_id is not None:
+        metadata = {"thread_id": thread_id}
     await adapter.send_inline_keyboard(
         chat_id=chat_id,
         text=screen.text,
         buttons=screen.buttons,
         callback_prefix="fibo",
-        metadata={"state": screen.state},
+        metadata=metadata,
     )
 
 
@@ -790,7 +835,7 @@ async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
     if not text.startswith("/fibo"):
         return False
     parts = text.split(maxsplit=1)
-    if not parts or parts[0] != "/fibo":
+    if not parts or parts[0].split("@", 1)[0] != "/fibo":
         return False
     wizard = get_fibo_wizard()
     chat_key = _chat_key(msg)
@@ -804,17 +849,24 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> bool:
 
     The adapter has already routed the call here because
     ``data.startswith("fibo:")``. This function strips the ``fibo:``
-    prefix, runs the wizard one step, edits the originating message
-    in place to the next screen, and acknowledges the query.
+    prefix (same boundary contract as /trade), runs the wizard one
+    step on the **singleton** wizard, and renders the next screen.
     """
     raw = str(data or "")
     if not raw.startswith("fibo:"):
         return False
-    payload = raw.split(":", 1)[1] if ":" in raw else ""
+    # Mirror /trade: strip exactly one "fibo:" prefix, keep the rest intact
+    # so payloads like "exchange:lighter" survive (NOT split on every ':').
+    payload = raw[len("fibo:"):]
     wizard = get_fibo_wizard()
-    chat_key = _chat_key(getattr(query, "message", query))
+    query_message = getattr(query, "message", None)
+    chat_key = _chat_key(query_message if query_message is not None else query)
     screen = wizard.handle_callback(chat_key, payload)
     await _send_screen(adapter, query, screen)
+    try:
+        await query.answer()
+    except Exception:
+        pass
     return True
 
 
@@ -843,4 +895,5 @@ __all__ = [
     "handle_fibo_command",
     "handle_fibo_callback",
     "handle_fibo_text",
+    "_reset_fibo_wizard_for_tests",
 ]
