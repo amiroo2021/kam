@@ -2,18 +2,21 @@
 
 Wizard flow:
   ▶️ Start Fibo
-  → Exchange (Lighter only for v1)
-  → Account (discovered from the configured x_<exchange>_agent.py)
+  → Exchange (same TradeDesk discovery as /trade)
+  → Account (same TradeDesk account discovery as /trade)
+  → GoldenFibo support check (UI-level; unsupported → clean message)
   → Instrument (selection or manual input)
   → BUY / SELL
-  → Percentage
   → Step0 Volume (default 0.01)
+  → Percentage (default 0.01)
   → Review (showing V0..V20 + cumulative exposure)
   → START
   🔵 Running Fibo  → LIST / DETAIL
   🛑 STOP Fibo     → STOP a single registration
 
-The wizard is purely UI. Strategy math lives in `plugins.trade.golden_fibo.config`.
+Discovery reuses TradeDesk (shared with /trade). Strategy math lives in
+`plugins.trade.golden_fibo.config`. Runtime support is still gated by
+`fibo_service.SUPPORTED_EXCHANGES` — discovery and execution are separate.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from .golden_fibo.config import (
     golden_fibo_cumulative_volume,
     golden_fibo_volume,
 )
+from .wizard import _account_option_parts
 
 logger = logging.getLogger(__name__)
 
@@ -139,28 +143,59 @@ def _validate_direction(s: str) -> Optional[str]:
 
 
 def _account_aliases_for_exchange(tradedesk: TradeDesk, exchange: str) -> List[str]:
-    """Discover configured account aliases for the given exchange."""
+    """Return account aliases via the same TradeDesk path /trade uses.
+
+    Does NOT parse .env / os.environ itself — TradeDesk → agent.list_accounts()
+    is the single discovery source.
+    """
     try:
-        names = tradedesk.list_accounts(exchange=exchange) or []
+        entries = tradedesk.list_accounts(exchange) if exchange else []
     except Exception:
-        names = []
-    if not names:
-        prefix = f"{exchange.upper()}_"
-        seen = []
-        for k in sorted(__import__("os").environ.keys()):
-            ks = str(k)
-            if ks.startswith(prefix) and "_CHAIN" in ks:
-                rest = ks[len(prefix):]
-                alias = rest.split("_")[0]
-                if alias and alias not in seen:
-                    seen.append(alias)
-        names = seen
-    return [str(n) for n in names]
+        entries = []
+    aliases: List[str] = []
+    seen: set[str] = set()
+    for entry in entries or []:
+        alias, _label = _account_option_parts(entry)
+        if not alias or alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
 
 
-def _supported_exchanges(tradedesk: TradeDesk) -> List[str]:
-    """Return the exchanges that support GoldenFibo. v1: Lighter only."""
-    return list(SUPPORTED_EXCHANGES)
+def _account_entries_for_exchange(tradedesk: TradeDesk, exchange: str) -> List[Any]:
+    """Raw account entries from TradeDesk (same source as /trade buttons)."""
+    try:
+        entries = tradedesk.list_accounts(exchange) if exchange else []
+    except Exception:
+        return []
+    return list(entries or [])
+
+
+def _discovered_exchanges(tradedesk: TradeDesk) -> List[str]:
+    """Exchanges from TradeDesk agent discovery — identical source to /trade.
+
+    Must NOT filter by GoldenFibo runtime support. Unsupported exchanges are
+    still shown; the support check happens after account selection.
+    """
+    try:
+        return list(tradedesk.list_exchanges() or [])
+    except Exception:
+        return []
+
+
+def _golden_fibo_supported(exchange: str) -> bool:
+    """True when fibo_service has a runtime adapter for this exchange."""
+    return str(exchange or "").strip().lower() in {
+        str(x).strip().lower() for x in SUPPORTED_EXCHANGES
+    }
+
+
+def _exchange_display_name(exchange: str) -> str:
+    ex = str(exchange or "").strip()
+    if not ex:
+        return "this exchange"
+    return ex[:1].upper() + ex[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +210,23 @@ class FiboWizard:
         service: Optional[FiboServiceProtocol] = None,
     ) -> None:
         self._desk = tradedesk or get_tradedesk()
-        self._service = service or get_fibo_service()
+        # Do NOT call get_fibo_service() here — that constructs
+        # PersistentFiboService(start_thread=True) and would start a
+        # golden-fibo-poll thread inside the Telegram gateway process
+        # on every /fibo open. Service is resolved lazily on start/list/stop.
+        self._service_override = service
         self._states: Dict[Tuple[Any, ...], WizardState] = {}
+
+    @property
+    def _service(self) -> FiboServiceProtocol:
+        """IPC client to fibo.service (or an injected test stub).
+
+        Production path uses get_fibo_service() → FiboSocketClient only.
+        Never constructs an in-process PersistentFiboService poller.
+        """
+        if self._service_override is not None:
+            return self._service_override
+        return get_fibo_service()
 
     def reset(self, chat_key: Tuple[Any, ...]) -> None:
         self._states.pop(chat_key, None)
@@ -252,10 +302,23 @@ class FiboWizard:
             return self._set_state(s, self._render_running_detail(chat_key, s, reg_key=reg))
         if raw.startswith("stop_pick:"):
             reg = raw.split(":", 1)[1]
-            return self._set_state(s, self._render_stop_confirm(chat_key, s, reg_key=reg))
-        if raw.startswith("confirm_stop:"):
+            return self._set_state(s, self._render_stop_mode(chat_key, s, reg_key=reg))
+        if raw.startswith("smooth_confirm:"):
             reg = raw.split(":", 1)[1]
-            return self._set_state(s, self._on_stop(chat_key, s, reg_key=reg))
+            return self._set_state(s, self._render_smooth_confirm(chat_key, s, reg_key=reg))
+        if raw.startswith("emergency_confirm:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_emergency_confirm(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_smooth:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._on_smooth_shutdown(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_emergency:"):
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._on_emergency_stop(chat_key, s, reg_key=reg))
+        if raw.startswith("confirm_stop:"):
+            # Legacy callback → mode select (never silent-stop)
+            reg = raw.split(":", 1)[1]
+            return self._set_state(s, self._render_stop_mode(chat_key, s, reg_key=reg))
         return self.open(chat_key)
 
     def handle_text(self, chat_key: Tuple[Any, ...], text: str) -> Screen:
@@ -288,10 +351,10 @@ class FiboWizard:
     # ------------------------------------------------------------------
     def _back(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         if s.state == "review":
-            return self._render_step0_volume(chat_key, s)
-        if s.state == "step0_volume":
             return self._render_percentage(chat_key, s)
         if s.state == "percentage":
+            return self._render_step0_volume(chat_key, s)
+        if s.state == "step0_volume":
             return self._render_direction(chat_key, s)
         if s.state == "direction":
             return self._render_instrument(chat_key, s)
@@ -299,9 +362,24 @@ class FiboWizard:
             return self._render_instrument(chat_key, s)
         if s.state == "instrument":
             return self._render_account(chat_key, s)
-        if s.state == "account":
+        if s.state == "unsupported_exchange":
+            s.account = None
             return self._render_exchange(chat_key, s)
-        if s.state in ("running_detail", "stop_confirm"):
+        if s.state == "account":
+            s.account = None
+            return self._render_exchange(chat_key, s)
+        if s.state in (
+            "running_detail",
+            "stop_confirm",
+            "stop_mode",
+            "stop_smooth_confirm",
+            "stop_emergency_confirm",
+            "stop_pick",
+        ):
+            if s.state in ("stop_smooth_confirm", "stop_emergency_confirm") and s.registration_key:
+                return self._render_stop_mode(chat_key, s, s.registration_key)
+            if s.state == "stop_mode" and s.registration_key:
+                return self._render_stop_pick(chat_key, s)
             return self._render_running(chat_key, s)
         return self.open(chat_key)
 
@@ -309,43 +387,91 @@ class FiboWizard:
     # Renderers
     # ------------------------------------------------------------------
     def _render_exchange(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
-        options = _supported_exchanges(self._desk)
+        options = _discovered_exchanges(self._desk)
+        if not options:
+            return Screen(
+                text=(
+                    "GoldenFibo\n\n"
+                    "No exchanges are currently available.\n"
+                    "Add an ``x_<exchange>_agent.py`` module to the trade "
+                    "plugin's agents directory and try again."
+                ),
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="exchange",
+            )
         buttons = [[_button(ex.upper(), f"exchange:{ex}")] for ex in options]
         buttons.append([_button(*BUTTON_BACK)])
         return Screen(
-            text="Select exchange (GoldenFibo v1):",
+            text="Select exchange:",
             buttons=buttons,
             state="exchange",
         )
 
     def _on_exchange(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         value = value.strip().lower()
-        if value not in _supported_exchanges(self._desk):
+        if value not in _discovered_exchanges(self._desk):
             return self._render_exchange(chat_key, s)
         s.exchange = value
+        s.account = None
         return self._render_account(chat_key, s)
 
     def _render_account(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
-        aliases = _account_aliases_for_exchange(self._desk, s.exchange or "")
-        if aliases:
-            buttons = [[_button(a, f"account:{a}")] for a in aliases]
-        else:
-            buttons = []
-        buttons.append([_button(*BUTTON_BACK)])
-        text = (
-            f"Exchange: {s.exchange.upper()}\n"
-            "Select account:"
+        exchange = s.exchange or ""
+        entries = _account_entries_for_exchange(self._desk, exchange)
+        rows: List[List[Dict[str, str]]] = []
+        for entry in entries:
+            alias, label = _account_option_parts(entry)
+            if not alias or not label:
+                continue
+            rows.append([_button(label, f"account:{alias}")])
+        if not rows:
+            # Match /trade: no free-text account entry when discovery is empty.
+            return Screen(
+                text=(
+                    f"GoldenFibo\n\n"
+                    f"Exchange: {exchange}\n\n"
+                    "No accounts are configured for this exchange."
+                ),
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="account",
+            )
+        rows.append([_button(*BUTTON_BACK)])
+        return Screen(
+            text=(
+                f"Exchange: {exchange.upper()}\n"
+                "Select account:"
+            ),
+            buttons=rows,
+            state="account",
         )
-        if not aliases:
-            text += "\n\nNo configured accounts discovered — type the account alias when prompted."
-        return Screen(text=text, buttons=buttons, state="account")
 
     def _on_account(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         value = value.strip()
-        if not value:
+        exchange = s.exchange or ""
+        valid = set(_account_aliases_for_exchange(self._desk, exchange))
+        if not value or value not in valid:
             return self._render_account(chat_key, s)
         s.account = value
+        # Support check AFTER account selection, BEFORE instrument/start.
+        if not _golden_fibo_supported(exchange):
+            return self._render_unsupported_exchange(chat_key, s)
         return self._render_instrument(chat_key, s)
+
+    def _render_unsupported_exchange(
+        self, chat_key: Tuple[Any, ...], s: WizardState
+    ) -> Screen:
+        """Graceful UI stop — no service/network/trading mutation."""
+        name = _exchange_display_name(s.exchange or "")
+        return Screen(
+            text=(
+                f"GoldenFibo is not yet available on {name}.\n\n"
+                "Exchange discovery matches /trade, but GoldenFibo "
+                "runtime support for this venue is not implemented yet.\n\n"
+                "Choose Back to pick another exchange."
+            ),
+            buttons=[[_button(*BUTTON_BACK)]],
+            state="unsupported_exchange",
+        )
 
     def _render_instrument(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         buttons = [[_button(sym, f"instrument:{sym}")] for sym in _QUICK_INSTRUMENTS]
@@ -401,7 +527,7 @@ class FiboWizard:
         if v is None:
             return self._render_direction(chat_key, s)
         s.direction = v
-        return self._render_percentage(chat_key, s)
+        return self._render_step0_volume(chat_key, s)
 
     def _render_percentage(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         return Screen(
@@ -410,6 +536,7 @@ class FiboWizard:
                 f"Account: {s.account}\n"
                 f"Instrument: {s.instrument}\n"
                 f"Direction: {s.direction}\n"
+                f"Step0 volume: {_vol_label(s.step0_volume or '0')}\n"
                 f"Enter percentage (e.g. 0.01 for 1%). Default: 0.01"
             ),
             buttons=[[_button(*BUTTON_BACK)]],
@@ -421,7 +548,7 @@ class FiboWizard:
         if v is None:
             return self._render_percentage(chat_key, s)
         s.percentage = v
-        return self._render_step0_volume(chat_key, s)
+        return self._render_review(chat_key, s)
 
     def _render_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         buttons = [
@@ -435,7 +562,6 @@ class FiboWizard:
                 f"Account: {s.account}\n"
                 f"Instrument: {s.instrument}\n"
                 f"Direction: {s.direction}\n"
-                f"Percentage: {_percent_label(s.percentage or _DEFAULT_PERCENTAGE)}\n"
                 "Enter Step0 volume (default 0.01 for SOL, 0.0001 for BTC-like):"
             ),
             buttons=buttons,
@@ -447,7 +573,7 @@ class FiboWizard:
         if v is None:
             return self._render_step0_volume(chat_key, s)
         s.step0_volume = v
-        return self._render_review(chat_key, s)
+        return self._render_percentage(chat_key, s)
 
     def _on_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         return self._on_step0_pick(chat_key, s, value)
@@ -501,7 +627,14 @@ class FiboWizard:
         if not resp.get("ok"):
             err = resp.get("error", "INTERNAL")
             text = f"❌ Start failed: {err}\n\n"
-            if err == "OPPOSITE_DIRECTION_ACTIVE":
+            if err == "SERVICE_UNAVAILABLE":
+                detail = resp.get("detail") or (
+                    "fibo.service is not running. "
+                    "The Telegram gateway will not start the robot in-process. "
+                    "Start fibo.service, then try again."
+                )
+                text += detail
+            elif err == "OPPOSITE_DIRECTION_ACTIVE":
                 existing = resp.get("existing_registration_key", "?")
                 text += f"An opposite-direction registration is already active: {existing}"
             elif err == "DUPLICATE_REGISTRATION":
@@ -533,7 +666,23 @@ class FiboWizard:
     def _render_running(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         resp = self._service.execute_command({"op": "list"})
         if not resp.get("ok"):
-            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="running_list")
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            if err == "SERVICE_UNAVAILABLE":
+                text = (
+                    "❌ fibo.service is not available.\n\n"
+                    f"{detail}\n\n"
+                    "Running Fibo is served by the daemon, not the Telegram gateway."
+                )
+            else:
+                text = f"Failed to list: {err}"
+                if detail:
+                    text += f"\n{detail}"
+            return Screen(
+                text=text,
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="running_list",
+            )
         active = resp.get("registrations") or []
         quarantined = resp.get("quarantined") or []
         if not active:
@@ -574,6 +723,11 @@ class FiboWizard:
             f"Status: {r.get('status')}\n"
             f"Freeze reason: {r.get('freeze_reason')}\n"
         )
+        shutdown_mode = r.get("shutdown_mode") or ""
+        if str(r.get("status") or "") == "smooth_shutdown" or shutdown_mode == "smooth":
+            text += "Shutdown: Smooth — waiting for current cycle to finish\n"
+        elif shutdown_mode == "emergency" or str(r.get("status") or "") == "stopping":
+            text += "Shutdown: Emergency STOP in progress\n"
         buttons = [
             [_button("🛑 STOP", f"stop_pick:{reg_key}")],
             [_button(*BUTTON_REFRESH)],
@@ -587,7 +741,17 @@ class FiboWizard:
     def _render_stop_pick(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         resp = self._service.execute_command({"op": "list"})
         if not resp.get("ok"):
-            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="stop_pick")
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            if err == "SERVICE_UNAVAILABLE":
+                text = (
+                    "❌ fibo.service is not available.\n\n"
+                    f"{detail}\n\n"
+                    "STOP is served by the daemon over IPC."
+                )
+            else:
+                text = f"Failed to list: {err}"
+            return Screen(text=text, buttons=[[_button(*BUTTON_BACK)]], state="stop_pick")
         active = resp.get("registrations") or []
         if not active:
             return Screen(
@@ -603,49 +767,137 @@ class FiboWizard:
             state="stop_pick",
         )
 
-    def _render_stop_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+    def _render_stop_mode(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
         s.registration_key = reg_key
         return Screen(
             text=(
-                f"STOP GoldenFibo for {reg_key}?\n\n"
-                "This stops further robot operation for this registration.\n"
-                "It does NOT auto-close the live position or any unrelated orders."
+                f"Stop mode for {reg_key}:\n\n"
+                "Choose how to stop this GoldenFibo registration."
             ),
             buttons=[
-                [_button("🛑 Confirm STOP", f"confirm_stop:{reg_key}")],
-                [_button(*BUTTON_CANCEL)],
+                [_button("🟡 Smooth Shutdown", f"smooth_confirm:{reg_key}")],
+                [_button("🔴 Emergency STOP", f"emergency_confirm:{reg_key}")],
+                [_button(*BUTTON_BACK)],
             ],
-            state="stop_confirm",
+            state="stop_mode",
         )
 
-    def _on_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
-        resp = self._service.execute_command({"op": "stop", "registration_key": reg_key})
+    def _render_smooth_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        return Screen(
+            text=(
+                f"🟡 Smooth Shutdown for {reg_key}?\n\n"
+                "Finish the current GoldenFibo cycle normally.\n"
+                "The robot will continue managing the current position, TP, partial fills,\n"
+                "and ladder until the current cycle closes.\n"
+                "No new cycle will start afterward."
+            ),
+            buttons=[
+                [_button("🟡 Confirm Smooth Shutdown", f"confirm_smooth:{reg_key}")],
+                [_button(*BUTTON_CANCEL)],
+            ],
+            state="stop_smooth_confirm",
+        )
+
+    def _render_emergency_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        s.registration_key = reg_key
+        return Screen(
+            text=(
+                f"🔴 Emergency STOP for {reg_key}?\n\n"
+                "Immediately stop this GoldenFibo registration.\n"
+                "Cancel its pending ladder, close its open position, remove its TP,\n"
+                "verify clean, then deregister."
+            ),
+            buttons=[
+                [_button("🔴 Confirm Emergency STOP", f"confirm_emergency:{reg_key}")],
+                [_button(*BUTTON_CANCEL)],
+            ],
+            state="stop_emergency_confirm",
+        )
+
+    def _render_stop_confirm(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        # Backward-compatible entry: route to mode selection.
+        return self._render_stop_mode(chat_key, s, reg_key)
+
+    def _on_smooth_shutdown(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        resp = self._service.execute_command({"op": "smooth_shutdown", "registration_key": reg_key})
         if not resp.get("ok"):
             err = resp.get("error", "INTERNAL")
-            if err == "OLD_STRATEGY_REGISTRATION":
-                text = (
-                    f"❌ {reg_key} is an old-strategy quarantined record. "
-                    "It cannot be stopped through /fibo. Decommission it manually."
-                )
-            else:
-                text = f"❌ Stop failed: {err}"
+            detail = resp.get("detail") or ""
+            text = f"❌ Smooth Shutdown failed: {err}\n\n{detail}"
             return Screen(
                 text=text,
                 buttons=[[_button(*BUTTON_BACK)], [_button(*BUTTON_EXIT)]],
                 state="stop_done",
             )
-        text = f"✅ Stopped GoldenFibo for {reg_key}.\n\nThe live position and any pending orders are untouched."
+        if resp.get("immediate"):
+            text = (
+                f"✅ Smooth Shutdown complete for {reg_key}.\n\n"
+                f"{resp.get('detail') or 'Deregistered (already clean).'}"
+            )
+        else:
+            text = (
+                f"✅ Smooth Shutdown armed for {reg_key}.\n\n"
+                f"{resp.get('detail') or ''}\n\n"
+                "Status will show SMOOTH_SHUTDOWN until the current cycle finishes."
+            )
         return Screen(
             text=text,
             buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
             state="stop_done",
         )
 
+    def _on_emergency_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        resp = self._service.execute_command({"op": "emergency_stop", "registration_key": reg_key})
+        if not resp.get("ok"):
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            text = f"❌ Emergency STOP failed: {err}\n\n{detail}"
+            return Screen(
+                text=text,
+                buttons=[[_button(*BUTTON_BACK)], [_button(*BUTTON_EXIT)]],
+                state="stop_done",
+            )
+        actions = resp.get("actions") or []
+        text = (
+            f"✅ Emergency STOP complete for {reg_key}.\n\n"
+            "Owned pending/TP canceled, position closed when present, "
+            "lane verified clean, registration deregistered."
+        )
+        if actions:
+            text += "\n\nActions:\n- " + "\n- ".join(str(a) for a in actions[:12])
+        return Screen(
+            text=text,
+            buttons=[[_button(*BUTTON_RUNNING)], [_button(*BUTTON_EXIT)]],
+            state="stop_done",
+        )
+
+    def _on_stop(self, chat_key: Tuple[Any, ...], s: WizardState, reg_key: str) -> Screen:
+        # Legacy single STOP path kept for old callbacks — prefer emergency? No:
+        # route to mode select so user always chooses explicitly.
+        return self._render_stop_mode(chat_key, s, reg_key)
+
+
+_FIBO_WIZARD: Optional["FiboWizard"] = None
+
 
 def get_fibo_wizard() -> FiboWizard:
-    """Module-level singleton accessor."""
-    return FiboWizard()
+    """Return the process-wide FiboWizard singleton.
 
+    MUST match /trade's ``_WIZARD = TradeWizard()`` pattern. Returning a
+    new instance per call drops in-memory ``WizardState`` between Telegram
+    callbacks, so exchange/account selections vanish on the next click.
+    """
+    global _FIBO_WIZARD
+    if _FIBO_WIZARD is None:
+        _FIBO_WIZARD = FiboWizard()
+    return _FIBO_WIZARD
+
+
+def _reset_fibo_wizard_for_tests() -> None:
+    """Test-only: drop the singleton so the next get_fibo_wizard() is fresh."""
+    global _FIBO_WIZARD
+    _FIBO_WIZARD = None
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +910,6 @@ def get_fibo_wizard() -> FiboWizard:
 # message dispatch.
 # ---------------------------------------------------------------------------
 _TEXT_HANDLING_STATES = frozenset({
-    "account",
     "instrument_input",
     "percentage",
     "step0_volume",
@@ -668,27 +919,129 @@ _TEXT_HANDLING_STATES = frozenset({
 def _chat_key(msg_or_query: Any) -> Tuple[Any, ...]:
     """Derive a stable chat key from a Telegram message or callback query.
 
-    Uses (chat_id, message_thread_id) when available so topic-aware
-    Telegram conversations are isolated from one another.
+    Aligned with /trade's ``_chat_key_from_message``:
+    - chat_id coerced to str
+    - optional message_thread_id for topic isolation
+    """
+    chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
+    if chat_id is None:
+        chat_id = getattr(
+            getattr(getattr(msg_or_query, "message", None), "chat", None),
+            "id",
+            None,
+        )
+    if chat_id is None:
+        return ("unknown",)
+    thread_id = getattr(msg_or_query, "message_thread_id", None)
+    if thread_id is None:
+        # Callback queries: thread lives on query.message
+        thread_id = getattr(
+            getattr(msg_or_query, "message", None), "message_thread_id", None
+        )
+    return (str(chat_id), thread_id) if thread_id is not None else (str(chat_id),)
+
+
+async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
+    """Send a NEW wizard screen message (commands / free-text only).
+
+    Callbacks must use ``_edit_screen`` so buttons like 🔄 Refresh update
+    the existing Telegram card in place instead of stacking duplicates.
     """
     chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
     if chat_id is None:
         chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+    metadata = None
     thread_id = getattr(msg_or_query, "message_thread_id", None)
-    return (chat_id,) if thread_id is None else (chat_id, thread_id)
-
-
-async def _send_screen(adapter: Any, msg_or_query: Any, screen: Screen) -> None:
-    chat_id = getattr(getattr(msg_or_query, "chat", None), "id", None)
-    if chat_id is None:
-        chat_id = getattr(getattr(getattr(msg_or_query, "message", None), "chat", None), "id", None)
+    if thread_id is None:
+        thread_id = getattr(
+            getattr(msg_or_query, "message", None), "message_thread_id", None
+        )
+    if thread_id is not None:
+        metadata = {"thread_id": thread_id}
     await adapter.send_inline_keyboard(
         chat_id=chat_id,
         text=screen.text,
         buttons=screen.buttons,
         callback_prefix="fibo",
-        metadata={"state": screen.state},
+        metadata=metadata,
     )
+
+
+def _is_message_not_modified_error(exc: BaseException) -> bool:
+    """Telegram no-op when edit content is identical to the current message."""
+    text = str(exc or "").lower()
+    return (
+        "message is not modified" in text
+        or "message_not_modified" in text
+    )
+
+
+def _build_fibo_inline_keyboard(screen: Screen) -> Any:
+    """Build InlineKeyboardMarkup with ``fibo:`` callback prefix (mirror /trade)."""
+    try:
+        from plugins.platforms.telegram.adapter import (
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+        )
+    except Exception:
+        # Minimal stand-in for unit tests without telegram adapter import.
+        class InlineKeyboardButton:  # type: ignore[no-redef]
+            def __init__(self, text: str, callback_data: str = ""):
+                self.text = text
+                self.callback_data = callback_data
+
+        class InlineKeyboardMarkup:  # type: ignore[no-redef]
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+
+    rows = []
+    for row in screen.buttons or []:
+        button_row = []
+        for btn in row:
+            if not isinstance(btn, dict):
+                continue
+            label = str(btn.get("text", "") or "")
+            suffix = str(btn.get("callback_data", "") or "")
+            if not label or not suffix:
+                continue
+            if not suffix.startswith("fibo:"):
+                cb = f"fibo:{suffix}"
+            else:
+                cb = suffix
+            button_row.append(InlineKeyboardButton(label, callback_data=cb))
+        if button_row:
+            rows.append(button_row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _edit_screen(query: Any, screen: Screen) -> str:
+    """Edit the callback's originating Telegram message in place.
+
+    Returns:
+      - ``\"edited\"`` — message text/markup updated
+      - ``\"noop\"`` — Telegram reported message-not-modified (success)
+      - ``\"failed\"`` — edit could not be performed (no duplicate send)
+
+    Does NOT fall back to send_inline_keyboard (avoids duplicate status cards).
+    """
+    keyboard = _build_fibo_inline_keyboard(screen)
+    edit = getattr(query, "edit_message_text", None)
+    if not callable(edit):
+        logger.warning(
+            "fibo wizard: callback query has no edit_message_text; cannot update in place"
+        )
+        return "failed"
+    try:
+        await edit(text=screen.text, reply_markup=keyboard)
+        return "edited"
+    except Exception as exc:  # noqa: BLE001
+        if _is_message_not_modified_error(exc):
+            return "noop"
+        logger.warning(
+            "fibo wizard: edit_message_text failed (no duplicate send): %s",
+            exc,
+        )
+        return "failed"
 
 
 async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
@@ -703,7 +1056,7 @@ async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
     if not text.startswith("/fibo"):
         return False
     parts = text.split(maxsplit=1)
-    if not parts or parts[0] != "/fibo":
+    if not parts or parts[0].split("@", 1)[0] != "/fibo":
         return False
     wizard = get_fibo_wizard()
     chat_key = _chat_key(msg)
@@ -715,19 +1068,26 @@ async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
 async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> bool:
     """Handle a ``fibo:`` prefixed callback query.
 
-    The adapter has already routed the call here because
-    ``data.startswith("fibo:")``. This function strips the ``fibo:``
-    prefix, runs the wizard one step, edits the originating message
-    in place to the next screen, and acknowledges the query.
+    Mirrors /trade: strip the ``fibo:`` prefix, advance the singleton
+    wizard, and **edit the originating message in place**. This is what
+    makes 🔄 Refresh update the same registration-detail card instead of
+    stacking new messages.
     """
     raw = str(data or "")
     if not raw.startswith("fibo:"):
         return False
-    payload = raw.split(":", 1)[1] if ":" in raw else ""
+    # Mirror /trade: strip exactly one "fibo:" prefix, keep the rest intact
+    # so payloads like "exchange:lighter" survive (NOT split on every ':').
+    payload = raw[len("fibo:"):]
     wizard = get_fibo_wizard()
-    chat_key = _chat_key(getattr(query, "message", query))
+    query_message = getattr(query, "message", None)
+    chat_key = _chat_key(query_message if query_message is not None else query)
     screen = wizard.handle_callback(chat_key, payload)
-    await _send_screen(adapter, query, screen)
+    await _edit_screen(query, screen)
+    try:
+        await query.answer()
+    except Exception:
+        pass
     return True
 
 
@@ -756,4 +1116,7 @@ __all__ = [
     "handle_fibo_command",
     "handle_fibo_callback",
     "handle_fibo_text",
+    "_reset_fibo_wizard_for_tests",
+    "_edit_screen",
+    "_is_message_not_modified_error",
 ]

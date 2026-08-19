@@ -31,10 +31,10 @@ if any(name in repr(h) for h in sys.path_hooks for name in _KNOWN_EDITABLE_FINDE
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
-for _cached in [k for k in list(sys.modules)
-              if k.startswith("plugins.trade")
-              and not k.startswith("plugins.trade.tests")]:
-    sys.modules.pop(_cached, None)
+# NOTE: Do NOT pop plugins.trade.* from sys.modules here.
+# Session-level isolation lives in conftest.py. Mid-suite pops
+# create dual CanonicalResponse/TradeDesk identities and break
+# later tests (INVALID_AGENT_RESPONSE / ImportError agents).
 
 
 from plugins.trade.fibo_service import (
@@ -53,6 +53,7 @@ class TestFiboDaemonServiceCompatibility(unittest.TestCase):
                 state_path=Path(tmp) / "service_state.json",
                 ledger_path=Path(tmp) / "service_ledger.jsonl",
                 event_log_path=Path(tmp) / "events.jsonl",
+                start_thread=False,
             )
             self.assertIsInstance(svc.ledger, FiboCycleLedger)
 
@@ -76,6 +77,7 @@ class TestFiboDaemonServiceCompatibility(unittest.TestCase):
                 state_path=Path(tmp) / "service_state.json",
                 ledger=ledger,
                 event_log_path=Path(tmp) / "events.jsonl",
+                start_thread=False,
             )
             # The daemon-provided ledger must be used as-is.
             self.assertIs(svc.ledger, ledger)
@@ -128,9 +130,8 @@ class TestServiceReconcileNeedsRecovery(unittest.TestCase):
         from pathlib import Path
         from plugins.trade.golden_fibo.config import GoldenFiboConfig
         from plugins.trade.golden_fibo.state import GoldenFiboState
-        sys_mods = [m for m in sys.modules if m.startswith("plugins.trade")]
-        for m in sys_mods: sys.modules.pop(m, None)
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+        # Do NOT pop plugins.trade.* from sys.modules — that creates dual
+        # CanonicalResponse/TradeDesk identities and breaks later tests.
         from plugins.trade.fibo_service import PersistentFiboService
 
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,7 +16,14 @@ STATUS_NEVER_STARTED = "never_started"
 STATUS_RUNNING = "running"
 STATUS_NEEDS_RECOVERY = "needs_recovery"
 STATUS_STOPPING = "stopping"
+STATUS_SMOOTH_SHUTDOWN = "smooth_shutdown"
+STATUS_COMPLETED = "completed"  # terminal; service deregisters
 STATUS_QUARANTINED_OLD_STRATEGY = "quarantined_old_strategy"
+
+# Durable stop intents (survive gateway + fibo.service restart)
+SHUTDOWN_MODE_NONE = ""
+SHUTDOWN_MODE_SMOOTH = "smooth"
+SHUTDOWN_MODE_EMERGENCY = "emergency"
 
 # Order roles
 ROLE_ENTRY = "entry"
@@ -109,6 +116,8 @@ class GoldenFiboState:
     # status
     status: str = STATUS_NEVER_STARTED
     freeze_reason: Optional[str] = None
+    # Durable stop intent: "" | "smooth" | "emergency"
+    shutdown_mode: str = SHUTDOWN_MODE_NONE
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -148,6 +157,7 @@ class GoldenFiboState:
             "submission_exchange_order_id": self.submission_exchange_order_id,
             "status": self.status,
             "freeze_reason": self.freeze_reason,
+            "shutdown_mode": self.shutdown_mode or SHUTDOWN_MODE_NONE,
         }
 
     @classmethod
@@ -193,4 +203,5 @@ class GoldenFiboState:
             submission_exchange_order_id=None if data.get("submission_exchange_order_id") is None else int(data.get("submission_exchange_order_id") or 0),
             status=str(data.get("status", STATUS_NEVER_STARTED)),
             freeze_reason=data.get("freeze_reason"),
+            shutdown_mode=str(data.get("shutdown_mode") or SHUTDOWN_MODE_NONE),
         )

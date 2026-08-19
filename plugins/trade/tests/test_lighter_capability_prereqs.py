@@ -41,19 +41,17 @@ sys.path_hooks[:] = [
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
-for _cached in [k for k in list(sys.modules)
-              if k.startswith("plugins.trade")
-              and not k.startswith("plugins.trade.tests")]:
-    sys.modules.pop(_cached, None)
+# NOTE: Do NOT pop plugins.trade.* from sys.modules here.
+# Session-level isolation lives in conftest.py. Mid-suite pops
+# create dual CanonicalResponse/TradeDesk identities and break
+# later tests (INVALID_AGENT_RESPONSE / ImportError agents).
 
-# Save LIGHTER_ env vars so the agent's credentials lookup works
-# for the amiroo test account.
-_PRESERVED_ENV = {}
-for _k in list(os.environ.keys()):
-    if _k.startswith("LIGHTER_"):
-        _PRESERVED_ENV[_k] = os.environ[_k]
-        os.environ.pop(_k, None)
-
+# Do NOT strip LIGHTER_* from os.environ at import time either.
+# Earlier revisions popped every LIGHTER_* key into _PRESERVED_ENV and
+# never restored them, which silently destroyed host credentials
+# (LIGHTER_ROBIN_*, LIGHTER_AMIROO_*, …) for every later test module
+# in the same pytest process. These tests are contract-presence checks
+# and do not need a wiped credential environment.
 import unittest
 from decimal import Decimal
 from typing import Any, Dict, List, Optional

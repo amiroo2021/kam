@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import json
 import tempfile
 from decimal import Decimal
@@ -29,10 +30,10 @@ if any(name in repr(h) for h in sys.path_hooks for name in _KNOWN_EDITABLE_FINDE
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
-for _cached in [k for k in list(sys.modules)
-              if k.startswith("plugins.trade")
-              and not k.startswith("plugins.trade.tests")]:
-    sys.modules.pop(_cached, None)
+# NOTE: Do NOT pop plugins.trade.* from sys.modules here.
+# Session-level isolation lives in conftest.py. Mid-suite pops
+# create dual CanonicalResponse/TradeDesk identities and break
+# later tests (INVALID_AGENT_RESPONSE / ImportError agents).
 
 
 import unittest
@@ -181,6 +182,7 @@ def _make_service(tmpdir: str, *, with_stub: bool = True) -> PersistentFiboServi
         state_path=state_path,
         ledger_path=ledger_path,
         event_log_path=event_log_path,
+        start_thread=False,
     )
     if with_stub:
         # Replace the adapter per registration with the stub.
@@ -339,7 +341,7 @@ class TestServiceListDetail(unittest.TestCase):
                     {"registration_key": "lighter/amiroo:SOL:counterBUY", "strategy": "fibonacci_counter_cascade"},
                 ],
             }))
-            svc = PersistentFiboService(state_path=state_path)
+            svc = PersistentFiboService(state_path=state_path, start_thread=False)
             r = svc.execute_command({"op": "list"})
             self.assertTrue(r["ok"])
             self.assertEqual(r["registrations_count"], 0)
@@ -403,7 +405,7 @@ class TestServiceStop(unittest.TestCase):
                     {"registration_key": "lighter/amiroo:SOL:counterBUY", "strategy": "fibonacci_counter_cascade"},
                 ],
             }))
-            svc = PersistentFiboService(state_path=state_path)
+            svc = PersistentFiboService(state_path=state_path, start_thread=False)
             r = svc.execute_command({"op": "stop", "registration_key": "lighter/amiroo:SOL:counterBUY"})
             self.assertFalse(r["ok"])
             self.assertEqual(r["error"], "OLD_STRATEGY_REGISTRATION")
@@ -446,7 +448,7 @@ class TestServiceRestartSafety(unittest.TestCase):
                     {"registration_key": "lighter/amiroo:SOL:counterBUY", "strategy": "fibonacci_counter_cascade"},
                 ],
             }))
-            svc = PersistentFiboService(state_path=state_path)
+            svc = PersistentFiboService(state_path=state_path, start_thread=False)
             r = svc.execute_command({"op": "list"})
             # The old counter record is quarantined, NOT loaded as a GoldenFibo registration
             self.assertEqual(r["registrations_count"], 0)
@@ -467,7 +469,7 @@ class TestServiceQuarantine(unittest.TestCase):
                     {"registration_key": "lighter/amiroo:SOL:counterBUY", "strategy": "fibonacci_counter_cascade"},
                 ],
             }))
-            svc = PersistentFiboService(state_path=state_path)
+            svc = PersistentFiboService(state_path=state_path, start_thread=False)
             # Provide a stub adapter that would record any calls
             stub = _StubLighterAdapter()
             svc._adapters["lighter/amiroo:SOL:counterBUY"] = stub
@@ -542,22 +544,36 @@ class TestWizardFlow(unittest.TestCase):
         for label in labels:
             self.assertNotIn("Counter", label)
 
-    def test_exchange_selection_shows_only_lighter(self):
-        s = self.wizard.handle_callback(("chat", 1), "menu:start")
+    def test_exchange_selection_shows_tradedesk_discovery(self):
+        """Exchange list comes from TradeDesk, not SUPPORTED_EXCHANGES alone."""
+        from plugins.trade.fibo_wizard import FiboWizard, _discovered_exchanges
+
+        class _Desk:
+            def list_exchanges(self):
+                return ["arcus", "lighter", "ondoperps"]
+
+            def list_accounts(self, exchange):
+                return []
+
+        w = FiboWizard(tradedesk=_Desk(), service=self._stub_service)
+        s = w.handle_callback(("chat", 1), "menu:start")
         labels = [b["text"] for btn_row in s.buttons for b in btn_row]
-        # Should only have LIGHTER as option
-        for label in labels:
-            for forbidden in ("ONDO", "ARCUS", "ONDO PERPS", "ARCUS", "HYPERLIQUID"):
-                self.assertNotIn(forbidden, label.upper())
+        self.assertIn("LIGHTER", labels)
+        self.assertIn("ARCUS", labels)
+        self.assertIn("ONDOPERPS", labels)
+        # Parity with the discovery helper itself.
+        self.assertEqual(
+            sorted(x.upper() for x in _discovered_exchanges(_Desk()) if x),
+            sorted(lab for lab in labels if lab not in ("◀️ Back", "✕ Exit")),
+        )
 
     def test_account_screen_uses_discovery(self):
-        # After picking exchange, account is rendered via _account_aliases_for_exchange
+        # After picking exchange, account is rendered via TradeDesk.list_accounts
         s = self.wizard.handle_callback(("chat", 1), "menu:start")
         s = self.wizard.handle_callback(("chat", 1), "exchange:lighter")
-        # The button texts should include configured accounts (or none)
         labels = [b["text"] for btn_row in s.buttons for b in btn_row]
-        # The default fallback is to look at LIGHTER_<ALIAS>_CHAIN env vars
         self.assertTrue(isinstance(labels, list))
+        self.assertEqual(s.state, "account")
 
     def test_instrument_screen_has_quick_select_and_other(self):
         s = self.wizard.handle_callback(("chat", 1), "menu:start")
@@ -577,11 +593,14 @@ class TestWizardFlow(unittest.TestCase):
         s = self.wizard.handle_callback(("chat", 1), "account:amiroo")
         s = self.wizard.handle_callback(("chat", 1), "instrument:SOL")
         s = self.wizard.handle_callback(("chat", 1), "direction:BUY")
-        s = self.wizard.handle_text(("chat", 1), "0.02")
+        # After direction: step0_volume first, then percentage, then review.
         self.assertEqual(s.state, "step0_volume")
         s = self.wizard.handle_callback(("chat", 1), "step0:0.01")
+        self.assertEqual(s.state, "percentage")
+        s = self.wizard.handle_text(("chat", 1), "0.02")
         self.assertEqual(s.state, "review")
         self.assertIn("Step0 volume: 0.01", s.text)
+        self.assertIn("Percentage: 2.00%", s.text)
         self.assertIn("Ladder (V0..V20)", s.text)
         self.assertIn("Cumulative through Step20", s.text)
 
@@ -591,8 +610,9 @@ class TestWizardFlow(unittest.TestCase):
         s = self.wizard.handle_callback(("chat", 1), "account:amiroo")
         s = self.wizard.handle_callback(("chat", 1), "instrument:SOL")
         s = self.wizard.handle_callback(("chat", 1), "direction:BUY")
-        s = self.wizard.handle_text(("chat", 1), "0.01")
+        # step0 then percentage then review.
         s = self.wizard.handle_callback(("chat", 1), "step0:0.01")
+        s = self.wizard.handle_text(("chat", 1), "0.01")
         for n in range(21):
             self.assertIn(f"Step{n:<2} =", s.text)
 
@@ -602,8 +622,9 @@ class TestWizardFlow(unittest.TestCase):
         s = self.wizard.handle_callback(("chat", 1), "account:amiroo")
         s = self.wizard.handle_callback(("chat", 1), "instrument:SOL")
         s = self.wizard.handle_callback(("chat", 1), "direction:BUY")
-        s = self.wizard.handle_text(("chat", 1), "0.01")
+        # step0 then percentage then confirm_start.
         s = self.wizard.handle_callback(("chat", 1), "step0:0.01")
+        s = self.wizard.handle_text(("chat", 1), "0.01")
         s = self.wizard.handle_callback(("chat", 1), "confirm_start")
         self.assertEqual(s.state, "started")
         self.assertEqual(len(self._stub_service.start_calls), 1)
@@ -648,10 +669,12 @@ class TestWizardFlow(unittest.TestCase):
             self.wizard.handle_text(("chat", 1), "0.01")
             self.wizard.handle_callback(("chat", 1), "step0:0.01")
             self.wizard.handle_callback(("chat", 1), "confirm_start")
-        # Stop only SOL
+        # Stop only SOL via Emergency STOP mode (explicit two-mode UI)
         s = self.wizard.handle_callback(("chat", 1), "stop_pick:lighter/amiroo/SOL/BUY")
-        self.assertEqual(s.state, "stop_confirm")
-        s = self.wizard.handle_callback(("chat", 1), "confirm_stop:lighter/amiroo/SOL/BUY")
+        self.assertEqual(s.state, "stop_mode")
+        s = self.wizard.handle_callback(("chat", 1), "emergency_confirm:lighter/amiroo/SOL/BUY")
+        self.assertEqual(s.state, "stop_emergency_confirm")
+        s = self.wizard.handle_callback(("chat", 1), "confirm_emergency:lighter/amiroo/SOL/BUY")
         sol_stop_calls = [k for k in self._stub_service.stop_calls if k == "lighter/amiroo/SOL/BUY"]
         eth_stop_calls = [k for k in self._stub_service.stop_calls if k == "lighter/amiroo/ETH/BUY"]
         self.assertEqual(len(sol_stop_calls), 1)
@@ -712,6 +735,28 @@ class _StubService:
                 return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION"}
             self._active.pop(key, None)
             return {"ok": True, "registration_key": key, "status": "stopped"}
+        if op == "emergency_stop":
+            self.stop_calls.append(command.get("registration_key"))
+            key = command.get("registration_key")
+            if key in self._quarantined:
+                return {"ok": False, "error": "OLD_STRATEGY_REGISTRATION"}
+            self._active.pop(key, None)
+            return {
+                "ok": True,
+                "registration_key": key,
+                "status": "stopped",
+                "mode": "emergency",
+                "actions": ["deregistered"],
+            }
+        if op == "smooth_shutdown":
+            key = command.get("registration_key")
+            return {
+                "ok": True,
+                "registration_key": key,
+                "status": "smooth_shutdown",
+                "mode": "smooth",
+                "immediate": False,
+            }
         if op == "preview":
             return {"ok": True, "step0_volume": command.get("step0_volume"), "ladder": [{"step": n, "size": "0.01", "cumulative_through_step": "0.01"} for n in range(21)], "cumulative_through_step20": "0.01"}
         return {"ok": False, "error": "UNKNOWN"}
@@ -720,18 +765,52 @@ class _StubService:
 # ---------------------------------------------------------------------------
 # Old engine cannot be reached
 # ---------------------------------------------------------------------------
-class TestOldEngineNotReachable:
+class TestOldEngineNotReachable(unittest.TestCase):
     """Confirm the legacy counter-cascade engine is not reachable via /fibo."""
 
     def test_fibo_directory_does_not_exist(self):
         self.assertFalse(Path("/root/kam/plugins/trade/fibo").exists())
 
     def test_no_old_engine_imports(self):
-        # The service module should not import the legacy engine
+        # The service module should not import the legacy engine.
+        # Scan only the code (strip docstrings) — module/function
+        # docstrings narrate the historical quarantine for human
+        # readers and may legitimately mention legacy class names
+        # like CounterType / step0_tp to describe what the old
+        # engine used to do.
+        import ast
         with open("/root/kam/plugins/trade/fibo_service.py") as f:
             src = f.read()
+        lines = src.splitlines()
+        tree = ast.parse(src)
+        # Build the set of line numbers covered by docstrings (any
+        # expression-statement string constant that is the first
+        # statement of a module/function/class body).
+        docstring_lines = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not node.body:
+                    continue
+                first = node.body[0]
+                if (
+                    isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)
+                ):
+                    start = first.lineno
+                    end = getattr(first, "end_lineno", start)
+                    for ln in range(start, end + 1):
+                        docstring_lines.add(ln)
         for token in ("CounterType", "FiboInstance", "FiboManager", "step0_tp", "step_price", "FiboLiveRunner", "RuntimeBundle"):
-            self.assertNotIn(token, src)
+            pattern = re.compile(r"\b" + re.escape(token) + r"\b")
+            for idx, line in enumerate(lines, start=1):
+                if idx in docstring_lines:
+                    continue
+                self.assertNotRegex(
+                    line,
+                    pattern,
+                    f"legacy token {token!r} found in code line {idx}: {line!r}",
+                )
 
     def test_wizard_no_counter_concepts(self):
         with open("/root/kam/plugins/trade/fibo_wizard.py") as f:

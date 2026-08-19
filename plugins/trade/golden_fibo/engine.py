@@ -35,8 +35,11 @@ from plugins.trade.golden_fibo.state import (
     ROLE_ENTRY,
     ROLE_LADDER,
     ROLE_TP,
+    SHUTDOWN_MODE_SMOOTH,
+    STATUS_COMPLETED,
     STATUS_NEEDS_RECOVERY,
     STATUS_RUNNING,
+    STATUS_SMOOTH_SHUTDOWN,
     SUBMISSION_ATTEMPTED,
     SUBMISSION_CONFIRMED,
     SUBMISSION_NEEDS_RECOVERY,
@@ -267,6 +270,43 @@ class GoldenFiboEngine:
         actions.append("healthy waiting")
         return TickResult(state=self.state, actions=actions)
 
+    def _is_smooth_shutdown(self) -> bool:
+        mode = str(getattr(self.state, "shutdown_mode", "") or "")
+        status = str(self.state.status or "")
+        return mode == SHUTDOWN_MODE_SMOOTH or status == STATUS_SMOOTH_SHUTDOWN
+
+    def _complete_smooth_shutdown(self, actions: List[str]) -> TickResult:
+        """Current cycle finished under Smooth Shutdown — no new Step0."""
+        actions.append("smooth_shutdown_complete: deregister (no new Step0)")
+        self.state.status = STATUS_COMPLETED
+        self.state.shutdown_mode = SHUTDOWN_MODE_SMOOTH
+        self.state.freeze_reason = "smooth_shutdown_complete"
+        # Clear cycle-scoped identities so list/detail show clean terminal state
+        self.state.pending_order_role = None
+        self.state.pending_order_client_id = None
+        self.state.pending_order_exchange_id = None
+        self.state.pending_requested_price = None
+        self.state.pending_requested_size = None
+        self.state.pending_confirmed_price = None
+        self.state.pending_confirmed_size = None
+        self.state.current_tp_client_id = None
+        self.state.current_tp_order_id = None
+        self.state.current_tp_role = None
+        self.state.current_tp_price = None
+        self.state.current_tp_size = None
+        self.state.tp_exit_attempts = 0
+        self.state.highest_filled_step = -1
+        self.state.fill_prices = {}
+        self.state.expected_cumulative_size = Decimal("0")
+        self.state.next_step = 0
+        self.state.submission_phase = SUBMISSION_NOT_SUBMITTED
+        self.state.submission_client_id = None
+        self.state.submission_step = None
+        self.state.submission_role = None
+        self.state.submission_attempted_at = None
+        self.state.submission_exchange_order_id = None
+        return TickResult(state=self.state, actions=actions)
+
     # ------------------------------------------------------------------
     # Case A: start a new cycle
     # ------------------------------------------------------------------
@@ -279,7 +319,11 @@ class GoldenFiboEngine:
 
         If we re-enter this path with a prior SUBMISSION_ATTEMPTED
         still unresolved, we freeze instead of resubmitting.
+
+        Smooth Shutdown: never start a fresh Step0 — complete instead.
         """
+        if self._is_smooth_shutdown():
+            return self._complete_smooth_shutdown(actions)
         # Guard: never resubmit an already-attempted Step0.
         if self.state.submission_phase == SUBMISSION_ATTEMPTED:
             return self._freeze(
@@ -765,6 +809,9 @@ class GoldenFiboEngine:
         self.state.expected_cumulative_size = Decimal("0")
         self.state.next_step = 0
         self.state.cycle_id += 1
+        if self._is_smooth_shutdown():
+            # Orphan canceled after TP exit — cycle is done; do not re-arm Step0.
+            return self._complete_smooth_shutdown(actions)
         return TickResult(state=self.state, actions=actions)
 
     def reconcile_needs_recovery_pending_fill(self, actions: List[str]) -> TickResult:
@@ -841,7 +888,9 @@ class GoldenFiboEngine:
         return result
 
     def _handle_cycle_end(self, actions: List[str]) -> TickResult:
-        # Already flat and no pending — start fresh cycle
+        # Already flat and no pending — start fresh cycle, unless Smooth Shutdown.
+        if self._is_smooth_shutdown():
+            return self._complete_smooth_shutdown(actions)
         return self._start_fresh_cycle(actions)
 
     # ------------------------------------------------------------------

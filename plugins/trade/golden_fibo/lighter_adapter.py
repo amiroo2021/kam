@@ -268,6 +268,30 @@ class LighterGoldenFiboAdapter:
         })
         return _is_success(resp)
 
+    def close_position(self, *, account: str, instrument: str) -> Dict[str, Any]:
+        """Reduce-only close of the live position via x_lighter_agent.
+
+        Used only by Emergency STOP after ownership checks. Returns a
+        flat dict with verified/success flags for the service layer.
+        """
+        resp = lighter_agent.execute({
+            "operation": "close_position",
+            "account": account,
+            "symbol": instrument,
+        })
+        payload = _get_payload(resp)
+        action = payload.get("position_action") or {}
+        if hasattr(action, "to_dict"):
+            action = action.to_dict()
+        return {
+            "success": _is_success(resp),
+            "verified": bool(action.get("verified")) if isinstance(action, dict) else False,
+            "status": (action.get("status") if isinstance(action, dict) else None),
+            "message": (action.get("message") if isinstance(action, dict) else None),
+            "error": getattr(getattr(resp, "error", None), "code", None),
+            "raw": payload,
+        }
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

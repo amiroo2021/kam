@@ -39,11 +39,27 @@ _REPO = _HERE.parent.parent.parent  # /root/kam
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-# Use a clean, empty HERMES_HOME for every test so the persistent
-# ``~/.hermes/.env`` from this machine cannot leak into discovery.
+# Isolate Hibachi discovery from the host ~/.hermes/.env WITHOUT
+# permanently stealing HERMES_HOME for the rest of the pytest session.
+# Earlier revisions set os.environ["HERMES_HOME"] = empty at import and
+# never restored it, which broke every later module that relies on
+# dotenv-backed credentials (Lighter, etc.).
+_SAVED_HERMES_HOME = os.environ.get("HERMES_HOME")
 EMPTY_HOME = Path(tempfile.mkdtemp(prefix="hibachi_empty_home_"))
 (EMPTY_HOME / ".env").write_text("")
 os.environ["HERMES_HOME"] = str(EMPTY_HOME)
+
+
+def setUpModule() -> None:
+    os.environ["HERMES_HOME"] = str(EMPTY_HOME)
+
+
+def tearDownModule() -> None:
+    if _SAVED_HERMES_HOME is None:
+        os.environ.pop("HERMES_HOME", None)
+    else:
+        os.environ["HERMES_HOME"] = _SAVED_HERMES_HOME
+
 
 from plugins.trade.agents import x_hibachi_agent as hibachi  # noqa: E402
 from plugins.trade import tradedesk  # noqa: E402
@@ -107,6 +123,9 @@ class _HibachiEnvTest(unittest.TestCase):
     """Base class that wipes HIBACHI_* env around every test."""
 
     def setUp(self):
+        # Re-assert empty HERMES_HOME after session conftest may have
+        # restored the host value between tests.
+        os.environ["HERMES_HOME"] = str(EMPTY_HOME)
         for k in list(os.environ):
             if k.startswith("HIBACHI_"):
                 os.environ.pop(k, None)
@@ -117,6 +136,7 @@ class _HibachiEnvTest(unittest.TestCase):
             if k.startswith("HIBACHI_"):
                 os.environ.pop(k, None)
         hibachi._MarketCache.invalidate()
+        os.environ["HERMES_HOME"] = str(EMPTY_HOME)
 
 
 class TestDiscovery(_HibachiEnvTest):
