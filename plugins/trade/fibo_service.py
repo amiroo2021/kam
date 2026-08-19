@@ -1127,7 +1127,7 @@ class PersistentFiboService:
 
 
 # ---------------------------------------------------------------------------
-# Socket server
+# Socket server + client (IPC control plane)
 # ---------------------------------------------------------------------------
 class _FiboCommandHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
@@ -1181,32 +1181,122 @@ class FiboSocketServiceHost(socketserver.ThreadingUnixStreamServer):
                 pass
 
 
+class FiboSocketClient:
+    """Unix-socket IPC client used by the Telegram /fibo wizard (gateway).
+
+    This is the ONLY production service handle the gateway may hold.
+    It never constructs PersistentFiboService and never starts a poll
+    thread. If fibo.service / the socket is down, every command returns
+    ``{"ok": False, "error": "SERVICE_UNAVAILABLE", ...}`` with ZERO
+    exchange side effects.
+    """
+
+    def __init__(
+        self,
+        socket_path: Optional[Path] = None,
+        *,
+        timeout: float = _DEFAULT_SOCKET_TIMEOUT,
+    ) -> None:
+        self.socket_path = Path(socket_path or resolve_fibo_socket_path())
+        self.timeout = float(timeout)
+
+    def ping(self) -> bool:
+        """True if the daemon socket accepts a connection right now."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                sock.connect(str(self.socket_path))
+            return True
+        except OSError:
+            return False
+
+    def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        path = self.socket_path
+        if not path.exists():
+            return {
+                "ok": False,
+                "error": "SERVICE_UNAVAILABLE",
+                "detail": (
+                    f"fibo.service is not reachable (socket missing: {path}). "
+                    "Start/enable fibo.service before using /fibo START, "
+                    "Running, or STOP. Opening the menu does not start the robot."
+                ),
+            }
+        try:
+            payload = json.dumps(command, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                sock.connect(str(path))
+                sock.sendall(payload)
+                # One JSON response line
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            if not buf.strip():
+                return {
+                    "ok": False,
+                    "error": "SERVICE_UNAVAILABLE",
+                    "detail": f"empty response from fibo.service at {path}",
+                }
+            try:
+                resp = json.loads(buf.decode("utf-8").strip())
+            except json.JSONDecodeError as exc:
+                return {
+                    "ok": False,
+                    "error": "SERVICE_UNAVAILABLE",
+                    "detail": f"invalid JSON from fibo.service: {exc}",
+                }
+            if not isinstance(resp, dict):
+                return {
+                    "ok": False,
+                    "error": "SERVICE_UNAVAILABLE",
+                    "detail": "non-object response from fibo.service",
+                }
+            return resp
+        except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError) as exc:
+            return {
+                "ok": False,
+                "error": "SERVICE_UNAVAILABLE",
+                "detail": (
+                    f"fibo.service unreachable at {path}: {exc}. "
+                    "The Telegram gateway will not run the trading poll loop."
+                ),
+            }
+
 
 # ---------------------------------------------------------------------------
-# Singleton accessor
+# Singleton accessor — GATEWAY/UI uses IPC client ONLY
 # ---------------------------------------------------------------------------
-_service_singleton: Optional[PersistentFiboService] = None
+_service_singleton: Optional[FiboServiceProtocol] = None
 _service_lock = threading.Lock()
 
 
 def get_fibo_service() -> FiboServiceProtocol:
-    """Return the singleton PersistentFiboService.
+    """Return the process-wide **IPC client** to fibo.service.
 
-    Tests can call ``_reset_fibo_service()`` to wipe the singleton.
+    CRITICAL control-plane rule (2026-08-19):
+    - Telegram gateway / /fibo wizard MUST use this client.
+    - This function MUST NEVER construct PersistentFiboService.
+    - This function MUST NEVER start ``golden-fibo-poll``.
+    - Trading ownership lives exclusively in fibo_daemon / fibo.service.
+
+    Tests that need an in-process engine construct
+    ``PersistentFiboService(start_thread=False, ...)`` directly and
+    inject it into FiboWizard(service=...).
     """
     global _service_singleton
     with _service_lock:
         if _service_singleton is None:
-            _service_singleton = PersistentFiboService()
+            _service_singleton = FiboSocketClient()
         return _service_singleton
 
 
 def _reset_fibo_service() -> None:
+    """Drop the gateway IPC client singleton (tests / process cleanup)."""
     global _service_singleton
     with _service_lock:
-        if _service_singleton is not None:
-            try:
-                _service_singleton.shutdown()
-            except Exception:
-                pass
+        # Client has no poll thread; nothing to shut down.
         _service_singleton = None

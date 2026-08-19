@@ -219,6 +219,11 @@ class FiboWizard:
 
     @property
     def _service(self) -> FiboServiceProtocol:
+        """IPC client to fibo.service (or an injected test stub).
+
+        Production path uses get_fibo_service() → FiboSocketClient only.
+        Never constructs an in-process PersistentFiboService poller.
+        """
         if self._service_override is not None:
             return self._service_override
         return get_fibo_service()
@@ -598,7 +603,14 @@ class FiboWizard:
         if not resp.get("ok"):
             err = resp.get("error", "INTERNAL")
             text = f"❌ Start failed: {err}\n\n"
-            if err == "OPPOSITE_DIRECTION_ACTIVE":
+            if err == "SERVICE_UNAVAILABLE":
+                detail = resp.get("detail") or (
+                    "fibo.service is not running. "
+                    "The Telegram gateway will not start the robot in-process. "
+                    "Start fibo.service, then try again."
+                )
+                text += detail
+            elif err == "OPPOSITE_DIRECTION_ACTIVE":
                 existing = resp.get("existing_registration_key", "?")
                 text += f"An opposite-direction registration is already active: {existing}"
             elif err == "DUPLICATE_REGISTRATION":
@@ -630,7 +642,23 @@ class FiboWizard:
     def _render_running(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         resp = self._service.execute_command({"op": "list"})
         if not resp.get("ok"):
-            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="running_list")
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            if err == "SERVICE_UNAVAILABLE":
+                text = (
+                    "❌ fibo.service is not available.\n\n"
+                    f"{detail}\n\n"
+                    "Running Fibo is served by the daemon, not the Telegram gateway."
+                )
+            else:
+                text = f"Failed to list: {err}"
+                if detail:
+                    text += f"\n{detail}"
+            return Screen(
+                text=text,
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="running_list",
+            )
         active = resp.get("registrations") or []
         quarantined = resp.get("quarantined") or []
         if not active:
@@ -684,7 +712,17 @@ class FiboWizard:
     def _render_stop_pick(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         resp = self._service.execute_command({"op": "list"})
         if not resp.get("ok"):
-            return Screen(text="Failed to list.", buttons=[[_button(*BUTTON_BACK)]], state="stop_pick")
+            err = resp.get("error", "INTERNAL")
+            detail = resp.get("detail") or ""
+            if err == "SERVICE_UNAVAILABLE":
+                text = (
+                    "❌ fibo.service is not available.\n\n"
+                    f"{detail}\n\n"
+                    "STOP is served by the daemon over IPC."
+                )
+            else:
+                text = f"Failed to list: {err}"
+            return Screen(text=text, buttons=[[_button(*BUTTON_BACK)]], state="stop_pick")
         active = resp.get("registrations") or []
         if not active:
             return Screen(
@@ -719,7 +757,12 @@ class FiboWizard:
         resp = self._service.execute_command({"op": "stop", "registration_key": reg_key})
         if not resp.get("ok"):
             err = resp.get("error", "INTERNAL")
-            if err == "OLD_STRATEGY_REGISTRATION":
+            if err == "SERVICE_UNAVAILABLE":
+                text = (
+                    f"❌ STOP failed: fibo.service unavailable.\n\n"
+                    f"{resp.get('detail') or ''}"
+                )
+            elif err == "OLD_STRATEGY_REGISTRATION":
                 text = (
                     f"❌ {reg_key} is an old-strategy quarantined record. "
                     "It cannot be stopped through /fibo. Decommission it manually."
