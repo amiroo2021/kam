@@ -231,6 +231,26 @@ def cmd_install(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
 
+    # Telegram adapter dispatch seams + plugins.enabled (REQUIRED for
+    # /trade and /fibo to work on a fresh Hermes install). Payload copy
+    # alone is not enough — the adapter must route slash/callback/text.
+    from adapter_wiring import apply_adapter_wiring as _apply_adapter_wiring
+
+    wiring = _apply_adapter_wiring(
+        hermes_root=hermes_root,
+        hermes_home=hermes_home,
+        capabilities=caps,
+        dry_run=dry_run,
+    )
+    if not wiring.get("ok", False):
+        print(f"ERROR: Telegram adapter wiring failed: {wiring.get('error') or wiring}", file=sys.stderr)
+        if not dry_run:
+            return 1
+    else:
+        patched = sum(1 for p in wiring.get("patches") or [] if p.get("action") in ("patched", "would-patch"))
+        already = sum(1 for p in wiring.get("patches") or [] if p.get("action") in ("already-installed", "native-present"))
+        print(f"adapter wiring: {patched} applied, {already} already present; config={wiring.get('config')}")
+
     if dry_run:
         # Zero mutation. Just print the plan.
         print()
@@ -242,6 +262,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     for cap, res in zip(caps, results):
         set_capability(manifest, cap, res)
     manifest["shared"] = shared_record
+    manifest["adapter_wiring"] = {
+        "capabilities": caps,
+        "patches": wiring.get("patches") or [],
+        "config": wiring.get("config"),
+    }
     save_manifest(hermes_home, manifest)
     print(f"manifest: {install_state_path(hermes_home)}")
     print(f"OK -- installed: {', '.join(caps)}")
@@ -263,6 +288,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     from verify_shared import run as run_verify_shared
     from verify_trade_capability import run as verify_trade
     from verify_fibo_capability import run as verify_fibo
+    from adapter_wiring import verify_adapter_wiring
 
     shared_ok = run_verify_shared(
         argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
@@ -280,6 +306,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown capability: {cap}")
         if not ok:
             failed.append(cap)
+
+    # Layer B: Telegram adapter dispatch must actually be wired. Payload
+    # presence alone is not enough (Lodo fresh-install regression).
+    print("==> verify telegram adapter wiring")
+    wire_ok, wire_msgs = verify_adapter_wiring(hermes_root=hermes_root, capabilities=caps)
+    for msg in wire_msgs:
+        print(f"    {msg}")
+    if not wire_ok:
+        failed.append("adapter_wiring")
+
     if failed:
         print(f"VERIFY FAILED: {', '.join(failed)}")
         return 1
@@ -303,6 +339,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     from uninstall_trade_capability import run as uninstall_trade
     from uninstall_fibo_capability import run as uninstall_fibo
     from uninstall_shared import run as uninstall_shared
+    from adapter_wiring import remove_adapter_wiring
+    from capabilities import is_installed as _is_installed
 
     results: List[dict] = []
     for cap in reversed(caps):
@@ -320,10 +358,31 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
 
+    # Compute remaining capabilities after this uninstall (from current
+    # manifest, minus the ones being removed).
+    remaining = []
+    for known in KNOWN_CAPABILITIES:
+        if known in caps:
+            continue
+        if _is_installed(hermes_home, known):
+            remaining.append(known)
+
+    wiring = remove_adapter_wiring(
+        hermes_root=hermes_root,
+        capabilities=caps,
+        remaining_capabilities=remaining,
+        dry_run=dry_run,
+    )
+    print(f"adapter unwiring: {wiring.get('patches')}")
+
     if dry_run:
         print()
         print("DRY RUN COMPLETE -- zero mutations performed.")
         return 0
+
+    if not wiring.get("ok", True):
+        print(f"ERROR: adapter unwiring failed: {wiring.get('error')}", file=sys.stderr)
+        return 1
 
     manifest = load_manifest(hermes_home)
     for cap in caps:

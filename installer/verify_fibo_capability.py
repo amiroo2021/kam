@@ -87,9 +87,23 @@ def run(
         print(f"    [FAIL] {msg}")
         ok = False
     for probe in FIBO_IMPORT_PROBES:
-        if _try_import(probe, repo_root):
-            print(f"    [ok] import: {probe}")
-        else:
+        # Prefer installed tree under hermes_root.
+        installed = hermes_root / Path(probe.replace(".", "/") if "." in probe and "/" not in probe else probe)
+        # FIBO_IMPORT_PROBES use slash form plugins/trade/...
+        installed = hermes_root / probe
+        if not installed.with_suffix(".py").is_file() and not installed.is_file():
+            # fall back to repo AST probe
+            if _try_import(probe, repo_root):
+                print(f"    [ok] import(source): {probe}")
+            else:
+                print(f"    [FAIL] import: {probe}")
+                ok = False
+            continue
+        path = installed if installed.is_file() else installed.with_suffix(".py")
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+            print(f"    [ok] import(installed): {probe}")
+        except SyntaxError:
             print(f"    [FAIL] import: {probe}")
             ok = False
     template = repo_root / "installer" / "fibo.service.template"
@@ -98,6 +112,22 @@ def run(
     else:
         print(f"    [FAIL] fibo.service.template missing: {template}")
         ok = False
+    # Telegram adapter dispatch (installed tree — Lodo gate).
+    from adapter_wiring import FIBO_ADAPTER_SENTINELS
+    from patchspecs import TELEGRAM_ADAPTER
+
+    adapter = hermes_root / TELEGRAM_ADAPTER
+    if not adapter.is_file():
+        print(f"    [FAIL] missing Telegram adapter at {adapter}")
+        ok = False
+    else:
+        text = adapter.read_text(encoding="utf-8")
+        for kind, needle in FIBO_ADAPTER_SENTINELS.items():
+            if needle in text:
+                print(f"    [ok] adapter fibo {kind} seam")
+            else:
+                print(f"    [FAIL] adapter fibo {kind} seam missing")
+                ok = False
     return ok
 
 

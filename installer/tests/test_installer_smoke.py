@@ -100,13 +100,26 @@ def _run_script(
 
 
 def _make_fresh_root_pair() -> Tuple[Path, Path, Path]:
-    """Return (tmpdir, hermes_root, hermes_home) for a fresh isolated run."""
+    """Return (tmpdir, hermes_root, hermes_home) for a fresh isolated run.
+
+    Plants a pristine Telegram adapter (no /trade or /fibo seams) so the
+    modular installer can apply capability-aware dispatch wiring the same
+    way it must on a genuine fresh Hermes install (Lodo contract).
+    """
     tmp = Path(tempfile.mkdtemp(prefix="kam-smoke-"))
     hermes_root = tmp / "hermes_root"
     hermes_home = tmp / "hermes_home"
     hermes_root.mkdir(parents=True, exist_ok=True)
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_root / "plugins").mkdir(exist_ok=True)
+    # Pristine adapter + minimal config for plugins.enabled.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from pristine_telegram_adapter import PRISTINE_TELEGRAM_ADAPTER  # noqa: WPS433
+
+    adapter = hermes_root / "plugins" / "platforms" / "telegram" / "adapter.py"
+    adapter.parent.mkdir(parents=True, exist_ok=True)
+    adapter.write_text(PRISTINE_TELEGRAM_ADAPTER, encoding="utf-8")
+    (hermes_home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
     return tmp, hermes_root, hermes_home
 
 

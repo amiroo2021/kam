@@ -485,18 +485,9 @@ def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     ]
 
 
-def adapter_specs() -> List[PatchSpec]:
-     """The Telegram adapter seams for /trade and /fibo, in file order."""
-     return [
-        PatchSpec(
-            seam="fibo callback dispatch",
-            relative_path=TELEGRAM_ADAPTER,
-            anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
-            anchor_after="# --- Model picker callbacks ---",
-            block=_FIBO_CALLBACK_BLOCK,
-            insertion_indent="        ",
-            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_callback",
-        ),
+def trade_adapter_specs() -> List[PatchSpec]:
+    """Telegram adapter seams for /trade only (command + callback + text)."""
+    return [
         PatchSpec(
             seam="callback dispatch",
             relative_path=TELEGRAM_ADAPTER,
@@ -505,18 +496,6 @@ def adapter_specs() -> List[PatchSpec]:
             block=_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_callback",
-        ),
-        PatchSpec(
-            seam="fibo text interception",
-            relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(update.message)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.TEXT, "
-                "update_id=update.update_id)"
-            ),
-            block=_FIBO_TEXT_BLOCK,
-            insertion_indent="        ",
-            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_text",
         ),
         PatchSpec(
             seam="wizard text interception",
@@ -531,18 +510,6 @@ def adapter_specs() -> List[PatchSpec]:
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
         ),
         PatchSpec(
-            seam="fibo slash command dispatch",
-            relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(msg)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.COMMAND, "
-                "update_id=update.update_id)"
-            ),
-            block=_FIBO_COMMAND_BLOCK,
-            insertion_indent="        ",
-            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_command",
-        ),
-        PatchSpec(
             seam="slash command dispatch",
             relative_path=TELEGRAM_ADAPTER,
             anchor_before="await self._ensure_forum_commands(msg)",
@@ -555,6 +522,76 @@ def adapter_specs() -> List[PatchSpec]:
             native_sentinel="from plugins.trade.wizard import handle_trade_command",
         ),
     ]
+
+
+def fibo_adapter_specs() -> List[PatchSpec]:
+    """Telegram adapter seams for /fibo only (command + callback + text)."""
+    return [
+        PatchSpec(
+            seam="fibo callback dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
+            anchor_after="# --- Model picker callbacks ---",
+            block=_FIBO_CALLBACK_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_callback",
+        ),
+        PatchSpec(
+            seam="fibo text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before="await self._ensure_forum_commands(update.message)",
+            anchor_after=(
+                "event = self._build_message_event(msg, MessageType.TEXT, "
+                "update_id=update.update_id)"
+            ),
+            block=_FIBO_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_text",
+        ),
+        PatchSpec(
+            seam="fibo slash command dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before="await self._ensure_forum_commands(msg)",
+            anchor_after=(
+                "event = self._build_message_event(msg, MessageType.COMMAND, "
+                "update_id=update.update_id)"
+            ),
+            block=_FIBO_COMMAND_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_command",
+        ),
+    ]
+
+
+def adapter_specs() -> List[PatchSpec]:
+    """Telegram adapter seams for /trade and /fibo, in file order.
+
+    Fibo blocks are listed before trade blocks so both can share the same
+    anchors: each insert lands after ``anchor_before``, so applying fibo
+    first keeps trade inserts closer to the anchor and both stay between
+    the anchors.
+    """
+    return fibo_adapter_specs() + trade_adapter_specs()
+
+
+def specs_for_capabilities(
+    capabilities: List[str],
+    hermes_root: Optional[Path] = None,
+) -> List[PatchSpec]:
+    """Return adapter (+ shared helper) specs for the given capabilities.
+
+    The inline-keyboard helper is included whenever *any* capability is
+    installed, because both wizards need ``send_inline_keyboard``.
+    """
+    caps = {str(c).strip().lower() for c in capabilities if str(c).strip()}
+    specs: List[PatchSpec] = []
+    if "fibo" in caps:
+        specs.extend(fibo_adapter_specs())
+    if "trade" in caps:
+        specs.extend(trade_adapter_specs())
+    if caps & {"trade", "fibo"}:
+        specs.extend(helper_specs(hermes_root))
+    return specs
 
 
 def legacy_commands_specs() -> List[PatchSpec]:
