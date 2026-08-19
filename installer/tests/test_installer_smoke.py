@@ -88,8 +88,14 @@ def _run_script(
 ) -> Tuple[int, str, str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(hermes_home)
+    # Fresh-root smoke tests validate file payload + wiring, not pip/SDK
+    # installs (those need a real Hermes venv). Always pass --skip-deps for
+    # install.sh invocations unless the caller already set it.
+    final_args = list(args)
+    if script.name == "install.sh" and "--skip-deps" not in final_args:
+        final_args.append("--skip-deps")
     proc = subprocess.run(
-        [str(script)] + args + ["--hermes-root", str(hermes_root), "--hermes-home", str(hermes_home)],
+        [str(script)] + final_args + ["--hermes-root", str(hermes_root), "--hermes-home", str(hermes_home)],
         capture_output=True,
         text=True,
         env=env,

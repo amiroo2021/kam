@@ -83,6 +83,41 @@ def run(
         else:
             print(f"    [FAIL] shared import: {probe}")
             ok = False
+    # Every shipped exchange agent must be present under the *installed*
+    # hermes_root (Lodo partial-agent regression).
+    from installer_shared import SHARED_REL_PATHS
+
+    expected_agents = [
+        rel for rel in SHARED_REL_PATHS
+        if rel.name.startswith("x_") and rel.name.endswith("_agent.py")
+    ]
+    agents_dir = hermes_root / "plugins" / "trade" / "agents"
+    if not agents_dir.is_dir():
+        print(f"    [FAIL] missing agents dir: {agents_dir}")
+        ok = False
+    else:
+        installed = {p.name for p in agents_dir.glob("x_*_agent.py")}
+        expected_names = {rel.name for rel in expected_agents}
+        missing = sorted(expected_names - installed)
+        extra = sorted(installed - expected_names)
+        if missing:
+            print(f"    [FAIL] missing agent files under {agents_dir}: {missing}")
+            ok = False
+        else:
+            print(f"    [ok] all {len(expected_names)} exchange agents installed: {sorted(expected_names)}")
+        if extra:
+            print(f"    [note] extra agent files present: {extra}")
+        # AST-parse each *present* installed agent (import may need SDKs).
+        for name in sorted(expected_names & installed):
+            path = agents_dir / name
+            try:
+                ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError as exc:
+                print(f"    [FAIL] {name} syntax: {exc}")
+                ok = False
+            except OSError as exc:
+                print(f"    [FAIL] {name} read: {exc}")
+                ok = False
     # kam/ directory.
     kam_dir = kam_root(hermes_home)
     if kam_dir.is_dir():

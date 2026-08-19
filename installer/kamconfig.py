@@ -377,3 +377,98 @@ def disable_trade(
         "action": "would-" + action if (dry_run and action == "removed") else action,
         "other_plugins_preserved": other_before,
     }
+
+
+DEFAULT_TELEGRAM_MENU_MAX = 60
+MINIMUM_TELEGRAM_MENU_MAX = 61
+
+
+def get_telegram_menu_max_commands(config: Dict[str, Any]) -> int:
+    """Return platforms.telegram.extra.command_menu.max_commands (default 60)."""
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return DEFAULT_TELEGRAM_MENU_MAX
+    telegram = platforms.get("telegram")
+    if not isinstance(telegram, dict):
+        return DEFAULT_TELEGRAM_MENU_MAX
+    extra = telegram.get("extra")
+    if not isinstance(extra, dict):
+        return DEFAULT_TELEGRAM_MENU_MAX
+    menu = extra.get("command_menu")
+    if not isinstance(menu, dict):
+        return DEFAULT_TELEGRAM_MENU_MAX
+    raw = menu.get("max_commands", DEFAULT_TELEGRAM_MENU_MAX)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TELEGRAM_MENU_MAX
+
+
+def ensure_telegram_menu_capacity(
+    config_path: Path,
+    backup_dir: Optional[Path] = None,
+    *,
+    dry_run: bool = False,
+    minimum: int = MINIMUM_TELEGRAM_MENU_MAX,
+) -> Dict[str, Any]:
+    """Ensure Telegram BotCommand menu capacity can hold /trade and /fibo.
+
+    Hermes defaults to 60 slots. With a full native command set, plugin
+    commands at the end of the menu are trimmed from ``setMyCommands`` even
+    though dispatch still works when typed. Raising
+    ``platforms.telegram.extra.command_menu.max_commands`` to *minimum*
+    (default 61) is the smallest config change that publishes both.
+    """
+    if yaml is None:
+        raise ConfigError("PyYAML unavailable; cannot adjust Telegram menu capacity")
+    before = parse_config(config_path)
+    current = get_telegram_menu_max_commands(before)
+    if current >= minimum:
+        return {
+            "path": str(config_path),
+            "action": "already-sufficient",
+            "max_commands": current,
+            "minimum_max_commands": minimum,
+        }
+    if dry_run:
+        return {
+            "path": str(config_path),
+            "action": "would-set",
+            "max_commands_before": current,
+            "max_commands_after": minimum,
+            "minimum_max_commands": minimum,
+        }
+
+    # Mutate a deep copy via nested dicts, then dump. Preserve all top-level
+    # keys that parse_config saw; values for unrelated sections are taken
+    # from the parsed tree (comments may be lost — acceptable for this
+    # nested platforms path where hermes_cli is the production alternative).
+    after = dict(before)
+    platforms = dict(after.get("platforms") or {}) if isinstance(after.get("platforms"), dict) else {}
+    telegram = dict(platforms.get("telegram") or {}) if isinstance(platforms.get("telegram"), dict) else {}
+    extra = dict(telegram.get("extra") or {}) if isinstance(telegram.get("extra"), dict) else {}
+    menu = dict(extra.get("command_menu") or {}) if isinstance(extra.get("command_menu"), dict) else {}
+    menu["max_commands"] = int(minimum)
+    extra["command_menu"] = menu
+    telegram["extra"] = extra
+    platforms["telegram"] = telegram
+    after["platforms"] = platforms
+
+    # Preserve other top-level keys.
+    missing = set(before) - set(after)
+    if missing:
+        raise ConfigError(f"menu capacity edit would drop top-level keys: {sorted(missing)}")
+    if get_telegram_menu_max_commands(after) < minimum:
+        raise ConfigError("menu capacity edit did not raise max_commands")
+
+    new_text = yaml.safe_dump(after, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    if backup_dir is not None:
+        backup_config(config_path, backup_dir)
+    _write_atomic(config_path, new_text)
+    return {
+        "path": str(config_path),
+        "action": "set",
+        "max_commands_before": current,
+        "max_commands_after": minimum,
+        "minimum_max_commands": minimum,
+    }

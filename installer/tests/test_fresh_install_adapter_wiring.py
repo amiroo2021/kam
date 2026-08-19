@@ -62,9 +62,17 @@ def _run_install(caps: List[str], hermes_root: Path, hermes_home: Path) -> int:
     argv = []
     for c in caps:
         argv.append(f"--{c}")
-    argv.extend(["--hermes-root", str(hermes_root), "--hermes-home", str(hermes_home)])
-    # installer.main expects action via script name; force --action install
-    argv.extend(["--action", "install"])
+    argv.extend(
+        [
+            "--hermes-root",
+            str(hermes_root),
+            "--hermes-home",
+            str(hermes_home),
+            "--skip-deps",  # unit tests cover files/wiring; deps are separate
+            "--action",
+            "install",
+        ]
+    )
     return INST.main(argv)
 
 

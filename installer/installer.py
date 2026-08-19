@@ -209,6 +209,34 @@ def cmd_install(args: argparse.Namespace) -> int:
         if legacy_dir.is_dir():
             print(f"DRY: would migrate legacy {legacy_dir} → retired")
 
+    # Dependencies (SDK + requirements) — required so exchange agents that
+    # import third-party SDKs (edgex, hyperliquid, pacifica, rise, …) can
+    # load on a fresh Hermes venv. Without this, TradeDesk silently skips
+    # agents that fail import and /trade shows a partial exchange list.
+    deps_record: dict = {"action": "skipped", "reason": "skip-deps" if args.skip_deps else None}
+    if not args.skip_deps:
+        try:
+            from install_trade import install_dependencies as _install_dependencies
+            from adapter_wiring import _python_exe as _py_exe
+        except Exception:
+            # Fallback local import of python exe helper
+            from install_trade import install_dependencies as _install_dependencies
+
+            def _py_exe(root: Path) -> Path:
+                v = root / "venv" / "bin" / "python"
+                return v if v.is_file() else Path(sys.executable)
+
+        try:
+            python_exe = _py_exe(hermes_root)
+            print(f"dependencies: python={python_exe}")
+            deps_record = _install_dependencies(python_exe, dry_run)
+            print(f"dependencies: {deps_record.get('action')}")
+        except Exception as exc:
+            print(f"ERROR: dependency install failed: {exc}", file=sys.stderr)
+            if not dry_run:
+                return 1
+            deps_record = {"action": "error", "error": str(exc)}
+
     # Shared core (idempotent).
     shared_record = _install_shared(
         argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
@@ -266,7 +294,9 @@ def cmd_install(args: argparse.Namespace) -> int:
         "capabilities": caps,
         "patches": wiring.get("patches") or [],
         "config": wiring.get("config"),
+        "command_menu": wiring.get("command_menu"),
     }
+    manifest["dependencies"] = deps_record
     save_manifest(hermes_home, manifest)
     print(f"manifest: {install_state_path(hermes_home)}")
     print(f"OK -- installed: {', '.join(caps)}")
@@ -315,6 +345,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"    {msg}")
     if not wire_ok:
         failed.append("adapter_wiring")
+
+    # Layer C: BotCommand publication (plugins.enabled + menu capacity).
+    from adapter_wiring import verify_command_menu_publication
+
+    print("==> verify telegram command menu publication")
+    menu_ok, menu_msgs = verify_command_menu_publication(
+        hermes_home=hermes_home, capabilities=caps
+    )
+    for msg in menu_msgs:
+        print(f"    {msg}")
+    if not menu_ok:
+        failed.append("command_menu")
 
     if failed:
         print(f"VERIFY FAILED: {', '.join(failed)}")

@@ -150,22 +150,40 @@ def apply_adapter_wiring(
 
     # Plugin API registration requires plugins.enabled to include "trade"
     # (the package name). Both /trade and /fibo handlers live in that package.
+    # Also raise Telegram BotCommand menu capacity so published slash menus
+    # include /trade and /fibo (dispatch alone is not enough).
     try:
         config_path = C.find_config(hermes_home)
         if config_path is None:
             record["config"] = {"action": "skipped", "reason": "config-not-found"}
+            record["command_menu"] = {
+                "action": "skipped",
+                "reason": "config-not-found",
+                "minimum_max_commands": getattr(C, "MINIMUM_TELEGRAM_MENU_MAX", 61),
+            }
         else:
+            cfg_backup = backup_dir if backup_dir is not None else hermes_home / "kam" / "backups"
+            if not dry_run:
+                cfg_backup.mkdir(parents=True, exist_ok=True)
             if dry_run:
                 record["config"] = {"action": "would-enable", "path": str(config_path)}
             else:
-                cfg_backup = backup_dir if backup_dir is not None else hermes_home / "kam" / "backups"
-                cfg_backup.mkdir(parents=True, exist_ok=True)
                 record["config"] = C.enable_trade(config_path, cfg_backup, dry_run=False)
+            try:
+                record["command_menu"] = C.ensure_telegram_menu_capacity(
+                    config_path,
+                    None if dry_run else cfg_backup,
+                    dry_run=dry_run,
+                )
+            except C.ConfigError as exc:
+                record["command_menu"] = {"action": "skipped", "reason": str(exc)}
     except C.ConfigError as exc:
         # Menu enablement is best-effort; adapter seams still make routing work.
         record["config"] = {"action": "skipped", "reason": str(exc)}
+        record["command_menu"] = {"action": "skipped", "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001
         record["config"] = {"action": "skipped", "reason": f"unexpected: {exc}"}
+        record["command_menu"] = {"action": "skipped", "reason": f"unexpected: {exc}"}
 
     return record
 
@@ -333,11 +351,59 @@ def assert_capability_seams(
     return failures
 
 
+def verify_command_menu_publication(
+    *,
+    hermes_home: Path,
+    capabilities: Sequence[str],
+) -> Tuple[bool, List[str]]:
+    """Verify plugin enablement + Telegram menu capacity for installed caps."""
+    caps = {str(c).lower() for c in capabilities}
+    messages: List[str] = []
+    ok = True
+    if not (caps & {"trade", "fibo"}):
+        return True, ["[ok] no trade/fibo caps; menu publication N/A"]
+
+    config_path = C.find_config(hermes_home)
+    if config_path is None:
+        return False, [
+            f"[FAIL] no config.yaml under {hermes_home}; cannot publish BotCommands"
+        ]
+
+    try:
+        cfg = C.parse_config(config_path)
+    except C.ConfigError as exc:
+        return False, [f"[FAIL] cannot parse config: {exc}"]
+
+    if not C.is_trade_enabled(cfg):
+        ok = False
+        messages.append(
+            "[FAIL] plugins.enabled does not include 'trade' "
+            "(plugin register() will not run)"
+        )
+    else:
+        messages.append("[ok] plugins.enabled includes 'trade'")
+
+    max_cmds = C.get_telegram_menu_max_commands(cfg)
+    minimum = getattr(C, "MINIMUM_TELEGRAM_MENU_MAX", 61)
+    if max_cmds < minimum:
+        ok = False
+        messages.append(
+            f"[FAIL] platforms.telegram.extra.command_menu.max_commands={max_cmds} "
+            f"< {minimum}; /trade and/or /fibo may be trimmed from BotCommand menu"
+        )
+    else:
+        messages.append(
+            f"[ok] Telegram command_menu.max_commands={max_cmds} (>= {minimum})"
+        )
+    return ok, messages
+
+
 __all__ = [
     "TRADE_ADAPTER_SENTINELS",
     "FIBO_ADAPTER_SENTINELS",
     "apply_adapter_wiring",
     "remove_adapter_wiring",
     "verify_adapter_wiring",
+    "verify_command_menu_publication",
     "assert_capability_seams",
 ]
