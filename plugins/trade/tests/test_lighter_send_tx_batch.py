@@ -61,10 +61,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 # Drop any cached copy of the plugins.trade.* modules so the resolver
 # re-resolves them to the source tree. Keep plugins.trade.tests.* so
 # the unittest loader can still find this test module.
-for _cached in [k for k in list(sys.modules)
-              if k.startswith("plugins.trade")
-              and not k.startswith("plugins.trade.tests")]:
-    sys.modules.pop(_cached, None)
+# NOTE: Do NOT pop plugins.trade.* from sys.modules here.
+# Session-level isolation lives in conftest.py. Mid-suite pops
+# create dual CanonicalResponse/TradeDesk identities and break
+# later tests (INVALID_AGENT_RESPONSE / ImportError agents).
 
 # Module-level env management: do NOT pop LIGHTER_* env vars at
 # import time. We preserve them and only mutate them on a per-class
@@ -2070,7 +2070,11 @@ def _new_order_request() -> Dict[str, Any]:
     return {
         "operation": "new_order",
         "exchange": "lighter",
-        "account": "robin",
+        # Must match the LIGHTER_RH_* stubs set at module import. Using a
+        # host-only alias like "robin" makes these tests depend on live
+        # machine credentials and break when any earlier module strips
+        # LIGHTER_* from os.environ.
+        "account": "rh",
         "symbol": "BTC",
         "side": "buy",
         "order_type": "limit",

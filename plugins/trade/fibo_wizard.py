@@ -288,10 +288,10 @@ class FiboWizard:
     # ------------------------------------------------------------------
     def _back(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         if s.state == "review":
-            return self._render_step0_volume(chat_key, s)
-        if s.state == "step0_volume":
             return self._render_percentage(chat_key, s)
         if s.state == "percentage":
+            return self._render_step0_volume(chat_key, s)
+        if s.state == "step0_volume":
             return self._render_direction(chat_key, s)
         if s.state == "direction":
             return self._render_instrument(chat_key, s)
@@ -401,7 +401,7 @@ class FiboWizard:
         if v is None:
             return self._render_direction(chat_key, s)
         s.direction = v
-        return self._render_percentage(chat_key, s)
+        return self._render_step0_volume(chat_key, s)
 
     def _render_percentage(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         return Screen(
@@ -410,6 +410,7 @@ class FiboWizard:
                 f"Account: {s.account}\n"
                 f"Instrument: {s.instrument}\n"
                 f"Direction: {s.direction}\n"
+                f"Step0 volume: {_vol_label(s.step0_volume or '0')}\n"
                 f"Enter percentage (e.g. 0.01 for 1%). Default: 0.01"
             ),
             buttons=[[_button(*BUTTON_BACK)]],
@@ -421,7 +422,7 @@ class FiboWizard:
         if v is None:
             return self._render_percentage(chat_key, s)
         s.percentage = v
-        return self._render_step0_volume(chat_key, s)
+        return self._render_review(chat_key, s)
 
     def _render_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         buttons = [
@@ -435,7 +436,6 @@ class FiboWizard:
                 f"Account: {s.account}\n"
                 f"Instrument: {s.instrument}\n"
                 f"Direction: {s.direction}\n"
-                f"Percentage: {_percent_label(s.percentage or _DEFAULT_PERCENTAGE)}\n"
                 "Enter Step0 volume (default 0.01 for SOL, 0.0001 for BTC-like):"
             ),
             buttons=buttons,
@@ -447,7 +447,7 @@ class FiboWizard:
         if v is None:
             return self._render_step0_volume(chat_key, s)
         s.step0_volume = v
-        return self._render_review(chat_key, s)
+        return self._render_percentage(chat_key, s)
 
     def _on_step0_volume(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         return self._on_step0_pick(chat_key, s, value)

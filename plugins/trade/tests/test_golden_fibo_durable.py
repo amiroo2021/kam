@@ -36,10 +36,10 @@ if any(name in repr(h) for h in sys.path_hooks for name in _KNOWN_EDITABLE_FINDE
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
-for _cached in [k for k in list(sys.modules)
-              if k.startswith("plugins.trade")
-              and not k.startswith("plugins.trade.tests")]:
-    sys.modules.pop(_cached, None)
+# NOTE: Do NOT pop plugins.trade.* from sys.modules here.
+# Session-level isolation lives in conftest.py. Mid-suite pops
+# create dual CanonicalResponse/TradeDesk identities and break
+# later tests (INVALID_AGENT_RESPONSE / ImportError agents).
 
 
 from plugins.trade.golden_fibo.config import GoldenFiboConfig
@@ -703,6 +703,7 @@ class TestRestartSafety(unittest.TestCase):
                 state_path=Path(tmp) / "service_state.json",
                 ledger_path=Path(tmp) / "service_ledger.jsonl",
                 event_log_path=Path(tmp) / "service-events.log",
+                start_thread=False,
             )
             # The engine's tick for this registration must freeze, not resubmit.
             svc2._adapters[key] = _ServiceStubAdapter()

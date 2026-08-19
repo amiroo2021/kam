@@ -772,6 +772,11 @@ class TestEndToEndRendering(unittest.TestCase):
             (agents_dir / "x_example_agent.py").write_text(fake_file.read_text())
             desk = TradeDesk()
             with mock.patch.object(tradedesk, "_agents_dir", return_value=agents_dir):
+                # Explicit cache reset (matches other discovery tests in this
+                # file). Fresh TradeDesk() already starts empty; this guards
+                # against future constructor changes.
+                desk._agents = {}
+                desk._loaded = False
                 w = TradeWizard(tradedesk=desk)
                 key = ("chat",)
                 s = w.open(key)
