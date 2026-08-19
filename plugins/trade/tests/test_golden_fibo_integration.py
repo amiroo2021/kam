@@ -191,8 +191,8 @@ def _make_service(tmpdir: str, *, with_stub: bool = True) -> PersistentFiboServi
 
 
 class TestServiceStart(unittest.TestCase):
-    def test_supported_exchanges_is_lighter_only(self):
-        self.assertEqual(SUPPORTED_EXCHANGES, ("lighter",))
+    def test_supported_exchanges_includes_lighter_and_arcus(self):
+        self.assertEqual(SUPPORTED_EXCHANGES, ("lighter", "arcus"))
 
     def test_start_creates_registration(self):
         with tempfile.TemporaryDirectory() as tmp:

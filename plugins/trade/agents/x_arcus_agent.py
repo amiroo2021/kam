@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+import threading
 import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -35,7 +36,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPositionActionResult,
@@ -206,10 +209,17 @@ def capabilities() -> List[str]:
         "ladder",
         "cancel_order_group",
         "cancel_orders",
+        "cancel_order",
         "positions_management",
         "set_tp",
         "set_sl",
         "close_position",
+        "resolve_instrument",
+        "market_constraints",
+        "market_price",
+        "position_state",
+        "get_order_state",
+        "get_order_state_by_client_id",
     ]
 
 
@@ -248,17 +258,135 @@ def _format_arcus_error(status_code: int, payload: Any) -> str:
     return str(code or message or f"HTTP {status_code}")
 
 
-def _public_get(credentials: Dict[str, Any], path: str) -> Dict[str, Any]:
-    response = requests.get(
-        f"{credentials['base_url']}{path}",
-        params={"address": credentials["wallet"], "accountIndex": credentials["account_index"]},
-        timeout=API_TIMEOUT_SECONDS,
+class _ArcusGetGate:
+    """Process-wide Arcus GET coalescing + 429 backoff (Arcus-only).
+
+    - Coalesce identical GETs within a short TTL (one fibo poll window).
+    - On HTTP 429: honor Retry-After when present, else exponential backoff.
+    - Stale cache may be returned for non-critical reads while backing off.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+        self._backoff_until = 0.0
+        self._backoff_seconds = 0.0
+        self._ttl_seconds = 1.25  # >= one default fibo poll (2s) half-window
+        self._max_backoff = 60.0
+        self._min_backoff = 1.5
+
+    def _key(self, credentials: Dict[str, Any], path: str) -> Tuple[str, str, str]:
+        return (
+            str(credentials.get("base_url") or ""),
+            str(credentials.get("wallet") or "").lower(),
+            str(path),
+        )
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    def backoff_remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._backoff_until - time.time())
+
+    def get(
+        self,
+        credentials: Dict[str, Any],
+        path: str,
+        *,
+        use_cache: bool = True,
+        allow_stale_on_backoff: bool = True,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        key = self._key(credentials, path)
+        now = time.time()
+        with self._lock:
+            if use_cache and not force_refresh and key in self._cache:
+                ts, payload = self._cache[key]
+                if now - ts <= self._ttl_seconds:
+                    return dict(payload)
+            wait = self._backoff_until - now
+            if wait > 0:
+                stale = self._cache.get(key)
+                if allow_stale_on_backoff and stale is not None:
+                    return dict(stale[1])
+                raise RuntimeError(
+                    f"429 Client Error: Too Many Requests (backoff {wait:.1f}s remaining) "
+                    f"for url: {credentials.get('base_url')}{path}"
+                )
+
+        response = requests.get(
+            f"{credentials['base_url']}{path}",
+            params={"address": credentials["wallet"], "accountIndex": credentials["account_index"]},
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+            delay = None
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = None
+            with self._lock:
+                if delay is None or delay <= 0:
+                    self._backoff_seconds = (
+                        self._min_backoff
+                        if self._backoff_seconds <= 0
+                        else min(self._max_backoff, self._backoff_seconds * 2.0)
+                    )
+                    delay = self._backoff_seconds
+                else:
+                    self._backoff_seconds = min(self._max_backoff, float(delay))
+                self._backoff_until = time.time() + float(delay)
+                stale = self._cache.get(key) if allow_stale_on_backoff else None
+            if stale is not None:
+                return dict(stale[1])
+            raise RuntimeError(
+                f"429 Client Error: Too Many Requests for url: {credentials.get('base_url')}{path}"
+                + (f" (retry-after {delay}s)" if delay else "")
+            )
+
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Arcus response body was not a JSON object")
+        with self._lock:
+            # Successful GET clears backoff growth baseline gradually.
+            if self._backoff_until <= time.time():
+                self._backoff_seconds = max(0.0, self._backoff_seconds * 0.5 if self._backoff_seconds > self._min_backoff else 0.0)
+            self._cache[key] = (time.time(), dict(payload))
+        return payload
+
+
+_ARCUS_GET_GATE = _ArcusGetGate()
+
+
+def _public_get(
+    credentials: Dict[str, Any],
+    path: str,
+    *,
+    use_cache: bool = True,
+    allow_stale_on_backoff: bool = True,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    return _ARCUS_GET_GATE.get(
+        credentials,
+        path,
+        use_cache=use_cache,
+        allow_stale_on_backoff=allow_stale_on_backoff,
+        force_refresh=force_refresh,
     )
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError("Arcus response body was not a JSON object")
-    return payload
+
+
+def arcus_http_backoff_remaining() -> float:
+    """Seconds remaining on Arcus GET backoff (0 if clear)."""
+    return float(_ARCUS_GET_GATE.backoff_remaining())
+
+
+def arcus_clear_get_cache() -> None:
+    _ARCUS_GET_GATE.clear_cache()
 
 
 def _coerce_order_id(order_id: Any) -> Optional[int]:
@@ -798,13 +926,17 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
         requested_volume = _decimal_or_zero(_resolve_request_value(request, "volume", aliases=["size", "quantity"]))
         requested_price = _decimal_or_zero(_resolve_request_value(request, "price"))
         reduce_only = bool(_resolve_request_value(request, "reduce_only", aliases=["reduceOnly"])) if _resolve_request_value(request, "reduce_only", aliases=["reduceOnly"]) is not None else False
-        client_id_raw = _resolve_request_value(request, "client_id", aliases=["clientId"])
+        client_id_raw = _resolve_request_value(
+            request,
+            "client_id",
+            aliases=["clientId", "client_order_id", "client_order_index"],
+        )
         if not symbol:
             return make_failure(operation="new_order", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
         if side not in _SIDE_TO_INT:
             return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_SIDE", message="Side must be buy or sell.")
-        if order_type != "limit":
-            return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_ORDER_TYPE", message="Only limit orders are supported.")
+        if order_type not in {"limit", "market"}:
+            return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_ORDER_TYPE", message="Only limit and market orders are supported.")
         market = _resolve_market(symbol)
         step_size = _decimal_or_zero(market["step_size"])
         tick_size = _decimal_or_zero(market["tick_size"])
@@ -812,13 +944,23 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
         submitted_price = _quantize_down(requested_price, int(market["price_precision"]))
         if step_size > 0 and submitted_volume <= 0:
             return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="INVALID_VOLUME", message="Volume rounds down to zero at the market step size.")
+        client_id = _arcus_normalize_client_id(client_id_raw)
+        if order_type == "market":
+            return _arcus_place_market_order(
+                credentials=credentials,
+                account=credentials["account"],
+                market=market,
+                symbol=symbol,
+                side=side,
+                quantity=submitted_volume,
+                reduce_only=reduce_only,
+                client_id=client_id,
+                requested_volume=requested_volume,
+            )
         if tick_size > 0 and submitted_price <= 0:
             return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="INVALID_PRICE", message="Price rounds down to zero at the market tick size.")
         if _decimal_or_zero(market["min_notional"]) > 0 and submitted_volume * submitted_price < _decimal_or_zero(market["min_notional"]):
             return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="NOTIONAL_BELOW_MINIMUM", message="Order notional is below the market minimum.")
-        client_id = str(client_id_raw).strip() if client_id_raw is not None else ""
-        if not client_id:
-            client_id = f"arcus-{uuid.uuid4().hex[:16]}"
         payload = _build_new_order_payload(
             credentials=credentials,
             market=market,
@@ -861,6 +1003,7 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
             verified=verified_order_id is not None,
             status="success" if verified_order_id is not None else "failed",
             exchange_order_id=verified_order_id,
+            client_order_id=client_id,
         )
         if verified_order_id is not None:
             return make_success(operation="new_order", exchange=name, account=credentials["account"], order=order_result)
@@ -1488,18 +1631,26 @@ def _position_action_result(
     )
 
 
-def _arcus_position_context(account: str, symbol: str) -> Optional[Tuple[str, Decimal, Decimal, List[Dict[str, Any]]]]:
-    """Read the live position + open orders for ``symbol``.
+def _arcus_position_context(
+    account: str,
+    symbol: str,
+    *,
+    require_open_orders: bool = False,
+) -> Optional[Tuple[str, Decimal, Decimal, List[Dict[str, Any]]]]:
+    """Read the live position (+ best-effort open orders) for ``symbol``.
 
     Returns (side_lower, current_size, reference_mark_price, open_orders_rows)
     or None if the position is zero/missing.
+
+    openOrders failures (e.g. 429) do NOT null the whole context when the
+    account/position endpoint succeeded — open_orders is returned as [] and
+    callers that need order identity must check emptiness / require_open_orders.
     """
     credentials = _lookup_credentials(account)
     if credentials is None:
         return None
     try:
-        account_payload = _public_get(credentials, "/v1/account")
-        orders_payload = _public_get(credentials, "/v1/openOrders")
+        account_payload = _public_get(credentials, "/v1/account", force_refresh=False)
     except Exception:
         return None
     positions = account_payload.get("positions", {}) or {}
@@ -1518,8 +1669,17 @@ def _arcus_position_context(account: str, symbol: str) -> Optional[Tuple[str, De
     size = _decimal_or_zero(position.get("size"))
     if size <= 0:
         return None
-    mark = _decimal_or_zero(position.get("markPx"))
-    open_orders = orders_payload.get("orders", []) or []
+    mark = _decimal_or_zero(position.get("markPx") or position.get("markPrice"))
+    open_orders: List[Dict[str, Any]] = []
+    try:
+        orders_payload = _public_get(credentials, "/v1/openOrders")
+        open_orders = orders_payload.get("orders", []) or []
+        if not isinstance(open_orders, list):
+            open_orders = []
+    except Exception:
+        if require_open_orders:
+            return None
+        open_orders = []
     return side_text, size, mark, open_orders
 
 
@@ -1975,7 +2135,14 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         responses = _arcus_batch_place_tpsl(
             credentials, market_id, closing_side,
             body_quantity, qty_units,
-            [("TAKE_PROFIT", stop_price_ticks, f"arcus-tp-{uuid.uuid4().hex[:10]}")],
+            [("TAKE_PROFIT", stop_price_ticks, _arcus_normalize_client_id(
+                request.get("client_order_id")
+                if request.get("client_order_id") is not None
+                else request.get("client_order_index")
+                if request.get("client_order_index") is not None
+                else request.get("client_id"),
+                default_prefix="arcus-tp-",
+            ))],
         )
     except Exception as exc:
         return make_failure(
@@ -2223,7 +2390,12 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
     )
     timestamp_ns = int(time.time_ns())
     good_til_time_us = (int(time.time() * 1000) + _ARCUS_GOOD_TIL_TIME_MIN_FUTURE_MS) * 1000
-    client_id = f"arcus-close-{uuid.uuid4().hex[:10]}"
+    coi_raw = request.get("client_order_id")
+    if coi_raw is None:
+        coi_raw = request.get("client_order_index")
+    if coi_raw is None:
+        coi_raw = request.get("client_id")
+    client_id = _arcus_normalize_client_id(coi_raw, default_prefix="arcus-close-")
     typed_close = _build_arcus_typed_payload_place(
         credentials=credentials,
         market_id=market_id,
@@ -2406,6 +2578,571 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
         return make_failure(operation="cancel_order_group", exchange=name, account=account, code="CANCEL_FAILED", message=sanitize_error_message(str(exc)))
 
 
+# ---------------------------------------------------------------------------
+# GoldenFibo / generic single-order helpers (read + market + cancel)
+# ---------------------------------------------------------------------------
+def _arcus_normalize_client_id(raw: Any, *, default_prefix: str = "arcus-") -> str:
+    """Normalize caller client id to Arcus clientId string.
+
+    Accepts int V2 GoldenFibo ids, numeric strings, or free-form strings.
+    When *raw* is empty, mint a unique default (legacy /trade behavior).
+    """
+    if raw is None:
+        return f"{default_prefix}{uuid.uuid4().hex[:16]}"
+    text = str(raw).strip()
+    if not text:
+        return f"{default_prefix}{uuid.uuid4().hex[:16]}"
+    # Prefer pure integer form for V2 / numeric ids.
+    try:
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return str(int(text))
+        # large ints may come as float-looking? reject
+        as_int = int(text, 0) if text.lower().startswith("0x") else int(text)
+        return str(as_int)
+    except (TypeError, ValueError):
+        return text
+
+
+def _arcus_fetch_mark_price(credentials: Dict[str, Any], symbol: str, market: Dict[str, Any]) -> Decimal:
+    """Best-effort mark/last for market IOC pricing."""
+    # Prefer account mark if position/market context available via public markets.
+    try:
+        markets_payload = _public_get(credentials, "/v1/markets")
+        markets = markets_payload.get("markets") if isinstance(markets_payload, dict) else None
+        target = _normalize_symbol(symbol)
+        mid = int(market.get("market_id") or 0)
+        if isinstance(markets, list):
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                if int(m.get("marketId") or 0) == mid or _normalize_symbol(m.get("marketDisplayName")) == target:
+                    for key in ("markPx", "markPrice", "indexPrice", "oraclePrice", "lastPrice", "midPrice"):
+                        px = _decimal_or_zero(m.get(key))
+                        if px > 0:
+                            return px
+    except Exception:
+        pass
+    # Fall back: open account snapshot mark from position if any
+    try:
+        acc = _public_get(credentials, "/v1/account")
+        positions = acc.get("positions") if isinstance(acc, dict) else None
+        if isinstance(positions, dict):
+            for _, row in positions.items():
+                if not isinstance(row, dict):
+                    continue
+                if _normalize_symbol(row.get("marketDisplayName") or row.get("symbol")) == _normalize_symbol(symbol):
+                    px = _decimal_or_zero(row.get("markPx") or row.get("markPrice"))
+                    if px > 0:
+                        return px
+    except Exception:
+        pass
+    return Decimal("0")
+
+
+def _arcus_place_market_order(
+    *,
+    credentials: Dict[str, Any],
+    account: str,
+    market: Dict[str, Any],
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    reduce_only: bool,
+    client_id: str,
+    requested_volume: Decimal,
+) -> CanonicalResponse:
+    """Place MARKET IOC (same primitive as close_position). Used for GF Step0."""
+    tick_size = _decimal_or_zero(market["tick_size"])
+    step_size = _decimal_or_zero(market["step_size"])
+    price_precision = int(market["price_precision"])
+    size_precision = int(market["size_precision"])
+    mark = _arcus_fetch_mark_price(credentials, symbol, market)
+    if mark <= 0:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="MARK_PRICE_UNAVAILABLE",
+            message="Mark price unavailable; cannot price market order slippage bound.",
+        )
+    side_l = side.strip().lower()
+    if side_l == "buy":
+        slip_price = mark * Decimal("1.01")
+    else:
+        slip_price = mark * Decimal("0.99")
+    slip_price_ticks = int((slip_price / tick_size).to_integral_value(rounding=ROUND_HALF_UP)) if tick_size > 0 else 0
+    if slip_price_ticks <= 0:
+        return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_PRICE", message="Market slip price invalid.")
+    slip_price_str = _format_decimal_places(Decimal(slip_price_ticks) * tick_size, price_precision)
+    qty_q = int((quantity / step_size).to_integral_value()) if step_size > 0 else 0
+    if qty_q <= 0:
+        return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_VOLUME", message="Volume rounds down to zero.")
+    timestamp_ns = int(time.time_ns())
+    good_til_time_us = (int(time.time() * 1000) + _ARCUS_GOOD_TIL_TIME_MIN_FUTURE_MS) * 1000
+    typed = _build_arcus_typed_payload_place(
+        credentials=credentials,
+        market_id=int(market["market_id"]),
+        price_ticks=slip_price_ticks,
+        qty_quantums=qty_q,
+        side=side_l,
+        time_in_force="ioc",
+        good_til_time_us=good_til_time_us,
+        timestamp_ns=timestamp_ns,
+        reduce_only=bool(reduce_only),
+        client_id=client_id,
+    )
+    signed_msg = _typed_payload_bytes(typed)
+    priv = _ed25519_private_key_from_hex(credentials["private_key_hex"])
+    sig_hex = priv.sign(signed_msg.encode("utf-8")).hex()
+    body = {
+        "address": credentials["wallet"],
+        "marketId": int(market["market_id"]),
+        "accountIndex": int(credentials["account_index"]),
+        "orderSide": "BUY" if side_l == "buy" else "SELL",
+        "orderType": "MARKET",
+        "timeInForce": "IOC",
+        "quantity": _format_decimal_places(quantity, size_precision),
+        "price": slip_price_str,
+        "goodTilTime": str(good_til_time_us),
+        "timestamp": timestamp_ns,
+        "reduceOnly": bool(reduce_only),
+        "clientId": client_id,
+        "clientTime": str(timestamp_ns),
+        "signature": sig_hex,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": _api_key_for_signing(credentials["api_signing_key"]),
+        "X-Timestamp": str(timestamp_ns),
+        "X-Signature": sig_hex,
+    }
+    try:
+        response = requests.post(
+            f"{credentials['base_url']}/v1/placeOrder",
+            headers=headers,
+            data=json.dumps(body, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        try:
+            resp_payload = response.json()
+        except ValueError:
+            resp_payload = {"raw": response.text}
+        if response.status_code >= 400:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=account,
+                code="ORDER_SUBMISSION_FAILED",
+                message=_format_arcus_error(response.status_code, resp_payload),
+            )
+    except Exception as exc:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="ORDER_SUBMISSION_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    verified_order_id = _coerce_order_id(
+        (resp_payload or {}).get("orderId") if isinstance(resp_payload, dict) else None
+    )
+    order_result = CanonicalOrderResult(
+        symbol=str(market.get("display_symbol") or symbol),
+        side=side_l,
+        order_type="market",
+        requested_volume=_decimal_text(requested_volume),
+        requested_price=_decimal_text(slip_price_str),
+        submitted_volume=_format_decimal_places(quantity, size_precision),
+        submitted_price=slip_price_str,
+        verified=verified_order_id is not None,
+        status="success" if verified_order_id is not None else "failed",
+        exchange_order_id=verified_order_id,
+        client_order_id=client_id,
+    )
+    if verified_order_id is not None:
+        return make_success(operation="new_order", exchange=name, account=account, order=order_result)
+    return make_failure(
+        operation="new_order",
+        exchange=name,
+        account=account,
+        code="VERIFICATION_FAILED",
+        message="Arcus market order placement did not return an order id.",
+        order=order_result,
+    )
+
+
+def _arcus_normalize_open_order_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Map an Arcus openOrders row into the GoldenFibo order_state shape."""
+    oid_raw = row.get("orderId") or row.get("order_id")
+    oid = _coerce_order_id(oid_raw)
+    side = str(row.get("side") or "").strip().lower()
+    otype = str(row.get("orderType") or row.get("type") or "limit").strip().lower()
+    tpsl = str(row.get("tpslType") or "").strip().upper()
+    status_raw = str(row.get("status") or "").strip().upper()
+    original = _decimal_or_zero(row.get("originalSize") if row.get("originalSize") is not None else row.get("quantity"))
+    remaining = _decimal_or_zero(row.get("remainingSize") if row.get("remainingSize") is not None else original)
+    filled = original - remaining if original > 0 else Decimal("0")
+    if filled < 0:
+        filled = Decimal("0")
+    price = _decimal_or_zero(row.get("price") or row.get("triggerPrice") or row.get("stopPrice"))
+    trigger = _decimal_or_zero(row.get("triggerPrice") or row.get("stopPrice"))
+    client_raw = row.get("clientId") or row.get("client_id")
+    client_idx = None
+    try:
+        if client_raw is not None and str(client_raw).strip() != "":
+            client_idx = int(str(client_raw).strip())
+    except (TypeError, ValueError):
+        client_idx = client_raw
+    reduce_only = bool(row.get("reduceOnly") or row.get("isPositionTPSL") or tpsl in {"TAKE_PROFIT", "STOP_LOSS"})
+    # Taxonomy
+    if status_raw in {"FILLED", "DONE", "CLOSED"} or (original > 0 and remaining <= 0 and tpsl == ""):
+        taxonomy = "FILLED"
+        status = "filled"
+    elif status_raw in {"CANCELED", "CANCELLED", "EXPIRED"}:
+        taxonomy = "CANCELED"
+        status = "canceled"
+    elif status_raw in {"UNTRIGGERED", "OPEN", "NEW", "LIVE", "ACTIVE", "PARTIALLY_FILLED", ""}:
+        if remaining > 0 and filled > 0:
+            taxonomy = "ACTIVE"
+            status = "partially_filled"
+        else:
+            taxonomy = "ACTIVE"
+            status = "open" if status_raw != "UNTRIGGERED" else "untriggered"
+    else:
+        taxonomy = "ACTIVE"
+        status = status_raw.lower() or "open"
+    symbol = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
+    return {
+        "order_index": oid,
+        "exchange_order_id": oid,
+        "client_order_index": client_idx,
+        "client_order_id": client_raw,
+        "symbol": symbol,
+        "side": side,
+        "type": "take-profit" if tpsl == "TAKE_PROFIT" else ("stop-loss" if tpsl == "STOP_LOSS" else otype),
+        "status": status,
+        "taxonomy": taxonomy,
+        "requested_price": _decimal_text(price if price > 0 else trigger),
+        "requested_size": _decimal_text(original),
+        "filled_size": _decimal_text(filled),
+        "remaining_size": _decimal_text(remaining),
+        "filled_quote": None,
+        "actual_fill_price": None,
+        "reduce_only": reduce_only,
+        "raw": row,
+    }
+
+
+def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not symbol:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    try:
+        market = _resolve_market(symbol)
+    except ValueError as exc:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account, code=str(exc) or "INSTRUMENT_NOT_FOUND", message=sanitize_error_message(str(exc)))
+    sym = str(market.get("display_symbol") or symbol)
+    instrument = CanonicalInstrument(
+        requested_symbol=symbol,
+        symbol=sym,
+        display_name=sym,
+        price_increment=_decimal_text(market.get("tick_size")),
+        size_increment=_decimal_text(market.get("step_size")),
+        minimum_size=_decimal_text(market.get("step_size")),
+    )
+    # Attach venue constraint extras for GoldenFibo adapter via order_state twin
+    # (CanonicalInstrument is narrow; market_constraints carries full set.)
+    return make_success(operation="resolve_instrument", exchange=name, account=account, instrument=instrument)
+
+
+def _execute_market_constraints(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not symbol:
+        return make_failure(operation="market_constraints", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    try:
+        market = _resolve_market(symbol)
+    except ValueError as exc:
+        return make_failure(operation="market_constraints", exchange=name, account=account, code=str(exc) or "INSTRUMENT_NOT_FOUND", message=sanitize_error_message(str(exc)))
+    state = {
+        "symbol": market.get("display_symbol") or symbol,
+        "market_id": int(market["market_id"]),
+        "min_base_amount": _decimal_text(market.get("step_size")),
+        "min_quote_amount": _decimal_text(market.get("min_notional")),
+        "size_decimals": int(market["size_precision"]),
+        "price_decimals": int(market["price_precision"]),
+        "tick_size": _decimal_text(market.get("tick_size")),
+        "step_size": _decimal_text(market.get("step_size")),
+    }
+    return make_success(operation="market_constraints", exchange=name, account=account, order_state=state)
+
+
+def _execute_market_price(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="market_price", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    try:
+        market = _resolve_market(symbol)
+    except ValueError as exc:
+        return make_failure(operation="market_price", exchange=name, account=account, code=str(exc) or "INSTRUMENT_NOT_FOUND", message=sanitize_error_message(str(exc)))
+    mark = _arcus_fetch_mark_price(credentials, symbol, market)
+    sym = str(market.get("display_symbol") or symbol)
+    mp = CanonicalMarketPrice(
+        requested_symbol=symbol,
+        market=sym,
+        mark_price=_decimal_text(mark) if mark > 0 else None,
+        price=_decimal_text(mark) if mark > 0 else None,
+    )
+    return make_success(operation="market_price", exchange=name, account=account, market_price=mp)
+
+
+def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="position_state", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    try:
+        payload = _public_get(credentials, "/v1/account")
+        positions = _normalize_positions(payload.get("positions") if isinstance(payload, dict) else {})
+    except Exception as exc:
+        return make_failure(operation="position_state", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
+    if symbol:
+        target = _normalize_symbol(symbol)
+        filtered = []
+        for p in positions:
+            d = p.to_dict() if hasattr(p, "to_dict") else dict(p)
+            if _normalize_symbol(d.get("symbol")) == target:
+                # Normalize side/size for GoldenFibo engine
+                side = str(d.get("side") or "").lower()
+                size = _decimal_or_zero(d.get("size"))
+                if side in {"long", "short"} and size > 0:
+                    filtered.append(
+                        CanonicalPosition(
+                            symbol=str(d.get("symbol") or target),
+                            side=side,
+                            size=_decimal_text(size),
+                            entry_price=str(d.get("entry_price") or "0"),
+                            pnl=str(d.get("pnl") or "0"),
+                            tp=d.get("tp"),
+                            sl=d.get("sl"),
+                        )
+                    )
+        positions = filtered
+    return make_success(operation="position_state", exchange=name, account=account, positions=positions)
+
+
+def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="get_order_state", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    raw_oid = request.get("order_index")
+    if raw_oid is None:
+        raw_oid = request.get("order_id")
+    if raw_oid is None:
+        return make_failure(operation="get_order_state", exchange=name, account=account, code="MISSING_ORDER_ID", message="order_index is required.")
+    want = _coerce_order_id(raw_oid)
+    want_s = str(raw_oid).strip().lower()
+    try:
+        orders = _fetch_open_orders_for_account(credentials)
+    except Exception as exc:
+        return make_failure(operation="get_order_state", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
+    for row in orders:
+        if not isinstance(row, dict):
+            continue
+        oid = _coerce_order_id(row.get("orderId"))
+        oid_s = str(row.get("orderId") or "").strip().lower()
+        if (want is not None and oid == want) or (want_s and oid_s == want_s):
+            return make_success(operation="get_order_state", exchange=name, account=account, order_state=_arcus_normalize_open_order_row(row))
+    return make_success(operation="get_order_state", exchange=name, account=account, order_state={})
+
+
+def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    symbol = str(request.get("symbol") or "").strip().upper()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    cid_raw = request.get("client_order_index")
+    if cid_raw is None:
+        cid_raw = request.get("client_order_id")
+    if cid_raw is None:
+        cid_raw = request.get("client_id")
+    if cid_raw is None:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account, code="MISSING_CLIENT_ID", message="client_order_index is required.")
+    want = str(cid_raw).strip()
+    try:
+        orders = _fetch_open_orders_for_account(credentials)
+    except Exception as exc:
+        return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
+    target_sym = _normalize_symbol(symbol) if symbol else ""
+    for row in orders:
+        if not isinstance(row, dict):
+            continue
+        if target_sym:
+            row_sym = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
+            if row_sym != target_sym:
+                continue
+        crow = str(row.get("clientId") or row.get("client_id") or "").strip()
+        if crow == want:
+            return make_success(
+                operation="get_order_state_by_client_id",
+                exchange=name,
+                account=account,
+                order_state=_arcus_normalize_open_order_row(row),
+            )
+    # Filled market orders leave openOrders. If a live position exists for the
+    # symbol, synthesize a FILLED record using average entry as P0 so GoldenFibo
+    # Step0 confirmation can proceed without inventing a fill.
+    if symbol:
+        try:
+            acc = _public_get(credentials, "/v1/account")
+            positions = acc.get("positions") if isinstance(acc, dict) else {}
+            if isinstance(positions, dict):
+                for _, prow in positions.items():
+                    if not isinstance(prow, dict):
+                        continue
+                    if _normalize_symbol(prow.get("marketDisplayName") or prow.get("symbol")) != target_sym:
+                        continue
+                    size = abs(_decimal_or_zero(prow.get("size") or prow.get("positionSize")))
+                    if size <= 0:
+                        continue
+                    side_raw = str(prow.get("side") or "").strip().lower()
+                    if side_raw in {"long", "buy", "1"}:
+                        side = "buy"
+                    elif side_raw in {"short", "sell", "-1"}:
+                        side = "sell"
+                    else:
+                        # signed size
+                        signed = _decimal_or_zero(prow.get("size"))
+                        side = "buy" if signed > 0 else "sell"
+                    entry = _decimal_or_zero(prow.get("averageEntryPrice") or prow.get("entryPrice"))
+                    synthetic = {
+                        "order_index": None,
+                        "exchange_order_id": None,
+                        "client_order_index": int(want) if want.isdigit() else want,
+                        "client_order_id": want,
+                        "symbol": target_sym,
+                        "side": side,
+                        "type": "market",
+                        "status": "filled",
+                        "taxonomy": "FILLED",
+                        "requested_size": _decimal_text(size),
+                        "filled_size": _decimal_text(size),
+                        "remaining_size": "0",
+                        "actual_fill_price": _decimal_text(entry) if entry > 0 else None,
+                        "reduce_only": False,
+                        "synthetic_from_position": True,
+                    }
+                    return make_success(
+                        operation="get_order_state_by_client_id",
+                        exchange=name,
+                        account=account,
+                        order_state=synthetic,
+                    )
+        except Exception:
+            pass
+    return make_success(operation="get_order_state_by_client_id", exchange=name, account=account, order_state={})
+
+
+def _execute_cancel_order(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="cancel_order", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    raw_oid = request.get("order_index")
+    if raw_oid is None:
+        raw_oid = request.get("order_id")
+    if raw_oid is None:
+        return make_failure(operation="cancel_order", exchange=name, account=account, code="MISSING_ORDER_ID", message="order_index is required.")
+    # Prefer original hex string when available
+    oid_str = str(raw_oid).strip()
+    # If numeric int was stored from coerce, try to find hex form in open orders
+    try:
+        orders = _fetch_open_orders_for_account(credentials)
+    except Exception as exc:
+        return make_failure(operation="cancel_order", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
+    want = _coerce_order_id(raw_oid)
+    market_id = None
+    for row in orders:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("orderId") or "").strip()
+        cid = _coerce_order_id(rid)
+        if (want is not None and cid == want) or rid.lower() == oid_str.lower():
+            oid_str = rid
+            # market id from row or resolve
+            try:
+                market_id = int(row.get("marketId") or 0) or None
+            except Exception:
+                market_id = None
+            if market_id is None:
+                sym = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol"))
+                try:
+                    market_id = int(_resolve_market(sym)["market_id"])
+                except Exception:
+                    pass
+            break
+    if market_id is None:
+        # Still try cancel if caller provided market_id
+        try:
+            market_id = int(request.get("market_id") or 0) or None
+        except Exception:
+            market_id = None
+    if market_id is None:
+        # last resort: symbol
+        sym = str(request.get("symbol") or "").strip().upper()
+        if sym:
+            try:
+                market_id = int(_resolve_market(sym)["market_id"])
+            except Exception:
+                market_id = None
+    if market_id is None:
+        return make_failure(operation="cancel_order", exchange=name, account=account, code="INSTRUMENT_NOT_FOUND", message="Could not resolve market for cancel.")
+    ts_ns = int(time.time_ns())
+    cancel_body = {
+        "address": credentials["wallet"],
+        "marketId": int(market_id),
+        "accountIndex": int(credentials["account_index"]),
+        "kind": "orderId",
+        "orderId": oid_str,
+        "timestamp": ts_ns,
+    }
+    try:
+        typed = _build_arcus_typed_payload_cancel(
+            credentials=credentials, market_id=int(market_id), order_id=oid_str, timestamp_ns=ts_ns,
+        )
+        _signed_post(credentials, "/v1/cancelOrder", cancel_body, typed_payload=typed)
+    except Exception as exc:
+        return make_failure(operation="cancel_order", exchange=name, account=account, code="CANCEL_FAILED", message=sanitize_error_message(str(exc)))
+    # verify absent
+    try:
+        after = _fetch_open_orders_for_account(credentials)
+        still = False
+        for row in after:
+            rid = str(row.get("orderId") or "").strip()
+            if rid.lower() == oid_str.lower() or _coerce_order_id(rid) == want:
+                still = True
+                break
+        verified = not still
+    except Exception:
+        verified = False
+    state = {
+        "order_index": want if want is not None else oid_str,
+        "status": "canceled" if verified else "unknown",
+        "taxonomy": "CANCELED" if verified else "UNKNOWN",
+        "verified": verified,
+    }
+    if verified:
+        return make_success(operation="cancel_order", exchange=name, account=account, order_state=state)
+    return make_failure(operation="cancel_order", exchange=name, account=account, code="VERIFICATION_FAILED", message="Cancel could not be verified.", order_state=state)
+
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     if not isinstance(request, dict):
         operation = ""
@@ -2435,4 +3172,18 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_set_sl(account, request)
     if operation == "close_position":
         return _execute_close_position(account, request)
+    if operation == "cancel_order":
+        return _execute_cancel_order(request)
+    if operation == "resolve_instrument":
+        return _execute_resolve_instrument(request)
+    if operation == "market_constraints":
+        return _execute_market_constraints(request)
+    if operation == "market_price":
+        return _execute_market_price(request)
+    if operation == "position_state":
+        return _execute_position_state(request)
+    if operation == "get_order_state":
+        return _execute_get_order_state(request)
+    if operation == "get_order_state_by_client_id":
+        return _execute_get_order_state_by_client_id(request)
     return make_failure(operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED", message=f"Arcus does not implement '{operation}' yet.")

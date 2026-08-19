@@ -69,6 +69,7 @@ from .golden_fibo.state import (
     GoldenFiboState,
 )
 from .golden_fibo.lighter_adapter import LighterGoldenFiboAdapter
+from .golden_fibo.arcus_adapter import ArcusGoldenFiboAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ class FiboServiceProtocol(Protocol):
 # Direction validation
 # ---------------------------------------------------------------------------
 VALID_DIRECTIONS = ("BUY", "SELL")
-SUPPORTED_EXCHANGES = ("lighter",)
+SUPPORTED_EXCHANGES = ("lighter", "arcus")
 
 
 def _is_valid_registration_key(key: str) -> bool:
@@ -299,7 +300,7 @@ class PersistentFiboService:
             self.ledger = FiboCycleLedger(self.ledger_path)
         self._states: Dict[str, GoldenFiboState] = {}
         self._configs: Dict[str, GoldenFiboConfig] = {}
-        self._adapters: Dict[str, LighterGoldenFiboAdapter] = {}
+        self._adapters: Dict[str, Any] = {}
         self._lock = threading.RLock()
         self._shutdown = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -378,10 +379,18 @@ class PersistentFiboService:
     # ------------------------------------------------------------------
     # Engine construction
     # ------------------------------------------------------------------
-    def _adapter_for(self, key: str) -> LighterGoldenFiboAdapter:
+    def _adapter_for(self, key: str) -> Any:
         adapter = self._adapters.get(key)
         if adapter is None:
-            adapter = LighterGoldenFiboAdapter()
+            exchange = str(key.split("/", 1)[0] if "/" in key else "").lower()
+            # Prefer registration state exchange when available.
+            st = self._states.get(key)
+            if st is not None and st.exchange:
+                exchange = str(st.exchange).lower()
+            if exchange == "arcus":
+                adapter = ArcusGoldenFiboAdapter()
+            else:
+                adapter = LighterGoldenFiboAdapter()
             self._adapters[key] = adapter
         return adapter
 
@@ -431,11 +440,25 @@ class PersistentFiboService:
                 if state.status == STATUS_STOPPING:
                     # Emergency STOP in progress or tombstone — no tick mutations
                     continue
+                # Emergency mode: never let normal/reconcile polling compete with
+                # the emergency path (Arcus 429 storms observed live).
+                if str(getattr(state, "shutdown_mode", "") or "") == SHUTDOWN_MODE_EMERGENCY:
+                    continue
                 if state.status == STATUS_COMPLETED:
                     # Should have been popped; defensive cleanup
                     self._states.pop(key, None)
                     self._save_state()
                     continue
+                # Arcus-specific: while HTTP GET backoff is active, skip reconcile
+                # hammering that only amplifies 429s.
+                if str(state.exchange).lower() == "arcus" and state.status == STATUS_NEEDS_RECOVERY:
+                    try:
+                        from .agents import x_arcus_agent as _arcus_mod
+
+                        if float(_arcus_mod.arcus_http_backoff_remaining()) > 0.05:
+                            continue
+                    except Exception:
+                        pass
             try:
                 self._drive_one(key)
             except Exception as exc:
@@ -1060,6 +1083,32 @@ class PersistentFiboService:
         """
         key = str(command.get("registration_key") or "").strip()
         actions: List[str] = []
+
+        def _read_position_bounded(adapter: Any, account: str, instrument: str, label: str) -> Dict[str, Any]:
+            """Bounded read with Arcus 429-aware waits; never invents state."""
+            last_exc: Optional[BaseException] = None
+            for attempt in range(1, 6):
+                try:
+                    return adapter.position_state(account, instrument)
+                except Exception as exc:
+                    last_exc = exc
+                    msg = str(exc)
+                    is_429 = "429" in msg or "Too Many Requests" in msg
+                    actions.append(f"{label} position_state attempt={attempt} err={exc}")
+                    if not is_429 or attempt >= 5:
+                        break
+                    delay = min(20.0, 1.5 * (2 ** (attempt - 1)))
+                    # Prefer Arcus gate remaining if available.
+                    try:
+                        if str(getattr(adapter, "name", "")).find("arcus") >= 0 or "arcus" in key:
+                            from .agents import x_arcus_agent as _arcus_mod
+
+                            delay = max(delay, float(_arcus_mod.arcus_http_backoff_remaining()) + 0.2)
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+            raise RuntimeError(str(last_exc) if last_exc else "position_state failed")
+
         with self._lock:
             state = self._states.get(key)
             if state is None:
@@ -1082,12 +1131,14 @@ class PersistentFiboService:
 
         # Work outside lock for venue I/O
         try:
-            position = adapter.position_state(account, instrument)
+            position = _read_position_bounded(adapter, account, instrument, "initial")
         except Exception as exc:
             with self._lock:
                 st = self._states.get(key)
                 if st is not None:
-                    st.status = STATUS_NEEDS_RECOVERY
+                    # Keep STOPPING + emergency mode so poll does not resume hammering.
+                    st.status = STATUS_STOPPING
+                    st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                     st.freeze_reason = f"emergency_stop position_state failed: {exc}"
                     self._save_state()
             return {
@@ -1095,6 +1146,7 @@ class PersistentFiboService:
                 "error": "NEEDS_RECOVERY",
                 "detail": f"position_state failed: {exc}",
                 "registration_key": key,
+                "actions": actions,
             }
 
         live_size = Decimal(str(position.get("size") or "0"))
@@ -1118,34 +1170,99 @@ class PersistentFiboService:
                 "registration_key": key,
             }
 
-        # 3) Cancel owned pending ladder (remaining qty on partial fills)
-        if pending_oid is not None:
+        # Helpers -----------------------------------------------------------
+        def _order_absent_or_terminal(adapter: Any, account: str, oid: int) -> bool:
+            """True if order is gone or not ACTIVE (idempotent cancel success)."""
             try:
-                ok = adapter.cancel_order(account=account, order_index=int(pending_oid))
-                actions.append(f"cancel_pending oid={pending_oid} ok={ok}")
+                st_ord = adapter.get_order_state(account, int(oid)) or {}
+            except Exception:
+                st_ord = {}
+            if not st_ord:
+                return True
+            tax = str(st_ord.get("taxonomy") or "").upper()
+            status = str(st_ord.get("status") or "").upper()
+            if tax in ("ACTIVE",):
+                return False
+            if status in ("OPEN", "NEW", "LIVE", "UNTRIGGERED", "PARTIALLY_FILLED"):
+                # Some venues leave taxonomy empty while still open.
+                if tax in ("", "UNKNOWN") and status in ("OPEN", "NEW", "LIVE", "UNTRIGGERED", "PARTIALLY_FILLED"):
+                    return False
+            return True
+
+        def _cancel_owned(adapter: Any, account: str, oid: Optional[int], label: str) -> bool:
+            if oid is None:
+                return True
+            try:
+                ok = bool(adapter.cancel_order(account=account, order_index=int(oid)))
             except Exception as exc:
-                with self._lock:
-                    st = self._states.get(key)
-                    if st is not None:
-                        st.status = STATUS_NEEDS_RECOVERY
-                        st.freeze_reason = f"emergency_stop cancel pending failed: {exc}"
-                        self._save_state()
-                return {
-                    "ok": False,
-                    "error": "NEEDS_RECOVERY",
-                    "detail": f"cancel pending failed: {exc}",
-                    "registration_key": key,
-                    "actions": actions,
-                }
+                actions.append(f"cancel_{label} oid={oid} exc={exc}")
+                ok = False
+            if ok:
+                actions.append(f"cancel_{label} oid={oid} ok=True")
+                return True
+            # Idempotent: already gone / filled / canceled
+            if _order_absent_or_terminal(adapter, account, int(oid)):
+                actions.append(f"cancel_{label} oid={oid} idempotent_absent=True")
+                return True
+            actions.append(f"cancel_{label} oid={oid} ok=False still_active")
+            return False
+
+        def _wait_until_flat(
+            adapter: Any,
+            account: str,
+            instrument: str,
+            *,
+            total_timeout: float = 75.0,
+        ) -> tuple[bool, Dict[str, Any]]:
+            """Read-only wait for flat. Never submits close. Honors 429 backoff."""
+            delays = [1.0, 2.0, 4.0, 8.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+            deadline = time.time() + float(total_timeout)
+            last_pos: Dict[str, Any] = {}
+            for i, dly in enumerate(delays):
+                if time.time() >= deadline:
+                    break
+                try:
+                    # Prefer Arcus gate remaining
+                    try:
+                        if "arcus" in key or "arcus" in str(getattr(adapter, "name", "")).lower():
+                            from .agents import x_arcus_agent as _arcus_mod
+                            wait_b = float(_arcus_mod.arcus_http_backoff_remaining())
+                            if wait_b > 0.05:
+                                actions.append(f"flat_wait backoff={wait_b:.1f}s")
+                                time.sleep(min(wait_b + 0.2, max(0.0, deadline - time.time())))
+                    except Exception:
+                        pass
+                    last_pos = _read_position_bounded(adapter, account, instrument, f"flat_wait_{i}")
+                    sz = Decimal(str(last_pos.get("size") or "0"))
+                    side = last_pos.get("side")
+                    open_ = sz > 0 and side in ("long", "short")
+                    actions.append(f"flat_wait i={i} size={sz} side={side}")
+                    if not open_:
+                        return True, last_pos
+                except Exception as exc:
+                    actions.append(f"flat_wait i={i} err={exc}")
+                    # 429 etc: continue until deadline
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                time.sleep(min(dly, remain))
+            return False, last_pos
+
+        # 3) Cancel owned pending ladder (idempotent)
+        if pending_oid is not None:
+            if not _cancel_owned(adapter, account, pending_oid, "pending"):
+                # Not fatal yet — close may still flatten; continue
+                actions.append("pending cancel inconclusive; continuing to close/verify")
 
         # Re-read position after cancel (partial fill may have left size)
         try:
-            position = adapter.position_state(account, instrument)
+            position = _read_position_bounded(adapter, account, instrument, "post_cancel")
         except Exception as exc:
             with self._lock:
                 st = self._states.get(key)
                 if st is not None:
-                    st.status = STATUS_NEEDS_RECOVERY
+                    st.status = STATUS_STOPPING
+                    st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                     st.freeze_reason = f"emergency_stop re-read position failed: {exc}"
                     self._save_state()
             return {
@@ -1175,9 +1292,19 @@ class PersistentFiboService:
                 "actions": actions,
             }
 
-        # 4) Close owned position at actual live size
-        if has_position:
-            close_client_id = None
+        # 4) Close owned position at actual live size — exactly once
+        already_submitted = False
+        close_client_id = None
+        with self._lock:
+            st0 = self._states.get(key)
+            if st0 is not None and str(st0.emergency_close_phase or "") == "submitted":
+                already_submitted = True
+                close_client_id = st0.emergency_close_client_id
+                actions.append(
+                    f"resume_emergency_close_submitted client_order_id={close_client_id}"
+                )
+
+        if has_position and not already_submitted:
             try:
                 from .golden_fibo.client_id_v2 import (
                     ROLE_EMERGENCY_CLOSE as V2_ROLE_EMERGENCY_CLOSE,
@@ -1188,30 +1315,35 @@ class PersistentFiboService:
                 with self._lock:
                     st = self._states.get(key)
                     if st is not None and int(getattr(st, "client_id_version", 2) or 2) >= 2:
-                        if not st.cycle_uid:
-                            # Emergency before any cycle_uid (should be rare): mint one
-                            from .golden_fibo.client_id_v2 import allocate_cycle_uid
-                            prev = int(st.highest_cycle_uid or 0) or None
-                            uid = allocate_cycle_uid(previous_local_cycle_uid=prev)
-                            st.cycle_uid = uid
-                            st.highest_cycle_uid = max(int(st.highest_cycle_uid or 0), uid)
-                            st.client_seq_by_role_step = dict(st.client_seq_by_role_step or {})
-                        step_ec = int(st.highest_filled_step)
-                        if step_ec < 0:
-                            step_ec = STEP_UNKNOWN
-                        close_client_id = allocate_client_id(
-                            direction=st.direction or direction,
-                            role=V2_ROLE_EMERGENCY_CLOSE,
-                            cycle_uid=int(st.cycle_uid),
-                            step=int(step_ec),
-                            seq_map=st.client_seq_by_role_step,
-                        )
+                        # Reuse existing emergency close id if already allocated
+                        if st.emergency_close_client_id is not None:
+                            close_client_id = int(st.emergency_close_client_id)
+                        else:
+                            if not st.cycle_uid:
+                                from .golden_fibo.client_id_v2 import allocate_cycle_uid
+                                prev = int(st.highest_cycle_uid or 0) or None
+                                uid = allocate_cycle_uid(previous_local_cycle_uid=prev)
+                                st.cycle_uid = uid
+                                st.highest_cycle_uid = max(int(st.highest_cycle_uid or 0), uid)
+                                st.client_seq_by_role_step = dict(st.client_seq_by_role_step or {})
+                            step_ec = int(st.highest_filled_step)
+                            if step_ec < 0:
+                                step_ec = STEP_UNKNOWN
+                            close_client_id = allocate_client_id(
+                                direction=st.direction or direction,
+                                role=V2_ROLE_EMERGENCY_CLOSE,
+                                cycle_uid=int(st.cycle_uid),
+                                step=int(step_ec),
+                                seq_map=st.client_seq_by_role_step,
+                            )
+                            st.emergency_close_client_id = int(close_client_id)
                         self._save_state()
             except ClientIdError as exc:
                 with self._lock:
                     st = self._states.get(key)
                     if st is not None:
-                        st.status = STATUS_NEEDS_RECOVERY
+                        st.status = STATUS_STOPPING
+                        st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                         st.freeze_reason = f"emergency_stop client_id allocation failed: {exc}"
                         self._save_state()
                 return {
@@ -1229,13 +1361,14 @@ class PersistentFiboService:
                     close_kw["client_order_id"] = int(close_client_id)
                 close_res = adapter.close_position(**close_kw)
                 actions.append(f"close_position result={close_res} client_order_id={close_client_id}")
-                if not close_res.get("success") and not close_res.get("verified"):
-                    # POSITION_NOT_FOUND is ok if already flat
+                submitted_ok = bool(close_res.get("success")) or bool(close_res.get("verified"))
+                if not submitted_ok:
                     if close_res.get("error") not in ("POSITION_NOT_FOUND",):
                         with self._lock:
                             st = self._states.get(key)
                             if st is not None:
-                                st.status = STATUS_NEEDS_RECOVERY
+                                st.status = STATUS_STOPPING
+                                st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                                 st.freeze_reason = f"emergency_stop close failed: {close_res}"
                                 self._save_state()
                         return {
@@ -1245,11 +1378,39 @@ class PersistentFiboService:
                             "registration_key": key,
                             "actions": actions,
                         }
+                # Persist EMERGENCY_CLOSE_SUBMITTED even if verified=False
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None:
+                        st.emergency_close_phase = "submitted"
+                        st.freeze_reason = "EMERGENCY_CLOSE_SUBMITTED"
+                        st.status = STATUS_STOPPING
+                        st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
+                        if close_client_id is not None:
+                            st.emergency_close_client_id = int(close_client_id)
+                        ex_oid = None
+                        raw = close_res.get("raw") if isinstance(close_res, dict) else None
+                        if isinstance(raw, dict):
+                            pa = raw.get("position_action") or {}
+                            if isinstance(pa, dict):
+                                ex_oid = pa.get("exchange_order_id")
+                        if ex_oid is None and isinstance(close_res, dict):
+                            ex_oid = close_res.get("exchange_order_id")
+                        if ex_oid is not None:
+                            try:
+                                st.emergency_close_exchange_id = int(ex_oid)
+                            except (TypeError, ValueError):
+                                pass
+                        st.emergency_close_submitted_at = time.time()
+                        st.emergency_close_pre_size = str(live_size)
+                        self._save_state()
+                actions.append("phase=EMERGENCY_CLOSE_SUBMITTED")
             except Exception as exc:
                 with self._lock:
                     st = self._states.get(key)
                     if st is not None:
-                        st.status = STATUS_NEEDS_RECOVERY
+                        st.status = STATUS_STOPPING
+                        st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                         st.freeze_reason = f"emergency_stop close exception: {exc}"
                         self._save_state()
                 return {
@@ -1260,74 +1421,80 @@ class PersistentFiboService:
                     "actions": actions,
                 }
 
-        # 5) Cancel owned TP if still present
-        if tp_oid is not None:
-            try:
-                ok = adapter.cancel_order(account=account, order_index=int(tp_oid))
-                actions.append(f"cancel_tp oid={tp_oid} ok={ok}")
-            except Exception as exc:
-                actions.append(f"cancel_tp failed: {exc}")
-                # Continue to verify — TP may already be gone after close
-
-        # 6) Verify clean
-        try:
-            position = adapter.position_state(account, instrument)
-        except Exception as exc:
+        # 5) Patient flat verification (no second close)
+        flat, position = _wait_until_flat(adapter, account, instrument, total_timeout=75.0)
+        if not flat:
+            live_size = Decimal(str((position or {}).get("size") or "0"))
             with self._lock:
                 st = self._states.get(key)
                 if st is not None:
-                    st.status = STATUS_NEEDS_RECOVERY
-                    st.freeze_reason = f"emergency_stop verify position failed: {exc}"
-                    self._save_state()
-            return {
-                "ok": False,
-                "error": "NEEDS_RECOVERY",
-                "detail": str(exc),
-                "registration_key": key,
-                "actions": actions,
-            }
-        live_size = Decimal(str(position.get("size") or "0"))
-        live_side = position.get("side")
-        still_open = live_size > 0 and live_side in ("long", "short")
-        if still_open:
-            with self._lock:
-                st = self._states.get(key)
-                if st is not None:
-                    st.status = STATUS_NEEDS_RECOVERY
+                    st.status = STATUS_STOPPING
+                    st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                     st.freeze_reason = (
-                        f"emergency_stop incomplete: position still open size={live_size}"
+                        f"emergency_stop incomplete: position not confirmed flat "
+                        f"size={live_size} (close may still be settling)"
                     )
+                    # Keep emergency_close_phase=submitted so retry won't double-close
+                    if not st.emergency_close_phase:
+                        st.emergency_close_phase = "submitted"
                     self._save_state()
             return {
                 "ok": False,
                 "error": "NEEDS_RECOVERY",
-                "detail": f"position still open size={live_size}",
+                "detail": f"position not confirmed flat size={live_size}",
                 "registration_key": key,
                 "actions": actions,
             }
 
-        # Verify tracked orders gone (best-effort)
-        for label, oid in (("pending", pending_oid), ("tp", tp_oid)):
-            if oid is None:
-                continue
-            try:
-                st_ord = adapter.get_order_state(account, int(oid))
-            except Exception:
-                st_ord = {}
-            tax = str((st_ord or {}).get("taxonomy") or "").upper()
-            if tax == "ACTIVE":
+        with self._lock:
+            st = self._states.get(key)
+            if st is not None:
+                st.emergency_close_phase = "verified"
+                st.freeze_reason = "EMERGENCY_CLOSE_VERIFIED_FLAT"
+                self._save_state()
+        actions.append("flat_confirmed")
+
+        # 6) TP cleanup AFTER flat (position TP often auto-gone)
+        if tp_oid is not None:
+            if not _cancel_owned(adapter, account, tp_oid, "tp"):
+                # Re-check once after short wait
+                time.sleep(1.0)
+                if not _order_absent_or_terminal(adapter, account, int(tp_oid)):
+                    with self._lock:
+                        st = self._states.get(key)
+                        if st is not None:
+                            st.status = STATUS_STOPPING
+                            st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
+                            st.freeze_reason = (
+                                f"emergency_stop incomplete: tp oid={tp_oid} still ACTIVE"
+                            )
+                            self._save_state()
+                    return {
+                        "ok": False,
+                        "error": "NEEDS_RECOVERY",
+                        "detail": f"tp still ACTIVE oid={tp_oid}",
+                        "registration_key": key,
+                        "actions": actions,
+                    }
+                actions.append(f"cancel_tp oid={tp_oid} gone_after_wait")
+
+        # Also ensure pending gone
+        if pending_oid is not None and not _order_absent_or_terminal(adapter, account, int(pending_oid)):
+            _cancel_owned(adapter, account, pending_oid, "pending_final")
+            if not _order_absent_or_terminal(adapter, account, int(pending_oid)):
                 with self._lock:
                     st = self._states.get(key)
                     if st is not None:
-                        st.status = STATUS_NEEDS_RECOVERY
+                        st.status = STATUS_STOPPING
+                        st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
                         st.freeze_reason = (
-                            f"emergency_stop incomplete: {label} oid={oid} still ACTIVE"
+                            f"emergency_stop incomplete: pending oid={pending_oid} still ACTIVE"
                         )
                         self._save_state()
                 return {
                     "ok": False,
                     "error": "NEEDS_RECOVERY",
-                    "detail": f"{label} still ACTIVE",
+                    "detail": f"pending still ACTIVE oid={pending_oid}",
                     "registration_key": key,
                     "actions": actions,
                 }

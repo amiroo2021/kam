@@ -128,6 +128,12 @@ class GoldenFiboState:
     freeze_reason: Optional[str] = None
     # Durable stop intent: "" | "smooth" | "emergency"
     shutdown_mode: str = SHUTDOWN_MODE_NONE
+    # Emergency close submission tracking (exactly-once close + patient verify)
+    emergency_close_phase: str = ""  # "" | "submitted" | "verified"
+    emergency_close_client_id: Optional[int] = None
+    emergency_close_exchange_id: Optional[int] = None
+    emergency_close_submitted_at: Optional[float] = None
+    emergency_close_pre_size: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -174,6 +180,11 @@ class GoldenFiboState:
             "status": self.status,
             "freeze_reason": self.freeze_reason,
             "shutdown_mode": self.shutdown_mode or SHUTDOWN_MODE_NONE,
+            "emergency_close_phase": self.emergency_close_phase or "",
+            "emergency_close_client_id": self.emergency_close_client_id,
+            "emergency_close_exchange_id": self.emergency_close_exchange_id,
+            "emergency_close_submitted_at": self.emergency_close_submitted_at,
+            "emergency_close_pre_size": self.emergency_close_pre_size,
         }
 
     @classmethod
@@ -227,4 +238,25 @@ class GoldenFiboState:
             status=str(data.get("status", STATUS_NEVER_STARTED)),
             freeze_reason=data.get("freeze_reason"),
             shutdown_mode=str(data.get("shutdown_mode") or SHUTDOWN_MODE_NONE),
+            emergency_close_phase=str(data.get("emergency_close_phase") or ""),
+            emergency_close_client_id=(
+                None
+                if data.get("emergency_close_client_id") is None
+                else int(data.get("emergency_close_client_id") or 0)
+            ),
+            emergency_close_exchange_id=(
+                None
+                if data.get("emergency_close_exchange_id") is None
+                else int(data.get("emergency_close_exchange_id") or 0)
+            ),
+            emergency_close_submitted_at=(
+                None
+                if data.get("emergency_close_submitted_at") is None
+                else float(data.get("emergency_close_submitted_at") or 0.0)
+            ),
+            emergency_close_pre_size=(
+                None
+                if data.get("emergency_close_pre_size") is None
+                else str(data.get("emergency_close_pre_size"))
+            ),
         )

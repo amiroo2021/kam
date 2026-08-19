@@ -198,6 +198,7 @@ class CanonicalOrderResult:
     verified: bool
     status: str = "success"
     exchange_order_id: Optional[str | int] = None
+    client_order_id: Optional[str | int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -213,6 +214,8 @@ class CanonicalOrderResult:
         }
         if self.exchange_order_id is not None:
             data["exchange_order_id"] = self.exchange_order_id
+        if self.client_order_id is not None:
+            data["client_order_id"] = self.client_order_id
         return data
 
 
@@ -530,6 +533,7 @@ def make_failure(
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
     position_action: Optional[CanonicalPositionActionResult] = None,
+    order_state: Optional[Dict[str, Any]] = None,
     exchange_reason: Optional[str] = None,
 ) -> CanonicalResponse:
     """Wrap an exchange-native failure in the canonical envelope.
@@ -557,7 +561,12 @@ def make_failure(
         ladder=ladder,
         cancel_group=cancel_group,
         position_action=position_action,
-        error=CanonicalError(code=code, message=sanitized_message, exchange_reason=sanitized_exchange_reason),
+        order_state=order_state,
+        error=CanonicalError(
+            code=code,
+            message=sanitized_message,
+            exchange_reason=sanitized_exchange_reason,
+        ),
     )
 
 
