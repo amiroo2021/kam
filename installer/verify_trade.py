@@ -128,6 +128,11 @@ def main(argv: List[str]) -> int:
 
     def check_register_registers_trade() -> str:
         """register() must advertise /trade and /fibo via the supported plugin API."""
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
+
         mod = importlib.import_module("plugins.trade")
         if not hasattr(mod, "register"):
             raise AssertionError("plugins.trade.register missing")
@@ -138,7 +143,24 @@ def main(argv: List[str]) -> int:
             def register_command(self, name, handler=None, description="", args_hint=""):
                 seen.append({"name": name, "handler": handler, "description": description})
 
-        mod.register(_Ctx())
+        # Capability-aware register() reads ~/.hermes/kam/install_state.json.
+        # Provide a temp installed-both manifest for the dry-run-source gate.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / "kam").mkdir(parents=True)
+            (home / "kam" / "install_state.json").write_text(
+                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+            )
+            old = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = str(home)
+            try:
+                mod.register(_Ctx())
+            finally:
+                if old is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old
+
         names = [s["name"] for s in seen]
         if names.count("trade") != 1:
             raise AssertionError(f"expected one 'trade' registration, got {names}")
@@ -282,6 +304,10 @@ def main(argv: List[str]) -> int:
         def check_command_menu() -> str:
             """/trade and /fibo must be advertised via the plugin API, not a commands.py patch."""
             import inspect as _inspect
+            import json
+            import os
+            import tempfile
+            from pathlib import Path
 
             plugin = importlib.import_module("plugins.trade")
             src = _inspect.getsource(plugin.register)
@@ -299,7 +325,22 @@ def main(argv: List[str]) -> int:
                         "description": description, "args_hint": args_hint,
                     })
 
-            plugin.register(_Ctx())
+            with tempfile.TemporaryDirectory() as td:
+                home = Path(td)
+                (home / "kam").mkdir(parents=True)
+                (home / "kam" / "install_state.json").write_text(
+                    json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                )
+                old = os.environ.get("HERMES_HOME")
+                os.environ["HERMES_HOME"] = str(home)
+                try:
+                    plugin.register(_Ctx())
+                finally:
+                    if old is None:
+                        os.environ.pop("HERMES_HOME", None)
+                    else:
+                        os.environ["HERMES_HOME"] = old
+
             names = [r["name"] for r in recorded]
             if names.count("trade") != 1:
                 raise AssertionError(f"register() registered 'trade' {names.count('trade')}x")

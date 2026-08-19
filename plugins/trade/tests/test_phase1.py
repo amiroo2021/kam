@@ -585,7 +585,11 @@ class TestHermesIntegration(unittest.TestCase):
     """Test 12: existing non-/trade Telegram behavior is unaffected."""
 
     def test_12a_trade_in_command_registry(self):
-        """The plugin registers /trade as a Telegram-menu command."""
+        """The plugin registers /trade as a Telegram-menu command when installed."""
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
         from plugins.trade import register as trade_register, _handle_trade_slash
 
         class _StubCtx:
@@ -602,8 +606,23 @@ class TestHermesIntegration(unittest.TestCase):
                     }
                 )
 
-        ctx = _StubCtx()
-        trade_register(ctx)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / "kam").mkdir(parents=True)
+            (home / "kam" / "install_state.json").write_text(
+                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+            )
+            old = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = str(home)
+            try:
+                ctx = _StubCtx()
+                trade_register(ctx)
+            finally:
+                if old is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old
+
         names = {call["name"] for call in ctx.calls}
         self.assertIn("trade", names)
         trade_cmd = next(call for call in ctx.calls if call["name"] == "trade")

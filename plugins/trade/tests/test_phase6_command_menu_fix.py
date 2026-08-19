@@ -270,7 +270,11 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
 
     def test_telegram_menu_contains_trade_after_plugin_registration(self) -> None:
         # Register the trade plugin manually so the test doesn't depend
-        # on global plugin discovery order.
+        # on global plugin discovery order. Capability-aware register()
+        # needs an install_state.json with trade+fibo installed.
+        import json
+        import os
+        import tempfile
         from plugins.trade import register as trade_register, _handle_trade_slash, _handle_fibo_slash
 
         class _StubCtx:
@@ -283,8 +287,22 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
                     "description": description, "args_hint": args_hint,
                 })
 
-        ctx = _StubCtx()
-        trade_register(ctx)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / "kam").mkdir(parents=True)
+            (home / "kam" / "install_state.json").write_text(
+                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+            )
+            old = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = str(home)
+            try:
+                ctx = _StubCtx()
+                trade_register(ctx)
+            finally:
+                if old is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old
 
         # Verify the plugin registered both Telegram-menu commands.
         self.assertEqual(len(ctx.calls), 2)
@@ -383,6 +401,9 @@ class TradeRegistrationIsIdempotentTests(unittest.TestCase):
     """Calling register(ctx) twice must not duplicate /trade."""
 
     def test_register_is_idempotent(self) -> None:
+        import json
+        import os
+        import tempfile
         from plugins.trade import register as trade_register
 
         class _StubCtx:
@@ -400,9 +421,24 @@ class TradeRegistrationIsIdempotentTests(unittest.TestCase):
                     "args_hint": args_hint,
                 }
 
-        ctx = _StubCtx()
-        trade_register(ctx)
-        trade_register(ctx)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / "kam").mkdir(parents=True)
+            (home / "kam" / "install_state.json").write_text(
+                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+            )
+            old = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = str(home)
+            try:
+                ctx = _StubCtx()
+                trade_register(ctx)
+                trade_register(ctx)
+            finally:
+                if old is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = old
+
         self.assertEqual(set(ctx.entries.keys()), {"trade", "fibo"})
         self.assertEqual(ctx.entries["trade"]["description"],
                          "Open the trading wizard")
