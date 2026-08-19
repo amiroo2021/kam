@@ -544,22 +544,36 @@ class TestWizardFlow(unittest.TestCase):
         for label in labels:
             self.assertNotIn("Counter", label)
 
-    def test_exchange_selection_shows_only_lighter(self):
-        s = self.wizard.handle_callback(("chat", 1), "menu:start")
+    def test_exchange_selection_shows_tradedesk_discovery(self):
+        """Exchange list comes from TradeDesk, not SUPPORTED_EXCHANGES alone."""
+        from plugins.trade.fibo_wizard import FiboWizard, _discovered_exchanges
+
+        class _Desk:
+            def list_exchanges(self):
+                return ["arcus", "lighter", "ondoperps"]
+
+            def list_accounts(self, exchange):
+                return []
+
+        w = FiboWizard(tradedesk=_Desk(), service=self._stub_service)
+        s = w.handle_callback(("chat", 1), "menu:start")
         labels = [b["text"] for btn_row in s.buttons for b in btn_row]
-        # Should only have LIGHTER as option
-        for label in labels:
-            for forbidden in ("ONDO", "ARCUS", "ONDO PERPS", "ARCUS", "HYPERLIQUID"):
-                self.assertNotIn(forbidden, label.upper())
+        self.assertIn("LIGHTER", labels)
+        self.assertIn("ARCUS", labels)
+        self.assertIn("ONDOPERPS", labels)
+        # Parity with the discovery helper itself.
+        self.assertEqual(
+            sorted(x.upper() for x in _discovered_exchanges(_Desk()) if x),
+            sorted(lab for lab in labels if lab not in ("◀️ Back", "✕ Exit")),
+        )
 
     def test_account_screen_uses_discovery(self):
-        # After picking exchange, account is rendered via _account_aliases_for_exchange
+        # After picking exchange, account is rendered via TradeDesk.list_accounts
         s = self.wizard.handle_callback(("chat", 1), "menu:start")
         s = self.wizard.handle_callback(("chat", 1), "exchange:lighter")
-        # The button texts should include configured accounts (or none)
         labels = [b["text"] for btn_row in s.buttons for b in btn_row]
-        # The default fallback is to look at LIGHTER_<ALIAS>_CHAIN env vars
         self.assertTrue(isinstance(labels, list))
+        self.assertEqual(s.state, "account")
 
     def test_instrument_screen_has_quick_select_and_other(self):
         s = self.wizard.handle_callback(("chat", 1), "menu:start")

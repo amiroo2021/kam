@@ -2,18 +2,21 @@
 
 Wizard flow:
   ▶️ Start Fibo
-  → Exchange (Lighter only for v1)
-  → Account (discovered from the configured x_<exchange>_agent.py)
+  → Exchange (same TradeDesk discovery as /trade)
+  → Account (same TradeDesk account discovery as /trade)
+  → GoldenFibo support check (UI-level; unsupported → clean message)
   → Instrument (selection or manual input)
   → BUY / SELL
-  → Percentage
   → Step0 Volume (default 0.01)
+  → Percentage (default 0.01)
   → Review (showing V0..V20 + cumulative exposure)
   → START
   🔵 Running Fibo  → LIST / DETAIL
   🛑 STOP Fibo     → STOP a single registration
 
-The wizard is purely UI. Strategy math lives in `plugins.trade.golden_fibo.config`.
+Discovery reuses TradeDesk (shared with /trade). Strategy math lives in
+`plugins.trade.golden_fibo.config`. Runtime support is still gated by
+`fibo_service.SUPPORTED_EXCHANGES` — discovery and execution are separate.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from .golden_fibo.config import (
     golden_fibo_cumulative_volume,
     golden_fibo_volume,
 )
+from .wizard import _account_option_parts
 
 logger = logging.getLogger(__name__)
 
@@ -139,28 +143,59 @@ def _validate_direction(s: str) -> Optional[str]:
 
 
 def _account_aliases_for_exchange(tradedesk: TradeDesk, exchange: str) -> List[str]:
-    """Discover configured account aliases for the given exchange."""
+    """Return account aliases via the same TradeDesk path /trade uses.
+
+    Does NOT parse .env / os.environ itself — TradeDesk → agent.list_accounts()
+    is the single discovery source.
+    """
     try:
-        names = tradedesk.list_accounts(exchange=exchange) or []
+        entries = tradedesk.list_accounts(exchange) if exchange else []
     except Exception:
-        names = []
-    if not names:
-        prefix = f"{exchange.upper()}_"
-        seen = []
-        for k in sorted(__import__("os").environ.keys()):
-            ks = str(k)
-            if ks.startswith(prefix) and "_CHAIN" in ks:
-                rest = ks[len(prefix):]
-                alias = rest.split("_")[0]
-                if alias and alias not in seen:
-                    seen.append(alias)
-        names = seen
-    return [str(n) for n in names]
+        entries = []
+    aliases: List[str] = []
+    seen: set[str] = set()
+    for entry in entries or []:
+        alias, _label = _account_option_parts(entry)
+        if not alias or alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
 
 
-def _supported_exchanges(tradedesk: TradeDesk) -> List[str]:
-    """Return the exchanges that support GoldenFibo. v1: Lighter only."""
-    return list(SUPPORTED_EXCHANGES)
+def _account_entries_for_exchange(tradedesk: TradeDesk, exchange: str) -> List[Any]:
+    """Raw account entries from TradeDesk (same source as /trade buttons)."""
+    try:
+        entries = tradedesk.list_accounts(exchange) if exchange else []
+    except Exception:
+        return []
+    return list(entries or [])
+
+
+def _discovered_exchanges(tradedesk: TradeDesk) -> List[str]:
+    """Exchanges from TradeDesk agent discovery — identical source to /trade.
+
+    Must NOT filter by GoldenFibo runtime support. Unsupported exchanges are
+    still shown; the support check happens after account selection.
+    """
+    try:
+        return list(tradedesk.list_exchanges() or [])
+    except Exception:
+        return []
+
+
+def _golden_fibo_supported(exchange: str) -> bool:
+    """True when fibo_service has a runtime adapter for this exchange."""
+    return str(exchange or "").strip().lower() in {
+        str(x).strip().lower() for x in SUPPORTED_EXCHANGES
+    }
+
+
+def _exchange_display_name(exchange: str) -> str:
+    ex = str(exchange or "").strip()
+    if not ex:
+        return "this exchange"
+    return ex[:1].upper() + ex[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +334,11 @@ class FiboWizard:
             return self._render_instrument(chat_key, s)
         if s.state == "instrument":
             return self._render_account(chat_key, s)
+        if s.state == "unsupported_exchange":
+            s.account = None
+            return self._render_exchange(chat_key, s)
         if s.state == "account":
+            s.account = None
             return self._render_exchange(chat_key, s)
         if s.state in ("running_detail", "stop_confirm"):
             return self._render_running(chat_key, s)
@@ -309,43 +348,91 @@ class FiboWizard:
     # Renderers
     # ------------------------------------------------------------------
     def _render_exchange(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
-        options = _supported_exchanges(self._desk)
+        options = _discovered_exchanges(self._desk)
+        if not options:
+            return Screen(
+                text=(
+                    "GoldenFibo\n\n"
+                    "No exchanges are currently available.\n"
+                    "Add an ``x_<exchange>_agent.py`` module to the trade "
+                    "plugin's agents directory and try again."
+                ),
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="exchange",
+            )
         buttons = [[_button(ex.upper(), f"exchange:{ex}")] for ex in options]
         buttons.append([_button(*BUTTON_BACK)])
         return Screen(
-            text="Select exchange (GoldenFibo v1):",
+            text="Select exchange:",
             buttons=buttons,
             state="exchange",
         )
 
     def _on_exchange(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         value = value.strip().lower()
-        if value not in _supported_exchanges(self._desk):
+        if value not in _discovered_exchanges(self._desk):
             return self._render_exchange(chat_key, s)
         s.exchange = value
+        s.account = None
         return self._render_account(chat_key, s)
 
     def _render_account(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
-        aliases = _account_aliases_for_exchange(self._desk, s.exchange or "")
-        if aliases:
-            buttons = [[_button(a, f"account:{a}")] for a in aliases]
-        else:
-            buttons = []
-        buttons.append([_button(*BUTTON_BACK)])
-        text = (
-            f"Exchange: {s.exchange.upper()}\n"
-            "Select account:"
+        exchange = s.exchange or ""
+        entries = _account_entries_for_exchange(self._desk, exchange)
+        rows: List[List[Dict[str, str]]] = []
+        for entry in entries:
+            alias, label = _account_option_parts(entry)
+            if not alias or not label:
+                continue
+            rows.append([_button(label, f"account:{alias}")])
+        if not rows:
+            # Match /trade: no free-text account entry when discovery is empty.
+            return Screen(
+                text=(
+                    f"GoldenFibo\n\n"
+                    f"Exchange: {exchange}\n\n"
+                    "No accounts are configured for this exchange."
+                ),
+                buttons=[[_button(*BUTTON_BACK)]],
+                state="account",
+            )
+        rows.append([_button(*BUTTON_BACK)])
+        return Screen(
+            text=(
+                f"Exchange: {exchange.upper()}\n"
+                "Select account:"
+            ),
+            buttons=rows,
+            state="account",
         )
-        if not aliases:
-            text += "\n\nNo configured accounts discovered — type the account alias when prompted."
-        return Screen(text=text, buttons=buttons, state="account")
 
     def _on_account(self, chat_key: Tuple[Any, ...], s: WizardState, value: str) -> Screen:
         value = value.strip()
-        if not value:
+        exchange = s.exchange or ""
+        valid = set(_account_aliases_for_exchange(self._desk, exchange))
+        if not value or value not in valid:
             return self._render_account(chat_key, s)
         s.account = value
+        # Support check AFTER account selection, BEFORE instrument/start.
+        if not _golden_fibo_supported(exchange):
+            return self._render_unsupported_exchange(chat_key, s)
         return self._render_instrument(chat_key, s)
+
+    def _render_unsupported_exchange(
+        self, chat_key: Tuple[Any, ...], s: WizardState
+    ) -> Screen:
+        """Graceful UI stop — no service/network/trading mutation."""
+        name = _exchange_display_name(s.exchange or "")
+        return Screen(
+            text=(
+                f"GoldenFibo is not yet available on {name}.\n\n"
+                "Exchange discovery matches /trade, but GoldenFibo "
+                "runtime support for this venue is not implemented yet.\n\n"
+                "Choose Back to pick another exchange."
+            ),
+            buttons=[[_button(*BUTTON_BACK)]],
+            state="unsupported_exchange",
+        )
 
     def _render_instrument(self, chat_key: Tuple[Any, ...], s: WizardState) -> Screen:
         buttons = [[_button(sym, f"instrument:{sym}")] for sym in _QUICK_INSTRUMENTS]
