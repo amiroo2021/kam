@@ -391,7 +391,10 @@ class TestInstallerSystemdUnit(unittest.TestCase):
         self.assertIn("HERMES_HOME={{HERMES_HOME}}", tpl)
 
     def test_live_unit_points_at_hermes_fibo_paths(self):
-        unit = Path("/etc/systemd/system/fibo.service").read_text()
+        unit_path = Path("/etc/systemd/system/fibo.service")
+        if not unit_path.is_file():
+            self.skipTest("fibo.service not installed on this host")
+        unit = unit_path.read_text()
         self.assertIn("plugins.trade.fibo_daemon", unit)
         self.assertIn("/root/.hermes/fibo/service.sock", unit)
         self.assertIn("/root/.hermes/fibo/service_state.json", unit)
