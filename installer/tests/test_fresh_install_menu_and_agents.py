@@ -190,5 +190,34 @@ class FullAgentPayloadTests(unittest.TestCase):
         self.assertNotEqual(_verify(["trade"], env), 0)
 
 
+class PluginYamlDiscoveryTests(unittest.TestCase):
+    """Lodo: payload without plugin.yaml → discover_plugins never loads trade."""
+
+    def tearDown(self) -> None:
+        tmp = getattr(self, "_tmp", None)
+        if tmp and Path(tmp).is_dir():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_install_copies_plugin_yaml(self):
+        env = _fresh()
+        self._tmp = env["tmp"]
+        self.assertEqual(_install(["trade", "fibo"], env), 0)
+        yaml_path = env["hermes_root"] / "plugins" / "trade" / "plugin.yaml"
+        self.assertTrue(yaml_path.is_file(), "plugin.yaml must be installed for discovery")
+        text = yaml_path.read_text(encoding="utf-8")
+        self.assertIn("name:", text)
+        self.assertIn("trade", text)
+        self.assertEqual(_verify(["trade", "fibo"], env), 0)
+
+    def test_verify_fails_without_plugin_yaml(self):
+        env = _fresh()
+        self._tmp = env["tmp"]
+        self.assertEqual(_install(["trade"], env), 0)
+        yaml_path = env["hermes_root"] / "plugins" / "trade" / "plugin.yaml"
+        self.assertTrue(yaml_path.is_file())
+        yaml_path.unlink()
+        self.assertNotEqual(_verify(["trade"], env), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

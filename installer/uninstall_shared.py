@@ -45,6 +45,7 @@ SHARED_REL_PATHS = [
     Path("plugins") / "trade" / "canonical.py",
     Path("plugins") / "trade" / "tradedesk.py",
     Path("plugins") / "trade" / "__init__.py",
+    Path("plugins") / "trade" / "plugin.yaml",
 ]
 
 

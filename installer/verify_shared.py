@@ -118,6 +118,23 @@ def run(
             except OSError as exc:
                 print(f"    [FAIL] {name} read: {exc}")
                 ok = False
+
+    # Hermes PluginManager only discovers directories that contain plugin.yaml.
+    # Payload + __init__.py alone is NOT enough for slash-command registration.
+    plugin_yaml = hermes_root / "plugins" / "trade" / "plugin.yaml"
+    if plugin_yaml.is_file():
+        text = plugin_yaml.read_text(encoding="utf-8", errors="replace")
+        if "name:" in text and "trade" in text:
+            print(f"    [ok] plugin.yaml present for discovery: {plugin_yaml}")
+        else:
+            print(f"    [FAIL] plugin.yaml missing name: trade marker: {plugin_yaml}")
+            ok = False
+    else:
+        print(
+            f"    [FAIL] missing {plugin_yaml} "
+            "(Hermes will not discover plugins.trade → empty get_plugin_commands)"
+        )
+        ok = False
     # kam/ directory.
     kam_dir = kam_root(hermes_home)
     if kam_dir.is_dir():
