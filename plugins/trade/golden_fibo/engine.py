@@ -31,6 +31,17 @@ from plugins.trade.golden_fibo.config import (
     golden_fibo_tp_price,
     golden_fibo_volume,
 )
+from plugins.trade.golden_fibo.client_id_v2 import (
+    ROLE_EMERGENCY_CLOSE as V2_ROLE_EMERGENCY_CLOSE,
+    ROLE_LADDER_ENTRY as V2_ROLE_LADDER_ENTRY,
+    ROLE_SHARED_TP as V2_ROLE_SHARED_TP,
+    ROLE_STEP0 as V2_ROLE_STEP0,
+    STEP_UNKNOWN,
+    ClientIdError,
+    SeqExhaustedError,
+    allocate_client_id,
+    allocate_cycle_uid,
+)
 from plugins.trade.golden_fibo.state import (
     ROLE_ENTRY,
     ROLE_LADDER,
@@ -77,13 +88,96 @@ class GoldenFiboEngine:
         config: GoldenFiboConfig,
         state: GoldenFiboState,
         adapter: Any,
-        client_order_id_factory: Callable[[], int],
+        client_order_id_factory: Optional[Callable[[], int]] = None,
+        *,
+        exchange_highest_cycle_uid: Optional[int] = None,
     ) -> None:
         self.config = config
         self.state = state
         self.adapter = adapter
+        # Legacy factory kept only for unit tests that inject a simple counter.
+        # Production paths always use V2 when client_id_version >= 2 (default).
         self._next_client_id = client_order_id_factory
+        self._exchange_highest_cycle_uid = exchange_highest_cycle_uid
         self._venue_constraints_cache: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # V2 client_order_index allocation (stateful, restart-safe)
+    # ------------------------------------------------------------------
+    def _use_v2_ids(self) -> bool:
+        """Production default is V2. Legacy factory is used only when
+        ``state.client_id_version < 2`` (explicit opt-out for older tests).
+        """
+        return int(getattr(self.state, "client_id_version", 2) or 2) >= 2
+
+    def _begin_new_cycle_uid(self) -> int:
+        """Allocate a durable CYCLE_UID for a brand-new cycle; reset SEQ map."""
+        prev = int(self.state.highest_cycle_uid or 0) or None
+        # Prefer watermark; also consider current cycle_uid if set
+        if self.state.cycle_uid:
+            prev = max(prev or 0, int(self.state.cycle_uid))
+        uid = allocate_cycle_uid(
+            previous_local_cycle_uid=prev,
+            highest_exchange_cycle_uid=self._exchange_highest_cycle_uid,
+        )
+        self.state.cycle_uid = int(uid)
+        self.state.highest_cycle_uid = max(int(self.state.highest_cycle_uid or 0), int(uid))
+        self.state.client_seq_by_role_step = {}
+        self.state.client_id_version = 2
+        return int(uid)
+
+    def _allocate_v2_client_id(
+        self,
+        *,
+        role_code: int,
+        step: int,
+        engine_role: str,
+    ) -> int:
+        """Allocate or reuse V2 client id for a logical order.
+
+        Reuses submission_client_id when the same logical submission is
+        already PREPARED/ATTEMPTED (idempotent retry path).
+        """
+        if (
+            self.state.submission_client_id is not None
+            and self.state.submission_role == engine_role
+            and self.state.submission_step == step
+            and self.state.submission_phase
+            in (SUBMISSION_PREPARED, SUBMISSION_ATTEMPTED, SUBMISSION_NEEDS_RECOVERY)
+        ):
+            # Same logical order — never mint a new ID.
+            return int(self.state.submission_client_id)
+
+        if not self.state.cycle_uid:
+            # Safety: should have been set at cycle start.
+            self._begin_new_cycle_uid()
+
+        try:
+            return allocate_client_id(
+                direction=self.config.direction,
+                role=role_code,
+                cycle_uid=int(self.state.cycle_uid),
+                step=int(step),
+                seq_map=self.state.client_seq_by_role_step,
+            )
+        except SeqExhaustedError as exc:
+            # Freeze rather than wrap/duplicate.
+            raise ClientIdError(str(exc)) from exc
+
+    def _next_id_for(
+        self,
+        *,
+        role_code: int,
+        step: int,
+        engine_role: str,
+    ) -> int:
+        if self._use_v2_ids():
+            return self._allocate_v2_client_id(
+                role_code=role_code, step=step, engine_role=engine_role
+            )
+        if self._next_client_id is None:
+            raise ClientIdError("no client id factory and V2 disabled")
+        return int(self._next_client_id())
 
     # ------------------------------------------------------------------
     # Public API
@@ -334,10 +428,20 @@ class GoldenFiboEngine:
         size = self.config.step0_volume
         order_side = self.config.direction.lower()  # "buy" or "sell"
 
-        # Deterministic client identity per (registration, cycle, step, role).
-        # Computed ONCE per logical Step0 and persisted BEFORE the venue call.
-        # Never regenerated on retry/recovery for the same logical order.
-        client_id = self._next_client_id()
+        # Deterministic client identity per logical order.
+        # V2 (default): cycle_uid + role/step/seq. Legacy: injected factory.
+        try:
+            if self._use_v2_ids():
+                self._begin_new_cycle_uid()
+                client_id = self._next_id_for(
+                    role_code=V2_ROLE_STEP0, step=0, engine_role=ROLE_ENTRY
+                )
+            else:
+                if self._next_client_id is None:
+                    raise ClientIdError("legacy factory missing")
+                client_id = int(self._next_client_id())
+        except ClientIdError as exc:
+            return self._freeze(f"client_id allocation failed: {exc}")
 
         # PREPARE: persist everything BEFORE the venue call.
         # Cycle-boundary reset: every cycle-scoped field must reflect ONLY the
@@ -345,6 +449,8 @@ class GoldenFiboEngine:
         # into the new cycle (historical evidence belongs in forensic logs,
         # not the active state machine).
         self.state.cycle_id += 1
+        # Note: cycle_uid already allocated; client_seq_by_role_step already reset
+        # inside _begin_new_cycle_uid. Do not clear cycle_uid here.
         self.state.next_step = 0
         self.state.highest_filled_step = -1
         self.state.fill_prices = {}
@@ -500,7 +606,15 @@ class GoldenFiboEngine:
                     "Reconcile configuration before any resubmission."
                 )
 
-        tp_client_id = self._next_client_id()
+        try:
+            tp_step = max(0, int(self.state.highest_filled_step))
+            tp_client_id = self._next_id_for(
+                role_code=V2_ROLE_SHARED_TP,
+                step=tp_step,
+                engine_role=ROLE_TP,
+            )
+        except ClientIdError as exc:
+            return self._freeze(f"TP client_id allocation failed: {exc}")
 
         # Cancel the previous shared TP (if any) BEFORE placing the new one.
         # The shared TP is a single resting reduce-only LIMIT; replacing it
@@ -628,7 +742,14 @@ class GoldenFiboEngine:
                 "reconcile exchange state before any resubmission"
             )
 
-        client_id = self._next_client_id()
+        try:
+            client_id = self._next_id_for(
+                role_code=V2_ROLE_LADDER_ENTRY,
+                step=int(next_n),
+                engine_role=ROLE_LADDER,
+            )
+        except ClientIdError as exc:
+            return self._freeze(f"ladder client_id allocation failed: {exc}")
         order_side = self.config.direction.lower()
 
         # PREPARE + ATTEMPT durable record for the ladder submission.
@@ -1037,7 +1158,15 @@ class GoldenFiboEngine:
         actions.append(f"TP volume sync: canceled old TP oid={old_oid}")
 
         # Place exactly ONE new TP at the same price for live_size.
-        tp_client_id = self._next_client_id()
+        try:
+            tp_step = max(0, int(self.state.highest_filled_step))
+            tp_client_id = self._next_id_for(
+                role_code=V2_ROLE_SHARED_TP,
+                step=tp_step,
+                engine_role=ROLE_TP,
+            )
+        except ClientIdError as exc:
+            return self._freeze(f"TP volume sync client_id allocation failed: {exc}")
         self.state.submission_phase = SUBMISSION_PREPARED
         self.state.submission_client_id = tp_client_id
         self.state.submission_step = self.state.highest_filled_step

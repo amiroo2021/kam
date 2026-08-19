@@ -4275,17 +4275,32 @@ def _submit_tpsl_order(credentials: Dict[str, Any], market: Dict[str, Any], *, o
     return dict(result.get("value") or {})
 
 
-def _submit_close_position(credentials: Dict[str, Any], market: Dict[str, Any], *, current_size: Decimal, closing_side: str) -> Dict[str, Any]:
+def _submit_close_position(
+    credentials: Dict[str, Any],
+    market: Dict[str, Any],
+    *,
+    current_size: Decimal,
+    closing_side: str,
+    client_order_index: Optional[int] = None,
+) -> Dict[str, Any]:
     async def _run_submit() -> Dict[str, Any]:
         signer = _build_signer_client(credentials)
         try:
             size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
             submitted_volume = _quantize_down(current_size, size_decimals)
             base_amount = _to_scaled_int(submitted_volume, size_decimals)
-            client_order_index = int(time.time_ns() % LIGHTER_MAX_CLIENT_ORDER_INDEX) or 1
+            if client_order_index is not None:
+                coi = int(client_order_index)
+                if coi <= 0 or coi > LIGHTER_MAX_CLIENT_ORDER_INDEX:
+                    raise ValueError(
+                        f"client_order_index out of Lighter range: {coi}"
+                    )
+            else:
+                # Legacy /trade and non-GF callers: time-based id (unchanged).
+                coi = int(time.time_ns() % LIGHTER_MAX_CLIENT_ORDER_INDEX) or 1
             tx, api_response, error = await signer.create_market_order_limited_slippage(
                 int(market["market_id"]),
-                client_order_index,
+                coi,
                 base_amount,
                 LIGHTER_CLOSE_MAX_SLIPPAGE,
                 closing_side == "sell",
@@ -4294,7 +4309,12 @@ def _submit_close_position(credentials: Dict[str, Any], market: Dict[str, Any], 
             )
             if error:
                 raise RuntimeError(f"Lighter close position failed: {error}")
-            return {"exchange_order_id": getattr(tx, "order_index", None), "submitted_volume": _decimal_text(submitted_volume), "tx_hash": getattr(api_response, "tx_hash", None)}
+            return {
+                "exchange_order_id": getattr(tx, "order_index", None),
+                "submitted_volume": _decimal_text(submitted_volume),
+                "tx_hash": getattr(api_response, "tx_hash", None),
+                "client_order_index": coi,
+            }
         finally:
             api_client = getattr(signer, "api_client", None)
             if api_client is not None and hasattr(api_client, "close"):
@@ -4425,9 +4445,33 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
     requested_symbol = str(request.get('symbol') or '').strip().upper()
     if not requested_symbol:
         return make_failure(operation='close_position', exchange=name, account=account_name, code='MISSING_SYMBOL', message='Symbol is required.')
+    # Optional GoldenFibo V2 (or any caller-supplied) client_order_index.
+    # When omitted, _submit_close_position keeps the legacy time_ns id
+    # so /trade and other callers are unchanged.
+    coi_raw = request.get("client_order_id")
+    if coi_raw is None:
+        coi_raw = request.get("client_order_index")
+    client_order_index = None
+    if coi_raw is not None and str(coi_raw).strip() != "":
+        try:
+            client_order_index = int(coi_raw)
+        except (TypeError, ValueError):
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=account_name,
+                code="INVALID_INPUTS",
+                message="client_order_id must be an integer",
+            )
     try:
         _fetched, credentials, _target, market, _active_orders, current_side, current_size, closing_side, _auth_token = _find_position_management_context(request, include_active_orders=False)
-        submit_result = _submit_close_position(credentials, market, current_size=current_size, closing_side=closing_side)
+        submit_result = _submit_close_position(
+            credentials,
+            market,
+            current_size=current_size,
+            closing_side=closing_side,
+            client_order_index=client_order_index,
+        )
         verified = _verify_position_closed(request, symbol=requested_symbol)
     except LookupError as exc:
         code = str(exc) or 'POSITION_NOT_FOUND'
@@ -4436,6 +4480,8 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
         action = _position_action_result(operation='close_position', symbol=requested_symbol, verified=False, status='failed')
         return make_failure(operation='close_position', exchange=name, account=account_name, code='ORDER_SUBMISSION_FAILED', message=sanitize_error_message(str(exc)), position_action=action)
     action = _position_action_result(operation='close_position', symbol=requested_symbol, verified=verified, current_side=current_side, current_size=_decimal_text(current_size), exchange_order_id=submit_result.get('exchange_order_id'), message='Position closed.', status=('success' if verified else 'failed'))
+    if isinstance(action, dict) and submit_result.get("client_order_index") is not None:
+        action["client_order_index"] = submit_result.get("client_order_index")
     if verified:
         return make_success(operation='close_position', exchange=name, account=account_name, position_action=action)
     return make_failure(operation='close_position', exchange=name, account=account_name, code='VERIFICATION_FAILED', message='Position close could not be verified.', position_action=action)

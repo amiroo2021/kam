@@ -148,6 +148,7 @@ class TestServiceReconcileNeedsRecovery(unittest.TestCase):
                 direction="BUY", percentage=Decimal("0.001"), step0_volume=Decimal("0.200"),
             )
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key, exchange=cfg.exchange, account=cfg.account,
                 instrument=cfg.instrument, direction=cfg.direction,
                 percentage=cfg.percentage, step0_volume=cfg.step0_volume,

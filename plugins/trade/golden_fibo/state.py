@@ -29,6 +29,7 @@ SHUTDOWN_MODE_EMERGENCY = "emergency"
 ROLE_ENTRY = "entry"
 ROLE_LADDER = "ladder"
 ROLE_TP = "tp"
+ROLE_EMERGENCY_CLOSE = "emergency_close"
 
 # Durable submission phases. Once SUBMISSION_ATTEMPTED is persisted,
 # an exception/timeout/unknown response MUST NOT permit automatic
@@ -57,6 +58,15 @@ class GoldenFiboState:
 
     registration_key: str = ""
     cycle_id: int = 0
+    # V2 client_order_index: durable cycle UID (24-bit) shared by Step0/ladder/TP/EClose
+    # for the whole cycle. Not rebuilt every tick. 0 means "not yet allocated".
+    cycle_uid: int = 0
+    client_id_version: int = 2
+    # last used SEQ per "role:step" key within the current cycle_uid
+    client_seq_by_role_step: Dict[str, int] = field(default_factory=dict)
+    # Monotonic watermark of allocated cycle_uids (registration-local). Used so a
+    # restart never reuses a prior cycle_uid even if epoch-minute goes backwards.
+    highest_cycle_uid: int = 0
 
     # static config (mirrors GoldenFiboConfig)
     exchange: str = ""
@@ -125,6 +135,12 @@ class GoldenFiboState:
             "schema_version": self.schema_version,
             "registration_key": self.registration_key,
             "cycle_id": self.cycle_id,
+            "cycle_uid": int(self.cycle_uid or 0),
+            "client_id_version": int(self.client_id_version or 2),
+            "client_seq_by_role_step": {
+                str(k): int(v) for k, v in (self.client_seq_by_role_step or {}).items()
+            },
+            "highest_cycle_uid": int(self.highest_cycle_uid or 0),
             "exchange": self.exchange,
             "account": self.account,
             "instrument": self.instrument,
@@ -167,6 +183,13 @@ class GoldenFiboState:
             schema_version=int(data.get("schema_version", 1) or 1),
             registration_key=str(data.get("registration_key", "")),
             cycle_id=int(data.get("cycle_id", 0) or 0),
+            cycle_uid=int(data.get("cycle_uid", 0) or 0),
+            client_id_version=int(data.get("client_id_version", 2) or 2),
+            client_seq_by_role_step={
+                str(k): int(v)
+                for k, v in ((data.get("client_seq_by_role_step") or {}) if isinstance(data.get("client_seq_by_role_step"), dict) else {}).items()  # type: ignore[union-attr]
+            },
+            highest_cycle_uid=int(data.get("highest_cycle_uid", 0) or 0),
             exchange=str(data.get("exchange", "")),
             account=str(data.get("account", "")),
             instrument=str(data.get("instrument", "")),

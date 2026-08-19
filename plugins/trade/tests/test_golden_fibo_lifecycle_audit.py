@@ -165,6 +165,7 @@ def _make_engine(direction: str = "BUY", step0: str = "0.200",
         step0_volume=Decimal(step0),
     )
     state = GoldenFiboState(
+        client_id_version=1,
         registration_key=cfg.registration_key, exchange=cfg.exchange,
         account=cfg.account, instrument=cfg.instrument,
         direction=cfg.direction, percentage=cfg.percentage,

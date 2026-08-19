@@ -177,6 +177,7 @@ def _cid_factory():
 def _healthy_step0_step1_state(adapter: _FakeAdapter) -> GoldenFiboState:
     """Position open, TP active, Step1 ladder pending ACTIVE."""
     st = GoldenFiboState(
+        client_id_version=1,
         registration_key="lighter/amiroo/SOL/BUY",
         exchange="lighter",
         account="amiroo",
@@ -333,6 +334,7 @@ class TestSmoothShutdownEngine(unittest.TestCase):
         ad.pos_side = None
         ad.pos_size = Decimal("0")
         st = GoldenFiboState(
+        client_id_version=1,
             registration_key="lighter/amiroo/SOL/BUY",
             exchange="lighter",
             account="amiroo",
@@ -399,6 +401,7 @@ class TestServiceStopModes(unittest.TestCase):
 
     def test_5_smooth_already_flat_immediate_deregister(self):
         st = GoldenFiboState(
+        client_id_version=1,
             registration_key="lighter/amiroo/SOL/BUY",
             exchange="lighter",
             account="amiroo",
@@ -448,6 +451,7 @@ class TestServiceStopModes(unittest.TestCase):
 
     def test_8_emergency_already_flat_idempotent(self):
         st = GoldenFiboState(
+        client_id_version=1,
             registration_key="lighter/amiroo/SOL/BUY",
             exchange="lighter",
             account="amiroo",
@@ -485,6 +489,7 @@ class TestServiceStopModes(unittest.TestCase):
         buy = _healthy_step0_step1_state(self.ad)
         buy.registration_key = "lighter/amiroo/SOL/BUY"
         sell = GoldenFiboState(
+        client_id_version=1,
             registration_key="lighter/amiroo/SOL/SELL",
             exchange="lighter",
             account="amiroo",

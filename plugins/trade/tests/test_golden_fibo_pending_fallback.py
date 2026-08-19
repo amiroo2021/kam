@@ -136,6 +136,7 @@ def _engine(direction="BUY", step0="0.200"):
         direction=direction, percentage=Decimal("0.01"), step0_volume=Decimal(step0),
     )
     state = GoldenFiboState(
+        client_id_version=1,
         registration_key=cfg.registration_key, exchange=cfg.exchange, account=cfg.account,
         instrument=cfg.instrument, direction=cfg.direction,
         percentage=cfg.percentage, step0_volume=cfg.step0_volume,
@@ -283,6 +284,7 @@ class TestExactLiveStep1Transition(unittest.TestCase):
             direction="BUY", percentage=Decimal("0.001"), step0_volume=Decimal("0.200"),
         )
         state = GoldenFiboState(
+        client_id_version=1,
             registration_key=cfg.registration_key, exchange=cfg.exchange, account=cfg.account,
             instrument=cfg.instrument, direction=cfg.direction,
             percentage=cfg.percentage, step0_volume=cfg.step0_volume,

@@ -268,17 +268,29 @@ class LighterGoldenFiboAdapter:
         })
         return _is_success(resp)
 
-    def close_position(self, *, account: str, instrument: str) -> Dict[str, Any]:
+    def close_position(
+        self,
+        *,
+        account: str,
+        instrument: str,
+        client_order_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Reduce-only close of the live position via x_lighter_agent.
 
-        Used only by Emergency STOP after ownership checks. Returns a
-        flat dict with verified/success flags for the service layer.
+        Used only by Emergency STOP after ownership checks. When
+        *client_order_id* is provided (GoldenFibo V2), it is forwarded so
+        exchange history can attribute the close. Returns a flat dict with
+        verified/success flags for the service layer.
         """
-        resp = lighter_agent.execute({
+        req: Dict[str, Any] = {
             "operation": "close_position",
             "account": account,
             "symbol": instrument,
-        })
+        }
+        if client_order_id is not None:
+            req["client_order_id"] = int(client_order_id)
+            req["client_order_index"] = int(client_order_id)
+        resp = lighter_agent.execute(req)
         payload = _get_payload(resp)
         action = payload.get("position_action") or {}
         if hasattr(action, "to_dict"):
@@ -289,6 +301,7 @@ class LighterGoldenFiboAdapter:
             "status": (action.get("status") if isinstance(action, dict) else None),
             "message": (action.get("message") if isinstance(action, dict) else None),
             "error": getattr(getattr(resp, "error", None), "code", None),
+            "client_order_id": client_order_id,
             "raw": payload,
         }
 

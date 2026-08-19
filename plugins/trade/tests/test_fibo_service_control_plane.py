@@ -279,6 +279,7 @@ class TestServiceUpIpcPath(unittest.TestCase):
             step0_volume=__import__("decimal").Decimal("0.2"),
         )
         st = GoldenFiboState(
+        client_id_version=1,
             registration_key=cfg.registration_key,
             exchange=cfg.exchange,
             account=cfg.account,

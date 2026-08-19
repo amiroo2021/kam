@@ -401,9 +401,13 @@ class PersistentFiboService:
         return cfg
 
     def _client_id_factory(self, key: str) -> Callable[[], int]:
-        # Deterministic monotonic per key (no time-based) so restart safety is
-        # preserved across crashes.
-        counter = {"n": self._states[key].cycle_id * 1000000 + 100000}  # noqa: F841
+        """Legacy factory retained for older engine call sites / tests.
+
+        Production GoldenFiboEngine paths use V2 client_id_v2 allocation
+        from persisted state (cycle_uid + seq map). This factory is only
+        used when client_id_version < 2.
+        """
+        counter = {"n": self._states[key].cycle_id * 1000000 + 100000}
 
         def _next() -> int:
             counter["n"] += 1
@@ -1173,9 +1177,58 @@ class PersistentFiboService:
 
         # 4) Close owned position at actual live size
         if has_position:
+            close_client_id = None
             try:
-                close_res = adapter.close_position(account=account, instrument=instrument)
-                actions.append(f"close_position result={close_res}")
+                from .golden_fibo.client_id_v2 import (
+                    ROLE_EMERGENCY_CLOSE as V2_ROLE_EMERGENCY_CLOSE,
+                    STEP_UNKNOWN,
+                    ClientIdError,
+                    allocate_client_id,
+                )
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None and int(getattr(st, "client_id_version", 2) or 2) >= 2:
+                        if not st.cycle_uid:
+                            # Emergency before any cycle_uid (should be rare): mint one
+                            from .golden_fibo.client_id_v2 import allocate_cycle_uid
+                            prev = int(st.highest_cycle_uid or 0) or None
+                            uid = allocate_cycle_uid(previous_local_cycle_uid=prev)
+                            st.cycle_uid = uid
+                            st.highest_cycle_uid = max(int(st.highest_cycle_uid or 0), uid)
+                            st.client_seq_by_role_step = dict(st.client_seq_by_role_step or {})
+                        step_ec = int(st.highest_filled_step)
+                        if step_ec < 0:
+                            step_ec = STEP_UNKNOWN
+                        close_client_id = allocate_client_id(
+                            direction=st.direction or direction,
+                            role=V2_ROLE_EMERGENCY_CLOSE,
+                            cycle_uid=int(st.cycle_uid),
+                            step=int(step_ec),
+                            seq_map=st.client_seq_by_role_step,
+                        )
+                        self._save_state()
+            except ClientIdError as exc:
+                with self._lock:
+                    st = self._states.get(key)
+                    if st is not None:
+                        st.status = STATUS_NEEDS_RECOVERY
+                        st.freeze_reason = f"emergency_stop client_id allocation failed: {exc}"
+                        self._save_state()
+                return {
+                    "ok": False,
+                    "error": "NEEDS_RECOVERY",
+                    "detail": str(exc),
+                    "registration_key": key,
+                    "actions": actions,
+                }
+            except Exception:
+                close_client_id = None  # fall back to agent time_ns id
+            try:
+                close_kw = {"account": account, "instrument": instrument}
+                if close_client_id is not None:
+                    close_kw["client_order_id"] = int(close_client_id)
+                close_res = adapter.close_position(**close_kw)
+                actions.append(f"close_position result={close_res} client_order_id={close_client_id}")
                 if not close_res.get("success") and not close_res.get("verified"):
                     # POSITION_NOT_FOUND is ok if already flat
                     if close_res.get("error") not in ("POSITION_NOT_FOUND",):

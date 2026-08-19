@@ -305,6 +305,7 @@ def _cfg(direction="BUY") -> GoldenFiboConfig:
 
 def _engine(cfg, adapter, next_id=iter(range(1, 1_000_000))):
     state = GoldenFiboState(
+        client_id_version=1,
         registration_key=cfg.registration_key,
         exchange=cfg.exchange,
         account=cfg.account,
@@ -463,6 +464,7 @@ class TestStopStartPreflight(unittest.TestCase):
             # Manually inject a registration that is mid-submission.
             key = "lighter/amiroo/SOL/BUY"
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key,
                 exchange="lighter",
                 account="amiroo",
@@ -492,6 +494,7 @@ class TestStopStartPreflight(unittest.TestCase):
             svc = _make_service(tmp)
             key = "lighter/amiroo/SOL/BUY"
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key,
                 exchange="lighter",
                 account="amiroo",
@@ -515,6 +518,7 @@ class TestStopStartPreflight(unittest.TestCase):
             key = "lighter/amiroo/SOL/BUY"
             # Inject tombstone.
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key,
                 exchange="lighter",
                 account="amiroo",
@@ -549,6 +553,7 @@ class TestStopStartPreflight(unittest.TestCase):
             svc = _make_service(tmp)
             key = "lighter/amiroo/SOL/BUY"
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key,
                 exchange="lighter",
                 account="amiroo",
@@ -682,6 +687,7 @@ class TestRestartSafety(unittest.TestCase):
             key = "lighter/amiroo/SOL/BUY"
             # Persist an attempted record.
             state = GoldenFiboState(
+        client_id_version=1,
                 registration_key=key,
                 exchange="lighter",
                 account="amiroo",

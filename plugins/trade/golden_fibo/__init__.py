@@ -14,6 +14,13 @@ from plugins.trade.golden_fibo.config import (
     golden_fibo_volume,
 )
 from plugins.trade.golden_fibo.state import GoldenFiboState
+from plugins.trade.golden_fibo.client_id_v2 import (
+    MAGIC,
+    VERSION,
+    decode_golden_fibo_client_id,
+    encode_golden_fibo_client_id,
+    is_golden_fibo_v2_client_id,
+)
 
 
 __all__ = [
@@ -23,4 +30,9 @@ __all__ = [
     "GoldenFiboConfig",
     "GoldenFiboState",
     "golden_fibo_volume",
+    "MAGIC",
+    "VERSION",
+    "decode_golden_fibo_client_id",
+    "encode_golden_fibo_client_id",
+    "is_golden_fibo_v2_client_id",
 ]

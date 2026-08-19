@@ -277,6 +277,7 @@ class TestEngineConsumesRealLighterRequestedSize(unittest.TestCase):
             step0_volume=Decimal("0.200"),
         )
         state = GoldenFiboState(
+        client_id_version=1,
             registration_key=cfg.registration_key,
             exchange=cfg.exchange,
             account=cfg.account,

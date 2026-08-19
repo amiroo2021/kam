@@ -103,6 +103,7 @@ def _engine(direction: str, p0: str = "76.126", step0: str = "0.200", min_quote:
         direction=direction, percentage=Decimal("0.01"), step0_volume=Decimal(step0),
     )
     state = GoldenFiboState(
+        client_id_version=1,
         registration_key=cfg.registration_key, exchange=cfg.exchange,
         account=cfg.account, instrument=cfg.instrument, direction=cfg.direction,
         percentage=cfg.percentage, step0_volume=cfg.step0_volume,

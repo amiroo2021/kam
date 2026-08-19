@@ -187,6 +187,7 @@ class TestConfig(unittest.TestCase):
 class TestStateSchema(unittest.TestCase):
     def test_round_trip(self):
         s = GoldenFiboState(
+        client_id_version=1,
             registration_key="lighter/amiroo/SOL/BUY",
             cycle_id=1,
             exchange="lighter",
@@ -234,6 +235,7 @@ class TestStateSchema(unittest.TestCase):
 
     def test_old_strategy_state(self):
         s = GoldenFiboState(
+        client_id_version=1,
             strategy="fibonacci_counter_cascade",
             registration_key="lighter/amiroo:SOL:counterBUY",
             status=STATUS_QUARANTINED_OLD_STRATEGY,
@@ -888,6 +890,7 @@ class TestOldStrategyQuarantine(unittest.TestCase):
     def test_old_strategy_state_status(self):
         """Records with the old strategy name must be quarantined."""
         s = GoldenFiboState(
+        client_id_version=1,
             strategy="fibonacci_counter_cascade",
             registration_key="lighter/amiroo:SOL:counterBUY",
             status=STATUS_QUARANTINED_OLD_STRATEGY,
