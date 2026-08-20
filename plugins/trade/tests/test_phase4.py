@@ -2062,7 +2062,9 @@ class TestPositionManagementWrites(unittest.TestCase):
             self._live_sl_order(503651661975, "55000.0"),
             self._live_sl_order(503651661976, "56000.0"),
         ]
-        with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), mock.patch.object(hl, "_lookup_credentials", return_value=("0x1111111111111111111111111111111111111111", "secret")), mock.patch.object(hl, "_post_info", side_effect=[positions_raw, open_orders_raw, {}]):
+        with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), mock.patch.object(hl, "_lookup_credentials", return_value=("0x1111111111111111111111111111111111111111", "secret")), \
+            mock.patch.object(hl, "_discover_perp_dex_names", return_value=[""]), \
+            mock.patch.object(hl, "_post_info", side_effect=[positions_raw, open_orders_raw, {}]):
             response = hl._execute_positions_orders("FIBO", {"operation": "positions_orders", "exchange": "hyperliquid", "account": "FIBO"})
         self.assertTrue(response.success)
         self.assertEqual(response.open_order_count, 5)

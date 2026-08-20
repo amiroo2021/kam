@@ -83,6 +83,11 @@ CANCEL_BATCH_SIZE = 200
 # (allowing ASCII letters, digits, underscores). This is intentionally
 # permissive — the user may have many accounts.
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+# Process-lifetime cache of perp DEX names (native "" + HIP-3). Populated
+# only by network-capable callers; read (without network) by
+# ``_build_exchange_client`` so order/close construction stays hermetic and
+# unit tests never require live connectivity.
+_perp_dex_names_cache: Optional[List[str]] = None
 
 # Preflight heuristic: a valid Hyperliquid wallet address is a 0x-prefixed
 # 40-char hex string. We don't strictly validate the checksum — the API
@@ -498,16 +503,35 @@ def _resolve_exact_symbol_alias(symbol: str) -> str:
 
 
 def _fetch_perp_dex_names() -> List[str]:
+    """Return the native dex ("") plus every HIP-3 perp DEX name.
+
+    Memoized because perp DEX membership is static within a process lifetime
+    and this is called from discovery and from Exchange construction; caching
+    avoids repeated network round-trips. The cache is only populated by
+    callers that may hit the network (discovery/resolve); ``_build_exchange_client``
+    reads it without forcing a network fetch so unit tests stay hermetic.
+    """
+    global _perp_dex_names_cache
+    if _perp_dex_names_cache is not None:
+        return list(_perp_dex_names_cache)
     raw = _post_info({"type": "perpDexs"})
     names: List[str] = [""]
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "").strip()
-            if name and name not in names:
-                names.append(name)
-    return names
+            dex_name = str(item.get("name") or "").strip()
+            if dex_name and dex_name not in names:
+                names.append(dex_name)
+    _perp_dex_names_cache = names[:]
+    return list(_perp_dex_names_cache)
+
+
+def _cached_perp_dex_names() -> List[str]:
+    """Return the perp DEX list only if already fetched (no network)."""
+    if _perp_dex_names_cache is None:
+        return [""]
+    return list(_perp_dex_names_cache)
 
 
 def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
@@ -545,6 +569,12 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                     "dex": dex,
                     "dex_index": dex_index,
                     "internal_name": internal_name,
+                    # route_symbol is the FULL wire/execution identifier incl. dex
+                    # prefix (e.g. ``xyz:SP500``) — must be passed to the SDK for
+                    # market_close/order/TP-SL/cancel so the dex is resolved.
+                    "route_symbol": internal_name,
+                    # public_symbol is the dex-stripped display alias (e.g. ``SP500``)
+                    # used only for user-facing display and fuzzy matching.
                     "public_symbol": public_symbol,
                     "public_key": _symbol_key(public_symbol),
                     "internal_key": _symbol_key(internal_name),
@@ -663,7 +693,10 @@ def _execute_resolve_instrument(account: str, request: Dict[str, Any]) -> Canoni
 
     instrument = CanonicalInstrument(
         requested_symbol=requested_symbol,
-        symbol=candidate["public_symbol"],
+        # Route symbol carries the full wire identifier incl. dex prefix
+        # (e.g. ``xyz:SP500``) so downstream new_order/close/TP/SL/cancel
+        # route to the correct HIP-3 DEX.
+        symbol=candidate["route_symbol"],
         display_name=candidate["display_name"],
         price_increment=candidate["price_increment"],
         size_increment=candidate["size_increment"],
@@ -1125,7 +1158,7 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
     if submitted_price <= 0:
         return make_failure(operation="new_order", exchange=name, account=account, code="INVALID_PRICE", message="Price must be positive.")
 
-    coin = str(candidate.get("public_symbol") or requested_symbol)
+    coin = str(candidate.get("route_symbol") or candidate.get("public_symbol") or requested_symbol)
     order_request = {
         "coin": coin,
         "is_buy": requested_side == "buy",
@@ -1767,6 +1800,45 @@ def _aggregate_open_orders(
     return rows
 
 
+# --- Read-only positions / orders (dex-aware) -----------------------------
+
+def _fetch_clearinghouse_state(wallet: str, dex: str = "") -> Dict[str, Any]:
+    """POST clearinghouseState for a wallet, optionally scoped to a perp dex.
+
+    ``dex=""`` is the native perp clearinghouse; HIP-3 DEXes (e.g. ``xyz``)
+    return their own assetPositions keyed by full ``<dex>:<coin>`` coins.
+    """
+    payload: Dict[str, Any] = {"type": "clearinghouseState", "user": wallet}
+    if dex:
+        payload["dex"] = dex
+    raw = _post_info(payload)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _fetch_open_orders_for_dex(wallet: str, dex: str = "") -> List[Dict[str, Any]]:
+    payload: Dict[str, Any] = {"type": "frontendOpenOrders", "user": wallet}
+    if dex:
+        payload["dex"] = dex
+    raw = _post_info(payload)
+    return _normalize_open_orders(raw if isinstance(raw, list) else [])
+
+
+def _price_decimal_map_for_dex(dex: str = "") -> Dict[str, int]:
+    payload: Dict[str, Any] = {"type": "metaAndAssetCtxs"}
+    if dex:
+        payload["dex"] = dex
+    raw = _post_info(payload)
+    return _market_price_decimals_by_symbol(raw)
+
+
+def _discover_perp_dex_names() -> List[str]:
+    """Return native dex + every available HIP-3 perp DEX as route prefixes."""
+    names = _fetch_perp_dex_names()
+    if "" not in names:
+        names = [""] + names
+    return names
+
+
 def _execute_positions_orders(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     alias = _normalize_account_alias(account)
     if not alias:
@@ -1788,18 +1860,34 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
             message="Account is not configured.",
         )
 
-    dex = (request.get("dex") or "").strip()
-    positions_payload = {"type": "clearinghouseState", "user": wallet}
-    if dex:
-        positions_payload["dex"] = dex
-    open_orders_payload = {"type": "frontendOpenOrders", "user": wallet}
-    if dex:
-        open_orders_payload["dex"] = dex
+    dex_names = (
+        [str(request.get("dex") or "").strip()]
+        if (request.get("dex") or "")
+        else _discover_perp_dex_names()
+    )
 
     try:
-        positions_raw = _post_info(positions_payload)
-        open_orders_raw = _post_info(open_orders_payload)
-        market_meta_raw = _post_info({"type": "metaAndAssetCtxs"})
+        aggregated_positions: Dict[str, Any] = {"assetPositions": []}
+        aggregated_orders: List[Dict[str, Any]] = []
+        price_decimals_by_symbol: Dict[str, int] = {}
+        if dex_names:
+            for dex_idx, dex in enumerate(dex_names):
+                try:
+                    positions_raw = _fetch_clearinghouse_state(wallet, dex)
+                    open_orders = _fetch_open_orders_for_dex(wallet, dex)
+                except Exception:  # noqa: BLE001
+                    continue
+                dex_positions = positions_raw.get("assetPositions")
+                if isinstance(dex_positions, list):
+                    aggregated_positions["assetPositions"].extend(dex_positions)
+                aggregated_orders.extend(open_orders)
+                try:
+                    _decimals = _price_decimal_map_for_dex(dex)
+                    for sym, prec in _decimals.items():
+                        if sym not in price_decimals_by_symbol:
+                            price_decimals_by_symbol[sym] = prec
+                except Exception:  # noqa: BLE001
+                    continue
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation="positions_orders",
@@ -1809,10 +1897,8 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
             message=sanitize_error_message(str(exc)),
         )
 
-    normalized_orders = _normalize_open_orders(open_orders_raw)
-    price_decimals_by_symbol = _market_price_decimals_by_symbol(market_meta_raw)
     protection_orders_by_symbol: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for order in normalized_orders:
+    for order in aggregated_orders:
         symbol = order["symbol"]
         protection_type = _protection_order_tpsl(order)
         if protection_type not in {"tp", "sl"}:
@@ -1820,15 +1906,15 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
         symbol_map = protection_orders_by_symbol.setdefault(symbol, {"tp": [], "sl": []})
         symbol_map[protection_type].append(order)
 
-    positions = _normalize_positions_orders_positions(positions_raw, protection_orders_by_symbol)
-    order_groups = _aggregate_open_orders(normalized_orders, price_decimals_by_symbol)
+    positions = _normalize_positions_orders_positions(aggregated_positions, protection_orders_by_symbol)
+    order_groups = _aggregate_open_orders(aggregated_orders, price_decimals_by_symbol)
 
     return make_success(
         operation="positions_orders",
         exchange=name,
         account=account,
         positions=positions,
-        open_order_count=len(normalized_orders),
+        open_order_count=len(aggregated_orders),
         order_groups=order_groups,
     )
 
@@ -1872,10 +1958,39 @@ def _current_position_management_context(
         )
 
     positions = list(positions_response.positions or [])
-    symbol = (requested_symbol or "").strip().upper()
+    requested_raw = (requested_symbol or "").strip().upper()
+    symbol = requested_raw
+    # Match a position by its full route identifier (e.g. ``xyz:SP500``)
+    # OR by its dex-stripped alias (e.g. ``SP500``). Positions now carry the
+    # full coin from the API (including any HIP-3 dex prefix), so we must
+    # accept either form to preserve dex identity without an extra network
+    # round-trip here. ``_symbol_key`` strips non-alphanumerics, so both
+    # ``xyz:SP500`` and ``SP500`` collapse to the same canonical key when the
+    # requested symbol is a bare alias; a fully-prefixed request (``xyz:SP500``)
+    # only matches the position whose symbol carries that prefix, preventing
+    # cross-dex collisions.
+    requested_keys = {_symbol_key(requested_raw)}
+    if ":" in requested_raw:
+        # Fully-prefixed request: accept the prefix-preserved position symbol.
+        pass
+    else:
+        # Bare alias: a position may surface as either ``SP500`` (native-style,
+        # no prefix) or ``xyz:SP500`` (HIP-3). Accept the dex-stripped tail too.
+        requested_keys.add(_symbol_key(requested_raw))
     current_position = None
     for position in positions:
-        if str(getattr(position, "symbol", "")).strip().upper() == symbol:
+        pos_key = _symbol_key(getattr(position, "symbol", ""))
+        if not pos_key:
+            continue
+        pos_display = pos_key
+        if ":" in str(getattr(position, "symbol", "")):
+            # Strip the dex prefix for alias matching (kept the exact key
+            # above for prefixed requests). The full route key is already in
+            # ``requested_keys`` when the caller passed ``xyz:SP500``.
+            pos_display_alias = _symbol_key(str(getattr(position, "symbol", "")).split(":", 1)[1])
+        else:
+            pos_display_alias = pos_key
+        if pos_key in requested_keys or pos_display_alias in requested_keys:
             current_position = position
             break
     if current_position is None:
@@ -3129,11 +3244,24 @@ def _verify_close_position(
                 "reduced_by": None, "original_signed_size": original_signed_size}
 
     positions = list(getattr(post_positions_response, "positions", None) or [])
+    # Match the re-read position by its full route identifier (e.g.
+    # ``xyz:SP500``) OR its dex-stripped alias (e.g. ``SP500``). HIP-3
+    # positions surface with the prefixed coin, while ``symbol`` here may be
+    # either form depending on what the caller supplied.
+    requested_key = _symbol_key(symbol)
+    requested_has_dex = ":" in str(symbol)
     verify_position = None
     for position in positions:
-        if str(getattr(position, "symbol", "")).strip().upper() == symbol:
-            verify_position = position
-            break
+        pos_symbol = str(getattr(position, "symbol", ""))
+        pos_key = _symbol_key(pos_symbol)
+        if pos_key != requested_key and not (":" in pos_symbol and _symbol_key(pos_symbol.split(":", 1)[1]) == requested_key):
+            continue
+        # If the caller supplied a fully-prefixed route symbol, require the
+        # position to carry that same dex prefix (prevents cross-dex collision).
+        if requested_has_dex and ":" not in pos_symbol:
+            continue
+        verify_position = position
+        break
     if verify_position is None:
         # Re-read returned no row for this symbol. The agent's normalizer
         # drops zero-size positions, so a missing row means the position
@@ -3241,7 +3369,7 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
 
     # --- 1. Submit ---
     try:
-        response = exchange_client.market_close(str(context["candidate"].get("public_symbol") or symbol), sz=float(current_size))
+        response = exchange_client.market_close(str(context["candidate"].get("route_symbol") or context["candidate"].get("public_symbol") or symbol), sz=float(current_size))
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation="close_position",
@@ -3440,10 +3568,19 @@ def _build_exchange_client(account: str) -> Tuple[Optional[Exchange], Optional[s
     # state lookups (e.g. `market_close` reading current positions) target
     # the same account the /trade wizard already queries, instead of the
     # signing key's address. The signing key (`api_wallet`) still signs.
+    #
+    # ``perp_dexs`` must include the native dex ("") AND every HIP-3 perp DEX
+    # (e.g. ``xyz``) so the SDK's ``Info`` meta load registers the prefixed
+    # coins (``xyz:SP500``, …) for price/asset/size resolution. Without it,
+    # market_close/order/TP-SL on a HIP-3 coin would raise KeyError.
+    # Use the process-lifetime cache (populated by discovery) — never force a
+    # network fetch here so construction stays hermetic in unit tests.
+    perp_dex_names = _cached_perp_dex_names()
     return Exchange(
         wallet=api_wallet,
         base_url=_api_base(),
         account_address=trading_account_address,
+        perp_dexs=perp_dex_names,
     ), trading_account_address, secret
 
 

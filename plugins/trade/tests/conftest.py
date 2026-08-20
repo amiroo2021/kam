@@ -128,6 +128,22 @@ def _reset_lighter_module_knobs() -> None:
             cache.clear()
 
 
+def _reset_hyperliquid_perp_dex_cache() -> None:
+    """Clear the process-wide HIP-3 perp DEX name cache between tests.
+
+    HIP-3 discovery memoizes the perp DEX list in a module-global to avoid
+    repeated network calls. Individual tests patch ``_post_info`` and expect
+    deterministic reads, so any live discovery earlier in the process must not
+    leak a populated cache into a later test. Resetting the cache back to its
+    initial ``None`` keeps each test's own ``_post_info`` fake authoritative.
+    """
+    mod = sys.modules.get("plugins.trade.agents.x_hyperliquid_agent")
+    if mod is None:
+        return
+    if hasattr(mod, "_perp_dex_names_cache"):
+        setattr(mod, "_perp_dex_names_cache", None)
+
+
 def _restore_session_env() -> None:
     """Re-apply session-start HERMES_HOME + LIGHTER_* after noisy tests."""
     if _SESSION_HERMES_HOME is None:
@@ -161,6 +177,7 @@ def _trade_test_isolation():
     """
     _reset_tradedesk_singleton()
     _reset_lighter_module_knobs()
+    _reset_hyperliquid_perp_dex_cache()
     _restore_session_env()
     # Attach agents submodule if plugins.trade is already loaded without it.
     pt = sys.modules.get("plugins.trade")

@@ -279,6 +279,7 @@ class TestHyperliquidNormalization(unittest.TestCase):
             raise AssertionError(payload)
 
         self.patch("plugins.trade.agents.x_hyperliquid_agent._lookup_credentials", fake_lookup)
+        self.patch("plugins.trade.agents.x_hyperliquid_agent._discover_perp_dex_names", lambda: [""])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._post_info", fake_post)
         response = _hl_module().execute({"operation": "positions_orders", "exchange": "hyperliquid", "account": "FLEX"})
         self.assertTrue(response.success)
@@ -330,6 +331,7 @@ class TestHyperliquidNormalization(unittest.TestCase):
             raise AssertionError(payload)
 
         self.patch("plugins.trade.agents.x_hyperliquid_agent._lookup_credentials", fake_lookup)
+        self.patch("plugins.trade.agents.x_hyperliquid_agent._discover_perp_dex_names", lambda: [""])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._post_info", fake_post)
         response = _hl_module().execute({"operation": "positions_orders", "exchange": "hyperliquid", "account": "FLEX"})
         self.assertTrue(response.success)
@@ -403,6 +405,7 @@ class TestHyperliquidNormalization(unittest.TestCase):
             return original_format(value, places)
 
         self.patch("plugins.trade.agents.x_hyperliquid_agent._lookup_credentials", fake_lookup)
+        self.patch("plugins.trade.agents.x_hyperliquid_agent._discover_perp_dex_names", lambda: [""])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._post_info", fake_post)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._format_decimal_places", spy_format)
         response = module.execute({"operation": "positions_orders", "exchange": "hyperliquid", "account": "FLEX"})
@@ -444,6 +447,7 @@ class TestHyperliquidNormalization(unittest.TestCase):
             raise AssertionError(payload)
 
         self.patch("plugins.trade.agents.x_hyperliquid_agent._lookup_credentials", fake_lookup)
+        self.patch("plugins.trade.agents.x_hyperliquid_agent._discover_perp_dex_names", lambda: [""])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._post_info", fake_post)
 
         def guard_float(*args, **kwargs):

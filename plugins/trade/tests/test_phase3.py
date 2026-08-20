@@ -409,7 +409,9 @@ class TestHyperliquidInstrumentResolution(unittest.TestCase):
         self.assertEqual([req["type"] for req in requests], ["perpDexs", "metaAndAssetCtxs", "metaAndAssetCtxs"])
         self.assertIsNotNone(response.instrument)
         self.assertEqual(response.instrument.requested_symbol, "gold-usdc")
-        self.assertEqual(response.instrument.symbol, "GOLD")
+        # HIP-3 coins resolve to the full route symbol for execution; the
+        # dex-stripped alias remains as the display name.
+        self.assertEqual(response.instrument.symbol, "xyz:GOLD")
         self.assertEqual(response.instrument.display_name, "GOLD-USDC")
         self.assertEqual(response.instrument.price_increment, "0.01")
         self.assertEqual(response.instrument.size_increment, "0.01")
