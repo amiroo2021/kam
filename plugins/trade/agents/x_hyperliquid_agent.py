@@ -3000,10 +3000,37 @@ def _classify_close_response(response: Any) -> _CloseResponseVerdict:
       ``malformed_envelope``  → ``malformed``. Code
                                 ``CLOSE_RESPONSE_MALFORMED``.
 
+    The Hyperliquid SDK's ``market_close()`` can also return ``None``
+    (implicit) when its internal state lookup finds no matching
+    position for the requested coin — see the SDK source. We treat
+    that as a distinct, evidence-based outcome rather than folding
+    it into ``malformed_envelope``:
+      ``response is None``     → ``unconfirmed``. Code
+                                ``CLOSE_SUBMISSION_NOOP``. The
+                                position will still be re-verified
+                                after.
+
     In every non-success case the close path falls through to
     post-submit position verification; that re-read is authoritative.
     The string ``AMBIGUOUS_LADDER_RESPONSE`` MUST NOT appear here.
     """
+    # SDK silently returned None — most often because market_close()
+    # found no matching position for the requested coin under the
+    # configured account context. Evidence-based: report what we
+    # observed, not a guess at root cause.
+    if response is None:
+        return _CloseResponseVerdict(
+            kind="unconfirmed",
+            code="CLOSE_SUBMISSION_NOOP",
+            message=(
+                "Hyperliquid SDK returned no close result. "
+                "No matching position was found by the SDK close "
+                "operation. The position was re-verified and no "
+                "automatic retry was attempted."
+            ),
+            exchange_reason=None,
+        )
+
     _ok, _accepted, _rejected, _oids, _records, code, reason, branch = (
         _order_response_details(response, 1)
     )
@@ -3399,14 +3426,25 @@ def _build_exchange_client(account: str) -> Tuple[Optional[Exchange], Optional[s
     alias = _normalize_account_alias(account)
     if not alias:
         return None, None, None
-    wallet, secret = _lookup_credentials(alias)
-    if wallet is None or secret is None:
-        return None, wallet, secret
+    trading_account_address, secret = _lookup_credentials(alias)
+    if trading_account_address is None or secret is None:
+        return None, trading_account_address, secret
     try:
-        private_key_wallet = Account.from_key(secret)
+        api_wallet = Account.from_key(secret)
     except Exception:  # noqa: BLE001
-        return None, wallet, secret
-    return Exchange(wallet=private_key_wallet, base_url=_api_base()), wallet, secret
+        return None, trading_account_address, secret
+    # The signing key (`api_wallet`) and the trading account
+    # (`trading_account_address`) can differ — Hyperliquid supports API/agent
+    # wallets that sign on behalf of a master account. We pass the master
+    # account's public address as `account_address` so the SDK's internal
+    # state lookups (e.g. `market_close` reading current positions) target
+    # the same account the /trade wizard already queries, instead of the
+    # signing key's address. The signing key (`api_wallet`) still signs.
+    return Exchange(
+        wallet=api_wallet,
+        base_url=_api_base(),
+        account_address=trading_account_address,
+    ), trading_account_address, secret
 
 
 def _fetch_frontend_open_orders(wallet: str, dex: str = "") -> List[Dict[str, Any]]:
