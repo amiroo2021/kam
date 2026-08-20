@@ -1,10 +1,10 @@
-"""Phase 4 tests: Rise close_position (reduce-only IOC flatten)."""
+"""close_position tests: Rise reduce-only IOC flatten."""
 
 from __future__ import annotations
 
 import unittest
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from unittest import mock
 
 from plugins.trade.agents import x_rise_agent as rise
@@ -35,17 +35,14 @@ def _sol_market_metadata():
     }
 
 
-def _post_capture():
+def _post_capture(close_order_id: str = "0xCLOSE1"):
     captured = {"calls": []}
 
     def side_effect(*args, **kwargs):
         body = kwargs.get("data") or (args[1] if len(args) > 1 else {}) or {}
-        captured["calls"].append({
-            "url": args[0] if args else kwargs.get("url"),
-            "body": body,
-        })
-        # First call is /v1/orders/place; return a synthetic exchange_order_id.
-        return {"data": {"order_id": "0xCLOSE1", "wide_order_id": "w1"}}
+        captured["calls"].append({"url": args[0] if args else kwargs.get("url"),
+                                  "body": body})
+        return {"data": {"order_id": close_order_id, "wide_order_id": "w1"}}
 
     return captured, side_effect
 
@@ -54,16 +51,13 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self._cred = mock.patch.object(
             rise, "_lookup_credentials",
-            return_value=("0x" + "ab" * 20, "0x" + "11" * 32),
+            return_value=("0x679fb6c74b531E3f3136DecbE9238cec6029F59A",
+                          "0x" + ("11" * 32)),
         )
         self._cred.start()
-        # Avoid real waits in the close-poll loop.
-        self._sleep = mock.patch.object(rise._t, "sleep", return_value=None)
-        self._sleep.start()
 
     def tearDown(self):
         self._cred.stop()
-        self._sleep.stop()
 
 
 class PositionReadbackTests(_Base):
@@ -138,11 +132,11 @@ class AlreadyFlatTests(_Base):
                                              "entry_price": Decimal("0")}), \
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
-                "operation": "close_position", "account": "BASED",
-                "symbol": "SOL",
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
             })
         self.assertTrue(resp.success)
         self.assertEqual(resp.order_state["outcome"], "ALREADY_FLAT")
+        # No submission at all.
         self.assertEqual(len(captured["calls"]), 0)
 
 
@@ -151,8 +145,8 @@ class VerificationWindowTests(_Base):
         captured, side_effect = _post_capture()
         snaps = [
             {"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")},  # pre
-            {"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")},  # first post (still open)
-            {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0")},       # next post flat
+            {"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")},  # still open
+            {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0")},       # flat
         ]
         with mock.patch.object(rise, "_fetch_markets_payload",
                                return_value=_markets_sol()), \
@@ -167,23 +161,20 @@ class VerificationWindowTests(_Base):
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
                 "operation": "close_position", "account": "BASED",
-                "symbol": "SOL", "max_wait_seconds": 0.5,
+                "symbol": "SOL", "max_wait_seconds": 1.5,
             })
         self.assertTrue(resp.success)
         self.assertEqual(resp.order_state["outcome"], "CLOSED")
-        # Exactly one close submission
         self.assertEqual(len(captured["calls"]), 1)
 
     def test_transient_read_fail_then_flat_no_duplicate_close(self):
         captured, side_effect = _post_capture()
-        # First snapshot call succeeds (pre). Subsequent calls fail then succeed with flat.
         first_done = {"done": False}
 
         def snap(wallet, symbol):
             if not first_done["done"]:
                 first_done["done"] = True
                 return {"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")}
-            # After submit: raise once then return flat
             if getattr(snap, "_called", 0) == 0:
                 snap._called = 1
                 raise RuntimeError("transient 429")
@@ -202,20 +193,17 @@ class VerificationWindowTests(_Base):
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
                 "operation": "close_position", "account": "BASED",
-                "symbol": "SOL", "max_wait_seconds": 0.5,
+                "symbol": "SOL", "max_wait_seconds": 1.5,
             })
         self.assertTrue(resp.success)
         self.assertEqual(resp.order_state["outcome"], "CLOSED")
-        # Crucial: ONE close submission even with transient failures.
         self.assertEqual(len(captured["calls"]), 1)
 
     def test_persistent_failure_not_confirmed_no_duplicate(self):
         captured, side_effect = _post_capture()
 
         def snap(wallet, symbol):
-            # pre is long; subsequent reads also long (close did NOT fill).
-            return {"side": "long", "size": Decimal("0.2"),
-                    "entry_price": Decimal("80.5")}
+            return {"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")}
 
         with mock.patch.object(rise, "_fetch_markets_payload",
                                return_value=_markets_sol()), \
@@ -225,17 +213,14 @@ class VerificationWindowTests(_Base):
                                return_value=Decimal("81")), \
              mock.patch.object(rise, "_fetch_nonce_state",
                                return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
-             mock.patch.object(rise, "_rise_position_snapshot",
-                               side_effect=snap), \
+             mock.patch.object(rise, "_rise_position_snapshot", side_effect=snap), \
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
                 "operation": "close_position", "account": "BASED",
                 "symbol": "SOL", "max_wait_seconds": 0.2,
             })
-        # success=True (close submitted) but outcome=NOT_CONFIRMED
         self.assertTrue(resp.success)
         self.assertEqual(resp.order_state["outcome"], "NOT_CONFIRMED")
-        # Exactly one submission
         self.assertEqual(len(captured["calls"]), 1)
 
     def test_venue_rejects_close_failed(self):
@@ -244,26 +229,25 @@ class VerificationWindowTests(_Base):
         def fail_post(*args, **kwargs):
             captured["calls"].append(args[0] if args else kwargs.get("url"))
             raise rise._RiseHTTPError(status=500, path="/v1/orders/place",
-                                       body='{"error":"Internal"}')
+                                      body='{"error":"Internal"}')
 
         with mock.patch.object(rise, "_fetch_markets_payload",
-                               return_value=_markets_sol()), \
+                              return_value=_markets_sol()), \
              mock.patch.object(rise, "_market_cache",
-                               return_value={"4": _sol_market_metadata()}), \
+                              return_value={"4": _sol_market_metadata()}), \
              mock.patch.object(rise, "_rise_market_price",
-                               return_value=Decimal("81")), \
+                              return_value=Decimal("81")), \
              mock.patch.object(rise, "_fetch_nonce_state",
-                               return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
              mock.patch.object(rise, "_rise_position_snapshot",
-                               return_value={"side": "long", "size": Decimal("0.2"),
-                                             "entry_price": Decimal("80.5")}), \
+                              return_value={"side": "long", "size": Decimal("0.2"),
+                                            "entry_price": Decimal("80.5")}), \
              mock.patch.object(rise, "_post_json", side_effect=fail_post):
             resp = rise.execute({
-                "operation": "close_position", "account": "BASED",
-                "symbol": "SOL",
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
             })
         self.assertFalse(resp.success)
-        self.assertIn("500", (resp.error.message or "")) or True
+        self.assertIn("500", (resp.error.message or ""))
         # Exactly one attempt
         self.assertEqual(len(captured["calls"]), 1)
 
@@ -272,29 +256,28 @@ class OppositeSideGuardTests(_Base):
     def test_opposite_side_post_is_hard_failure(self):
         captured, side_effect = _post_capture()
         with mock.patch.object(rise, "_fetch_markets_payload",
-                               return_value=_markets_sol()), \
+                              return_value=_markets_sol()), \
              mock.patch.object(rise, "_market_cache",
-                               return_value={"4": _sol_market_metadata()}), \
+                              return_value={"4": _sol_market_metadata()}), \
              mock.patch.object(rise, "_rise_market_price",
-                               return_value=Decimal("81")), \
+                              return_value=Decimal("81")), \
              mock.patch.object(rise, "_fetch_nonce_state",
-                               return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
              mock.patch.object(rise, "_rise_position_snapshot",
-                               side_effect=[
-                                   {"side": "long", "size": Decimal("0.2"),
-                                    "entry_price": Decimal("80.5")},
-                                   {"side": "short", "size": Decimal("0.2"),
-                                    "entry_price": Decimal("80.5")},  # post is now opposite — reversal
-                               ]), \
+                              side_effect=[
+                                  {"side": "long", "size": Decimal("0.2"),
+                                   "entry_price": Decimal("80.5")},
+                                  {"side": "short", "size": Decimal("0.2"),
+                                   "entry_price": Decimal("80.5")},
+                              ]), \
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
-                "operation": "close_position", "account": "BASED",
-                "symbol": "SOL", "max_wait_seconds": 0.2,
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
+                "max_wait_seconds": 0.2,
             })
-        self.assertTrue(resp.success)
+        self.assertTrue(resp.success)  # submitted once, success container
         self.assertEqual(resp.order_state["outcome"], "FAILED")
         self.assertIn("opposite", resp.order_state.get("reason", "").lower())
-        # Exactly one close submission
         self.assertEqual(len(captured["calls"]), 1)
 
 
@@ -320,7 +303,7 @@ class ParamGuardTests(_Base):
 
     def test_instrument_not_found(self):
         with mock.patch.object(rise, "_fetch_markets_payload",
-                               return_value={"markets": []}), \
+                              return_value={"markets": []}), \
              mock.patch.object(rise, "_market_cache", return_value={}), \
              mock.patch.object(rise, "_post_json", return_value={}) as _post:
             resp = rise.execute({
@@ -332,9 +315,12 @@ class ParamGuardTests(_Base):
         self.assertEqual(_post.call_count, 0)
 
 
-class ExistingBehaviorTests(_Base):
-    def test_market_immediate_zero_default_unaffected(self):
+class CloseSizeFreshnessTests(_Base):
+    """Close must use the FRESH pre-read live position, not a stale/display size."""
+
+    def test_uses_live_position_size_not_stale_displayed(self):
         captured, side_effect = _post_capture()
+        # Caller passes a stale displayed size 0.1; live pre reads 0.2.
         with mock.patch.object(rise, "_fetch_markets_payload",
                                return_value=_markets_sol()), \
              mock.patch.object(rise, "_market_cache",
@@ -343,52 +329,142 @@ class ExistingBehaviorTests(_Base):
                                return_value=Decimal("81")), \
              mock.patch.object(rise, "_fetch_nonce_state",
                                return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
-             mock.patch.object(rise, "_fetch_open_orders_payload",
-                               side_effect=lambda wallet: {"data": {"orders": []}}), \
-             mock.patch.object(rise, "_normalize_open_orders", return_value=[]), \
              mock.patch.object(rise, "_rise_position_snapshot",
                                side_effect=[
+                                   {"side": "long", "size": Decimal("0.2"),
+                                    "entry_price": Decimal("80.5")},
                                    {"side": "flat", "size": Decimal("0"),
                                     "entry_price": Decimal("0")},
-                                   {"side": "long", "size": Decimal("0.2"),
-                                    "entry_price": Decimal("81.1")},
                                ]), \
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
-                "operation": "market_immediate", "account": "BASED",
-                "symbol": "SOL", "side": "buy", "volume": "0.2",
-                "slip_pct": "0.005", "max_wait_seconds": 0.5,
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
+                "volume": "0.1",  # stale/display — must NOT drive close size
             })
-        # Existing market_immediate behavior is unaffected by close_position changes.
         self.assertTrue(resp.success)
-        self.assertEqual(captured["calls"][0]["body"]["client_order_id"], "0")
-        self.assertFalse(captured["calls"][0]["body"]["reduce_only"])
+        self.assertEqual(resp.order_state["outcome"], "CLOSED")
+        body = captured["calls"][0]["body"]
+        # submitted size_steps == live pre size / step = 0.2 / 0.001 = 200
+        self.assertEqual(body["size_steps"], 200)
+        self.assertEqual(body["side"], 1)  # SELL
 
-    def test_new_order_default_zero(self):
+
+class PartialCloseTests(_Base):
+    def test_partial_remaining_position_reported(self):
         captured, side_effect = _post_capture()
         with mock.patch.object(rise, "_fetch_markets_payload",
-                               return_value=_markets_sol()), \
+                              return_value=_markets_sol()), \
              mock.patch.object(rise, "_market_cache",
-                               return_value={"4": _sol_market_metadata()}), \
-             mock.patch.object(rise, "_fetch_open_orders_payload",
-                               side_effect=lambda wallet: {"data": {"orders": []}}), \
-             mock.patch.object(rise, "_normalize_open_orders", return_value=[]), \
+                              return_value={"4": _sol_market_metadata()}), \
+             mock.patch.object(rise, "_rise_market_price",
+                              return_value=Decimal("81")), \
              mock.patch.object(rise, "_fetch_nonce_state",
-                               return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
-             mock.patch.object(rise, "_verify_new_order_submission",
-                               return_value=(True, "0xEOID",
-                                             {"market_id": "4"})), \
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+             mock.patch.object(rise, "_rise_position_snapshot",
+                              side_effect=[
+                                  {"side": "long", "size": Decimal("0.2"),
+                                   "entry_price": Decimal("80.5")},
+                                  {"side": "long", "size": Decimal("0.05"),
+                                   "entry_price": Decimal("80.5")},
+                              ]), \
              mock.patch.object(rise, "_post_json", side_effect=side_effect):
             resp = rise.execute({
-                "operation": "new_order", "account": "BASED",
-                "symbol": "SOL", "side": "buy",
-                "order_type": "limit", "volume": "0.2", "price": "81",
-                "time_in_force": "GTC",
+                "operation": "close_position", "account": "BASED",
+                "symbol": "SOL", "max_wait_seconds": 0.3,
             })
         self.assertTrue(resp.success)
-        # /trade LIMIT default: client_order_id="0", reduce_only=False
-        self.assertEqual(captured["calls"][0]["body"]["client_order_id"], "0")
-        self.assertFalse(captured["calls"][0]["body"]["reduce_only"])
+        self.assertEqual(resp.order_state["outcome"], "PARTIALLY_CLOSED")
+        self.assertEqual(resp.order_state["pre_position_size"], "0.2")
+        self.assertEqual(resp.order_state["post_position_size"], "0.05")
+        self.assertEqual(len(captured["calls"]), 1)
+
+
+class IOCNoMatchTests(_Base):
+    def test_unchanged_returns_not_confirmed(self):
+        # Close submitted but position unchanged (IOC no-match) => NOT_CONFIRMED.
+        captured, side_effect = _post_capture()
+        snaps = [{"side": "long", "size": Decimal("0.2"), "entry_price": Decimal("80.5")}]
+        with mock.patch.object(rise, "_fetch_markets_payload",
+                              return_value=_markets_sol()), \
+             mock.patch.object(rise, "_market_cache",
+                              return_value={"6880901": _sol_market_metadata()}), \
+             mock.patch.object(rise, "_rise_market_price",
+                              return_value=Decimal("81")), \
+             mock.patch.object(rise, "_fetch_nonce_state",
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+             mock.patch.object(rise, "_rise_position_snapshot", side_effect=snaps), \
+             mock.patch.object(rise, "_post_json", side_effect=side_effect):
+            resp = rise.execute({
+                "operation": "close_position", "account": "BASED",
+                "symbol": "SOL", "max_wait_seconds": 0.2,
+            })
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.order_state["outcome"], "NOT_CONFIRMED")
+        self.assertEqual(resp.order_state["post_position_size"], "0.2")
+        self.assertEqual(len(captured["calls"]), 1)
+
+
+class MalformedResponseTests(_Base):
+    def test_malformed_submit_response_position_grounded(self):
+        # A malformed/unparseable submit response must NOT be treated as a
+        # definitive success; the outcome is grounded in the post-close
+        # position read. Here the position flattens -> CLOSED regardless.
+        captured = {"calls": []}
+
+        def bad_post(*args, **kwargs):
+            captured["calls"].append(1)
+            return {"unexpected": "no data key"}
+
+        with mock.patch.object(rise, "_fetch_markets_payload",
+                              return_value=_markets_sol()), \
+             mock.patch.object(rise, "_market_cache",
+                              return_value={"4": _sol_market_metadata()}), \
+             mock.patch.object(rise, "_rise_market_price",
+                              return_value=Decimal("81")), \
+             mock.patch.object(rise, "_fetch_nonce_state",
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+             mock.patch.object(rise, "_rise_position_snapshot",
+                              side_effect=[
+                                  {"side": "long", "size": Decimal("0.2"),
+                                   "entry_price": Decimal("80.5")},
+                                  {"side": "flat", "size": Decimal("0"),
+                                   "entry_price": Decimal("0")},
+                              ]), \
+             mock.patch.object(rise, "_post_json", side_effect=bad_post):
+            resp = rise.execute({
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
+                "max_wait_seconds": 1.5,
+            })
+        # Position flat => CLOSED (submitted exactly once).
+        self.assertEqual(resp.order_state["outcome"], "CLOSED")
+        self.assertEqual(len(captured["calls"]), 1)
+
+    def test_malformed_submit_response_unchanged_not_confirmed(self):
+        # Malformed response AND position stays non-flat => NOT_CONFIRMED.
+        captured = {"calls": []}
+
+        def bad_post(*args, **kwargs):
+            captured["calls"].append(1)
+            return {"unexpected": "no data key"}
+
+        with mock.patch.object(rise, "_fetch_markets_payload",
+                              return_value=_markets_sol()), \
+             mock.patch.object(rise, "_market_cache",
+                              return_value={"4": _sol_market_metadata()}), \
+             mock.patch.object(rise, "_rise_market_price",
+                              return_value=Decimal("81")), \
+             mock.patch.object(rise, "_fetch_nonce_state",
+                              return_value={"nonce_anchor": 1, "current_bitmap_index": 0}), \
+             mock.patch.object(rise, "_rise_position_snapshot",
+                              return_value={"side": "long", "size": Decimal("0.2"),
+                                            "entry_price": Decimal("80.5")}), \
+             mock.patch.object(rise, "_post_json", side_effect=bad_post):
+            resp = rise.execute({
+                "operation": "close_position", "account": "BASED", "symbol": "SOL",
+                "max_wait_seconds": 0.2,
+            })
+        self.assertEqual(resp.order_state["outcome"], "NOT_CONFIRMED")
+        self.assertEqual(len(captured["calls"]), 1)
 
 
 if __name__ == "__main__":

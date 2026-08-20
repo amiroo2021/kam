@@ -2753,6 +2753,29 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
         _t.sleep(RISE_IMMEDIATE_VERIFY_POLL_SECONDS)
 
     # Window exhausted.
+    reduced = last_post["size"] < pre_size
+    if reduced and last_post["size"] > 0:
+        return make_success(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            order_state={
+                "outcome": "PARTIALLY_CLOSED",
+                "symbol": requested_symbol,
+                "submitted_size": _decimal_text(sub_vol),
+                "submitted_price": _decimal_text(sub_price),
+                "exchange_order_id": raw_close_order_id,
+                "pre_position_size": _decimal_text(pre_size),
+                "pre_position_side": pre_side,
+                "post_position_size": _decimal_text(last_post["size"]),
+                "post_position_side": last_post["side"],
+                "reason": (
+                    "position reduced but not fully flattened within the "
+                    "verification window; close was submitted exactly once and "
+                    "reduce_only prevents any reversal"
+                ),
+            },
+        )
     return make_success(
         operation="close_position",
         exchange=name,
