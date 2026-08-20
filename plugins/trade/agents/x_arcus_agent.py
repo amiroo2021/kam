@@ -22,6 +22,7 @@ Optional fields supported for flexibility:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -57,6 +58,40 @@ API_TIMEOUT_SECONDS = 20
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _WALLET_PATTERN = re.compile(r"^(0x|0X)?[0-9a-fA-F]{40}$")
 
+# Safe HTTP diagnostics. NEVER log secrets, signatures, authorization headers,
+# or signed request material — only operation/endpoint/status/elapsed/wait.
+_HTTP_LOGGER = logging.getLogger("plugins.trade.agents.x_arcus_agent.http")
+
+
+def _log_arcus_http(
+    *,
+    method: str,
+    endpoint: str,
+    status: int,
+    elapsed_s: float,
+    gate_wait_s: float,
+    retry_after: Optional[float] = None,
+    operation: Optional[str] = None,
+    attempt: int = 1,
+) -> None:
+    """Record a safe Arcus HTTP diagnostic line (no secret material)."""
+    try:
+        retry_part = f" retry_after={retry_after}" if retry_after is not None else ""
+        _HTTP_LOGGER.debug(
+            "arcus http method=%s endpoint=%s status=%s elapsed=%.3f "
+            "gate_wait=%.3f%s operation=%s attempt=%s",
+            method,
+            endpoint,
+            status,
+            elapsed_s,
+            gate_wait_s,
+            retry_part,
+            operation or "-",
+            attempt,
+        )
+    except Exception:  # noqa: BLE001 — logging must never break a trade.
+        pass
+
 _SIDE_TO_INT = {"buy": 0, "sell": 1}
 _INT_TO_SIDE = {0: "buy", 1: "sell"}
 _TIF_TO_INT = {"gtt": 0, "fok": 1, "ioc": 2, "alo": 3}
@@ -71,6 +106,70 @@ _ARCUS_OP_PLACE = 1
 _ARCUS_OP_CANCEL = 2
 _ARCUS_OP_MODIFY = 3
 _ARCUS_PAYLOAD_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# Arcus rate-limit write pacing + cancellation batch sizes.
+# Authoritative: https://docs.arcus.xyz/api-reference/rate-limits
+# ---------------------------------------------------------------------------
+# Global minimum interval between Arcus POST *starts* (write gate). Arcus
+# throttles per-subaccount order/cancel pools and on IP; a burst of back-to-
+# back POSTs trips a 429. Pacing to 100ms avoids ladder/cancel bursts.
+# One tunable knob so we can tune later without touching each call site.
+ARCUS_POST_MIN_INTERVAL_SECONDS = 0.1
+# Official max per /v1/batchCancelOrders request (docs: "Cancel up to 100
+# orders in a single request"). We chunk large groups to this ceiling.
+_ARCUS_CANCEL_BATCH_SIZE = 100  # docs-authoritative, do NOT guess.
+# /v1/markets is static metadata; cache safely for a whole wizard window to
+# avoid repeated one-request-per-operation metadata fetches. Volatile data
+# (positions / balances / open orders) is NEVER cached this long.
+_ARCUS_MARKETS_CACHE_TTL_SECONDS = 30.0
+# Flat cancel-pool cost of /v1/cancelAllOrders (docs rate-limit table).
+_ARCUS_CANCEL_ALL_COST = 1_000
+
+
+class _ArcusRateLimitedError(RuntimeError):
+    """A 429 that must NOT be auto-retried by order-creating code.
+
+    Carries the server's `Retry-After` (seconds) when supplied so callers can
+    surface it to the operator instead of blindly resubmitting. Order-creating
+    operations NEVER auto-retry this; they surface an
+    ``ARCUS_RATE_LIMITED`` failure and let the caller/operator decide.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds: Optional[float] = retry_after
+
+
+class _ArcusWriteGate:
+    """Process-wide pacing gate for Arcus POST writes.
+
+    All Arcus write operations (placeOrder, batchPlaceOrders, cancelOrder,
+    batchCancelOrders, cancelAllOrders, TPSL, close submit) sleep briefly
+    before firing so a burst never trips the per-account / per-IP pool.
+    Only the POST *start* is gated — we never sleep mid-loop per child.
+    """
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self._lock = threading.Lock()
+        self._min_interval = float(min_interval_seconds)
+        self._last_post_start = 0.0
+
+    def wait_for_slot(self) -> float:
+        """Block until a write slot is free; return the wait seconds."""
+
+        with self._lock:
+            now = time.time()
+            wait = self._min_interval - (now - self._last_post_start)
+            if wait > 0:
+                time.sleep(wait)
+            else:
+                wait = 0.0
+            self._last_post_start = time.time()
+            return float(wait)
+
+
+_ARCUS_WRITE_GATE = _ArcusWriteGate(ARCUS_POST_MIN_INTERVAL_SECONDS)
 
 
 def _hermes_home() -> Path:
@@ -282,6 +381,18 @@ class _ArcusGetGate:
             str(path),
         )
 
+    def _ttl_for_path(self, path: str) -> float:
+        """Path-aware cache TTL.
+
+        Volatile state (positions / balances / open orders) is cacheable only
+        for the short default window. Static market metadata (IDs, precision,
+        tick/step sizes) changes rarely and is safe to cache much longer so a
+        single wizard operation doesn't refetch it a dozen times.
+        """
+        if str(path).rstrip("/") == "/v1/markets":
+            return float(_ARCUS_MARKETS_CACHE_TTL_SECONDS)
+        return float(self._ttl_seconds)
+
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
@@ -301,10 +412,11 @@ class _ArcusGetGate:
     ) -> Dict[str, Any]:
         key = self._key(credentials, path)
         now = time.time()
+        ttl = self._ttl_for_path(path)
         with self._lock:
             if use_cache and not force_refresh and key in self._cache:
                 ts, payload = self._cache[key]
-                if now - ts <= self._ttl_seconds:
+                if now - ts <= ttl:
                     return dict(payload)
             wait = self._backoff_until - now
             if wait > 0:
@@ -350,6 +462,8 @@ class _ArcusGetGate:
 
         response.raise_for_status()
         payload = response.json()
+        _log_arcus_http(method="GET", endpoint=path, status=response.status_code,
+                        elapsed_s=0.0, gate_wait_s=0.0, operation="read")
         if not isinstance(payload, dict):
             raise RuntimeError("Arcus response body was not a JSON object")
         with self._lock:
@@ -502,8 +616,10 @@ def _signed_post(
     payload: Dict[str, Any],
     *,
     typed_payload: Optional[Dict[str, Any]] = None,
+    operation: Optional[str] = None,
+    attempt: int = 1,
 ) -> Dict[str, Any]:
-    """POST to Arcus.
+    """POST to Arcus (paced through the shared write gate).
 
     When ``typed_payload`` is provided, Ed25519 signs the Scheme 1 typed
     payload (sorted-key compact JSON, no prefix) and that exact byte string is
@@ -517,6 +633,12 @@ def _signed_post(
     HTTP body JSON directly. That fallback matches the pre-typed-payload code
     path; it does NOT match the live placeOrder/cancelOrder/modifyOrder path
     and will fail signature verification on those endpoints.
+
+    All Arcus writes go through :data:`_ARCUS_WRITE_GATE` so a burst of
+    placements/cancels is paced and does not trip the per-subaccount pool. A
+    429 raises :class:`_ArcusRateLimitedError` (with ``Retry-After`` when
+    supplied) and is NEVER auto-retried here — the order creator surfaces it
+    instead of risk a double-submit.
     """
     if not credentials.get("private_key_hex"):
         raise RuntimeError(_ARCUS_PRIVATE_KEY_MISSING_CODE + ": ARCUS private key is required for signed writes.")
@@ -535,16 +657,36 @@ def _signed_post(
         "X-Timestamp": timestamp_ns,
         "X-Signature": signature,
     }
+    gate_wait = _ARCUS_WRITE_GATE.wait_for_slot()
+    t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}{path}",
         headers=headers,
         data=body,
         timeout=API_TIMEOUT_SECONDS,
     )
+    elapsed = time.time() - t0
+    retry_after: Optional[float] = None
+    try:
+        _hdrs = getattr(response, "headers", None)
+        if _hdrs is not None:
+            ra = _hdrs.get("Retry-After") or _hdrs.get("retry-after")
+            if ra:
+                retry_after = max(0.0, float(ra))
+    except (TypeError, ValueError):
+        retry_after = None
+    _log_arcus_http(method="POST", endpoint=path, status=response.status_code,
+                    elapsed_s=elapsed, gate_wait_s=gate_wait, retry_after=retry_after,
+                    operation=operation, attempt=attempt)
     try:
         payload_obj = response.json()
     except ValueError:
         payload_obj = {"raw": response.text}
+    if response.status_code == 429:
+        raise _ArcusRateLimitedError(
+            f"HTTP 429 on {path}: {_format_arcus_error(429, payload_obj)}",
+            retry_after=retry_after,
+        )
     if response.status_code >= 400:
         raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
     return payload_obj if isinstance(payload_obj, dict) else {"raw": response.text}
@@ -1346,16 +1488,34 @@ def _submit_arcus_ladder_batch(
         "X-Timestamp": str(timestamp_ns),
         "X-Signature": first_signature,
     }
+    gate_wait = _ARCUS_WRITE_GATE.wait_for_slot()
+    t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}/v1/batchPlaceOrders",
         headers=headers,
         data=json.dumps({"orders": batch_body}, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
         timeout=API_TIMEOUT_SECONDS,
     )
+    elapsed = time.time() - t0
+    retry_after: Optional[float] = None
+    try:
+        ra = response.headers.get("Retry-After") or response.headers.get("retry-after")
+        if ra:
+            retry_after = max(0.0, float(ra))
+    except (TypeError, ValueError):
+        retry_after = None
+    _log_arcus_http(method="POST", endpoint="/v1/batchPlaceOrders", status=response.status_code,
+                    elapsed_s=elapsed, gate_wait_s=gate_wait, retry_after=retry_after,
+                    operation="ladder_batch")
     try:
         payload_obj = response.json()
     except ValueError:
         payload_obj = {"raw": response.text}
+    if response.status_code == 429:
+        raise _ArcusRateLimitedError(
+            f"HTTP 429 on /v1/batchPlaceOrders: {_format_arcus_error(429, payload_obj)}",
+            retry_after=retry_after,
+        )
     if response.status_code >= 400:
         raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
     return payload_obj if isinstance(payload_obj, dict) else {"raw": response.text}
@@ -1688,6 +1848,18 @@ def _arcus_normalize_tpsl_side(position_side_lower: str) -> str:
     the position when triggered). long → SELL, short → BUY.
     """
     return "sell" if position_side_lower == "long" else "buy"
+
+
+def _arcus_protection_type(row: Any) -> str:
+    """Return ``TP``/``SL`` for a position-level TPSL open-order row, else ``""``."""
+    if not isinstance(row, dict):
+        return ""
+    row_type = str(row.get("type") or "").strip().upper()
+    if row_type == "TAKE_PROFIT":
+        return "TP"
+    if row_type == "STOP_LOSS":
+        return "SL"
+    return ""
 
 
 def _arcus_find_existing_tpsl(
@@ -2327,44 +2499,59 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
     size_precision = market_meta["size_precision"]
     price_precision = market_meta["price_precision"]
 
-    # 1) Remove existing TP / SL.
+    # --- Cancel relevant orders before closing (optimized, one pass) -------
+    # We must remove: any position TP/SL, and every open order on the closing
+    # side for this symbol. We must NOT touch opposite-side orders.
+    #   1. If this symbol has open orders ONLY on the closing side (+ TPSL),
+    #      a single `cancelAllOrders(marketId)` clears exactly those (~1 POST).
+    #   2. Otherwise use `batchCancelOrders` for the closing-side OIDs, and
+    #      cancel any TP/SL individually (they are separate position-level rows).
     existing_tp = _arcus_find_existing_tpsl(open_orders, requested_symbol, "TP")
     existing_sl = _arcus_find_existing_tpsl(open_orders, requested_symbol, "SL")
-    if existing_tp is not None:
-        _arcus_cancel_one_tpsl(credentials, market_id, existing_tp)
-    if existing_sl is not None:
-        _arcus_cancel_one_tpsl(credentials, market_id, existing_sl)
-
-    # 2) Cancel all other open orders for the symbol on the closing side.
     closing_side = _arcus_normalize_tpsl_side(position_side)
-    for row in list(open_orders):
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("marketDisplayName") or "").upper() != requested_symbol.upper():
-            continue
-        if str(row.get("side") or "").strip().lower() != closing_side:
-            continue
-        # Skip the TPSL rows we just cancelled (they may still be in
-        # the local open_orders snapshot).
-        oid = str(row.get("orderId") or "").strip()
-        if not oid:
-            continue
-        ts_ns = int(time.time_ns())
-        cancel_body = {
-            "address": credentials["wallet"],
-            "marketId": market_id,
-            "accountIndex": int(credentials["account_index"]),
-            "kind": "orderId",
-            "orderId": oid,
-            "timestamp": ts_ns,
-        }
-        try:
-            typed = _build_arcus_typed_payload_cancel(
-                credentials=credentials, market_id=market_id, order_id=oid, timestamp_ns=ts_ns,
-            )
-            _signed_post(credentials, "/v1/cancelOrder", cancel_body, typed_payload=typed)
-        except Exception:
-            pass
+    same_symbol = [
+        row for row in open_orders
+        if isinstance(row, dict)
+        and str(row.get("marketDisplayName") or "").upper() == requested_symbol.upper()
+    ]
+    closing_side_rows = [
+        row for row in same_symbol
+        if str(row.get("side") or "").strip().lower() == closing_side
+        and str(row.get("orderId") or "").strip()
+        # Exclude position-level TPSL rows — they are canceled individually
+        # (in the opposite-side path) or by cancel-all (in the single-side path).
+        and _arcus_protection_type(row) == ""
+    ]
+    opposite_side_rows = [
+        row for row in same_symbol
+        if str(row.get("side") or "").strip().lower() != closing_side
+        and str(row.get("orderId") or "").strip()
+    ]
+    try:
+        if not opposite_side_rows:
+            # Safe symbol-wide cancel: only closing side (+ TPSL) exist.
+            _submit_cancel_all(credentials, market_id=market_id, operation="close_position")
+        else:
+            # Preserve opposite side: batch-cancel exactly the closing-side OIDs.
+            for chunk in _cancellation_batches(closing_side_rows):
+                _submit_batch_cancel(credentials, market_id, chunk, operation="close_position")
+            if existing_tp is not None:
+                _arcus_cancel_one_tpsl(credentials, market_id, existing_tp)
+            if existing_sl is not None:
+                _arcus_cancel_one_tpsl(credentials, market_id, existing_sl)
+    except _ArcusRateLimitedError as rl:
+        return make_failure(
+            operation="close_position", exchange=name, account=account,
+            code="ARCUS_RATE_LIMITED",
+            message=f"Arcus rate limit while preparing close; Retry-After {rl.retry_after_seconds}s. Close was NOT auto-retried.",
+            exchange_reason=(f"retry_after={rl.retry_after_seconds}" if rl.retry_after_seconds is not None else None),
+        )
+    except Exception:
+        # If prep-cancels fail, still attempt the close (the close itself is
+        # reduce-only IOC and reduce_only guards against reversal). Swallow
+        # prep-cancel errors so a transient cancel issue doesn't block the
+        # position close.
+        pass
 
     # 3) Place a MARKET IOC order for the full size. Slippage bound is
     #    ±10% of the current mark, per docs.
@@ -2490,6 +2677,177 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
     )
 
 
+def _submit_batch_cancel(
+    credentials: Dict[str, Any],
+    market_id: int,
+    order_rows: List[Dict[str, Any]],
+    *,
+    operation: Optional[str] = None,
+) -> Dict[str, Any]:
+    """POST /v1/batchCancelOrders for up to 100 cancel targets.
+
+    Authoritative (docs.arcus.xyz /api-reference/exchange/batch-cancel-orders):
+    body is ``{"cancels": [CancelOrderRequest...]}`` where each element is a
+    Scheme-1 signed cancel (op=2) carrying its OWN ``signature``; the shared
+    ``X-Timestamp`` must equal every element's ``ct``; ``X-Signature`` is set
+    to any one element's signature. Returns the parsed JSON envelope.
+    """
+    if not order_rows:
+        return {"responses": [], "rateLimit": None}
+    # One shared `ct` for the whole batch (replay-safe: a single batch is one
+    # request; a fresh timestamp per chunk avoids "request timestamp already
+    # used" across chunks).
+    timestamp_ns = int(time.time_ns())
+    private_key = _ed25519_private_key_from_hex(credentials["private_key_hex"])
+    cancels: List[Dict[str, Any]] = []
+    first_signature: Optional[str] = None
+    for row in order_rows:
+        order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        typed = _build_arcus_typed_payload_cancel(
+            credentials=credentials,
+            market_id=market_id,
+            order_id=order_id,
+            timestamp_ns=timestamp_ns,
+        )
+        signed_msg = _typed_payload_bytes(typed)
+        sig_hex = private_key.sign(signed_msg.encode("utf-8")).hex()
+        if first_signature is None:
+            first_signature = sig_hex
+        cancels.append(
+            {
+                "address": credentials["wallet"],
+                "marketId": market_id,
+                "accountIndex": int(credentials["account_index"]),
+                "kind": "orderId",
+                "orderId": order_id,
+                "signature": sig_hex,
+                "timestamp": timestamp_ns,
+            }
+        )
+    if not cancels:
+        return {"responses": [], "rateLimit": None}
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": _api_key_for_signing(credentials["api_signing_key"]),
+        "X-Timestamp": str(timestamp_ns),
+        "X-Signature": first_signature or "",
+    }
+    body = json.dumps({"cancels": cancels}, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8")
+    gate_wait = _ARCUS_WRITE_GATE.wait_for_slot()
+    t0 = time.time()
+    response = requests.post(
+        f"{credentials['base_url']}/v1/batchCancelOrders",
+        headers=headers,
+        data=body,
+        timeout=API_TIMEOUT_SECONDS,
+    )
+    elapsed = time.time() - t0
+    retry_after: Optional[float] = None
+    try:
+        _hdrs = getattr(response, "headers", None)
+        if _hdrs is not None:
+            ra = _hdrs.get("Retry-After") or _hdrs.get("retry-after")
+            if ra:
+                retry_after = max(0.0, float(ra))
+    except (TypeError, ValueError):
+        retry_after = None
+    _log_arcus_http(method="POST", endpoint="/v1/batchCancelOrders", status=response.status_code,
+                    elapsed_s=elapsed, gate_wait_s=gate_wait, retry_after=retry_after,
+                    operation=operation)
+    try:
+        payload_obj = response.json()
+    except ValueError:
+        payload_obj = {"raw": response.text}
+    if response.status_code == 429:
+        raise _ArcusRateLimitedError(
+            f"HTTP 429 on /v1/batchCancelOrders: {_format_arcus_error(429, payload_obj)}",
+            retry_after=retry_after,
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
+    return payload_obj if isinstance(payload_obj, dict) else {"raw": response.text}
+
+
+def _submit_cancel_all(
+    credentials: Dict[str, Any],
+    market_id: Optional[int] = None,
+    *,
+    operation: Optional[str] = None,
+) -> Dict[str, Any]:
+    """POST /v1/cancelAllOrders (Scheme 2 legacy message).
+
+    Authoritative: body ``{"address","accountIndex","marketId"?}`` signed with
+    the legacy ``ed25519(timestamp + action + canonical_json(body))`` message
+    where ``action`` is ``cancelAllOrders``. Returns 202 ``CANCEL_ALL_ACK``.
+    """
+    if not credentials.get("private_key_hex"):
+        raise RuntimeError(_ARCUS_PRIVATE_KEY_MISSING_CODE + ": ARCUS private key is required for signed writes.")
+    timestamp_ns = int(time.time_ns())
+    payload: Dict[str, Any] = {
+        "address": credentials["wallet"],
+        "accountIndex": int(credentials["account_index"]),
+    }
+    if market_id is not None:
+        payload["marketId"] = int(market_id)
+    action = "cancelAllOrders"
+    body = _canonical_json(payload)
+    # Legacy message: timestamp + action + canonical_json(body), concatenated.
+    signed_bytes = f"{timestamp_ns}{action}{body}"
+    private_key = _ed25519_private_key_from_hex(credentials["private_key_hex"])
+    sig_hex = private_key.sign(signed_bytes.encode("utf-8")).hex()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": _api_key_for_signing(credentials["api_signing_key"]),
+        "X-Timestamp": str(timestamp_ns),
+        "X-Signature": sig_hex,
+    }
+    gate_wait = _ARCUS_WRITE_GATE.wait_for_slot()
+    t0 = time.time()
+    response = requests.post(
+        f"{credentials['base_url']}/v1/cancelAllOrders",
+        headers=headers,
+        data=body.encode("utf-8"),
+        timeout=API_TIMEOUT_SECONDS,
+    )
+    elapsed = time.time() - t0
+    retry_after: Optional[float] = None
+    try:
+        _hdrs = getattr(response, "headers", None)
+        if _hdrs is not None:
+            ra = _hdrs.get("Retry-After") or _hdrs.get("retry-after")
+            if ra:
+                retry_after = max(0.0, float(ra))
+    except (TypeError, ValueError):
+        retry_after = None
+    _log_arcus_http(method="POST", endpoint="/v1/cancelAllOrders", status=response.status_code,
+                    elapsed_s=elapsed, gate_wait_s=gate_wait, retry_after=retry_after,
+                    operation=operation or "cancel_all")
+    try:
+        payload_obj = response.json()
+    except ValueError:
+        payload_obj = {"raw": response.text}
+    if response.status_code == 429:
+        raise _ArcusRateLimitedError(
+            f"HTTP 429 on /v1/cancelAllOrders: {_format_arcus_error(429, payload_obj)}",
+            retry_after=retry_after,
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
+    return payload_obj if isinstance(payload_obj, dict) else {"raw": response.text}
+
+
+def _cancellation_batches(order_rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Chunk cancel targets into <=100 order batches (docs max)."""
+    if not order_rows:
+        return []
+    return [
+        order_rows[i : i + _ARCUS_CANCEL_BATCH_SIZE]
+        for i in range(0, len(order_rows), _ARCUS_CANCEL_BATCH_SIZE)
+    ]
+
+
 def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
     account = str(request.get("account") or "").strip()
     credentials = _lookup_credentials(account)
@@ -2510,60 +2868,64 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
         before = _fetch_open_orders_for_account(credentials)
         target_symbol = _normalize_symbol(symbol)
         targets: List[Dict[str, Any]] = []
+        same_symbol_other_side: List[Dict[str, Any]] = []
         for row in before:
             row_symbol = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
             row_side = str(row.get("side") or "").strip().lower()
-            if row_symbol != target_symbol or row_side != side:
+            if row_symbol != target_symbol:
                 continue
             order_id = str(row.get("orderId") or "").strip()
             if not order_id:
                 continue
-            targets.append({"row": row, "order_id": order_id})
+            if row_side == side:
+                targets.append({"row": row, "order_id": order_id})
+            else:
+                same_symbol_other_side.append({"row": row, "order_id": order_id})
         if not targets:
             cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=0, cancelled_order_count=0, confirmed_absent_count=0, remaining_target_count=0, verified=True, partial=False, status="success", batch_count=0)
             return make_success(operation="cancel_order_group", exchange=name, account=credentials["account"], cancel_group=cancel_group)
+
+        # --- Cancellation hierarchy (authoritative Arcus capabilities) ---
+        # 1. If the symbol has open orders ONLY on the selected side (no
+        #    opposite-side orders to preserve AND no TPSL rows we keep), a
+        #    single `cancelAllOrders(marketId)` cancels exactly those orders
+        #    (~1 request instead of hundreds). cancelAllOrders cancels TPSL
+        #    within scope — acceptable here because the whole symbol/group is
+        #    being cleared. If the symbol ALSO has opposite-side orders, we
+        #    must NOT use symbol-wide cancel-all (it would remove the opposite
+        #    side), so we fall to exact-OID batch cancellation.
+        # 2. batchCancelOrders cancels exactly the selected OIDs (<=100 per
+        #    request), preserving opposite-side and unrelated orders.
+        # 3. Fallback: paced individual cancelOrder.
         cancelled = 0
         batches: List[Dict[str, Any]] = []
-        for target in targets:
-            order_id = target["order_id"]
-            try:
-                timestamp_ns = int(time.time_ns())
-                payload = {
-                    "address": credentials["wallet"],
-                    "marketId": market_id,
-                    "accountIndex": int(credentials["account_index"]),
-                    "kind": "orderId",
-                    "orderId": order_id,
-                    "timestamp": timestamp_ns,
-                }
-                typed_payload = _build_arcus_typed_payload_cancel(
-                    credentials=credentials,
-                    market_id=market_id,
-                    order_id=order_id,
-                    timestamp_ns=timestamp_ns,
-                )
-                _signed_post(credentials, "/v1/cancelOrder", payload, typed_payload=typed_payload)
-                cancelled += 1
-                batches.append({"submitted": 1, "accepted": 1, "ok": True})
-            except Exception as exc:
-                latest = _fetch_open_orders_for_account(credentials)
-                still_present = False
-                for latest_row in latest:
-                    if _normalize_symbol(latest_row.get("marketDisplayName") or latest_row.get("symbol") or latest_row.get("market")) != target_symbol:
-                        continue
-                    if str(latest_row.get("side") or "").strip().lower() != side:
-                        continue
-                    if str(latest_row.get("orderId") or "").strip() == order_id:
-                        still_present = True
-                        break
-                if not still_present:
-                    cancelled += 1
-                    batches.append({"submitted": 1, "accepted": 1, "ok": True, "verified_after_error": True})
-                    continue
-                reason_text = sanitize_error_message(str(exc))
-                batches.append({"submitted": 1, "accepted": 0, "ok": False, "reason": reason_text})
-                cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=0, remaining_target_count=len(targets) - cancelled, verified=False, partial=cancelled > 0, status="partial" if cancelled > 0 else "failed", batch_count=len(batches), batches=batches)
-                return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="CANCEL_FAILED", message=reason_text, cancel_group=cancel_group)
+        method: str = "cancel_all_order"
+        try:
+            if not same_symbol_other_side:
+                # Safe: symbol has only the selected side -> symbol-wide cancel.
+                cancelled = len(targets)
+                _submit_cancel_all(credentials, market_id=market_id, operation="cancel_order_group")
+                batches.append({"method": "cancel_all", "targeted": len(targets), "ok": True})
+            else:
+                method = "cancel_batch"
+                for chunk in _cancellation_batches(targets):
+                    batch_order_ids = [t["order_id"] for t in chunk]
+                    _submit_batch_cancel(credentials, market_id, chunk, operation="cancel_order_group")
+                    cancelled += len(chunk)
+                    batches.append({"method": "cancel_batch", "submitted": len(chunk), "accepted": len(chunk), "ok": True, "order_ids": batch_order_ids})
+        except _ArcusRateLimitedError as rl:
+            return make_failure(
+                operation="cancel_order_group", exchange=name, account=credentials["account"],
+                code="ARCUS_RATE_LIMITED",
+                message=f"Arcus rate limit reached; Retry-After {rl.retry_after_seconds}s. No cancellation was auto-retried.",
+                exchange_reason=(f"retry_after={rl.retry_after_seconds}" if rl.retry_after_seconds is not None else None),
+            )
+        except Exception as exc:
+            reason_text = sanitize_error_message(str(exc))
+            cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=0, remaining_target_count=len(targets) - cancelled, verified=False, partial=cancelled > 0, status="partial" if cancelled > 0 else "failed", batch_count=len(batches), batches=batches)
+            return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="CANCEL_FAILED", message=reason_text, cancel_group=cancel_group)
+
+        # ONE authoritative post-cancel openOrders read (never one per child).
         after = _fetch_open_orders_for_account(credentials)
         remaining = [row for row in after if _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market")) == target_symbol and str(row.get("side") or "").strip().lower() == side]
         confirmed_absent = len(targets) - len(remaining)

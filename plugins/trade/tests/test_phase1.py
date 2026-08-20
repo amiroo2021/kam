@@ -1255,24 +1255,23 @@ class TestArcusAgentPhase1(unittest.TestCase):
         arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
         market = {"market_id": 1, "display_symbol": "BTC-USD", "tick_size": arcus._decimal_or_zero("0.1"), "step_size": arcus._decimal_or_zero("0.00000001"), "price_precision": 1, "size_precision": 8, "min_notional": arcus._decimal_or_zero("5")}
 
-        calls = []
+        cancel_all_calls = []
 
         def fake_resolve_market(symbol):
             return market
 
-        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
-            calls.append((path, payload.get("orderId")))
-            if payload.get("orderId") == "ord-2":
-                raise RuntimeError("HTTP 500: error")
-            return {"status": "CANCELED"}
+        def fake_cancel_all(credentials, market_id=None, *, operation=None):
+            cancel_all_calls.append((market_id, operation))
+            return {"status": "CANCEL_ALL_ACKNOWLEDGED"}
 
         open_orders_before = [
             {"orderId": "ord-1", "marketDisplayName": "BTC-USD", "side": "BUY"},
             {"orderId": "ord-2", "marketDisplayName": "BTC-USD", "side": "BUY"},
             {"orderId": "ord-3", "marketDisplayName": "ETH-USD", "side": "BUY"},
         ]
+        # ord-2 still present after the (optimistic) cancel-all -> unconfirmed.
         open_orders_after = [
-            {"orderId": "ord-1", "marketDisplayName": "BTC-USD", "side": "BUY"},
+            {"orderId": "ord-2", "marketDisplayName": "BTC-USD", "side": "BUY"},
             {"orderId": "ord-3", "marketDisplayName": "ETH-USD", "side": "BUY"},
         ]
         fetch_state = {"count": 0}
@@ -1284,7 +1283,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
             return open_orders_after
 
         with mock.patch.object(arcus, "_resolve_market", side_effect=fake_resolve_market), \
-             mock.patch.object(arcus, "_signed_post", side_effect=fake_signed_post), \
+             mock.patch.object(arcus, "_submit_cancel_all", side_effect=fake_cancel_all), \
              mock.patch.object(arcus, "_fetch_open_orders_for_account", side_effect=fake_fetch_open_orders):
             response = arcus.execute({
                 "operation": "cancel_orders",
@@ -1296,7 +1295,9 @@ class TestArcusAgentPhase1(unittest.TestCase):
 
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "VERIFICATION_FAILED")
-        self.assertEqual([path for path, _ in calls], ["/v1/cancelOrder", "/v1/cancelOrder"])
+        # One symbol-wide cancel-all (not one call per order).
+        self.assertEqual(len(cancel_all_calls), 1)
+        self.assertEqual(cancel_all_calls[0][0], 1)
         self.assertEqual(response.cancel_group.cancelled_order_count, 2)
         self.assertEqual(response.cancel_group.remaining_target_count, 1)
 
@@ -1308,8 +1309,11 @@ class TestArcusAgentPhase1(unittest.TestCase):
         arcus = __import__("plugins.trade.agents.x_arcus_agent", fromlist=["*"])
         market = {"market_id": 1, "display_symbol": "BTC-USD", "tick_size": arcus._decimal_or_zero("0.1"), "step_size": arcus._decimal_or_zero("0.00000001"), "price_precision": 1, "size_precision": 8, "min_notional": arcus._decimal_or_zero("5")}
 
-        def fake_signed_post(credentials, path, payload, *, typed_payload=None):
-            return {"status": "CANCELED"}
+        cancel_all_calls = []
+
+        def fake_cancel_all(credentials, market_id=None, *, operation=None):
+            cancel_all_calls.append((market_id, operation))
+            return {"status": "CANCEL_ALL_ACKNOWLEDGED"}
 
         open_orders_before = [
             {"orderId": "ord-1", "marketDisplayName": "BTC-USD", "side": "BUY"},
@@ -1325,7 +1329,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
             return []
 
         with mock.patch.object(arcus, "_resolve_market", return_value=market), \
-             mock.patch.object(arcus, "_signed_post", side_effect=fake_signed_post), \
+             mock.patch.object(arcus, "_submit_cancel_all", side_effect=fake_cancel_all), \
              mock.patch.object(arcus, "_fetch_open_orders_for_account", side_effect=fake_fetch_open_orders):
             response = arcus.execute({
                 "operation": "cancel_orders",
@@ -1340,6 +1344,9 @@ class TestArcusAgentPhase1(unittest.TestCase):
         self.assertEqual(response.cancel_group.targeted_order_count, 2)
         self.assertEqual(response.cancel_group.confirmed_absent_count, 2)
         self.assertTrue(response.cancel_group.verified)
+        # Symbol has only BUY (selected side) -> one symbol-wide cancel-all.
+        self.assertEqual(len(cancel_all_calls), 1)
+        self.assertEqual(cancel_all_calls[0][0], 1)  # market_id
 
     def test_arcus_new_order_resolves_short_base_symbol(self):
         os.environ["ARCUS_AMIROO_WALLET"] = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
