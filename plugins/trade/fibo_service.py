@@ -70,6 +70,7 @@ from .golden_fibo.state import (
 )
 from .golden_fibo.lighter_adapter import LighterGoldenFiboAdapter
 from .golden_fibo.arcus_adapter import ArcusGoldenFiboAdapter
+from .golden_fibo.rise_adapter import RiseGoldenFiboAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ class FiboServiceProtocol(Protocol):
 # Direction validation
 # ---------------------------------------------------------------------------
 VALID_DIRECTIONS = ("BUY", "SELL")
-SUPPORTED_EXCHANGES = ("lighter", "arcus")
+SUPPORTED_EXCHANGES = ("lighter", "arcus", "rise")
 
 
 def _is_valid_registration_key(key: str) -> bool:
@@ -389,6 +390,8 @@ class PersistentFiboService:
                 exchange = str(st.exchange).lower()
             if exchange == "arcus":
                 adapter = ArcusGoldenFiboAdapter()
+            elif exchange == "rise":
+                adapter = RiseGoldenFiboAdapter()
             else:
                 adapter = LighterGoldenFiboAdapter()
             self._adapters[key] = adapter

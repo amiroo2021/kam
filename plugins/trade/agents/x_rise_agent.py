@@ -37,7 +37,9 @@ from eth_utils.crypto import keccak
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -53,6 +55,42 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "rise"
+
+# GoldenFibo V2 client_order_id canonical format.
+# The V2 integer is 48 bits, packed as (magic | version | direction | role | cycle_uid | step | seq).
+# We accept caller-supplied IDs as decimal strings within [0, 2**48 - 1].
+RISE_V2_MAX_INT = (1 << 48) - 1
+RISE_V2_DEFAULT_ID = "0"
+
+
+def _rise_normalize_v2_client_order_id(candidate):
+    """Validate and normalize a caller-supplied client_order_id for Rise.
+
+    Live evidence (Phase 3): the Rise on-chain PlaceOrderWithPermitV2
+    reverts on any non-zero ``client_order_id`` value. Therefore this
+    helper either:
+      * returns ``"0"`` when caller opted in with the literal "0"
+      * returns ``None`` when caller did not supply any client_order_id
+      * raises ``ValueError`` when caller supplied any other value
+        (rejected before any HTTP mutation)
+    """
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool):
+        raise ValueError(
+            "Rise rejects non-zero client_order_id values "
+            "(venue reverts PlaceOrderWithPermitV2)"
+        )
+    raw = str(candidate).strip()
+    if raw == "":
+        return None
+    if raw == "0":
+        return "0"
+    raise ValueError(
+        f"Rise rejects non-zero client_order_id values; got {raw!r}. "
+        "On Rise, the wire client_order_id must remain '0'."
+    )
+
 
 DEFAULT_API_BASE = "https://api.rise.trade"
 API_TIMEOUT_SECONDS = 20
@@ -177,7 +215,27 @@ def list_accounts() -> List[str]:
 
 
 def capabilities() -> List[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "ladder", "cancel_orders"]
+    # Phase 1: market_immediate is bounded-limit IOC fill.
+    return [
+        "balance",
+        "positions_orders",
+        "positions_management",
+        "new_order",
+        "ladder",
+        "cancel_order_group",
+        "cancel_orders",
+        "cancel_order",
+        "set_tp",
+        "set_sl",
+        "market_immediate",
+        "resolve_instrument",
+        "market_constraints",
+        "market_price",
+        "position_state",
+        "get_order_state",
+        "get_order_state_by_client_id",
+        "close_position",
+    ]
 
 
 def _api_base() -> str:
@@ -1149,6 +1207,88 @@ def _verify_new_order_submission(
     return True, _canonical_order_id(order), order
 
 
+def _classify_rise_limit_result(
+    *,
+    requested_volume: Decimal,
+    submitted_volume: Decimal,
+    side_int: int,
+    pre_position_size: Decimal,
+    post_position_size: Decimal,
+    pre_position_side: str,
+    post_position_side: str,
+    remaining_evidence: Optional[Decimal] = None,
+    still_in_open_orders: bool = False,
+) -> str:
+    """Classify a Rise limit submission from position/or order evidence.
+
+    Returns one of ``OPEN`` / ``PARTIALLY_FILLED`` / ``FILLED`` /
+    ``UNKNOWN``. Never infers FILLED from disappearance alone.
+
+    * OPEN: order still active with non-zero remaining and no contradictory
+      state.
+    * FILLED: confirmed position growth equals the requested quantity (or
+        equivalent evidence proves full execution).
+    * PARTIALLY_FILLED: confirmed fill delta > 0 and < requested quantity.
+    * UNKNOWN: order disappeared with no sufficient position evidence, or the
+        evidence is conflicting.
+    """
+    requested = abs(requested_volume)
+    submitted = abs(submitted_volume) if submitted_volume is not None else requested
+    # Expected growth sign per side.
+    growth = abs(post_position_size) - abs(pre_position_size)
+    # For BUY (0), a correctly-placed buy grows the long position.
+    pre_open = pre_position_size > 0 and pre_position_side in ("long", "short")
+
+    if still_in_open_orders:
+        rem = remaining_evidence
+        if rem is not None and rem > 0:
+            return "OPEN"
+        # Present but no remaining evidence; treat as open (defensive).
+        return "OPEN"
+
+    # Not in openOrders — never conclude FILLED from disappearance alone.
+    if growth is None:
+        return "UNKNOWN"
+
+    # Confirmed position growth vs requested.
+    if growth <= 0:
+        return "UNKNOWN"
+
+    fill_ratio = growth / submitted if submitted > 0 else Decimal("0")
+    if fill_ratio >= Decimal("0.999"):
+        return "FILLED"
+    if fill_ratio > 0:
+        if growth < requested:
+            return "PARTIALLY_FILLED"
+        return "FILLED"
+    return "UNKNOWN"
+
+
+def _order_id_in_open_orders(
+    wallet: str,
+    market_cache: Dict[str, Dict[str, Any]],
+    market_id: str,
+    target_order_id: Optional[str],
+) -> bool:
+    """Return True if *target_order_id* is still present in openOrders.
+
+    Used by the gated limit-result reconciliation to distinguish an order that
+    still rests (OPEN) from one that disappeared (filled / partial / unknown).
+    """
+    target = str(target_order_id or "").strip()
+    if not target:
+        return False
+    try:
+        open_payload = _fetch_open_orders_payload(wallet)
+        rows = _normalize_open_orders(open_payload, market_cache)
+    except Exception:
+        return False
+    for row in rows:
+        if str(row.get("order_id") or "").strip() == target:
+            return True
+    return False
+
+
 def _extract_response_order_id(payload: Any) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -1272,7 +1412,12 @@ def _submit_rise_limit_order(
     operation: str,
     account: str,
     verify_after_submit: bool = True,
+    client_order_id: Optional[str] = None,
 ) -> Tuple[CanonicalResponse, Dict[str, Any], Decimal, Decimal]:
+    # Caller-supplied GoldenFibo V2 client ID; None ⇒ /trade default.
+    _submitted_client_id = (
+        client_order_id if client_order_id is not None else RISE_V2_DEFAULT_ID
+    )
     step_price = _decimal_or_none(market.get("step_price"))
     step_size = _decimal_or_none(market.get("step_size"))
     min_order_size = _decimal_or_none(market.get("min_order_size")) or Decimal("0")
@@ -1363,7 +1508,12 @@ def _submit_rise_limit_order(
         "reduce_only": reduce_only,
         "stp_mode": RISE_STP_DEFAULT,
         "ttl_units": 0,
-        "client_order_id": "0",
+        
+
+
+
+
+"client_order_id": _submitted_client_id,
         "builder_id": 0,
         "permit": permit,
     }
@@ -1664,6 +1814,1292 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 (market_immediate) / Phase 2 (cancel_order) / GF read-stubs.
+# Only market_immediate is fully implemented in Phase 1. The other
+# helpers return NOT_IMPLEMENTED on purpose so later phases plug them in
+# without bloating this commit.
+# ---------------------------------------------------------------------------
+
+import time as _t
+
+RISE_DEFAULT_IMMEDIATE_SLIP_PCT = Decimal("0.01")
+RISE_IMMEDIATE_VERIFY_WAIT_SECONDS = 6.0
+RISE_IMMEDIATE_VERIFY_POLL_SECONDS = 0.5
+
+
+def _rise_market_price(account: str, requested_symbol: str) -> Decimal:
+    """Read reference price for *requested_symbol*.
+
+    /v1/markets items have ``last_price`` at the top level, not inside
+    ``config`` — so we cannot rely on the cache which only flattens config
+    keys. Read the raw payload directly.
+    """
+    try:
+        payload = _get_json(f"{_api_base()}/v1/markets")
+    except Exception:
+        return Decimal("0")
+    if not isinstance(payload, dict):
+        return Decimal("0")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    raw_markets = data.get("markets") if isinstance(data, dict) else None
+    if not isinstance(raw_markets, list):
+        return Decimal("0")
+    target = (requested_symbol or "").strip().upper()
+    for m in raw_markets:
+        if not isinstance(m, dict):
+            continue
+        cfg = m.get("config") if isinstance(m.get("config"), dict) else {}
+        name_candidates = [
+            str(cfg.get("name") or "").strip(),
+            str(m.get("display_name") or "").strip(),
+            str(m.get("base_asset_symbol") or "").strip(),
+        ]
+        if not any(_rise_symbol(n).upper() == target for n in name_candidates if n):
+            continue
+        # Prefer last → mark → mid → index → oracle
+        try:
+            for key in (
+                "last_price",
+                "last_traded_price",
+                "mark_price",
+                "mid_price",
+                "index_price",
+                "oracle_price",
+            ):
+                v = _decimal_or_none(m.get(key))
+                if v is not None and v > 0:
+                    return v
+        except Exception:
+            pass
+    return Decimal("0")
+
+
+def _rise_position_snapshot(wallet: str, requested_symbol: str) -> Dict[str, Any]:
+    """Return a snapshot of the position row for *requested_symbol*.
+
+    Shape::
+
+        {
+          "side": "long" | "short" | "flat",
+          "size": Decimal(absolute notional quantity, 0 when flat),
+          "entry_price": Decimal(avg_entry_price, 0 when flat),
+        }
+
+    * ``size`` is always a non-negative Decimal (we keep the absolute
+      quantity because some Rise payloads sign the size with the side).
+    * ``entry_price`` is whatever the venue reports; we do not invent
+      a value if the row is missing or zero.
+    """
+    snap = {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0")}
+    try:
+        payload = _fetch_portfolio(wallet)
+    except Exception:
+        return snap
+    if not isinstance(payload, dict):
+        return snap
+    positions_payload = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    positions = positions_payload.get("positions") if isinstance(positions_payload, dict) else None
+    if not isinstance(positions, list):
+        positions = payload.get("positions") if isinstance(payload.get("positions"), list) else []
+    target = str(requested_symbol or "").strip().upper()
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        sym = _rise_symbol(item.get("market_name") or item.get("symbol") or item.get("market"))
+        if sym.upper() != target:
+            continue
+        raw_size = _decimal_or_none(item.get("size"))
+        side_field = item.get("side")
+        side_norm = _rise_side(side_field, raw_size)
+        abs_size = abs(raw_size) if raw_size is not None else Decimal("0")
+        if abs_size <= 0:
+            side_norm = "flat"
+        entry = _decimal_or_none(item.get("avg_entry_price"))
+        if entry is None:
+            entry = Decimal("0")
+        return {
+            "side": side_norm,
+            "size": abs_size,
+            "entry_price": entry,
+        }
+    return snap
+
+
+def _execute_market_immediate(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Phase 1: bounded-limit IOC buy/sell via existing PlaceOrder.
+
+    Verification path:
+      * capture PRE-submit position snapshot
+      * submit IOC via existing signed LIMIT primitive
+      * capture POST-submit position snapshot
+      * SUCCESS iff: order not resting in openOrders AND post-side
+        matches expected_fill_side AND post-size increased by at least
+        the configured fill_threshold AND avg_entry_price inside the
+        slip bound (BUY fill <= bound, SELL fill >= bound)
+      * otherwise return FILL_NOT_CONFIRMED / FILL_SIDE_MISMATCH / ...
+        Never invent a fill.
+    """
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    requested_side = str(request.get("side") or "").strip().lower()
+    if not requested_symbol:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    if requested_side not in {"buy", "sell"}:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_SIDE", message="Side must be buy or sell.")
+    requested_volume_text = request.get("volume") or request.get("size")
+    requested_volume = _decimal_or_none(requested_volume_text)
+    if requested_volume is None or requested_volume <= 0:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_VOLUME", message="Volume must be positive.")
+
+    wallet_signer = _lookup_credentials(account)
+    if not wallet_signer or not wallet_signer[0] or not wallet_signer[1]:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="UNKNOWN_ACCOUNT", message="Unknown or incomplete Rise account credentials.")
+    wallet, signer_private = wallet_signer
+    expected_fill_side = "long" if requested_side == "buy" else "short"
+
+    # Phase 3: optional caller-supplied GoldenFibo V2 client_order_id.
+    raw_cid_mi = (
+        request.get("client_order_id")
+        if "client_order_id" in request
+        else (
+            request.get("client_id")
+            or request.get("client_order_index")
+        )
+    )
+    try:
+        normalized_cid_mi = _rise_normalize_v2_client_order_id(raw_cid_mi)
+    except ValueError as exc:
+        return make_failure(
+            operation="market_immediate",
+            exchange=name,
+            account=account,
+            code="RISE_CLIENT_ORDER_ID_UNSUPPORTED",
+            message=str(exc),
+        )
+    market_immediate_client_order_id = normalized_cid_mi or RISE_V2_DEFAULT_ID
+
+    if "slip_pct" in request:
+        parsed_slip = _decimal_or_none(request.get("slip_pct"))
+        if parsed_slip is None:
+            return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_SLIP_PCT", message="slip_pct could not be parsed.")
+        slip_pct = parsed_slip
+    else:
+        slip_pct = RISE_DEFAULT_IMMEDIATE_SLIP_PCT
+    if slip_pct <= 0 or slip_pct > Decimal("0.5"):
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_SLIP_PCT", message="slip_pct must be in (0, 0.5].")
+
+    requested_threshold = _decimal_or_none(request.get("fill_threshold")) or Decimal("0.95")
+    if requested_threshold <= 0 or requested_threshold > Decimal("1"):
+        requested_threshold = Decimal("0.95")
+
+    max_wait_text = request.get("max_wait_seconds")
+    if max_wait_text is None:
+        max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+    else:
+        try:
+            max_wait = float(max_wait_text)
+        except Exception:
+            max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+    if max_wait <= 0 or max_wait > 60:
+        max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+
+    try:
+        markets_payload = _fetch_markets_payload()
+        cache = _market_cache(markets_payload, {})
+    except Exception as exc:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="MARKETS_READ_FAILED", message=str(exc))
+
+    market = _resolve_market_by_symbol(requested_symbol, cache)
+    if market is None:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INSTRUMENT_NOT_FOUND", message="Instrument not found.")
+
+    step_price = _decimal_or_none(market.get("step_price"))
+    step_size = _decimal_or_none(market.get("step_size"))
+    min_order_size = _decimal_or_none(market.get("min_order_size")) or Decimal("0")
+    if step_price is None or step_price <= 0 or step_size is None or step_size <= 0:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_MARKET_METADATA", message="Missing step sizes.")
+
+    submitted_volume = _rise_quantize_to_step(requested_volume, step_size)
+    if submitted_volume <= 0 or submitted_volume < min_order_size:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_VOLUME", message="Volume rounds below market minimum after quantization.")
+
+    reference = _rise_market_price(account, requested_symbol)
+    if reference <= 0:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="MARK_PRICE_UNAVAILABLE", message="Reference price unavailable; cannot price market-immediate slip bound.")
+    if requested_side == "buy":
+        slip_price = reference * (Decimal("1") + slip_pct)
+    else:
+        slip_price = reference * (Decimal("1") - slip_pct)
+    slip_price = _rise_quantize_to_step(slip_price, step_price)
+    if slip_price <= 0:
+        return make_failure(operation="market_immediate", exchange=name, account=account, code="INVALID_SLIP_PRICE", message="Computed slip-price invalid.")
+
+    pre = _rise_position_snapshot(wallet, requested_symbol)
+
+    response, _payload, sub_vol, sub_price = _submit_rise_limit_order(
+        wallet=wallet,
+        signer_private=signer_private,
+        market_cache=cache,
+        market=market,
+        requested_symbol=requested_symbol,
+        requested_side=requested_side,
+        requested_volume=submitted_volume,
+        requested_price=slip_price,
+        requested_tif="IOC",
+        reduce_only=False,
+        operation="market_immediate",
+        account=account,
+        verify_after_submit=False,
+        client_order_id=market_immediate_client_order_id,
+    )
+    submitted_order = getattr(response, "order", None)
+    raw_exchange_order_id = (
+        submitted_order.exchange_order_id if submitted_order is not None else None
+    )
+    if raw_exchange_order_id is None:
+        # Try to recover from raw payload (raw response body).
+        try:
+            resp_obj = response
+        except Exception:
+            resp_obj = None
+        # _submit_rise_limit_order returned (resp, payload, ...) — already destructured
+        # but we can reach in via _payload closure? not directly. Best effort: if the
+        # response carries no exchange_order_id we treat as no-fill.
+        pass
+
+    deadline = _t.time() + max_wait
+    last_post = pre
+    while _t.time() < deadline:
+        try:
+            open_payload = _fetch_open_orders_payload(wallet)
+            rows = _normalize_open_orders(open_payload, cache)
+        except Exception:
+            rows = []
+        still_resting = bool(raw_exchange_order_id) and any(
+            str(r.get("order_id") or "") == str(raw_exchange_order_id) for r in rows
+        )
+        post = _rise_position_snapshot(wallet, requested_symbol)
+        last_post = post
+
+        if post["side"] == expected_fill_side and pre["side"] == expected_fill_side:
+            delta = post["size"] - pre["size"]
+        elif post["side"] == expected_fill_side and pre["side"] == "flat":
+            delta = post["size"]
+        else:
+            delta = Decimal("0")
+
+        if (not still_resting) and post["side"] == expected_fill_side and delta >= submitted_volume * requested_threshold:
+            fill_price = post["entry_price"]
+            if fill_price <= 0:
+                return make_failure(
+                    operation="market_immediate",
+                    exchange=name,
+                    account=account,
+                    code="FILL_NOT_CONFIRMED",
+                    message="Post-fill snapshot is missing avg_entry_price.",
+                    order_state={
+                        "exchange_order_id": raw_exchange_order_id,
+                        "submitted_volume": _decimal_text(submitted_volume),
+                        "submitted_price": _decimal_text(slip_price),
+                        "reference_price": _decimal_text(reference),
+                        "post_position": {
+                            "side": post["side"],
+                            "size": _decimal_text(post["size"]),
+                        },
+                    },
+                )
+            if requested_side == "buy" and fill_price > slip_price:
+                return make_failure(
+                    operation="market_immediate",
+                    exchange=name,
+                    account=account,
+                    code="FILL_PRICE_OUT_OF_SLIP",
+                    message=f"avg_entry_price {fill_price} above BUY slip bound {slip_price}.",
+                    order_state={
+                        "exchange_order_id": raw_exchange_order_id,
+                        "submitted_price": _decimal_text(slip_price),
+                        "fill_price": _decimal_text(fill_price),
+                    },
+                )
+            if requested_side == "sell" and fill_price < slip_price:
+                return make_failure(
+                    operation="market_immediate",
+                    exchange=name,
+                    account=account,
+                    code="FILL_PRICE_OUT_OF_SLIP",
+                    message=f"avg_entry_price {fill_price} below SELL slip bound {slip_price}.",
+                    order_state={
+                        "exchange_order_id": raw_exchange_order_id,
+                        "submitted_price": _decimal_text(slip_price),
+                        "fill_price": _decimal_text(fill_price),
+                    },
+                )
+            return make_success(
+                operation="market_immediate",
+                exchange=name,
+                account=account,
+                order=CanonicalOrderResult(
+                    symbol=requested_symbol,
+                    side=expected_fill_side,
+                    order_type="market",
+                    requested_volume=_decimal_text(requested_volume),
+                    requested_price=_decimal_text(reference),
+                    submitted_volume=_decimal_text(submitted_volume),
+                    submitted_price=_decimal_text(slip_price),
+                    verified=True,
+                    status="filled",
+                    exchange_order_id=raw_exchange_order_id,
+                    client_order_id="0",
+                ),
+                order_state={
+                    "fill_size": _decimal_text(post["size"]),
+                    "fill_price": _decimal_text(fill_price),
+                    "delta_size": _decimal_text(delta),
+                    "pre_position_size": _decimal_text(pre["size"]),
+                    "pre_position_side": pre["side"],
+                    "still_resting": False,
+                    "submitted_client_order_id": market_immediate_client_order_id,
+                    "venue_client_order_id": "",
+                    "venue_roundtrip_verified": False,
+                },
+            )
+        _t.sleep(RISE_IMMEDIATE_VERIFY_POLL_SECONDS)
+
+    pre_size = pre["size"]
+    pre_side = pre["side"]
+    post_side = last_post["side"]
+    post_size = last_post["size"]
+    if post_side == expected_fill_side and pre_side == expected_fill_side:
+        delta = post_size - pre_size
+    elif post_side == expected_fill_side and pre_side == "flat":
+        delta = post_size
+    else:
+        delta = Decimal("0")
+    note = {
+        "exchange_order_id": raw_exchange_order_id,
+        "submitted_volume": _decimal_text(submitted_volume),
+        "submitted_price": _decimal_text(slip_price),
+        "reference_price": _decimal_text(reference),
+        "pre_position_side": pre_side,
+        "pre_position_size": _decimal_text(pre_size),
+        "post_position_side": post_side,
+        "post_position_size": _decimal_text(post_size),
+        "delta_size": _decimal_text(delta),
+    }
+    if post_side == ("short" if expected_fill_side == "long" else "long"):
+        return make_failure(
+            operation="market_immediate",
+            exchange=name,
+            account=account,
+            code="FILL_SIDE_MISMATCH",
+            message=f"Post-submit position side {post_side} is opposite to expected {expected_fill_side}.",
+            order_state=note,
+        )
+    if delta <= 0:
+        return make_failure(
+            operation="market_immediate",
+            exchange=name,
+            account=account,
+            code="FILL_NOT_CONFIRMED",
+            message="No position-size increase observed; the IOC may not have filled.",
+            order_state=note,
+        )
+    required = submitted_volume * requested_threshold
+    if delta < required:
+        return make_failure(
+            operation="market_immediate",
+            exchange=name,
+            account=account,
+            code="FILL_NOT_CONFIRMED",
+            message=f"Position delta {delta} below required threshold {required}. Partial fill observed.",
+            order_state=note,
+        )
+    return make_failure(
+        operation="market_immediate",
+        exchange=name,
+        account=account,
+        code="FILL_NOT_CONFIRMED",
+        message="Verification window exhausted.",
+        order_state=note,
+    )
+
+
+
+def _execute_cancel_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Phase 2: cancel EXACTLY one Rise order by venue order_id.
+
+    Identifier: ``exchange_order_id`` (canonical venue string such as
+    ``"0xc0000024ef...00006f"``). Symbol is optional context only.
+    ``resting_order_id`` is accepted because the venue distinguishes the
+    canonical ``order_id`` from the integer used in the EIP712 cancel
+    signature.
+
+    Outcomes are normalized via ``order_state``:
+
+        CANCELED            — target was active, venue accepted, target
+                              gone on post-confirm; unrelated preserved.
+        ALREADY_TERMINAL    — target absent pre-submit (already canceled,
+                              filled, or never existed).
+        NOT_CONFIRMED       — cancel submitted but post-state unclear.
+        FAILED              — venue rejected or broader cancellation
+                              detected.
+    """
+    wallet_signer = _lookup_credentials(account)
+    if not wallet_signer or not wallet_signer[0] or not wallet_signer[1]:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or incomplete Rise account credentials.",
+            order_state={"identity_provided": _public_cancel_id_or_none(request)},
+        )
+
+    wallet, signer_private = wallet_signer
+
+    raw_order_id = str(
+        request.get("exchange_order_id")
+        or request.get("order_id")
+        or request.get("resting_order_id")
+        or ""
+    ).strip()
+    if not raw_order_id:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="MISSING_ORDER_ID",
+            message="exchange_order_id is required.",
+        )
+    if len(raw_order_id) > 128:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="MALFORMED_ORDER_ID",
+            message="exchange_order_id is too long.",
+        )
+    if not re.match(r"^[0-9a-zA-Z]+$", raw_order_id):
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="MALFORMED_ORDER_ID",
+            message="exchange_order_id must be alphanumeric only.",
+        )
+
+    context_symbol = str(request.get("symbol") or "").strip().upper()
+
+    # PRE: read openOrders so we can both confirm target identity and
+    # capture "other" ids to prove later that we did not mutate them.
+    try:
+        markets_payload = _fetch_markets_payload()
+        cache = _market_cache(markets_payload, {})
+        pre_open_payload = _fetch_open_orders_payload(wallet)
+        pre_open_rows = _normalize_open_orders(pre_open_payload, cache)
+    except Exception as exc:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="PRE_READ_FAILED",
+            message=f"openOrders read failed: {exc}",
+            order_state={"target": raw_order_id},
+        )
+
+    target_row = None
+    other_target_ids = []
+    for row in pre_open_rows:
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        if oid == raw_order_id:
+            if target_row is not None:
+                return make_failure(
+                    operation="cancel_order",
+                    exchange=name, account=account,
+                    code="DUPLICATE_TARGET_ID",
+                    message="Target id matched multiple active orders; refusing to act.",
+                    order_state={"target": raw_order_id},
+                )
+            target_row = row
+        else:
+            other_target_ids.append(oid)
+
+    if target_row is None:
+        note = {
+            "target": raw_order_id,
+            "context_symbol": context_symbol or None,
+            "active_orders_seen": len(pre_open_rows),
+            "unrelated_count": len(other_target_ids),
+        }
+        return make_success(
+            operation="cancel_order",
+            exchange=name, account=account,
+            order_state={"outcome": "ALREADY_TERMINAL", **note},
+        )
+
+    if context_symbol:
+        resolved_market_id = str(target_row.get("market_id") or "").strip()
+        matched_symbol = None
+        for m in (markets_payload.get("markets") or []):
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("market_id") or "") == resolved_market_id:
+                cfg = m.get("config") if isinstance(m.get("config"), dict) else {}
+                matched_symbol = _rise_symbol(cfg.get("name") or m.get("display_name"))
+                break
+        if matched_symbol and matched_symbol.upper() != context_symbol:
+            return make_failure(
+                operation="cancel_order",
+                exchange=name, account=account,
+                code="IDENTITY_MISMATCH",
+                message=(
+                    f"Target exchange_order_id belongs to {matched_symbol} but "
+                    f"caller supplied context_symbol={context_symbol}."
+                ),
+                order_state={"target": raw_order_id, "matched_symbol": matched_symbol},
+            )
+
+    resting_order_id = str(target_row.get("resting_order_id") or "").strip()
+    market_id_int = target_row.get("market_id")
+    if not resting_order_id or market_id_int is None:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="MISSING_RISK_METADATA",
+            message="Target open-order row lacks required cancel metadata (resting_order_id/market_id).",
+            order_state={"target": raw_order_id},
+        )
+    try:
+        market_id_value = int(market_id_int)
+        resting_order_id_value = int(resting_order_id)
+    except (TypeError, ValueError):
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="MALFORMED_RISK_METADATA",
+            message="Target open-order metadata is non-integer.",
+            order_state={"target": raw_order_id},
+        )
+
+    # SUBMIT: exactly one POST /v1/orders/cancel.
+    try:
+        nonce_state = _fetch_nonce_state(wallet)
+        nonce_anchor = int(str(nonce_state.get("nonce_anchor") or 0))
+        nonce_bitmap_index = int(str(nonce_state.get("current_bitmap_index") or 0))
+        if nonce_bitmap_index > 207:
+            nonce_anchor += 1
+            nonce_bitmap_index = 0
+        deadline = _rise_order_deadline()
+        action_hash = _rise_encode_cancel_action_hash(
+            market_id=market_id_value,
+            resting_order_id=resting_order_id_value,
+        )
+        signature = _rise_sign_eip712_verify_witness(
+            signer_private_key=signer_private,
+            domain_separator=b"",
+            account=wallet,
+            target=_rise_router_address(),
+            action_hash=action_hash,
+            nonce_anchor=nonce_anchor,
+            nonce_bitmap_index=nonce_bitmap_index,
+            deadline=deadline,
+        )
+        from eth_account import Account
+        signer_address = Account.from_key(signer_private).address
+        permit = {
+            "account": wallet,
+            "signer": signer_address,
+            "deadline": int(deadline),
+            "nonce_anchor": str(nonce_anchor),
+            "nonce_bitmap_index": int(nonce_bitmap_index),
+            "signature": _rise_sig_to_base64(signature),
+        }
+        cancel_body = {
+            "market_id": int(market_id_value),
+            "order_id": raw_order_id,
+            "permit": permit,
+        }
+        _post_json(f"{_api_base()}/v1/orders/cancel", cancel_body)
+    except _RiseHTTPError as exc:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="CANCEL_REJECTED",
+            message=f"HTTP {exc.status} on {exc.path}: {exc.body[:200]}",
+            order_state={"target": raw_order_id, "outcome": "FAILED"},
+        )
+    except Exception as exc:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name, account=account,
+            code="CANCEL_REJECTED",
+            message=sanitize_error_message(str(exc)),
+            order_state={"target": raw_order_id, "outcome": "FAILED"},
+        )
+
+    # POST: verify target is gone from openOrders AND unrelated orders
+    # remained intact.
+    try:
+        post_open_payload = _fetch_open_orders_payload(wallet)
+        post_rows = _normalize_open_orders(post_open_payload, cache)
+    except Exception as exc:
+        return make_success(
+            operation="cancel_order",
+            exchange=name, account=account,
+            order_state={
+                "outcome": "NOT_CONFIRMED",
+                "target": raw_order_id,
+                "reason": f"post-read failed: {exc}",
+            },
+        )
+
+    target_post_ids = {
+        str(row.get("order_id") or "").strip()
+        for row in post_rows
+        if str(row.get("order_id") or "").strip()
+    }
+    target_gone = raw_order_id not in target_post_ids
+    unrelated_preserved = all(
+        oid in target_post_ids for oid in other_target_ids
+    ) if other_target_ids else True
+
+    if target_gone and unrelated_preserved:
+        return make_success(
+            operation="cancel_order",
+            exchange=name, account=account,
+            order_state={
+                "outcome": "CANCELED",
+                "target": raw_order_id,
+                "unrelated_preserved": True,
+                "unrelated_count": len(other_target_ids),
+            },
+        )
+    if not target_gone:
+        return make_success(
+            operation="cancel_order",
+            exchange=name, account=account,
+            order_state={
+                "outcome": "NOT_CONFIRMED",
+                "target": raw_order_id,
+                "reason": "target still active after cancel",
+            },
+        )
+    return make_success(
+        operation="cancel_order",
+        exchange=name, account=account,
+        order_state={
+            "outcome": "FAILED",
+            "target": raw_order_id,
+            "reason": "broader cancellation detected (unrelated orders missing)",
+        },
+    )
+
+
+def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Phase 4: safe reduce-only close of an existing Rise position.
+
+    Mechanism: PlaceOrder with ``reduce_only=True`` (on-chain enforced via the
+    ``order_flags`` bit carried in the EIP712 ``action_hash``). The opposite
+    side IOC + exact actual position size guarantees no reversal because the
+    venue refuses to overshoot.
+
+    Outcomes are normalized via ``order_state``:
+        CLOSED                  - position verified flat post-submit
+        ALREADY_FLAT            - pre read showed no position (idempotent)
+        NOT_CONFIRMED           - close submitted but flat unverified in window
+        FAILED                  - venue rejected, side mismatch, or wider mutation
+
+    Exactly one close submission is ever attempted. Transient 429s retry the
+    verification read only — never the close.
+    """
+    wallet_signer = _lookup_credentials(account)
+    if not wallet_signer or not wallet_signer[0] or not wallet_signer[1]:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or incomplete Rise account credentials.",
+        )
+
+    wallet, signer_private = wallet_signer
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="symbol is required.",
+        )
+
+    # Caller must NOT supply a non-zero client_order_id (Phase 3 evidence).
+    raw_cid = (
+        request.get("client_order_id")
+        if "client_order_id" in request
+        else (
+            request.get("client_id")
+            or request.get("client_order_index")
+        )
+    )
+    try:
+        normalized_cid = _rise_normalize_v2_client_order_id(raw_cid)
+    except ValueError as exc:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="RISE_CLIENT_ORDER_ID_UNSUPPORTED",
+            message=str(exc),
+        )
+    client_order_id = normalized_cid or RISE_V2_DEFAULT_ID
+
+    # Slip bound, default to 0.5% — must be a tight enough bound that the
+    # reduce-only fill is acceptable.
+    if "slip_pct" in request:
+        parsed_slip = _decimal_or_none(request.get("slip_pct"))
+        if parsed_slip is None:
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=account,
+                code="INVALID_SLIP_PCT",
+                message="slip_pct could not be parsed.",
+            )
+        slip_pct = parsed_slip
+    else:
+        slip_pct = RISE_DEFAULT_IMMEDIATE_SLIP_PCT
+    if slip_pct <= 0 or slip_pct > Decimal("0.5"):
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="INVALID_SLIP_PCT",
+            message="slip_pct must be in (0, 0.5].",
+        )
+
+    max_wait_text = request.get("max_wait_seconds")
+    if max_wait_text is None:
+        max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+    else:
+        try:
+            max_wait = float(max_wait_text)
+        except Exception:
+            max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+    if max_wait <= 0 or max_wait > 60:
+        max_wait = RISE_IMMEDIATE_VERIFY_WAIT_SECONDS
+
+    # Load markets / cache.
+    try:
+        markets_payload = _fetch_markets_payload()
+        cache = _market_cache(markets_payload, {})
+    except Exception as exc:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=str(exc),
+        )
+    market = _resolve_market_by_symbol(requested_symbol, cache)
+    if market is None:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message="Instrument not found.",
+        )
+    step_price = _decimal_or_none(market.get("step_price"))
+    step_size = _decimal_or_none(market.get("step_size"))
+    if step_price is None or step_size is None or step_price <= 0 or step_size <= 0:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="INVALID_MARKET_METADATA",
+            message="Missing step sizes.",
+        )
+
+    # PRE: read live position snapshot for THIS symbol.
+    pre = _rise_position_snapshot(wallet, requested_symbol)
+    pre_size = pre["size"]
+    pre_side = pre["side"]
+    pre_entry = pre["entry_price"]
+
+    if pre_size <= 0:
+        # Already flat. Idempotent success.
+        return make_success(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            order_state={
+                "outcome": "ALREADY_FLAT",
+                "symbol": requested_symbol,
+                "pre_position_size": _decimal_text(pre_size),
+                "pre_position_side": pre_side,
+            },
+        )
+
+    # Determine close side + size.
+    close_side = "sell" if pre_side == "long" else "buy"
+    close_size = _rise_quantize_to_step(pre_size, step_size)
+    if close_size <= 0:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="INVALID_CLOSE_SIZE",
+            message=f"Pre-close size {pre_size} rounds to zero after quantization.",
+            order_state={"pre_position_size": _decimal_text(pre_size)},
+        )
+
+    # Compute slip-bound price for the immediate fill.
+    reference = _rise_market_price(account, requested_symbol)
+    if reference <= 0:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="MARK_PRICE_UNAVAILABLE",
+            message="Reference price unavailable; cannot price close slip bound.",
+        )
+    if close_side == "sell":
+        slip_price = reference * (Decimal("1") - slip_pct)
+    else:
+        slip_price = reference * (Decimal("1") + slip_pct)
+    slip_price = _rise_quantize_to_step(slip_price, step_price)
+    if slip_price <= 0:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="INVALID_SLIP_PRICE",
+            message="Computed slip-price invalid.",
+        )
+
+    # SUBMIT: one PlaceOrder with reduce_only=True, IOC, opposite side, exact size.
+    response, _payload, sub_vol, sub_price = _submit_rise_limit_order(
+        wallet=wallet,
+        signer_private=signer_private,
+        market_cache=cache,
+        market=market,
+        requested_symbol=requested_symbol,
+        requested_side=close_side,
+        requested_volume=close_size,
+        requested_price=slip_price,
+        requested_tif="IOC",
+        reduce_only=True,  # on-chain enforced
+        operation="close_position",
+        account=account,
+        verify_after_submit=False,
+        client_order_id=client_order_id,
+    )
+    submitted_order = getattr(response, "order", None)
+    raw_close_order_id = (
+        submitted_order.exchange_order_id if submitted_order is not None else None
+    )
+
+    if not getattr(response, "success", False):
+        # Surface the venue error (e.g. on-chain revert because reduce_only
+        # can't be honoured with the current state). No retry, no duplicate close.
+        return response
+
+    # POST: poll position until flat, idempotent, or timeout.
+    deadline = _t.time() + max_wait
+    last_post = pre
+    while _t.time() < deadline:
+        try:
+            post = _rise_position_snapshot(wallet, requested_symbol)
+        except Exception:
+            post = last_post  # transient read failure: stay with what we know
+        last_post = post
+        # hard-fail if venue shows the opposite side.
+        if post["side"] != "flat" and post["side"] != pre_side:
+            return make_success(
+                operation="close_position",
+                exchange=name,
+                account=account,
+                order_state={
+                    "outcome": "FAILED",
+                    "symbol": requested_symbol,
+                    "reason": (
+                        f"post-side {post['side']} is opposite to pre-side {pre_side};"
+                        " the close would have reversed exposure"
+                    ),
+                    "submitted_size": _decimal_text(sub_vol),
+                    "submitted_price": _decimal_text(sub_price),
+                    "exchange_order_id": raw_close_order_id,
+                    "pre_position_side": pre_side,
+                    "pre_position_size": _decimal_text(pre_size),
+                    "post_position_side": post["side"],
+                    "post_position_size": _decimal_text(post["size"]),
+                },
+            )
+        if post["size"] == 0:
+            return make_success(
+                operation="close_position",
+                exchange=name,
+                account=account,
+                order_state={
+                    "outcome": "CLOSED",
+                    "symbol": requested_symbol,
+                    "submitted_size": _decimal_text(sub_vol),
+                    "submitted_price": _decimal_text(sub_price),
+                    "fill_price": _decimal_text(post["entry_price"] or pre_entry),
+                    "exchange_order_id": raw_close_order_id,
+                    "pre_position_size": _decimal_text(pre_size),
+                    "pre_position_side": pre_side,
+                    "post_position_size": _decimal_text(post["size"]),
+                },
+            )
+        _t.sleep(RISE_IMMEDIATE_VERIFY_POLL_SECONDS)
+
+    # Window exhausted.
+    return make_success(
+        operation="close_position",
+        exchange=name,
+        account=account,
+        order_state={
+            "outcome": "NOT_CONFIRMED",
+            "symbol": requested_symbol,
+            "submitted_size": _decimal_text(sub_vol),
+            "submitted_price": _decimal_text(sub_price),
+            "exchange_order_id": raw_close_order_id,
+            "pre_position_size": _decimal_text(pre_size),
+            "pre_position_side": pre_side,
+            "post_position_size": _decimal_text(last_post["size"]),
+            "post_position_side": last_post["side"],
+            "reason": "verification window exhausted; close was submitted exactly once",
+        },
+    )
+
+
+def _public_cancel_id_or_none(request: Dict[str, Any]) -> Optional[str]:
+    cand = (
+        request.get("exchange_order_id")
+        or request.get("order_id")
+        or request.get("resting_order_id")
+    )
+    if cand is None:
+        return None
+    text = str(cand).strip()
+    return text or None
+
+
+
+def _rise_market_metadata(requested_symbol: str) -> Optional[Dict[str, Any]]:
+    """Return normalized market metadata for *requested_symbol*.
+
+    Single source of truth for GoldenFibo resolve_instrument /
+    market_constraints / market_price reads. Raises on read failure so the
+    caller can map it to a canonical failure.
+
+    Returns::
+
+        {
+          "symbol": canonical bare asset symbol,
+          "market_id": str,
+          "step_size": str,
+          "step_price": str,
+          "min_order_size": str,
+          "active": bool,
+        }
+    """
+    requested = str(requested_symbol or "").strip().upper()
+    if not requested:
+        return None
+    markets_payload = _fetch_markets_payload()
+    cache = _market_cache(markets_payload, {})
+    market = _resolve_market_by_symbol(requested, cache)
+    if market is None:
+        return None
+    step_price = _decimal_or_none(market.get("step_price"))
+    step_size = _decimal_or_none(market.get("step_size"))
+    # Do NOT invent missing mandatory steps. Surface them as empty strings so
+    # downstream preflight (market_constraints) can fail with
+    # INVALID_MARKET_METADATA rather than fabricating values.
+    return {
+        "market": {
+            "symbol": (market.get("symbol") or requested).strip().upper(),
+            "market_id": market.get("market_id"),
+            "step_size": _decimal_text(step_size) if step_size is not None else "",
+            "step_price": _decimal_text(step_price) if step_price is not None else "",
+            "min_order_size": _decimal_text(_decimal_or_none(market.get("min_order_size")) or Decimal("0")),
+            "active": bool(market.get("active", True)),
+        },
+        "market_id": market.get("market_id"),
+        "symbol": (market.get("symbol") or requested).strip().upper(),
+        "size_step": _decimal_text(step_size) if step_size is not None else "",
+        "price_tick": _decimal_text(step_price) if step_price is not None else "",
+        "min_size": _decimal_text(_decimal_or_none(market.get("min_order_size")) or Decimal("0")),
+        "size_precision": _step_precision(step_size),
+        "price_precision": _step_precision(step_price),
+    }
+
+
+def _market_constraints_fields(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize GoldenFibo preflight constraint fields from metadata."""
+    if not meta:
+        return {}
+    market = meta.get("market") or {}
+    return {
+        "symbol": meta.get("symbol"),
+        "market_id": market.get("market_id"),
+        "price_tick": meta.get("price_tick"),
+        "size_step": meta.get("size_step"),
+        "min_size": meta.get("min_size"),
+        "size_precision": meta.get("size_precision"),
+        "price_precision": meta.get("price_precision"),
+        "min_notional": None,  # Rise does not expose an explicit min notional.
+        "active": market.get("active"),
+    }
+
+
+def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    requested_symbol = str(request.get("symbol") or request.get("instrument") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        meta = _rise_market_metadata(requested_symbol)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    if meta is None:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    market = meta.get("market") or {}
+    instrument = CanonicalInstrument(
+        requested_symbol=requested_symbol,
+        symbol=str(market.get("symbol") or requested_symbol),
+        display_name=str(market.get("symbol") or requested_symbol),
+        price_increment=market.get("step_price"),
+        size_increment=market.get("step_size"),
+        minimum_size=market.get("min_order_size"),
+    )
+    return make_success(
+        operation="resolve_instrument",
+        exchange=name,
+        account=account,
+        instrument=instrument,
+        order_state=_market_constraints_fields(meta),
+    )
+
+
+def _execute_market_constraints(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    requested_symbol = str(request.get("symbol") or request.get("instrument") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        meta = _rise_market_metadata(requested_symbol)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    if meta is None:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    fields = _market_constraints_fields(meta)
+    # GoldenFibo preflight treats missing mandatory metadata as a hard fail.
+    # (Rise's market cache defaults absent steps to "0", so treat non-positive
+    # step values as missing rather than fabricating them.)
+    step_tick_d = _decimal_or_none(fields.get("price_tick"))
+    step_size_d = _decimal_or_none(fields.get("size_step"))
+    if (
+        not fields.get("price_tick")
+        or not fields.get("size_step")
+        or step_tick_d is None
+        or step_tick_d <= 0
+        or step_size_d is None
+        or step_size_d <= 0
+    ):
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code="INVALID_MARKET_METADATA",
+            message="Missing mandatory market step metadata.",
+        )
+    return make_success(
+        operation="market_constraints",
+        exchange=name,
+        account=account,
+        order_state=fields,
+    )
+
+
+def _execute_market_price(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    requested_symbol = str(request.get("symbol") or request.get("instrument") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        meta = _rise_market_metadata(requested_symbol)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    if meta is None:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    # Same reference-price source market_immediate uses for IOC slippage.
+    reference_raw = _rise_market_price(account, requested_symbol)
+    if reference_raw <= 0:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MARK_PRICE_UNAVAILABLE",
+            message="Reference price unavailable.",
+        )
+    symbol = str(meta.get("symbol") or requested_symbol)
+    mark_price = CanonicalMarketPrice(
+        requested_symbol=requested_symbol,
+        market=str(meta.get("market_id") or ""),
+        mark_price=_decimal_text(reference_raw),
+        price=_decimal_text(reference_raw),
+    )
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account,
+        market_price=mark_price,
+        order_state={"symbol": symbol, "market_id": meta.get("market_id")},
+    )
+
+
+def _execute_position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    wallet, _signer_private = _lookup_credentials(account)
+    if not wallet:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or incomplete Rise account credentials.",
+        )
+    requested_symbol = str(request.get("symbol") or request.get("instrument") or "").strip().upper()
+    if not requested_symbol:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        snap = _rise_position_snapshot(wallet, requested_symbol)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code="POSITIONS_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    size = snap.get("size")
+    if size is not None and size <= 0:
+        side = "flat"
+    else:
+        side = snap.get("side") or "flat"
+    if side == "flat":
+        position = CanonicalPosition(
+            symbol=requested_symbol,
+            side="flat",
+            size="0",
+            entry_price=None,
+            pnl="0",
+            tp=None,
+            sl=None,
+        )
+    else:
+        abs_size = abs(size) if size is not None else Decimal("0")
+        entry = snap.get("entry_price")
+        # Clamp: Rise portfolio may report the position with the platform's
+        # own precision; keep the venue-reported value verbatim (strings).
+        position = CanonicalPosition(
+            symbol=requested_symbol,
+            side=side,
+            size=_decimal_text(abs_size) if abs_size is not None else "0",
+            entry_price=_decimal_text(entry) if entry is not None and entry > 0 else str(entry or "0"),
+            pnl="0",
+            tp=None,
+            sl=None,
+        )
+    return make_success(
+        operation="position_state",
+        exchange=name,
+        account=account,
+        positions=[position],
+    )
+
+
+def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
+    return make_failure(
+        operation="get_order_state",
+        exchange=name,
+        account=str(request.get("account") or "").strip(),
+        code="NOT_IMPLEMENTED",
+        message="Phase 1 wiring only; full adapter lands in GF-attach phase.",
+    )
+
+
+def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalResponse:
+    return make_failure(
+        operation="get_order_state_by_client_id",
+        exchange=name,
+        account=str(request.get("account") or "").strip(),
+        code="NOT_IMPLEMENTED",
+        message="Phase 3 wires client-id reads; Phase 1 only adds market_immediate.",
+    )
+
+
+
 def _normalize_new_order_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(request, dict):
         return {}
@@ -1777,6 +3213,27 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
     requested_price_text = str(request.get("price") or "").strip()
     requested_tif = str(request.get("time_in_force") or "GTC").strip().upper() or "GTC"
     reduce_only = _coerce_bool(request.get("reduce_only"))
+
+    # Phase 3: optional caller-supplied GoldenFibo V2 client_order_id.
+    raw_cid = (
+        request.get("client_order_id")
+        if "client_order_id" in request
+        else (
+            request.get("client_id")
+            or request.get("client_order_index")
+        )
+    )
+    try:
+        normalized_cid = _rise_normalize_v2_client_order_id(raw_cid)
+    except ValueError as exc:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="RISE_CLIENT_ORDER_ID_UNSUPPORTED",
+            message=str(exc),
+        )
+    _submitted_client_id = normalized_cid or RISE_V2_DEFAULT_ID
 
     if not requested_symbol:
         return make_failure(operation="new_order", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
@@ -1900,11 +3357,16 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
             "reduce_only": reduce_only,
             "stp_mode": RISE_STP_DEFAULT,
             "ttl_units": 0,
-            "client_order_id": "0",
+            "client_order_id": _submitted_client_id,
             "builder_id": 0,
             "permit": permit,
         }
         _pre_open_orders_payload = _fetch_open_orders_payload(wallet)
+        reconcile_on_unverified = _coerce_bool(request.get("reconcile_on_unverified"))
+        # For gated reconciliation we need a pre-submission position snapshot.
+        pre_position = None
+        if reconcile_on_unverified:
+            pre_position = _rise_position_snapshot(wallet, requested_symbol)
         try:
             submission_payload = _post_json(f"{_api_base()}/v1/orders/place", payload)
         except _RiseHTTPError as exc:
@@ -1936,6 +3398,42 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
             price_ticks=price_ticks,
             response_order_id=response_order_id,
         )
+        # ALWAYS preserve the raw Rise exchange order id across every accepted
+        # submit path. Even if a post-submit verifier cannot find the order in
+        # openOrders (instant fill / partial / gone), GoldenFibo still needs the
+        # raw id for pending ownership, exact cancel, and restart reconciliation.
+        if not exchange_order_id and response_order_id:
+            exchange_order_id = response_order_id
+
+        classification: Optional[str] = None
+        remaining_size: Optional[Decimal] = None
+        if verified:
+            classification = "OPEN"
+        elif reconcile_on_unverified:
+            # Gate-only: classify via position evidence so GoldenFibo always
+            # receives a usable result instead of a VERIFICATION_FAILED raise.
+            post_position = _rise_position_snapshot(wallet, requested_symbol)
+            still_active = (
+                _order_id_in_open_orders(wallet, cache, str(market_id), exchange_order_id)
+                if exchange_order_id
+                else False
+            )
+            pre_size = Decimal(str((pre_position or {}).get("size") or "0"))
+            post_size = Decimal(str(post_position.get("size") or "0"))
+            classification = _classify_rise_limit_result(
+                requested_volume=requested_volume,
+                submitted_volume=submitted_volume,
+                side_int=side_int,
+                pre_position_size=pre_size,
+                post_position_size=post_size,
+                pre_position_side=str((pre_position or {}).get("side") or "flat"),
+                post_position_side=str(post_position.get("side") or "flat"),
+                still_in_open_orders=still_active,
+            )
+            # Remaining = submitted minus confirmed growth (never below zero).
+            growth = max(Decimal("0"), post_size - pre_size)
+            remaining_size = max(Decimal("0"), submitted_volume - growth)
+
         result = CanonicalOrderResult(
             symbol=requested_symbol,
             side=requested_side,
@@ -1944,12 +3442,37 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
             requested_price=_decimal_text(requested_price),
             submitted_volume=_decimal_text(submitted_volume),
             submitted_price=_decimal_text(submitted_price),
-            verified=verified,
-            status="success" if verified else "partial",
+            verified=verified or classification in ("OPEN", "FILLED", "PARTIALLY_FILLED"),
+            status=(
+                "success"
+                if verified
+                else (
+                    classification.lower() if classification
+                    else "partial"
+                )
+            ),
             exchange_order_id=exchange_order_id,
+            client_order_id=_submitted_client_id,
         )
         if verified:
             return make_success(operation="new_order", exchange=name, account=account, order=result)
+        if reconcile_on_unverified and classification:
+            # GoldenFibo gated path: return a usable success even when the order
+            # was not found in openOrders, so reconcile-from-position can proceed.
+            return make_success(
+                operation="new_order",
+                exchange=name,
+                account=account,
+                order=result,
+                order_state={
+                    "classification": classification,
+                    "verified": result.verified,
+                    "requested_size": _decimal_text(requested_volume),
+                    "remaining_size": (
+                        _decimal_text(remaining_size) if remaining_size is not None else "0"
+                    ),
+                },
+            )
         return make_failure(
             operation="new_order",
             exchange=name,
@@ -2198,6 +3721,25 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_ladder(account, normalized_request)
     if operation == "cancel_order_group":
         return _execute_cancel_order_group(account, normalized_request)
+    if operation == "cancel_order":
+        return _execute_cancel_order(account, normalized_request)
+    if operation == "close_position":
+        return _execute_close_position(account, normalized_request)
+    if operation == "resolve_instrument":
+        return _execute_resolve_instrument(normalized_request)
+    if operation == "market_constraints":
+        return _execute_market_constraints(normalized_request)
+    if operation == "market_price":
+        return _execute_market_price(normalized_request)
+    if operation == "position_state":
+        return _execute_position_state(account, normalized_request)
+    if operation == "get_order_state":
+        return _execute_get_order_state(normalized_request)
+    if operation == "get_order_state_by_client_id":
+        return _execute_get_order_state_by_client_id(normalized_request)
+    if operation == "market_immediate":
+        # Phase 1: bounded-limit + IOC slip within existing PlaceOrder.
+        return _execute_market_immediate(account, normalized_request)
     return make_failure(
         operation=operation,
         exchange=name,
@@ -2205,3 +3747,16 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         code="NOT_IMPLEMENTED",
         message="Not implemented yet.",
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 / 2 / 4 wiring:
+# Bounded-limit + IOC slip for immediate execution (market_immediate).
+# Single-order cancel-by-id (cancel_order).
+# Read-only wrappers required by GoldenFibo adapter contract.
+# ---------------------------------------------------------------------------
+
+RISE_DEFAULT_IMMEDIATE_SLIP_PCT = Decimal("0.01")  # 1.00% of reference mark
+RISE_IMMEDIATE_VERIFY_WAIT_SECONDS = 6.0
+RISE_IMMEDIATE_VERIFY_POLL_SECONDS = 0.5

@@ -255,6 +255,24 @@ class TestFiboDiscoveryParityWithTrade(unittest.TestCase):
         s = fibo.handle_callback(("f", 1), "back")
         self.assertEqual(s.state, "exchange")
 
+    def test_rise_supported_proceeds_to_instrument(self):
+        self.assertTrue(_golden_fibo_supported("rise"))
+        desk = _FakeDesk(
+            exchanges=["lighter", "rise"],
+            accounts={"rise": ["BASED"], "lighter": ["amiroo"]},
+        )
+        svc = _StubFiboService()
+        fibo = FiboWizard(tradedesk=desk, service=svc)
+        fibo.open(("f", 1))
+        s = fibo.handle_callback(("f", 1), "menu:start")
+        self.assertIn("RISE", _button_labels(s))
+        fibo.handle_callback(("f", 1), "exchange:rise")
+        s = fibo.handle_callback(("f", 1), "account:BASED")
+        self.assertEqual(s.state, "instrument")
+        self.assertIn("Select instrument", s.text)
+        self.assertEqual(svc.commands, [])
+        self.assertEqual(desk.execute_calls, [])
+
     def test_trade_discovery_helpers_unchanged_by_fibo_path(self):
         """Calling fibo discovery must not alter TradeDesk outputs for /trade."""
         desk = _FakeDesk(

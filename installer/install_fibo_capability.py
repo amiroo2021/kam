@@ -52,6 +52,7 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "golden_fibo" / "state.py",
     Path("plugins") / "trade" / "golden_fibo" / "client_id_v2.py",
     Path("plugins") / "trade" / "golden_fibo" / "arcus_adapter.py",
+    Path("plugins") / "trade" / "golden_fibo" / "rise_adapter.py",
 ]
 
 FIBO_SERVICE_TEMPLATE_PATH = REPO_ROOT / "installer" / "fibo.service.template"
