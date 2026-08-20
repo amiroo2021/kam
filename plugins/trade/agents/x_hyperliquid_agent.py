@@ -34,6 +34,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -2961,7 +2962,238 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     )
 
 
+@dataclass(frozen=True)
+class _CloseResponseVerdict:
+    """Evidence-based classification of a single-order market_close response.
+
+    Returned by ``_classify_close_response``. Re-interprets the shared
+    ``_order_response_details`` parser output (which was designed for
+    multi-order ladder batches) so a single close can never propagate
+    ladder-specific error codes like ``AMBIGUOUS_LADDER_RESPONSE``.
+    """
+    kind: str  # one of: "success", "rejected", "unconfirmed", "malformed"
+    code: str
+    message: str
+    exchange_reason: Optional[str] = None
+
+
+def _classify_close_response(response: Any) -> _CloseResponseVerdict:
+    """Classify a market_close response for the single-order close path.
+
+    Maps the shared parser's branches into evidence-based verdicts:
+
+      ``success``             → ``success`` (the parser saw a filled
+                                or resting child result).
+      ``top_level_error``     → ``rejected`` (the exchange rejected
+                                the entire submission; reason
+                                preserved verbatim).
+      ``child_error``         → ``rejected`` (the exchange rejected
+                                this child; reason preserved).
+      ``missing_statuses``,
+      ``status_count_mismatch``,
+      ``unknown_child``       → ``unconfirmed`` (the submission
+                                response did not provide a definitive
+                                single-order status). Code
+                                ``CLOSE_OUTCOME_UNCONFIRMED``.
+                                Evidence-based — does NOT infer IOC
+                                cancellation or liquidity failure.
+      ``malformed_envelope``  → ``malformed``. Code
+                                ``CLOSE_RESPONSE_MALFORMED``.
+
+    In every non-success case the close path falls through to
+    post-submit position verification; that re-read is authoritative.
+    The string ``AMBIGUOUS_LADDER_RESPONSE`` MUST NOT appear here.
+    """
+    _ok, _accepted, _rejected, _oids, _records, code, reason, branch = (
+        _order_response_details(response, 1)
+    )
+    if branch == "success":
+        return _CloseResponseVerdict(
+            kind="success",
+            code="",
+            message="",
+        )
+    if branch == "top_level_error":
+        return _CloseResponseVerdict(
+            kind="rejected",
+            code=code or "EXCHANGE_REJECTED",
+            message=str(reason or "Exchange rejected the close submission."),
+            exchange_reason=reason,
+        )
+    if branch == "child_error":
+        return _CloseResponseVerdict(
+            kind="rejected",
+            code=code or "EXCHANGE_REJECTED",
+            message=str(reason or "Exchange rejected this order."),
+            exchange_reason=reason,
+        )
+    if branch in ("missing_statuses", "status_count_mismatch", "unknown_child"):
+        # Evidence-based: the parser could not derive a definitive
+        # single-order status. Do NOT infer IOC cancellation or
+        # liquidity failure — that's an exchange-side fact that must
+        # come from the exchange itself.
+        return _CloseResponseVerdict(
+            kind="unconfirmed",
+            code="CLOSE_OUTCOME_UNCONFIRMED",
+            message=(
+                "Exchange response did not contain a definitive "
+                "single-order status. Position will be re-verified."
+            ),
+            exchange_reason=None,
+        )
+    # branch == "malformed_envelope" or anything else unexpected.
+    return _CloseResponseVerdict(
+        kind="malformed",
+        code="CLOSE_RESPONSE_MALFORMED",
+        message=(
+            "Exchange response could not be parsed. "
+            "Position will be re-verified."
+        ),
+        exchange_reason=None,
+    )
+
+
+def _verify_close_position(
+    post_positions_response: Any,
+    symbol: str,
+    original_signed_size: Decimal,
+    *,
+    tolerance: Decimal = Decimal("1e-9"),
+) -> Dict[str, Any]:
+    """Authoritative post-submit position verification.
+
+    Compares the re-read position's *signed* size against
+    ``original_signed_size`` and returns one of:
+
+      ``flat``                — abs(verify) <= tolerance AND
+                                verify direction matches original
+                                (residual within tolerance counts as
+                                flat for practical purposes; a true
+                                zero is preferred).
+      ``partial``             — abs(verify) > tolerance AND
+                                abs(verify) < abs(original) AND
+                                sign unchanged. ``reduced_by`` is
+                                positive and meaningful.
+      ``unchanged``           — abs(verify - original) <= tolerance.
+                                No measurable change.
+      ``increased_or_reversed`` — abs(verify) >= abs(original) AND
+                                sign unchanged (size grew — likely a
+                                competing fill) OR sign flipped.
+      ``unknown``             — re-read failed or returned no
+                                matching position row.
+
+    Inputs:
+      post_positions_response — ``CanonicalResponse`` from
+                                ``_execute_positions_orders``.
+      symbol                 — upper-cased instrument symbol.
+      original_signed_size   — signed size at submission time
+                                (positive for LONG, negative for
+                                SHORT).
+      tolerance              — Decimal tolerance for "equal" and
+                                "flat" comparisons (default 1e-9
+                                matches Hyperliquid's sz_decimals).
+
+    All comparisons use ``Decimal`` arithmetic — no float subtraction.
+    """
+    if post_positions_response is None or not getattr(
+        post_positions_response, "success", False
+    ):
+        return {"outcome": "unknown", "verify_signed_size": None,
+                "reduced_by": None, "original_signed_size": original_signed_size}
+
+    positions = list(getattr(post_positions_response, "positions", None) or [])
+    verify_position = None
+    for position in positions:
+        if str(getattr(position, "symbol", "")).strip().upper() == symbol:
+            verify_position = position
+            break
+    if verify_position is None:
+        # Re-read returned no row for this symbol. The agent's normalizer
+        # drops zero-size positions, so a missing row means the position
+        # leg is genuinely flat. Per the user's contract: "Position is
+        # flat → Return success." This applies regardless of original
+        # size — the live venue snapshot is the source of truth.
+        return {
+            "outcome": "flat",
+            "verify_signed_size": Decimal("0"),
+            "reduced_by": original_signed_size,
+            "original_signed_size": original_signed_size,
+        }
+
+    abs_size = _decimal_or_none(getattr(verify_position, "size", None))
+    side = str(getattr(verify_position, "side", "")).strip().lower()
+    if abs_size is None:
+        return {"outcome": "unknown", "verify_signed_size": None,
+                "reduced_by": None, "original_signed_size": original_signed_size}
+    verify_signed = abs_size if side == "long" else -abs_size
+
+    # Sign flip detection (reversal)
+    original_sign_is_negative = original_signed_size < 0
+    verify_sign_is_negative = verify_signed < 0
+    if original_sign_is_negative != verify_sign_is_negative and abs(verify_signed) > tolerance:
+        return {
+            "outcome": "increased_or_reversed",
+            "verify_signed_size": verify_signed,
+            "reduced_by": original_signed_size - verify_signed,
+            "original_signed_size": original_signed_size,
+        }
+
+    if abs(verify_signed) <= tolerance:
+        return {
+            "outcome": "flat",
+            "verify_signed_size": verify_signed,
+            "reduced_by": original_signed_size,
+            "original_signed_size": original_signed_size,
+        }
+
+    abs_original = abs(original_signed_size)
+    abs_verify = abs(verify_signed)
+    if abs(abs_verify - abs_original) <= tolerance:
+        return {
+            "outcome": "unchanged",
+            "verify_signed_size": verify_signed,
+            "reduced_by": Decimal("0"),
+            "original_signed_size": original_signed_size,
+        }
+    if abs_verify < abs_original:
+        return {
+            "outcome": "partial",
+            "verify_signed_size": verify_signed,
+            "reduced_by": abs_original - abs_verify,
+            "original_signed_size": original_signed_size,
+        }
+    # abs_verify > abs_original
+    return {
+        "outcome": "increased_or_reversed",
+        "verify_signed_size": verify_signed,
+        "reduced_by": original_signed_size - verify_signed,
+        "original_signed_size": original_signed_size,
+    }
+
+
 def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Single-position close for Hyperliquid.
+
+    Flow:
+      1. Build context (current symbol, side, signed size).
+      2. Submit ``market_close`` (an IOC reduce-only limit via the SDK).
+      3. Classify the response — ladder-specific error codes
+         (``AMBIGUOUS_LADDER_RESPONSE``) are re-mapped by
+         ``_classify_close_response`` and never reach the wizard.
+      4. **Authoritative post-submit verification**: re-read positions
+         and compare signed sizes. Outcomes:
+           flat              → success
+           partial           → CLOSE_PARTIALLY_FILLED (surface before /
+                              after / reduced-by; no auto-retry)
+           unchanged         → CLOSE_OUTCOME_UNCONFIRMED (or
+                              CLOSE_RESPONSE_MALFORMED if response was
+                              malformed); surface remaining position
+           increased_or_reversed → CLOSE_POSITION_MISMATCH
+           unknown (re-read failed) → CLOSE_VERIFICATION_UNAVAILABLE
+
+    The function NEVER auto-retries. AMBIGUOUS_LADDER_RESPONSE is
+    NEVER returned.
+    """
     requested_symbol = str(request.get("symbol") or "").strip()
     if not requested_symbol:
         return make_failure(operation="close_position", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
@@ -2973,12 +3205,14 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
 
     symbol = str(requested_symbol or "").strip().upper()
     current_position = context["current_position"]
-    current_size = context["current_size"]
+    current_size = context["current_size"]  # positive Decimal (CanonicalPosition.size is stored absolute)
     current_side = str(context["current_side"] or "").strip().lower()
+    original_signed_size = current_size if current_side == "long" else -current_size
     exchange_client, wallet, _secret = _build_exchange_client(account)
     if exchange_client is None or wallet is None:
         return make_failure(operation="close_position", exchange=name, account=account, code="ACCOUNT_NOT_CONFIGURED", message="Account is not configured.")
 
+    # --- 1. Submit ---
     try:
         response = exchange_client.market_close(str(context["candidate"].get("public_symbol") or symbol), sz=float(current_size))
     except Exception as exc:  # noqa: BLE001
@@ -2999,81 +3233,164 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
             ),
         )
 
-    ok, _accepted_count, _oids, error_code = _order_response_statuses(response, 1)
-    if not ok:
+    # --- 2. Evidence-based response classification (NOT ladder) ---
+    verdict = _classify_close_response(response)
+    submission_log = (
+        f"close_position {symbol}: classify={verdict.kind} "
+        f"code={verdict.code!r} reason={verdict.exchange_reason!r}"
+    )
+    try:
+        logging.info(submission_log)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Rejected: the exchange told us explicitly. Don't re-verify —
+    # surface the exchange reason and the current position size.
+    if verdict.kind == "rejected":
         return make_failure(
             operation="close_position",
             exchange=name,
             account=account,
-            code=error_code or "CLOSE_POSITION_FAILED",
-            message="Close position submission failed.",
+            code=verdict.code or "EXCHANGE_REJECTED",
+            message=verdict.message,
+            exchange_reason=verdict.exchange_reason,
             position_action=_position_action_result(
                 operation="close_position",
                 symbol=symbol,
                 verified=False,
                 removed=None,
-                status="failed",
+                status="rejected",
                 current_side=current_side,
                 current_size=current_size,
+                message=verdict.message,
             ),
         )
 
-    post_positions_response = _execute_positions_orders(account, {"operation": "positions_orders", "exchange": name, "account": account})
-    if not post_positions_response.success:
+    # --- 3. Authoritative post-submit verification ---
+    # Reached for: success, unconfirmed, malformed. The re-read is
+    # the source of truth for whether the close actually took effect.
+    post_positions_response = _execute_positions_orders(
+        account, {"operation": "positions_orders", "exchange": name, "account": account}
+    )
+    verification = _verify_close_position(
+        post_positions_response, symbol, original_signed_size
+    )
+    outcome = verification["outcome"]
+    verify_signed = verification["verify_signed_size"]
+    reduced_by = verification["reduced_by"]
+
+    if outcome == "flat":
+        return make_success(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            position_action=_position_action_result(
+                operation="close_position",
+                symbol=symbol,
+                verified=True,
+                removed=None,
+                status="success",
+                current_side=current_side,
+                current_size=current_size,
+                message="Position closed.",
+            ),
+        )
+
+    if outcome == "partial":
+        remaining_size = abs(verify_signed) if verify_signed is not None else None
+        msg = (
+            f"Position partially closed. Original={original_signed_size}, "
+            f"remaining={verify_signed}, reduced_by={reduced_by}. "
+            "Not retrying automatically."
+        )
         return make_failure(
             operation="close_position",
             exchange=name,
             account=account,
-            code=post_positions_response.error.code if post_positions_response.error else "VERIFICATION_FAILED",
-            message=post_positions_response.error.message if post_positions_response.error else "Position verification unavailable.",
+            code="CLOSE_PARTIALLY_FILLED",
+            message=msg,
             position_action=_position_action_result(
                 operation="close_position",
                 symbol=symbol,
                 verified=False,
                 removed=None,
-                status="failed",
+                status="partial",
                 current_side=current_side,
-                current_size=current_size,
+                current_size=remaining_size,
+                message=msg,
             ),
         )
 
-    verify_position = None
-    for position in post_positions_response.positions or []:
-        if str(getattr(position, "symbol", "")).strip().upper() == symbol:
-            verify_position = position
-            break
-    verify_size = _decimal_or_none(getattr(verify_position, "size", None)) if verify_position is not None else None
-    if verify_size is not None and verify_size > 0:
+    if outcome == "unchanged":
+        # Response was definitive enough not to claim exchange-level
+        # rejection, but the position is unchanged.
+        code = verdict.code if verdict.kind in ("unconfirmed", "malformed") else "CLOSE_OUTCOME_UNCONFIRMED"
+        if verdict.kind == "malformed":
+            code = "CLOSE_RESPONSE_MALFORMED"
         return make_failure(
             operation="close_position",
             exchange=name,
             account=account,
-            code="VERIFICATION_FAILED",
-            message="Position remained open after close submission.",
+            code=code,
+            message=(
+                "Close submission did not change the position. "
+                f"Remaining position: {original_signed_size}. "
+                "Not retrying automatically."
+            ),
             position_action=_position_action_result(
                 operation="close_position",
                 symbol=symbol,
                 verified=False,
                 removed=None,
-                status="failed",
+                status="unchanged",
                 current_side=current_side,
                 current_size=current_size,
             ),
         )
 
-    return make_success(
+    if outcome == "increased_or_reversed":
+        remaining_size = abs(verify_signed) if verify_signed is not None else current_size
+        msg = (
+            f"Position size unexpectedly changed during close: "
+            f"original={original_signed_size}, after={verify_signed}. "
+            "Not retrying automatically."
+        )
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="CLOSE_POSITION_MISMATCH",
+            message=msg,
+            position_action=_position_action_result(
+                operation="close_position",
+                symbol=symbol,
+                verified=False,
+                removed=None,
+                status="mismatch",
+                current_side=current_side,
+                current_size=remaining_size,
+                message=msg,
+            ),
+        )
+
+    # outcome == "unknown" (re-read failed)
+    return make_failure(
         operation="close_position",
         exchange=name,
         account=account,
+        code="CLOSE_VERIFICATION_UNAVAILABLE",
+        message=(
+            "Could not re-read positions after close submission. "
+            "Manual verification required."
+        ),
         position_action=_position_action_result(
             operation="close_position",
             symbol=symbol,
-            verified=True,
+            verified=False,
             removed=None,
-            status="success",
+            status="unknown",
             current_side=current_side,
             current_size=current_size,
-            message="Position closed.",
         ),
     )
 

@@ -2414,13 +2414,16 @@ class TestPositionManagementWrites(unittest.TestCase):
         hl = _hl_module()
         exchange = FakeExchange([{"response": {"data": {"statuses": [{"resting": {"oid": 500}}]}}}])
         pre_positions = [CanonicalPosition(symbol="HYPE", side="short", size="250", entry_price="71.075", pnl="+1", tp=None, sl=None)]
-        post_positions = [CanonicalPosition(symbol="BTC", side="long", size="1", entry_price="65000", pnl="+1", tp=None, sl=None)]
+        # Post-submit re-read returns NO positions for HYPE — the close
+        # actually took effect (HYPE leg was fully closed).
+        post_positions = []
         open_orders = [{"symbol": "BTC", "side": "buy", "oid": 88, "reduce_only": False, "is_position_tpsl": False, "price": "65000"}]
         self._patch_context([self._position_response(pre_positions), self._position_response(post_positions)], [open_orders, open_orders], exchange)
 
         response = hl.execute({"operation": "close_position", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
+        self.assertEqual(response.position_action.status, "success")
         self.assertEqual(len(exchange.requests), 1)
         self.assertEqual(exchange.requests[0][0]["coin"], "HYPE")
         self.assertEqual(exchange.requests[0][0]["sz"], 250.0)
