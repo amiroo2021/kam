@@ -388,6 +388,22 @@ def _rise_symbol(raw_market_name: Any) -> str:
     return market_name.strip().upper() or "UNKNOWN"
 
 
+_RISE_QUOTE_SUFFIXES = {"USD", "USDT", "USDC", "PERP"}
+
+
+def _rise_alias_keys(symbol: str) -> List[str]:
+    """User-facing and venue-native keys that map to one Rise market."""
+    raw = _rise_symbol(symbol)
+    keys: List[str] = []
+    if raw and raw != "UNKNOWN":
+        keys.append(raw)
+    if "-" in raw:
+        base, rest = raw.split("-", 1)
+        if rest in _RISE_QUOTE_SUFFIXES and base:
+            keys.append(base)
+    return keys
+
+
 def _tpsl_closing_side_for_position(side: str) -> str:
     return "SELL" if side == "long" else "BUY"
 
@@ -609,13 +625,24 @@ def _resolve_market_by_symbol(symbol: str, market_cache: Dict[str, Dict[str, Any
     requested = (symbol or "").strip().upper()
     if not requested:
         return None
-    matches: List[Dict[str, Any]] = []
+    keys = _rise_alias_keys(requested)
+    exact: List[Dict[str, Any]] = []
+    aliased: List[Dict[str, Any]] = []
     for market in market_cache.values():
-        if str(market.get("symbol") or "").strip().upper() != requested:
+        msym = str(market.get("symbol") or "").strip().upper()
+        if not msym:
             continue
-        matches.append(market)
+        if msym == requested or msym == _rise_symbol(requested):
+            exact.append(market)
+        elif msym in keys:
+            aliased.append(market)
+    matches = exact or aliased
     if not matches:
         return None
+    if not exact:
+        unique_ids = {str(m.get("market_id") or "") for m in aliased}
+        if len(unique_ids) > 1:
+            return None
     matches.sort(
         key=lambda market: (
             0 if bool(market.get("active")) else 1,
@@ -1669,12 +1696,22 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
     try:
         markets_payload = _fetch_markets_payload()
         cache = _market_cache(markets_payload, {})
+        market = _resolve_market_by_symbol(requested_symbol, cache)
+        if market is None:
+            return make_failure(
+                operation="cancel_order_group",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_NOT_FOUND",
+                message=f"Instrument not found: {requested_symbol}",
+            )
+        canonical = str(market.get("symbol") or "").strip().upper()
         pre_open_payload = _fetch_open_orders_payload(wallet)
         pre_orders = _normalize_open_orders(pre_open_payload, cache)
         target_orders = [
             order
             for order in pre_orders
-            if str(order.get("symbol") or "").strip().upper() == requested_symbol
+            if str(order.get("symbol") or "").strip().upper() == canonical
             and str(order.get("side") or "").strip().lower() == requested_side
         ]
         if not target_orders:
@@ -1845,7 +1882,8 @@ def _rise_market_price(account: str, requested_symbol: str) -> Decimal:
     raw_markets = data.get("markets") if isinstance(data, dict) else None
     if not isinstance(raw_markets, list):
         return Decimal("0")
-    target = (requested_symbol or "").strip().upper()
+    target_keys = set(_rise_alias_keys(requested_symbol))
+    target_keys.add((requested_symbol or "").strip().upper())
     for m in raw_markets:
         if not isinstance(m, dict):
             continue
@@ -1855,7 +1893,11 @@ def _rise_market_price(account: str, requested_symbol: str) -> Decimal:
             str(m.get("display_name") or "").strip(),
             str(m.get("base_asset_symbol") or "").strip(),
         ]
-        if not any(_rise_symbol(n).upper() == target for n in name_candidates if n):
+        if not any(
+            (_rise_symbol(n) in target_keys or str(n).strip().upper() in target_keys)
+            for n in name_candidates
+            if n
+        ):
             continue
         # Prefer last → mark → mid → index → oracle
         try:
@@ -1878,52 +1920,61 @@ def _rise_market_price(account: str, requested_symbol: str) -> Decimal:
 def _rise_position_snapshot(wallet: str, requested_symbol: str) -> Dict[str, Any]:
     """Return a snapshot of the position row for *requested_symbol*.
 
-    Shape::
-
-        {
-          "side": "long" | "short" | "flat",
-          "size": Decimal(absolute notional quantity, 0 when flat),
-          "entry_price": Decimal(avg_entry_price, 0 when flat),
-        }
-
-    * ``size`` is always a non-negative Decimal (we keep the absolute
-      quantity because some Rise payloads sign the size with the side).
-    * ``entry_price`` is whatever the venue reports; we do not invent
-      a value if the row is missing or zero.
+    Fetch/parse failures raise. INSTRUMENT_NOT_FOUND is ValueError.
+    A flat result is returned only after a successful portfolio read of a
+    resolved Rise market with no matching position row.
     """
-    snap = {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0")}
-    try:
-        payload = _fetch_portfolio(wallet)
-    except Exception:
-        return snap
+    payload = _fetch_portfolio(wallet)
     if not isinstance(payload, dict):
-        return snap
+        raise RuntimeError("Rise portfolio response was not an object")
+    portfolio_data = _extract_portfolio_payload(payload)
+    markets_error: Optional[BaseException] = None
+    try:
+        markets_payload = _fetch_markets_payload()
+        if not isinstance(markets_payload, dict):
+            markets_error = RuntimeError("Rise markets response was not an object")
+            markets_payload = {}
+    except Exception as exc:  # noqa: BLE001
+        markets_error = exc
+        markets_payload = {}
+    cache = _market_cache(markets_payload if isinstance(markets_payload, dict) else {}, portfolio_data)
+    market = _resolve_market_by_symbol(requested_symbol, cache)
+    if market is None:
+        if markets_error is not None:
+            raise RuntimeError("MARKETS_READ_FAILED") from markets_error
+        raise ValueError("INSTRUMENT_NOT_FOUND")
+    market_id = str(market.get("market_id") or "").strip()
+    canonical = str(market.get("symbol") or "").strip().upper()
     positions_payload = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     positions = positions_payload.get("positions") if isinstance(positions_payload, dict) else None
     if not isinstance(positions, list):
         positions = payload.get("positions") if isinstance(payload.get("positions"), list) else []
-    target = str(requested_symbol or "").strip().upper()
+    matched_item = None
     for item in positions:
         if not isinstance(item, dict):
             continue
-        sym = _rise_symbol(item.get("market_name") or item.get("symbol") or item.get("market"))
-        if sym.upper() != target:
-            continue
-        raw_size = _decimal_or_none(item.get("size"))
-        side_field = item.get("side")
-        side_norm = _rise_side(side_field, raw_size)
-        abs_size = abs(raw_size) if raw_size is not None else Decimal("0")
-        if abs_size <= 0:
-            side_norm = "flat"
-        entry = _decimal_or_none(item.get("avg_entry_price"))
-        if entry is None:
-            entry = Decimal("0")
-        return {
-            "side": side_norm,
-            "size": abs_size,
-            "entry_price": entry,
-        }
-    return snap
+        item_id = str(item.get("market_id") or "").strip()
+        item_sym = _rise_symbol(item.get("market_name") or item.get("symbol") or item.get("market"))
+        if (market_id and item_id == market_id) or (canonical and item_sym == canonical):
+            matched_item = item
+            break
+    if matched_item is None:
+        return {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0"), "symbol": canonical}
+    raw_size = _decimal_or_none(matched_item.get("size"))
+    side_field = matched_item.get("side")
+    side_norm = _rise_side(side_field, raw_size)
+    abs_size = abs(raw_size) if raw_size is not None else Decimal("0")
+    if abs_size <= 0:
+        side_norm = "flat"
+    entry = _decimal_or_none(matched_item.get("avg_entry_price"))
+    if entry is None:
+        entry = Decimal("0")
+    return {
+        "side": side_norm,
+        "size": abs_size,
+        "entry_price": entry,
+        "symbol": canonical,
+    }
 
 
 def _execute_market_immediate(account: str, request: Dict[str, Any]) -> CanonicalResponse:
@@ -2619,7 +2670,25 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
         )
 
     # PRE: read live position snapshot for THIS symbol.
-    pre = _rise_position_snapshot(wallet, requested_symbol)
+    try:
+        pre = _rise_position_snapshot(wallet, requested_symbol)
+    except ValueError as exc:
+        code = str(exc) if str(exc) in {"INSTRUMENT_NOT_FOUND"} else "POSITIONS_UNAVAILABLE"
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code=code,
+            message=sanitize_error_message(str(exc)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="POSITIONS_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
     pre_size = pre["size"]
     pre_side = pre["side"]
     pre_entry = pre["entry_price"]
@@ -3057,6 +3126,15 @@ def _execute_position_state(account: str, request: Dict[str, Any]) -> CanonicalR
         )
     try:
         snap = _rise_position_snapshot(wallet, requested_symbol)
+    except ValueError as exc:
+        code = str(exc) if str(exc) in {"INSTRUMENT_NOT_FOUND", "MISSING_SYMBOL"} else "POSITIONS_UNAVAILABLE"
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code=code,
+            message=sanitize_error_message(str(exc)),
+        )
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation="position_state",

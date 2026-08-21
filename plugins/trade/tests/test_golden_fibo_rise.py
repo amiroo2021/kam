@@ -515,7 +515,7 @@ class EngineIntegrationTests(unittest.TestCase):
                 return mock.Mock(success=True, error=None,
                                  market_price={"mark_price": "80",
                                                 "last_external_price": "80"})
-            if op == "positions_orders":
+            if op in ("positions_orders", "position_state"):
                 if position_seqs is None:
                     positions = []
                 else:

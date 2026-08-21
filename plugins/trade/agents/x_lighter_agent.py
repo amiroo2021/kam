@@ -1094,18 +1094,43 @@ def _fetch_market_catalog(base_url: str) -> List[Dict[str, Any]]:
     return combined
 
 
+_LIGHTER_QUOTE_SUFFIXES = {"USD", "USDT", "USDC", "PERP"}
+
+
+def _lighter_alias_keys(symbol: str) -> List[str]:
+    raw = str(symbol or "").strip().upper()
+    keys: List[str] = []
+    if raw:
+        keys.append(raw)
+    if "-" in raw:
+        base, rest = raw.split("-", 1)
+        if rest in _LIGHTER_QUOTE_SUFFIXES and base:
+            keys.append(base)
+    return keys
+
+
 def _resolve_market(base_url: str, requested_symbol: str) -> Optional[Dict[str, Any]]:
     symbol = str(requested_symbol or "").strip().upper()
     if not symbol:
         return None
-    candidates = []
+    keys = _lighter_alias_keys(symbol)
+    exact = []
+    aliased = []
     for entry in _fetch_market_catalog(base_url):
         entry_symbol = str(entry.get("symbol") or "").strip().upper()
-        if entry_symbol != symbol:
+        if not entry_symbol:
             continue
-        candidates.append(entry)
+        if entry_symbol == symbol:
+            exact.append(entry)
+        elif entry_symbol in keys:
+            aliased.append(entry)
+    candidates = exact or aliased
     if not candidates:
         return None
+    if not exact:
+        unique_ids = {int(str(item.get("market_id") or 0) or 0) for item in aliased}
+        if len(unique_ids) > 1:
+            return None
     candidates.sort(
         key=lambda item: (
             0 if str(item.get("market_type") or "").strip().lower() == "perp" else 1,
@@ -4189,6 +4214,11 @@ def _find_position_management_context(request: Dict[str, Any], *, include_active
     requested_symbol = str(request.get("symbol") or "").strip().upper()
     if not requested_symbol:
         raise ValueError("MISSING_SYMBOL")
+    market = _resolve_market(credentials["base_url"], requested_symbol)
+    if market is None:
+        raise LookupError("INSTRUMENT_NOT_FOUND")
+    canonical = str(market.get("symbol") or requested_symbol).strip().upper()
+    canonical_mid = int(market.get("market_id") or 0)
     raw_positions = target.get("positions") if isinstance(target, dict) else None
     if not isinstance(raw_positions, list):
         raise LookupError("POSITION_NOT_FOUND")
@@ -4196,7 +4226,12 @@ def _find_position_management_context(request: Dict[str, Any], *, include_active
     for item in raw_positions:
         if not isinstance(item, dict):
             continue
-        if str(item.get("symbol") or "").strip().upper() != requested_symbol:
+        item_sym = str(item.get("symbol") or "").strip().upper()
+        try:
+            item_mid = int(str(item.get("market_id") or 0) or 0)
+        except Exception:
+            item_mid = 0
+        if item_sym != canonical and not (canonical_mid and item_mid == canonical_mid):
             continue
         size_value = _decimal_or_none(item.get("position"))
         if size_value in (None, Decimal("0")):
@@ -4206,14 +4241,10 @@ def _find_position_management_context(request: Dict[str, Any], *, include_active
     if current_raw is None:
         raise LookupError("POSITION_NOT_FOUND")
     market_map = _fetch_market_symbol_map(credentials["base_url"])
-    market_id = int(str(current_raw.get("market_id") or 0))
-    market = dict(market_map.get(market_id) or {})
-    if not market.get("market_id") or market.get("size_decimals") is None or market.get("price_decimals") is None:
-        resolved_market = _resolve_market(credentials["base_url"], requested_symbol)
-        if resolved_market and int(str(resolved_market.get("market_id") or 0)) == market_id:
-            market = dict(resolved_market)
-    if not market:
-        raise LookupError("INSTRUMENT_NOT_FOUND")
+    market_id = int(str(current_raw.get("market_id") or canonical_mid or 0))
+    mapped = dict(market_map.get(market_id) or {})
+    if mapped.get("market_id"):
+        market = dict(mapped)
     if not market.get("market_id"):
         market["market_id"] = market_id
     sign_value = int(current_raw.get("sign") or 0)
@@ -4615,7 +4646,7 @@ def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
             message=f"Instrument not found: {requested_symbol}",
         )
     payload = {
-        "symbol": requested_symbol,
+        "symbol": str(market.get("symbol") or requested_symbol).strip().upper(),
         "market_id": market.get("market_id"),
         "size_decimals": int(market.get("size_decimals") or 0),
         "price_decimals": int(market.get("price_decimals") or 0),
@@ -4896,16 +4927,29 @@ def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
             code="MISSING_SYMBOL",
             message="Symbol is required.",
         )
+    market = _resolve_market(credentials["base_url"], requested_symbol)
+    if market is None:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account_name,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested_symbol}",
+        )
+    canonical = str(market.get("symbol") or requested_symbol).strip().upper()
+    canonical_mid = int(market.get("market_id") or 0)
     fetched = _fetch_account_entry(request)
     target = fetched.get("target")
     auth_token = str(fetched.get("auth_token") or "")
     active_orders = _fetch_active_orders(credentials, auth_token)
     sl = None
     tp = None
+    alias_keys = set(_lighter_alias_keys(requested_symbol))
+    alias_keys.add(canonical)
     for order in active_orders:
         if not isinstance(order, dict):
             continue
-        if str(order.get("symbol") or "").strip().upper() != requested_symbol:
+        if str(order.get("symbol") or "").strip().upper() not in alias_keys:
             continue
         trigger = _decimal_or_none(order.get("trigger_price"))
         if trigger is None:
@@ -4916,33 +4960,55 @@ def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
             sl = text
         elif "take" in label or "tp" in label:
             tp = text
-    positions_raw = target.get("positions") if isinstance(target, dict) else None
+    if not isinstance(target, dict):
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account_name,
+            code="POSITIONS_UNAVAILABLE",
+            message="Lighter account payload was not an object.",
+        )
+    positions_raw = target.get("positions")
+    if positions_raw is None:
+        positions_raw = []
+    if not isinstance(positions_raw, list):
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account_name,
+            code="POSITIONS_UNAVAILABLE",
+            message="Lighter positions payload was malformed.",
+        )
     matched = None
-    if isinstance(positions_raw, list):
-        for item in positions_raw:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("symbol") or "").strip().upper() != requested_symbol:
-                continue
-            size = _decimal_or_none(item.get("position")) or Decimal("0")
-            sign = int(item.get("sign") or 0)
-            if sign == 0 and size != 0:
-                sign = 1 if size > 0 else -1
-            if sign == 0:
-                continue
-            entry_price = _decimal_or_none(item.get("entry_quote"))
-            matched = {
-                "symbol": requested_symbol,
-                "side": "long" if sign > 0 else "short",
-                "size": str(abs(size)),
-                "entry_price": _decimal_text(entry_price) if entry_price is not None else None,
-                "sl": sl,
-                "tp": tp,
-            }
-            break
+    for item in positions_raw:
+        if not isinstance(item, dict):
+            continue
+        item_sym = str(item.get("symbol") or "").strip().upper()
+        try:
+            item_mid = int(str(item.get("market_id") or 0) or 0)
+        except Exception:
+            item_mid = 0
+        if item_sym != canonical and not (canonical_mid and item_mid == canonical_mid) and item_sym not in alias_keys:
+            continue
+        size = _decimal_or_none(item.get("position")) or Decimal("0")
+        sign = int(item.get("sign") or 0)
+        if sign == 0 and size != 0:
+            sign = 1 if size > 0 else -1
+        if sign == 0:
+            continue
+        entry_price = _decimal_or_none(item.get("entry_quote"))
+        matched = {
+            "symbol": canonical,
+            "side": "long" if sign > 0 else "short",
+            "size": str(abs(size)),
+            "entry_price": _decimal_text(entry_price) if entry_price is not None else None,
+            "sl": sl,
+            "tp": tp,
+        }
+        break
     if matched is None:
         matched = {
-            "symbol": requested_symbol,
+            "symbol": canonical,
             "side": None,
             "size": "0",
             "entry_price": None,

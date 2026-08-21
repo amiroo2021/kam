@@ -159,6 +159,7 @@ class RealMarketPriceDispatchTests(unittest.TestCase):
 class RealPositionStateDispatchTests(unittest.TestCase):
     def test_flat(self):
         with _creds_patch(), \
+             mock.patch.object(rise, "_fetch_markets_payload", return_value=_markets_payload()), \
              mock.patch.object(rise, "_fetch_portfolio", return_value=_flat_payload()):
             r = rise.execute({"operation": "position_state", "account": "BASED", "symbol": "HYPE"})
         d = r.to_dict()
@@ -173,6 +174,7 @@ class RealPositionStateDispatchTests(unittest.TestCase):
              "size": "0.2", "avg_entry_price": "66.5"},
         ])
         with _creds_patch(), \
+             mock.patch.object(rise, "_fetch_markets_payload", return_value=_markets_payload()), \
              mock.patch.object(rise, "_fetch_portfolio", return_value=payload):
             r = rise.execute({"operation": "position_state", "account": "BASED", "symbol": "HYPE"})
         d = r.to_dict()
@@ -186,6 +188,7 @@ class RealPositionStateDispatchTests(unittest.TestCase):
              "size": "-0.3", "avg_entry_price": "67.1"},
         ])
         with _creds_patch(), \
+             mock.patch.object(rise, "_fetch_markets_payload", return_value=_markets_payload()), \
              mock.patch.object(rise, "_fetch_portfolio", return_value=payload):
             r = rise.execute({"operation": "position_state", "account": "BASED", "symbol": "HYPE"})
         d = r.to_dict()
@@ -223,6 +226,8 @@ class AdapterThroughRealDispatchTests(unittest.TestCase):
         ad = RiseGoldenFiboAdapter()
         with mock.patch("plugins.trade.agents.x_rise_agent._lookup_credentials",
                         return_value=(IDENT, SIGNER)), \
+             mock.patch("plugins.trade.agents.x_rise_agent._fetch_markets_payload",
+                        return_value=_markets_payload()), \
              mock.patch("plugins.trade.agents.x_rise_agent._fetch_portfolio",
                         return_value=_flat_payload()):
             pos = ad.position_state("BASED", "HYPE")

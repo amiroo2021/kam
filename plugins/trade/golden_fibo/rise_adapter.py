@@ -211,23 +211,19 @@ class RiseGoldenFiboAdapter:
 
     def position_state(self, account: str, instrument: str) -> Dict[str, Any]:
         resp = _get_rise_agent().execute({
-            "operation": "positions_orders",
+            "operation": "position_state",
             "account": account,
+            "symbol": instrument,
         })
         if not _is_success(resp):
             raise RuntimeError(
-                f"positions_orders failed: {getattr(resp, 'error', None)}"
+                f"position_state failed: {getattr(resp, 'error', None)}"
             )
         positions = _get_payload(resp).get("positions") or []
-        # Normalize to {symbol, side, size, entry_price, ...}
-        for pos in positions:
-            if not isinstance(pos, dict):
-                continue
-            sym = str(pos.get("symbol") or "").upper()
-            # positions_orders exposes the canonical bare asset symbol
-            if sym.upper() == instrument.upper():
-                return self._normalize_position_row(pos, instrument)
-        return {"symbol": instrument, "side": None, "size": "0", "entry_price": None}
+        if not positions:
+            return {"symbol": instrument, "side": None, "size": "0", "entry_price": None}
+        pos = positions[0] if isinstance(positions[0], dict) else {}
+        return self._normalize_position_row(pos, instrument)
 
     def _normalize_position_row(self, pos: Dict[str, Any], instrument: str) -> Dict[str, Any]:
         raw_side = pos.get("side")
