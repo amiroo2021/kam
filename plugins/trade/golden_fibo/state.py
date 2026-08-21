@@ -164,6 +164,13 @@ class GoldenFiboState:
     emergency_close_exchange_id: Optional[Union[int, str]] = None
     emergency_close_submitted_at: Optional[float] = None
     emergency_close_pre_size: Optional[str] = None
+    # Operator-controlled advance gate. When True, the engine still
+    # reconciles FILLED pending ladders (promotes the step, rotates the
+    # TP, updates expected cumulative) but does NOT place the next
+    # ladder order. Used for staged live validations where the operator
+    # wants to inspect each step's promotion before the next order is
+    # submitted. Defaults to False (no behavior change).
+    pause_advance: bool = False
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -215,6 +222,7 @@ class GoldenFiboState:
             "emergency_close_exchange_id": self.emergency_close_exchange_id,
             "emergency_close_submitted_at": self.emergency_close_submitted_at,
             "emergency_close_pre_size": self.emergency_close_pre_size,
+            "pause_advance": bool(self.pause_advance),
         }
 
     @classmethod
@@ -285,4 +293,5 @@ class GoldenFiboState:
                 if data.get("emergency_close_pre_size") is None
                 else str(data.get("emergency_close_pre_size"))
             ),
+            pause_advance=bool(data.get("pause_advance", False)),
         )

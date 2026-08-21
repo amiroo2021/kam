@@ -1015,6 +1015,10 @@ class PersistentFiboService:
                 return self._cmd_list(command)
             if op == "detail":
                 return self._cmd_detail(command)
+            if op == "set_pause_advance":
+                return self._cmd_set_pause_advance(command, value=True)
+            if op == "clear_pause_advance":
+                return self._cmd_set_pause_advance(command, value=False)
             if op == "stop":
                 return self._cmd_stop(command)
             if op == "smooth_shutdown":
@@ -1183,6 +1187,30 @@ class PersistentFiboService:
             if state is None:
                 return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
             return {"ok": True, "registration": state.to_dict()}
+
+    def _cmd_set_pause_advance(self, command: Dict[str, Any], *, value: bool) -> Dict[str, Any]:
+        """Set or clear the per-registration ``pause_advance`` gate.
+
+        When ``pause_advance`` is True, the engine still reconciles a
+        FILLED pending ladder (promotes the step, rotates the TP, updates
+        expected cumulative) but does NOT place the next ladder order.
+        Used for staged live validations.
+
+        This control-plane op is the ONLY way to mutate the gate; the
+        daemon does not set it automatically.
+        """
+        key = str(command.get("registration_key") or "").strip()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            state.pause_advance = bool(value)
+            self._save_state()
+        return {
+            "ok": True,
+            "registration_key": key,
+            "pause_advance": bool(value),
+        }
 
     def _cmd_stop(self, command: Dict[str, Any]) -> Dict[str, Any]:
         key = str(command.get("registration_key") or "").strip()

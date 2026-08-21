@@ -237,13 +237,24 @@ class GoldenFiboEngine:
         # ordering: read pending -> decide (partial vs full) -> act.
         pending_filled: bool = False
         pending_state: Dict[str, Any] = {}
-        if self.state.pending_order_exchange_id is not None:
+        # Read pending-ladder state only when there's actually a pending
+        # ladder to check. The pending-RoleEntry path is handled by the
+        # service's _maybe_confirm_step0 (which calls the client-id
+        # lookup separately) — calling the lookup here for ROLE_ENTRY
+        # would double the per-tick lookup count. Critically: when the
+        # lookup IS run, the client-id fallback inside
+        # _read_pending_order_state handles the case where
+        # ``pending_order_exchange_id`` is None (Ondo alphanumeric ids
+        # do not fit the legacy int slot). Gating this on a non-None
+        # oid would leave such pending ladders unrecoverable.
+        if self.state.pending_order_role == ROLE_LADDER:
             pending_state = self._read_pending_order_state()
             pending_status = str(pending_state.get("status") or "")
             pending_taxonomy = str(pending_state.get("taxonomy") or "")
-            actions.append(
-                f"pending oid={self.state.pending_order_exchange_id} status={pending_status} taxonomy={pending_taxonomy}"
-            )
+            if pending_state:
+                actions.append(
+                    f"pending oid={self.state.pending_order_exchange_id} status={pending_status} taxonomy={pending_taxonomy}"
+                )
             if pending_taxonomy == "ACTIVE":
                 pass  # partial: TP-volume sync applies below
             elif pending_taxonomy == "FILLED":
@@ -908,10 +919,23 @@ class GoldenFiboEngine:
         self.state.pending_confirmed_price = None
         self.state.pending_confirmed_size = None
 
+        # Operator-controlled advance gate: when set, the engine still
+        # rotates the TP (so the position is protected) but does NOT
+        # place the next ladder order. The operator clears the gate via
+        # the control plane to advance on their own schedule.
+        pause_advance = bool(getattr(self.state, "pause_advance", False))
+
         # Rotate TP
         result = self._rotate_tp(promoted_pk)
         if result is not None:
             return result
+
+        if pause_advance:
+            actions.append(
+                f"pause_advance=True; NOT placing step{step_n + 1} ladder. "
+                f"Operator must clear pause_advance to continue."
+            )
+            return TickResult(state=self.state, actions=actions)
 
         # Place next ladder if not at Step20
         if step_n < MAX_STEP:
@@ -1011,6 +1035,56 @@ class GoldenFiboEngine:
         pending_taxonomy = str(pending_state.get("taxonomy") or "")
         if pending_taxonomy != "FILLED":
             return TickResult(state=self.state, actions=actions)
+
+        # Position-compatibility gate. The pending order FILLED on the
+        # venue, but that alone is not sufficient evidence to promote the
+        # step and place the next ladder: the live position must also be
+        # compatible. A wrong-side or insufficient-size live position
+        # means the FILLED order was on the wrong account, against the
+        # wrong direction, or partial — adopting it would create
+        # downstream TP / Step2 against a position that does not match.
+        # Fail closed: freeze with a descriptive NEEDS_RECOVERY reason
+        # instead of promoting. The engine does not persist state; the
+        # caller (_drive_one) will persist on this TickResult.
+        expected_side = "long" if self.config.direction.upper() == "BUY" else "short"
+        live_side = position.get("side")
+        if live_side != expected_side:
+            self.state.status = STATUS_NEEDS_RECOVERY
+            self.state.freeze_reason = (
+                f"ladder step order FILLED but live position side={live_side} "
+                f"does not match expected {expected_side}; refusing to "
+                f"promote against a mismatched position"
+            )
+            return self._freeze(self.state.freeze_reason)
+        # For a pending ladder order at next_step=n, the live position
+        # must already cover cumulative_volume(n) (Step0 + ... + Step_n
+        # all filled). This is the cumulative evidence that the FILLED
+        # order was actually ours.
+        if self.state.pending_order_role == "ladder" and self.state.next_step > 0:
+            try:
+                expected_cumulative = self.config.cumulative_volume(
+                    self.state.next_step
+                )
+            except Exception:
+                expected_cumulative = None
+            if expected_cumulative is not None and expected_cumulative > 0:
+                if live_size + Decimal("0.0000001") < expected_cumulative:
+                    self.state.status = STATUS_NEEDS_RECOVERY
+                    self.state.freeze_reason = (
+                        f"Step{self.state.next_step} order FILLED but live "
+                        f"position size={live_size} is smaller than expected "
+                        f"cumulative={expected_cumulative}; refusing to promote"
+                    )
+                    return self._freeze(self.state.freeze_reason)
+
+        # Backfill pending_order_exchange_id from the client-id lookup
+        # BEFORE _handle_confirmed_fill records step_orders[n], so the
+        # venue's native id (often alphanumeric on Ondo) is preserved
+        # in step_orders rather than collapsing to None.
+        backfilled_oid = pending_state.get("exchange_order_id")
+        if backfilled_oid is not None and backfilled_oid != "":
+            self.state.pending_order_exchange_id = backfilled_oid
+
         actions.append(
             f"reconcile_needs_recovery: pending oid={self.state.pending_order_exchange_id} "
             f"taxonomy=FILLED size={live_size}"
@@ -1115,11 +1189,17 @@ class GoldenFiboEngine:
         """Read the current pending ladder order state, tolerating the
         single-order lookup's inability to see FILLED orders on some accounts.
 
-        Tries get_order_state(exchange_order_id) first. If that returns a
-        useful record, use it. If empty/unavailable and a persisted
+        Tries get_order_state(exchange_order_id) first; if that returns a
+        useful record, use it. If empty/unavailable AND a persisted
         pending_order_client_id exists, fall back to
-        get_order_state_by_client_id(client_id), which uses the bounded paging
-        surface that DOES see filled orders.
+        get_order_state_by_client_id(client_id), which uses the bounded
+        paging surface that DOES see filled orders.
+
+        Critically: the client-id fallback runs even when
+        ``pending_order_exchange_id`` is None (the very common Ondo case
+        where the venue's alphanumeric ``orderId`` cannot fit the
+        legacy numeric slot). Relying on the persisted exchange id alone
+        would leave every such pending ladder unrecoverable forever.
 
         Identity validation on the fallback record: the returned order must
         match the persisted client id, the expected strategy side, the
@@ -1129,16 +1209,17 @@ class GoldenFiboEngine:
 
         Returns {} only when no usable record is found.
         """
+        st: Dict[str, Any] = {}
         oid = self.state.pending_order_exchange_id
-        if oid is None:
-            return {}
-        try:
-            st = self.adapter.get_order_state(self.config.account, oid)
-        except Exception:
-            st = {}
-        if st:
-            return st
-        # Fallback: client-id lookup sees filled orders.
+        if oid is not None:
+            try:
+                st = self.adapter.get_order_state(self.config.account, oid)
+            except Exception:
+                st = {}
+            if st:
+                return st
+        # Fallback: client-id lookup sees filled orders. Runs even when
+        # ``pending_order_exchange_id`` is None — see the method docstring.
         cid = self.state.pending_order_client_id
         if cid is None:
             return {}
