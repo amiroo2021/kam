@@ -1879,6 +1879,7 @@ class TestPositionManagementWrites(unittest.TestCase):
             "dex": "",
             "dex_index": 0,
             "internal_name": symbol,
+            "route_symbol": symbol,
             "public_symbol": symbol,
             "public_key": symbol,
             "internal_key": symbol,
@@ -1923,8 +1924,7 @@ class TestPositionManagementWrites(unittest.TestCase):
     def _patch_context(self, positions_side_effect, open_orders_side_effect, exchange):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._execute_positions_orders", mock.Mock(side_effect=positions_side_effect))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_open_orders_snapshot", mock.Mock(side_effect=open_orders_side_effect))
-        self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_perp_market_candidates", lambda: [self._candidate()])
-        self.patch("plugins.trade.agents.x_hyperliquid_agent._resolve_instrument_candidate", lambda requested, candidates: (candidates[0], ""))
+        self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_perp_market_candidates", lambda: [self._candidate("BTC"), self._candidate("HYPE")])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("100"))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 

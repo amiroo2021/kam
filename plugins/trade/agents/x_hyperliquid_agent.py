@@ -595,47 +595,39 @@ def _resolve_instrument_candidate(requested_symbol: str, candidates: List[Dict[s
     alias_key = _symbol_key(_resolve_exact_symbol_alias(requested_key))
     if not requested_key:
         return None, "INSTRUMENT_NOT_FOUND"
+    requested_upper = requested.upper()
+    route_qualified = ":" in requested
 
-    ranked: List[Tuple[Tuple[int, int, int, str, str], Dict[str, Any]]] = []
+    exact_route: List[Dict[str, Any]] = []
+    exact_public: List[Dict[str, Any]] = []
     for candidate in candidates:
+        route = str(candidate.get("route_symbol") or candidate.get("internal_name") or "")
         public_key = str(candidate.get("public_key") or "")
         internal_key = str(candidate.get("internal_key") or "")
-        if not public_key and not internal_key:
-            continue
+        public_symbol = str(candidate.get("public_symbol") or "")
+        if route.upper() == requested_upper or (internal_key and internal_key == requested_key and route_qualified):
+            exact_route.append(candidate)
+        elif public_key and (public_key == requested_key or public_key == alias_key):
+            exact_public.append(candidate)
+        elif public_symbol and public_symbol.upper() == requested_upper:
+            exact_public.append(candidate)
 
-        if requested_key == public_key:
-            match_kind = 0
-        elif requested_key == internal_key:
-            match_kind = 1
-        elif alias_key == public_key:
-            match_kind = 2
-        elif alias_key == internal_key:
-            match_kind = 3
-        elif requested_key in public_key or public_key in requested_key:
-            match_kind = 4
-        elif requested_key in internal_key or internal_key in requested_key:
-            match_kind = 5
-        else:
-            continue
+    if exact_route:
+        routes = {str(item.get("route_symbol") or "") for item in exact_route}
+        if len(routes) > 1:
+            return None, "INSTRUMENT_AMBIGUOUS"
+        return exact_route[0], ""
 
-        rank = (
-            match_kind,
-            int(candidate.get("dex_index") or 0),
-            len(public_key) if public_key else len(internal_key),
-            str(candidate.get("public_symbol") or ""),
-            str(candidate.get("internal_name") or ""),
-        )
-        ranked.append((rank, candidate))
-
-    if not ranked:
+    if route_qualified:
         return None, "INSTRUMENT_NOT_FOUND"
 
-    ranked.sort(key=lambda item: item[0])
-    best_rank = ranked[0][0]
-    best = [candidate for rank, candidate in ranked if rank == best_rank]
-    if len(best) > 1:
-        return None, "INSTRUMENT_AMBIGUOUS"
-    return best[0], ""
+    if exact_public:
+        routes = {str(item.get("route_symbol") or "") for item in exact_public}
+        if len(routes) > 1:
+            return None, "INSTRUMENT_AMBIGUOUS"
+        return exact_public[0], ""
+
+    return None, "INSTRUMENT_NOT_FOUND"
 
 
 def _execute_resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
@@ -1946,70 +1938,14 @@ def _current_position_management_context(
             message="Account alias is required.",
         )
 
-    positions_response = _execute_positions_orders(account, {"operation": "positions_orders", "exchange": name, "account": account})
-    if not positions_response.success:
+    requested_raw = (requested_symbol or "").strip()
+    if not requested_raw:
         return None, make_failure(
             operation=operation,
             exchange=name,
             account=account,
-            code=positions_response.error.code if positions_response.error else "POSITIONS_UNAVAILABLE",
-            message=positions_response.error.message if positions_response.error else "Positions unavailable.",
-            exchange_reason=getattr(positions_response.error, "exchange_reason", None) if positions_response.error else None,
-        )
-
-    positions = list(positions_response.positions or [])
-    requested_raw = (requested_symbol or "").strip().upper()
-    symbol = requested_raw
-    # Match a position by its full route identifier (e.g. ``xyz:SP500``)
-    # OR by its dex-stripped alias (e.g. ``SP500``). Positions now carry the
-    # full coin from the API (including any HIP-3 dex prefix), so we must
-    # accept either form to preserve dex identity without an extra network
-    # round-trip here. ``_symbol_key`` strips non-alphanumerics, so both
-    # ``xyz:SP500`` and ``SP500`` collapse to the same canonical key when the
-    # requested symbol is a bare alias; a fully-prefixed request (``xyz:SP500``)
-    # only matches the position whose symbol carries that prefix, preventing
-    # cross-dex collisions.
-    requested_keys = {_symbol_key(requested_raw)}
-    if ":" in requested_raw:
-        # Fully-prefixed request: accept the prefix-preserved position symbol.
-        pass
-    else:
-        # Bare alias: a position may surface as either ``SP500`` (native-style,
-        # no prefix) or ``xyz:SP500`` (HIP-3). Accept the dex-stripped tail too.
-        requested_keys.add(_symbol_key(requested_raw))
-    current_position = None
-    for position in positions:
-        pos_key = _symbol_key(getattr(position, "symbol", ""))
-        if not pos_key:
-            continue
-        pos_display = pos_key
-        if ":" in str(getattr(position, "symbol", "")):
-            # Strip the dex prefix for alias matching (kept the exact key
-            # above for prefixed requests). The full route key is already in
-            # ``requested_keys`` when the caller passed ``xyz:SP500``.
-            pos_display_alias = _symbol_key(str(getattr(position, "symbol", "")).split(":", 1)[1])
-        else:
-            pos_display_alias = pos_key
-        if pos_key in requested_keys or pos_display_alias in requested_keys:
-            current_position = position
-            break
-    if current_position is None:
-        return None, make_failure(
-            operation=operation,
-            exchange=name,
-            account=account,
-            code="POSITION_NOT_FOUND",
-            message="Position not found.",
-        )
-
-    wallet, _secret = _lookup_credentials(alias)
-    if wallet is None:
-        return None, make_failure(
-            operation=operation,
-            exchange=name,
-            account=account,
-            code="ACCOUNT_NOT_CONFIGURED",
-            message="Account is not configured.",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
         )
 
     try:
@@ -2023,7 +1959,7 @@ def _current_position_management_context(
             message=sanitize_error_message(str(exc)),
         )
 
-    candidate, error_code = _resolve_instrument_candidate(symbol, candidates)
+    candidate, error_code = _resolve_instrument_candidate(requested_raw, candidates)
     if candidate is None:
         message = "Multiple instruments match this symbol." if error_code == "INSTRUMENT_AMBIGUOUS" else "Instrument not found."
         return None, make_failure(
@@ -2032,6 +1968,49 @@ def _current_position_management_context(
             account=account,
             code=error_code,
             message=message,
+        )
+
+    wallet, _secret = _lookup_credentials(alias)
+    if wallet is None:
+        return None, make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_CONFIGURED",
+            message="Account is not configured.",
+        )
+
+    positions_response = _execute_positions_orders(account, {"operation": "positions_orders", "exchange": name, "account": account})
+    if not positions_response.success:
+        return None, make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code=positions_response.error.code if positions_response.error else "POSITIONS_UNAVAILABLE",
+            message=positions_response.error.message if positions_response.error else "Positions unavailable.",
+            exchange_reason=getattr(positions_response.error, "exchange_reason", None) if positions_response.error else None,
+        )
+
+    route = str(candidate.get("route_symbol") or candidate.get("internal_name") or "")
+    public = str(candidate.get("public_symbol") or "")
+    current_position = None
+    for position in list(positions_response.positions or []):
+        pos_sym = str(getattr(position, "symbol", "") or "")
+        if not pos_sym:
+            continue
+        if pos_sym == route or pos_sym.upper() == route.upper():
+            current_position = position
+            break
+        if ":" not in route and pos_sym.upper() == public.upper():
+            current_position = position
+            break
+    if current_position is None:
+        return None, make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code="POSITION_NOT_FOUND",
+            message="Position not found.",
         )
 
     try:

@@ -165,17 +165,14 @@ class Hip3ReadOnlyTests(unittest.TestCase):
         self.assertEqual(oflx["dex"], "flx")
 
     def test_bare_alias_resolves_to_single_dex_without_merging(self):
-        # A bare "SP500" resolves deterministically to one dex (lowest
-        # dex_index) but never splices two dexes together; the route symbol
-        # must be a single coherent dex-prefixed coin.
+        # Two HIP-3 routes sharing the public alias must not silently pick one.
         hl = _hl_module()
         xyz_sp = _candidate("xyz", "xyz:SP500")
         flx_sp = _candidate("flx", "flx:SP500")
         with mock.patch.object(hl, "_fetch_perp_market_candidates", lambda: [xyz_sp, flx_sp]):
-            candidate, _ = hl._resolve_instrument_candidate("SP500", [xyz_sp, flx_sp])
-        self.assertIsNotNone(candidate)
-        self.assertIn(":", candidate["route_symbol"])
-        self.assertIn(candidate["dex"], {"xyz", "flx"})
+            candidate, err = hl._resolve_instrument_candidate("SP500", [xyz_sp, flx_sp])
+        self.assertIsNone(candidate)
+        self.assertEqual(err, "INSTRUMENT_AMBIGUOUS")
 
     def test_resolve_instrument_returns_route_symbol(self):
         hl = _hl_module()

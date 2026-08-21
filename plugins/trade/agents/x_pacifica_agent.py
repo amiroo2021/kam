@@ -60,6 +60,7 @@ import base58
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -403,6 +404,7 @@ def capabilities() -> List[str]:
         "set_tp",
         "set_sl",
         "close_position",
+        "resolve_instrument",
     ]
 
 
@@ -574,6 +576,21 @@ def _get_market_info(symbol: str) -> Optional[Dict[str, Any]]:
         _PACIFICA_MARKET_INFO_CACHE = cache
         _PACIFICA_MARKET_INFO_FETCHED_AT = now
     return (_PACIFICA_MARKET_INFO_CACHE or {}).get(target)
+
+
+def _canonical_market_symbol(symbol: str) -> str:
+    """Resolve a caller symbol to Pacifica's listed /info symbol.
+
+    Raises ValueError(\"INSTRUMENT_NOT_FOUND\") when the market is not listed.
+    Transport failures from ``_get_market_info`` propagate.
+    """
+    info = _get_market_info(symbol)
+    if info is None:
+        raise ValueError("INSTRUMENT_NOT_FOUND")
+    listed = str(info.get("symbol") or "").strip().upper()
+    if not listed:
+        raise ValueError("INSTRUMENT_NOT_FOUND")
+    return listed
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +964,20 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
             operation="cancel_order_group", exchange=name, account=account,
             code="INVALID_SIDE", message="Side must be 'long' or 'short'.",
         )
+    try:
+        canonical = _canonical_market_symbol(symbol)
+    except ValueError:
+        return make_failure(
+            operation="cancel_order_group", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {symbol}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order_group", exchange=name, account=account,
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
     pacific_side = "bid" if canonical_side == "long" else "ask"
 
     # --- 1. snapshot open orders ---
@@ -966,7 +997,7 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
             continue
         row_symbol = str(row.get("symbol") or "").strip().upper()
         row_side = str(row.get("side") or "").strip().lower()
-        if row_symbol != symbol or row_side != pacific_side:
+        if row_symbol != canonical or row_side != pacific_side:
             continue
         raw_id = row.get("order_id")
         try:
@@ -1059,7 +1090,7 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
             continue
         row_symbol = str(row.get("symbol") or "").strip().upper()
         row_side = str(row.get("side") or "").strip().lower()
-        if row_symbol != symbol or row_side != pacific_side:
+        if row_symbol != canonical or row_side != pacific_side:
             continue
         try:
             still_open_ids.add(int(str(row.get("order_id"))))
@@ -2006,6 +2037,20 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             code="MISSING_SYMBOL", message="Symbol is required.",
         )
     try:
+        canonical = _canonical_market_symbol(symbol)
+    except ValueError:
+        return make_failure(
+            operation="set_tp", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {symbol}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="set_tp", exchange=name, account=account,
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    try:
         tp_price = Decimal(price_text) if price_text else Decimal("0")
     except Exception:
         return make_failure(
@@ -2022,7 +2067,7 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             code="POSITIONS_UNAVAILABLE",
             message=sanitize_error_message(str(exc)),
         )
-    pos = _find_position(positions, symbol)
+    pos = _find_position(positions, canonical)
     if pos is None:
         return make_failure(
             operation="set_tp", exchange=name, account=account,
@@ -2346,6 +2391,20 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             code="MISSING_SYMBOL", message="Symbol is required.",
         )
     try:
+        canonical = _canonical_market_symbol(symbol)
+    except ValueError:
+        return make_failure(
+            operation="set_sl", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {symbol}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="set_sl", exchange=name, account=account,
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    try:
         sl_price = Decimal(price_text) if price_text else Decimal("0")
     except Exception:
         return make_failure(
@@ -2362,7 +2421,7 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             code="POSITIONS_UNAVAILABLE",
             message=sanitize_error_message(str(exc)),
         )
-    pos = _find_position(positions, symbol)
+    pos = _find_position(positions, canonical)
     if pos is None:
         return make_failure(
             operation="set_sl", exchange=name, account=account,
@@ -2680,6 +2739,28 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
                 status="failed",
             ),
         )
+    try:
+        canonical = _canonical_market_symbol(symbol)
+    except ValueError:
+        return make_failure(
+            operation="close_position", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {symbol}",
+            position_action=_position_action_result(
+                operation="close_position", symbol=symbol, verified=False,
+                status="failed",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="close_position", exchange=name, account=account,
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+            position_action=_position_action_result(
+                operation="close_position", symbol=symbol, verified=False,
+                status="failed",
+            ),
+        )
 
     # --- locate the position ---
     try:
@@ -2690,7 +2771,7 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
             code="POSITIONS_UNAVAILABLE",
             message=sanitize_error_message(str(exc)),
         )
-    pos = _find_position(positions, symbol)
+    pos = _find_position(positions, canonical)
     if pos is None:
         # Already-flat is a verified no-op success.
         return make_success(
@@ -2849,7 +2930,7 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
             new_positions = _get_positions(creds["address"])
         except Exception:  # noqa: BLE001
             new_positions = []
-        new_pos = _find_position(new_positions, symbol)
+        new_pos = _find_position(new_positions, canonical)
         if new_pos is None:
             verified = True
             last_size_text = "0"
@@ -3729,6 +3810,51 @@ def _execute_positions_orders(account: str) -> CanonicalResponse:
         )
 
 
+def _execute_resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        canonical = _canonical_market_symbol(requested)
+    except ValueError:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    info = _get_market_info(canonical) or {}
+    instrument = CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=canonical,
+        display_name=str(info.get("symbol") or canonical),
+        price_increment=str(info.get("tick_size") or "") or None,
+        size_increment=str(info.get("lot_size") or "") or None,
+        minimum_size=str(info.get("lot_size") or "") or None,
+    )
+    return make_success(
+        operation="resolve_instrument",
+        exchange=name,
+        account=account,
+        instrument=instrument,
+    )
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     if not isinstance(request, dict):
         return make_failure(
@@ -3777,6 +3903,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_set_sl(account, request)
     if operation == "close_position":
         return _execute_close_position(account, request)
+    if operation == "resolve_instrument":
+        return _execute_resolve_instrument(account, request)
 
     return make_failure(
         operation=operation,
