@@ -1763,14 +1763,52 @@ class FiboSocketServiceHost(socketserver.ThreadingUnixStreamServer):
         super().__init__(str(self.socket_path), _FiboCommandHandler)
         self._serving_thread: Optional[threading.Thread] = None
         self._serving = True
+        self._stop_lock = threading.Lock()
+        self._stop_started = False
+        self._did_shutdown = False
+
+    def request_stop(self) -> None:
+        """Non-blocking stop. Safe from the serve_forever thread and signal handlers.
+
+        ``ThreadingUnixStreamServer.shutdown()`` must not run on the
+        ``serve_forever()`` thread (deadlock → systemd SIGKILL after 90s).
+        A single helper thread performs the blocking shutdown. Repeated
+        calls are no-ops.
+        """
+        with self._stop_lock:
+            if self._stop_started:
+                return
+            self._stop_started = True
+        threading.Thread(
+            target=self._stop_from_helper,
+            name="fibo-host-stop",
+            daemon=False,
+        ).start()
+
+    def _stop_from_helper(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def serve_forever(self) -> None:
         try:
             super().serve_forever()
         finally:
-            self.shutdown()
+            try:
+                self.shutdown()
+            finally:
+                if self.socket_path.exists():
+                    try:
+                        self.socket_path.unlink()
+                    except Exception:
+                        pass
 
     def shutdown(self) -> None:
+        with self._stop_lock:
+            if self._did_shutdown:
+                return
+            self._did_shutdown = True
         try:
             super().shutdown()
         except Exception:

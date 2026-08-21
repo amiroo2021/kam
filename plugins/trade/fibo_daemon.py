@@ -74,7 +74,7 @@ def main(argv: List[str] | None = None) -> int:
 
     def _stop(_signum: int, _frame) -> None:  # type: ignore[no-untyped-def]
         logger.info("Stopping fibo daemon")
-        host.shutdown()
+        host.request_stop()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
