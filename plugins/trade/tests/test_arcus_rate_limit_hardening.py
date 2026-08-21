@@ -161,6 +161,22 @@ class PositionContextHardeningTests(unittest.TestCase):
                         }
                     },
                 )
+            if url.endswith("/v1/markets"):
+                return _Resp(
+                    200,
+                    {
+                        "markets": [
+                            {
+                                "marketId": 3,
+                                "marketDisplayName": "SOL-USD",
+                                "baseAsset": "SOL",
+                                "tickSize": "0.001",
+                                "stepSize": "0.000001",
+                                "minOrderNotional": "10",
+                            }
+                        ]
+                    },
+                )
             return _Resp(429, {})
 
         with mock.patch.object(A, "_lookup_credentials", return_value=self.creds):

@@ -418,10 +418,15 @@ class GoldenFiboEngine:
         """
         if self._is_smooth_shutdown():
             return self._complete_smooth_shutdown(actions)
-        # Guard: never resubmit an already-attempted Step0.
-        if self.state.submission_phase == SUBMISSION_ATTEMPTED:
+        # Guard: never resubmit an already-attempted or confirmed Step0.
+        if self.state.submission_phase in (
+            SUBMISSION_ATTEMPTED,
+            SUBMISSION_CONFIRMED,
+            SUBMISSION_NEEDS_RECOVERY,
+        ):
             return self._freeze(
-                "Step0 already attempted (submission_attempted persisted); "
+                "Step0 already attempted/confirmed (submission_phase="
+                f"{self.state.submission_phase}); "
                 "reconcile exchange state before any resubmission"
             )
 
@@ -1012,6 +1017,21 @@ class GoldenFiboEngine:
         # Already flat and no pending — start fresh cycle, unless Smooth Shutdown.
         if self._is_smooth_shutdown():
             return self._complete_smooth_shutdown(actions)
+        if self.state.submission_phase in (
+            SUBMISSION_ATTEMPTED,
+            SUBMISSION_CONFIRMED,
+            SUBMISSION_NEEDS_RECOVERY,
+        ) and int(self.state.highest_filled_step) < 0:
+            return self._freeze(
+                "position reads flat after Step0 submission without confirmed fill; "
+                "do not place another Step0. Reconcile exchange state."
+            )
+        if int(self.state.highest_filled_step) >= 0:
+            # Completed cycle (TP exit). Reset submission so the next Step0
+            # is a new cycle, not a repeat of the unconfirmed first Step0.
+            self.state.submission_phase = SUBMISSION_NOT_SUBMITTED
+            self.state.submission_client_id = None
+            self.state.submission_exchange_order_id = None
         return self._start_fresh_cycle(actions)
 
     # ------------------------------------------------------------------

@@ -1134,6 +1134,11 @@ class PersistentFiboService:
             pending_oid = state.pending_order_exchange_id
             tp_oid = state.current_tp_order_id
             expected_side = "long" if direction == "BUY" else "short"
+            cycle_id = int(getattr(state, "cycle_id", 0) or 0)
+            submission_phase = str(getattr(state, "submission_phase", "") or "")
+            expected_size = Decimal(str(getattr(state, "expected_cumulative_size", 0) or 0))
+            highest_filled = int(getattr(state, "highest_filled_step", -1) or -1)
+            emergency_close_phase = str(getattr(state, "emergency_close_phase", "") or "")
 
         # Work outside lock for venue I/O
         try:
@@ -1158,6 +1163,38 @@ class PersistentFiboService:
         live_size = Decimal(str(position.get("size") or "0"))
         live_side = position.get("side")
         has_position = live_size > 0 and live_side in ("long", "short")
+
+        had_submission = (
+            pending_oid is not None
+            or tp_oid is not None
+            or cycle_id > 0
+            or expected_size > 0
+            or highest_filled >= 0
+            or submission_phase
+            in (SUBMISSION_ATTEMPTED, SUBMISSION_CONFIRMED, SUBMISSION_NEEDS_RECOVERY)
+        )
+        if (not has_position) and had_submission and emergency_close_phase != "submitted":
+            with self._lock:
+                st = self._states.get(key)
+                if st is not None:
+                    st.status = STATUS_NEEDS_RECOVERY
+                    st.shutdown_mode = SHUTDOWN_MODE_EMERGENCY
+                    st.freeze_reason = (
+                        "emergency_stop saw FLAT position_state after Step0/submission "
+                        "evidence; refusing to treat UNKNOWN/empty as flat"
+                    )
+                    self._save_state()
+            actions.append(
+                f"untrusted_flat size={live_size} side={live_side} "
+                f"cycle_id={cycle_id} phase={submission_phase}"
+            )
+            return {
+                "ok": False,
+                "error": "NEEDS_RECOVERY",
+                "detail": "position_state flat is untrusted after submission evidence",
+                "registration_key": key,
+                "actions": actions,
+            }
 
         if has_position and live_side != expected_side:
             with self._lock:

@@ -742,6 +742,46 @@ def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper() or "UNKNOWN"
 
 
+def _row_market_symbol(row: Any) -> str:
+    if not isinstance(row, dict):
+        return "UNKNOWN"
+    return _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
+
+
+def _identity_from_market(market: Dict[str, Any], requested: str = "") -> Dict[str, Any]:
+    """Canonical Arcus market identity + aliases (SOL ↔️ SOL-USD)."""
+    display = _normalize_symbol(
+        market.get("display_symbol") or market.get("marketDisplayName")
+    )
+    base = _normalize_symbol(market.get("base_asset") or market.get("baseAsset"))
+    req = _normalize_symbol(requested)
+    aliases = {item for item in (display, base, req) if item and item != "UNKNOWN"}
+    if display and "-" in display:
+        aliases.add(display.split("-", 1)[0])
+    return {
+        "market_id": int(market.get("market_id") or market.get("marketId") or 0),
+        "canonical_symbol": display if display != "UNKNOWN" else req,
+        "aliases": aliases,
+    }
+
+
+def _symbol_matches_identity(row_symbol: Any, identity: Dict[str, Any]) -> bool:
+    n = _normalize_symbol(row_symbol)
+    if not n or n == "UNKNOWN":
+        return False
+    aliases = identity.get("aliases") or set()
+    if n in aliases:
+        return True
+    base = n.split("-", 1)[0]
+    return bool(base) and base in aliases
+
+
+def _resolve_identity(symbol: str) -> Dict[str, Any]:
+    """Resolve a user/native symbol to canonical Arcus identity. Raises ValueError."""
+    market = _resolve_market(symbol)
+    return _identity_from_market(market, symbol)
+
+
 def _normalize_positions(
     positions_payload: Any,
     protections: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1003,9 +1043,12 @@ def _resolve_market(symbol: str) -> Dict[str, Any]:
     tick_size = _decimal_or_zero(market.get("tickSize"))
     step_size = _decimal_or_zero(market.get("stepSize"))
     min_notional = _decimal_or_zero(market.get("minOrderNotional"))
+    display = _normalize_symbol(market.get("marketDisplayName"))
+    base_asset = _normalize_symbol(market.get("baseAsset"))
     return {
         "market_id": int(market.get("marketId") or 0),
-        "display_symbol": _normalize_symbol(market.get("marketDisplayName")),
+        "display_symbol": display,
+        "base_asset": base_asset,
         "tick_size": tick_size,
         "step_size": step_size,
         "price_precision": _decimal_places(market.get("tickSize")),
@@ -2862,17 +2905,17 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
     try:
         market = _resolve_market(symbol)
         market_id = int(market["market_id"])
+        identity = _identity_from_market(market, symbol)
     except ValueError as exc:
         return make_failure(operation="cancel_order_group", exchange=name, account=account, code=str(exc), message=sanitize_error_message(str(exc)))
     try:
         before = _fetch_open_orders_for_account(credentials)
-        target_symbol = _normalize_symbol(symbol)
         targets: List[Dict[str, Any]] = []
         same_symbol_other_side: List[Dict[str, Any]] = []
         for row in before:
-            row_symbol = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
+            row_symbol = _row_market_symbol(row)
             row_side = str(row.get("side") or "").strip().lower()
-            if row_symbol != target_symbol:
+            if not _symbol_matches_identity(row_symbol, identity):
                 continue
             order_id = str(row.get("orderId") or "").strip()
             if not order_id:
@@ -2927,7 +2970,7 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
 
         # ONE authoritative post-cancel openOrders read (never one per child).
         after = _fetch_open_orders_for_account(credentials)
-        remaining = [row for row in after if _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market")) == target_symbol and str(row.get("side") or "").strip().lower() == side]
+        remaining = [row for row in after if _symbol_matches_identity(_row_market_symbol(row), identity) and str(row.get("side") or "").strip().lower() == side]
         confirmed_absent = len(targets) - len(remaining)
         verified = len(remaining) == 0
         cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=confirmed_absent, remaining_target_count=len(remaining), verified=verified, partial=not verified, status="success" if verified else "partial", batch_count=len(batches), batches=batches)
@@ -2967,17 +3010,19 @@ def _arcus_normalize_client_id(raw: Any, *, default_prefix: str = "arcus-") -> s
 
 def _arcus_fetch_mark_price(credentials: Dict[str, Any], symbol: str, market: Dict[str, Any]) -> Decimal:
     """Best-effort mark/last for market IOC pricing."""
+    identity = _identity_from_market(market, symbol)
     # Prefer account mark if position/market context available via public markets.
     try:
         markets_payload = _public_get(credentials, "/v1/markets")
         markets = markets_payload.get("markets") if isinstance(markets_payload, dict) else None
         target = _normalize_symbol(symbol)
         mid = int(market.get("market_id") or 0)
+        identity = _identity_from_market(market, symbol)
         if isinstance(markets, list):
             for m in markets:
                 if not isinstance(m, dict):
                     continue
-                if int(m.get("marketId") or 0) == mid or _normalize_symbol(m.get("marketDisplayName")) == target:
+                if int(m.get("marketId") or 0) == mid or _symbol_matches_identity(m.get("marketDisplayName"), identity):
                     for key in ("markPx", "markPrice", "indexPrice", "oraclePrice", "lastPrice", "midPrice"):
                         px = _decimal_or_zero(m.get(key))
                         if px > 0:
@@ -2992,7 +3037,7 @@ def _arcus_fetch_mark_price(credentials: Dict[str, Any], symbol: str, market: Di
             for _, row in positions.items():
                 if not isinstance(row, dict):
                     continue
-                if _normalize_symbol(row.get("marketDisplayName") or row.get("symbol")) == _normalize_symbol(symbol):
+                if _symbol_matches_identity(row.get("marketDisplayName") or row.get("symbol"), identity):
                     px = _decimal_or_zero(row.get("markPx") or row.get("markPrice"))
                     if px > 0:
                         return px
@@ -3267,33 +3312,43 @@ def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
         return make_failure(operation="position_state", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Arcus account is not configured.")
+    if not symbol:
+        return make_failure(operation="position_state", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    try:
+        identity = _resolve_identity(symbol)
+    except ValueError as exc:
+        return make_failure(
+            operation="position_state",
+            exchange=name,
+            account=account,
+            code=str(exc) or "INSTRUMENT_NOT_FOUND",
+            message=sanitize_error_message(str(exc)),
+        )
     try:
         payload = _public_get(credentials, "/v1/account")
         positions = _normalize_positions(payload.get("positions") if isinstance(payload, dict) else {})
     except Exception as exc:
         return make_failure(operation="position_state", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
-    if symbol:
-        target = _normalize_symbol(symbol)
-        filtered = []
-        for p in positions:
-            d = p.to_dict() if hasattr(p, "to_dict") else dict(p)
-            if _normalize_symbol(d.get("symbol")) == target:
-                # Normalize side/size for GoldenFibo engine
-                side = str(d.get("side") or "").lower()
-                size = _decimal_or_zero(d.get("size"))
-                if side in {"long", "short"} and size > 0:
-                    filtered.append(
-                        CanonicalPosition(
-                            symbol=str(d.get("symbol") or target),
-                            side=side,
-                            size=_decimal_text(size),
-                            entry_price=str(d.get("entry_price") or "0"),
-                            pnl=str(d.get("pnl") or "0"),
-                            tp=d.get("tp"),
-                            sl=d.get("sl"),
-                        )
-                    )
-        positions = filtered
+    filtered = []
+    for p in positions:
+        d = p.to_dict() if hasattr(p, "to_dict") else dict(p)
+        if not _symbol_matches_identity(d.get("symbol"), identity):
+            continue
+        side = str(d.get("side") or "").lower()
+        size = _decimal_or_zero(d.get("size"))
+        if side in {"long", "short"} and size > 0:
+            filtered.append(
+                CanonicalPosition(
+                    symbol=str(identity.get("canonical_symbol") or d.get("symbol") or symbol),
+                    side=side,
+                    size=_decimal_text(size),
+                    entry_price=str(d.get("entry_price") or "0"),
+                    pnl=str(d.get("pnl") or "0"),
+                    tp=d.get("tp"),
+                    sl=d.get("sl"),
+                )
+            )
+    positions = filtered
     return make_success(operation="position_state", exchange=name, account=account, positions=positions)
 
 
@@ -3337,17 +3392,27 @@ def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalR
     if cid_raw is None:
         return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account, code="MISSING_CLIENT_ID", message="client_order_index is required.")
     want = str(cid_raw).strip()
+    identity = None
+    if symbol:
+        try:
+            identity = _resolve_identity(symbol)
+        except ValueError as exc:
+            return make_failure(
+                operation="get_order_state_by_client_id",
+                exchange=name,
+                account=account,
+                code=str(exc) or "INSTRUMENT_NOT_FOUND",
+                message=sanitize_error_message(str(exc)),
+            )
     try:
         orders = _fetch_open_orders_for_account(credentials)
     except Exception as exc:
         return make_failure(operation="get_order_state_by_client_id", exchange=name, account=account, code="ARCUS_ERROR", message=sanitize_error_message(str(exc)))
-    target_sym = _normalize_symbol(symbol) if symbol else ""
     for row in orders:
         if not isinstance(row, dict):
             continue
-        if target_sym:
-            row_sym = _normalize_symbol(row.get("marketDisplayName") or row.get("symbol") or row.get("market"))
-            if row_sym != target_sym:
+        if identity is not None:
+            if not _symbol_matches_identity(_row_market_symbol(row), identity):
                 continue
         crow = str(row.get("clientId") or row.get("client_id") or "").strip()
         if crow == want:
@@ -3360,7 +3425,7 @@ def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalR
     # Filled market orders leave openOrders. If a live position exists for the
     # symbol, synthesize a FILLED record using average entry as P0 so GoldenFibo
     # Step0 confirmation can proceed without inventing a fill.
-    if symbol:
+    if symbol and identity is not None:
         try:
             acc = _public_get(credentials, "/v1/account")
             positions = acc.get("positions") if isinstance(acc, dict) else {}
@@ -3368,7 +3433,7 @@ def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalR
                 for _, prow in positions.items():
                     if not isinstance(prow, dict):
                         continue
-                    if _normalize_symbol(prow.get("marketDisplayName") or prow.get("symbol")) != target_sym:
+                    if not _symbol_matches_identity(prow.get("marketDisplayName") or prow.get("symbol"), identity):
                         continue
                     size = abs(_decimal_or_zero(prow.get("size") or prow.get("positionSize")))
                     if size <= 0:
@@ -3388,7 +3453,7 @@ def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalR
                         "exchange_order_id": None,
                         "client_order_index": int(want) if want.isdigit() else want,
                         "client_order_id": want,
-                        "symbol": target_sym,
+                        "symbol": identity.get("canonical_symbol") or symbol,
                         "side": side,
                         "type": "market",
                         "status": "filled",
