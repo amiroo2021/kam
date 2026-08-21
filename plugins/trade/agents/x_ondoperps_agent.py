@@ -2529,6 +2529,13 @@ def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Opti
         if remaining < 0:
             remaining = Decimal("0")
     taxonomy = "ACTIVE" if classification in {"OPEN", "PARTIALLY_FILLED"} else classification
+    # Ondo documents the average execution price as ``averageFillPrice``
+    # (and aliases ``avgFillPrice`` on older snapshots). Map it into the
+    # canonical GoldenFibo field ``actual_fill_price`` at this venue
+    # boundary so the generic Step0 promotion path can pick it up without
+    # needing per-venue field names. ``average_fill_price`` is preserved
+    # for any caller that prefers the venue-native name.
+    avg_fill_raw = order.get("averageFillPrice") or order.get("avgFillPrice")
     return {
         "exchange_order_id": oid,
         "client_order_id": order.get("clientOrderId"),
@@ -2540,7 +2547,8 @@ def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Opti
         "filled_size": _decimal_text(filled) if filled is not None else None,
         "remaining_size": _decimal_text(remaining) if remaining is not None else None,
         "limit_price": _decimal_text(order.get("price")),
-        "average_fill_price": _decimal_text(order.get("averageFillPrice") or order.get("avgFillPrice")),
+        "average_fill_price": _decimal_text(avg_fill_raw),
+        "actual_fill_price": _decimal_text(avg_fill_raw),
         "symbol": str(order.get("market") or "").strip() or None,
         "raw_status": order.get("status"),
     }

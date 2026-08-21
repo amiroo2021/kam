@@ -1360,5 +1360,319 @@ class OndoRecoveryGateTests(unittest.TestCase):
                 ladder_before, "No Step1 placed")
 
 
+# ---------------------------------------------------------------------------
+# averageFillPrice -> actual_fill_price normalization (incident 2026-08-21)
+# ---------------------------------------------------------------------------
+#
+# Ondo's order-by-client-id endpoint returns the average execution price
+# under the field name ``averageFillPrice`` (with an ``avgFillPrice`` alias
+# on older snapshots). GoldenFibo's generic Step0 fill-price extractor
+# expects the canonical field ``actual_fill_price``. Without normalization
+# at the venue boundary, an honest FILLED order cannot be promoted.
+#
+# These tests pin the contract at two levels:
+#   * ``_order_state_from_ondo_row`` must expose ``actual_fill_price``
+#     populated from the same Ondo-native source as ``average_fill_price``.
+#   * The Step0 confirmation path must successfully promote an Ondo
+#     FILLED order without any per-venue branching in the engine.
+
+
+class OndoAverageFillPriceNormalizationTests(unittest.TestCase):
+    """Tests A–D for the averageFillPrice -> actual_fill_price fix."""
+
+    def test_A_ondoperps_FILLED_order_row_exposes_canonical_actual_fill_price(self):
+        """A. ``_order_state_from_ondo_row`` exposes ``actual_fill_price``
+        populated from Ondo's ``averageFillPrice`` field. The legacy
+        ``average_fill_price`` alias is preserved for any caller that
+        prefers the venue-native name.
+        """
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        ondo_row = {
+            "orderId": "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV",
+            "clientOrderId": "82738593280000",
+            "side": "buy",
+            "price": "0",
+            "market": "ETH-USD.P",
+            "filledSize": "0.001",
+            "lastFillSize": "0.001",
+            "filledCost": "2.4126",
+            "fee": "0.000603",
+            "feeRebate": "0.00003",
+            "status": "fullyfilled",
+            "createdAt": "2026-08-21T19:24:37.164221084Z",
+            "filledAt": "2026-08-21T19:24:37.164221084Z",
+            "type": "market",
+            "size": "0.001",
+            "averageFillPrice": "2412.60",
+        }
+        normalized = _order_state_from_ondo_row(ondo_row)
+        # Canonical GoldenFibo field is populated from Ondo source.
+        # _decimal_text strips trailing zeros, so compare numerically.
+        self.assertEqual(Decimal(str(normalized.get("actual_fill_price"))),
+                         Decimal("2412.60"))
+        # Legacy alias preserved.
+        self.assertEqual(Decimal(str(normalized.get("average_fill_price"))),
+                         Decimal("2412.60"))
+        # Status / identity fields still flow.
+        self.assertEqual(normalized.get("status"), "FILLED")
+        self.assertEqual(normalized.get("taxonomy"), "FILLED")
+        self.assertEqual(normalized.get("filled_size"), "0.001")
+
+    def test_A_avgFillPrice_alias_also_populates_canonical(self):
+        """Some older Ondo snapshots use ``avgFillPrice`` instead of
+        ``averageFillPrice``. Both must feed the canonical field.
+        """
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        normalized = _order_state_from_ondo_row({
+            "orderId": "X",
+            "clientOrderId": "1",
+            "side": "buy",
+            "market": "ETH-USD.P",
+            "status": "fullyfilled",
+            "size": "0.001",
+            "filledSize": "0.001",
+            "avgFillPrice": "2412.60",  # older alias
+        })
+        self.assertEqual(Decimal(str(normalized.get("actual_fill_price"))),
+                         Decimal("2412.60"))
+        self.assertEqual(Decimal(str(normalized.get("average_fill_price"))),
+                         Decimal("2412.60"))
+
+    def test_B_FILLED_with_canonical_fill_price_and_matching_position_promotes(self):
+        """B. Ondo FILLED order with averageFillPrice + matching live
+        position promotes Step0 successfully and uses the fill price.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            # Build the row that the Ondo agent returns from a real
+            # fullyfilled order. Normalise it via the production
+            # helper to mirror the live data path.
+            ondo_row = {
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593280000",
+                "side": "buy",
+                "price": "0",
+                "market": "ETH-USD.P",
+                "filledSize": "0.001",
+                "lastFillSize": "0.001",
+                "filledCost": "2.4126",
+                "fee": "0.000603",
+                "status": "fullyfilled",
+                "createdAt": "2026-08-21T19:24:37.164Z",
+                "filledAt": "2026-08-21T19:24:37.164Z",
+                "type": "market",
+                "size": "0.001",
+                "averageFillPrice": "2412.60",
+            }
+            # Sanity-check the production normalizer first.
+            self.assertEqual(
+                Decimal(str(_order_state_from_ondo_row(ondo_row).get("actual_fill_price"))),
+                Decimal("2412.60"),
+            )
+            adapter.lookup_result = _order_state_from_ondo_row(ondo_row)
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "FILLED with canonical fill price + matching "
+                             "position MUST promote Step0")
+            # Fill price is sourced from actual_fill_price (Ondo's
+            # averageFillPrice mapped at the venue boundary).
+            self.assertEqual(state.fill_prices.get(0), Decimal("2412.60"))
+            self.assertEqual(Decimal(str(state.step_orders[0]["price"])),
+                             Decimal("2412.60"))
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+
+    def test_C_historical_FILLED_flat_position_still_does_not_promote(self):
+        """C. Historical FILLED + currently FLAT position MUST NOT
+        resurrect Step0 (regression for the safety gate, this time with
+        the fill-price normalizer fixed). Without the safety gate the
+        fix could let a historical fill revive downstream orders for a
+        closed position.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            ondo_row = {
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593280000",
+                "side": "buy",
+                "market": "ETH-USD.P",
+                "status": "fullyfilled",
+                "size": "0.001",
+                "filledSize": "0.001",
+                "averageFillPrice": "2412.60",
+            }
+            adapter.lookup_result = _order_state_from_ondo_row(ondo_row)
+            # Live position is FLAT (user closed the position externally).
+            adapter.position = {
+                "symbol": "ETH",
+                "side": None,
+                "size": "0",
+                "entry_price": None,
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+            ladder_before = sum(1 for c in adapter.calls if c[0] == "place_limit")
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Historical FILLED + flat position MUST NOT promote")
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                tp_before, "No TP placed")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "place_limit"),
+                ladder_before, "No Step1 placed")
+            self.assertIsNone(state.current_tp_order_id)
+            self.assertIsNone(state.step_orders.get(0))
+            self.assertEqual(state.status, "needs_recovery")
+
+    def test_D_missing_fill_price_fails_closed(self):
+        """D. A FILLED row with neither averageFillPrice, avgFillPrice,
+        nor actual_fill_price present must fail closed — freeze with
+        needs_recovery, no exchange mutation.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            ondo_row = {
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593280000",
+                "side": "buy",
+                "market": "ETH-USD.P",
+                "status": "fullyfilled",
+                "size": "0.001",
+                "filledSize": "0.001",
+                # Intentionally NO averageFillPrice / avgFillPrice.
+            }
+            adapter.lookup_result = _order_state_from_ondo_row(ondo_row)
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+            ladder_before = sum(1 for c in adapter.calls if c[0] == "place_limit")
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Missing fill price must not promote Step0")
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                tp_before, "No TP placed")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "place_limit"),
+                ladder_before, "No Step1 placed")
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("could not establish Step0 fill price",
+                          state.freeze_reason or "")
+
+    def test_D_invalid_fill_price_fails_closed(self):
+        """An unparseable averageFillPrice must also fail closed."""
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            ondo_row = {
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593280000",
+                "side": "buy",
+                "market": "ETH-USD.P",
+                "status": "fullyfilled",
+                "size": "0.001",
+                "filledSize": "0.001",
+                "averageFillPrice": "not-a-number",
+            }
+            adapter.lookup_result = _order_state_from_ondo_row(ondo_row)
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1)
+            self.assertEqual(adapter.place_market_calls, place_market_before)
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                tp_before)
+            self.assertEqual(state.status, "needs_recovery")
+
+
 if __name__ == "__main__":
     unittest.main()
