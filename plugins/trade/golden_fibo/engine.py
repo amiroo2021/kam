@@ -353,7 +353,11 @@ class GoldenFiboEngine:
         pending_alive = False
         if pending_filled:
             return self._handle_confirmed_fill(actions)
-        if self.state.pending_order_exchange_id is not None:
+        # Use the resolved pending_state taxonomy from the fallback-aware
+        # client-id lookup (line 250) rather than gating on
+        # pending_order_exchange_id. Ondo's alphanumeric ids leave
+        # pending_order_exchange_id as None even when the order is live.
+        if pending_state:
             pending_status = str(pending_state.get("status") or "")
             pending_taxonomy = str(pending_state.get("taxonomy") or "")
             if pending_taxonomy == "ACTIVE":
@@ -382,7 +386,12 @@ class GoldenFiboEngine:
             return self._handle_cycle_end(actions)
 
         # has_position
-        if self.state.pending_order_exchange_id is None:
+        # Gate on pending_alive (resolved order state from the
+        # fallback-aware client-id lookup) rather than
+        # pending_order_exchange_id (legacy numeric slot). Ondo's
+        # alphanumeric ids leave pending_order_exchange_id as None even
+        # when the order is live and verifiable via client-id.
+        if self.state.pending_order_exchange_id is None and not pending_alive:
             # Case C: position exists but expected pending ladder is absent
             return self._handle_missing_pending(position, live_size, actions)
 

@@ -2194,7 +2194,7 @@ class OndoStep1LadderRecoveryTests(unittest.TestCase):
             svc1 = _build_svc_for_step0(state_path, ledger_path, events_path)
             adapter1 = _OndoLadderStepAdapter()
             svc1._adapters[key] = adapter1
-            _seed_step1_state(svc1, key)
+            _seed_step1_running_state(svc1, key)
             adapter1.pending_lookup = {
                 "exchange_order_id": "2B6JBP76E4CBKPALTNEGTM6QFF2BF7IX",
                 "client_order_id": 82755773245472,
@@ -2956,6 +2956,241 @@ class OndoPendingIdentityPersistenceTests(unittest.TestCase):
                            if c["client_order_id"] == cid]
             self.assertEqual(len(step1_calls), 0,
                              "Post-crash recovery must NOT resubmit Step1")
+
+
+
+
+# ---------------------------------------------------------------------------
+# pending_alive gate fix (incident 2026-08-21 wave 5 — Step1 OPEN on venue
+# but engine froze because pending_order_exchange_id was None)
+# ---------------------------------------------------------------------------
+
+
+def _seed_step1_running_state(svc, key, *, client_id=82755773369376,
+                               step0_volume="0.001", percentage="0.001", cycle_uid=335407):
+    """Seed a registration where Step0 is promoted and Step1 is pending
+    (running state, not frozen). This is the normal post-Step0 state
+    before the Step1 fill."""
+    state = GoldenFiboState()
+    state.strategy = "golden_fibo"
+    state.schema_version = 1
+    state.registration_key = key
+    state.exchange = "ondoperps"
+    state.account = key.split("/")[1]
+    state.instrument = key.split("/")[2]
+    state.direction = "BUY"
+    state.percentage = Decimal(percentage)
+    state.step0_volume = Decimal(step0_volume)
+    state.cycle_uid = cycle_uid
+    state.highest_cycle_uid = cycle_uid
+    state.client_id_version = 2
+    state.next_step = 1
+    state.highest_filled_step = 0
+    state.expected_cumulative_size = Decimal(step0_volume)
+    state.fill_prices = {0: Decimal("2522.5")}
+    state.step_orders = {0: {
+        "role": "entry",
+        "client_id": 82738593500160,
+        "exchange_order_id": "3Z6IH3XUMYZEUMIJ2OZKN5PRQ6E3VTSC",
+        "status": "filled",
+        "price": "2522.5",
+        "size": step0_volume,
+    }}
+    state.current_tp_price = Decimal("2525")
+    state.current_tp_size = Decimal(step0_volume)
+    state.current_tp_role = "tp"
+    state.current_tp_client_id = 82772953238528
+    state.current_tp_order_id = None
+    # Step1 PENDING (placed but not yet filled).
+    state.pending_order_role = ROLE_LADDER
+    state.pending_order_client_id = client_id
+    state.pending_order_exchange_id = None  # Ondo alphanumeric
+    state.pending_requested_price = Decimal("2518.4185950")
+    state.pending_requested_size = Decimal(step0_volume)
+    state.pending_confirmed_price = Decimal("2518.4")
+    state.pending_confirmed_size = Decimal(step0_volume)
+    state.submission_phase = SUBMISSION_CONFIRMED
+    state.submission_client_id = client_id
+    state.submission_step = 1
+    state.submission_role = ROLE_LADDER
+    state.submission_attempted_at = 1787350038.9141467
+    state.submission_exchange_order_id = None
+    state.status = "running"
+    state.freeze_reason = None
+    state.shutdown_mode = ""
+    svc._states[key] = state
+    return state
+
+
+class OndoPendingAliveGateTests(unittest.TestCase):
+    """Tests A-H for the pending_alive gate fix in engine.tick()."""
+
+    def test_A_pending_order_exchange_id_None_client_id_ACTIVE_healthy(self):
+        """A. pending_order_exchange_id=None, pending_order_client_id
+        present, client-id lookup => ACTIVE. Engine must NOT freeze."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Step1 is OPEN on the venue.
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy",
+                "price": "2518.4",
+                "market": "ETH-USD.P",
+                "filledSize": "0",
+                "filledCost": "0",
+                "status": "ACTIVE",
+                "taxonomy": "ACTIVE",
+                "requested_size": "0.001",
+                "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter.position = {
+                "symbol": "ETH", "side": "long", "size": "0.001", "entry_price": "2522.5",
+            }
+            place_limit_before = len(adapter.place_limit_calls)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "running",
+                             "Engine must NOT freeze when Step1 is ACTIVE on venue")
+            self.assertIsNone(state.freeze_reason)
+            self.assertEqual(state.highest_filled_step, 0)
+            self.assertEqual(state.pending_order_client_id, 82755773369376)
+            self.assertEqual(len(adapter.place_limit_calls), place_limit_before,
+                             "No duplicate Step1 submitted")
+
+    def test_B_alphanumeric_orderId_backfilled_on_ACTIVE(self):
+        """B. Client-id lookup returns ACTIVE with alphanumeric orderId.
+        The engine should backfill pending_order_exchange_id from the
+        lookup so subsequent ticks can use the exchange-id path."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy",
+                "price": "2518.4",
+                "market": "ETH-USD.P",
+                "filledSize": "0",
+                "filledCost": "0",
+                "status": "ACTIVE",
+                "taxonomy": "ACTIVE",
+                "requested_size": "0.001",
+                "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter.position = {
+                "symbol": "ETH", "side": "long", "size": "0.001", "entry_price": "2522.5",
+            }
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "running")
+            # The engine does NOT backfill exchange_order_id from an
+            # ACTIVE lookup (that's only done for FILLED in
+            # reconcile_needs_recovery_pending_fill). The pending order
+            # stays client-id-only until it fills.
+            self.assertIsNone(state.pending_order_exchange_id)
+
+    def test_G_restart_with_pending_order_exchange_id_None_ACTIVE(self):
+        """G. Daemon restart with pending_order_exchange_id=None,
+        pending_order_client_id present, venue order ACTIVE.
+        Engine must NOT freeze after restart."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            key = "ondoperps/bitget/ETH/BUY"
+            svc1 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter1 = _OndoLadderStepAdapter()
+            svc1._adapters[key] = adapter1
+            _seed_step1_running_state(svc1, key)
+            adapter1.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0", "filledCost": "0", "status": "ACTIVE",
+                "taxonomy": "ACTIVE", "requested_size": "0.001", "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter1.position = {"symbol": "ETH", "side": "long", "size": "0.001", "entry_price": "2522.5"}
+            svc1._drive_one(key)
+            self.assertEqual(svc1._states[key].status, "running")
+            svc1._save_state()
+
+            # Restart.
+            svc2 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter2 = _OndoLadderStepAdapter()
+            svc2._adapters[key] = adapter2
+            adapter2.pending_lookup = dict(adapter1.pending_lookup)
+            adapter2.position = dict(adapter1.position)
+            svc2._drive_one(key)
+            self.assertEqual(svc2._states[key].status, "running",
+                             "Restart must NOT freeze when pending order is ACTIVE via client-id")
+            self.assertEqual(svc2._states[key].pending_order_client_id, 82755773369376)
+            self.assertEqual(len(adapter2.place_limit_calls), 0,
+                             "No resubmission after restart")
+
+    def test_H_pause_advance_blocks_step2_after_step1_fill(self):
+        """H. With pause_advance=True, if Step1 FILLS, Step2 must NOT
+        be placed."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Set pause_advance BEFORE the fill.
+            svc._states[key].pause_advance = True
+            # Step1 is now FILLED.
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0.001", "filledCost": "2.5184", "status": "FILLED",
+                "taxonomy": "FILLED", "requested_size": "0.001", "filled_size": "0.001",
+                "actual_fill_price": "2518.4", "symbol": "ETH",
+            }
+            adapter.position = {
+                "symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2520.45",
+            }
+            place_limit_before = len(adapter.place_limit_calls)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 1,
+                             "Step1 must be promoted")
+            self.assertEqual(state.expected_cumulative_size, Decimal("0.002"))
+            self.assertEqual(state.next_step, 1,
+                             "next_step must NOT advance past Step1 when pause_advance=True")
+            self.assertEqual(len(adapter.place_limit_calls), place_limit_before,
+                             "Step2 must NOT be placed when pause_advance=True")
+            self.assertTrue(state.pause_advance)
+            self.assertEqual(state.status, "running")
 
 
 if __name__ == "__main__":
