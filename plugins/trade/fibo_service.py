@@ -725,22 +725,24 @@ class PersistentFiboService:
             engine.confirm_step0_filled(p0)
             result = engine.place_step0_tp_and_step1(p0)
             self._states[key] = engine.state
-            # Promote the durable state back to RUNNING — Step0 is now
-            # confirmed and TP + Step1 are placed (or queued if the
-            # engine froze during TP/Step1 placement; that freeze is a
-            # separate signal we leave untouched below).
-            self._states[key].status = STATUS_RUNNING
-            self._states[key].freeze_reason = None
-            # Clear the in-memory bounded-retry counters so any subsequent
-            # restart / future cycle does not see stale counts.
-            if hasattr(self, "_step0_position_fallback_attempts"):
-                self._step0_position_fallback_attempts.pop(key, None)
-            self._save_state()
             if result is not None:
                 # Engine froze during TP/Step1 placement — propagate the
-                # freeze without overwriting it with our success status.
+                # freeze WITHOUT overwriting it with RUNNING. The pending
+                # identity (client_id, role, requested price/size) is
+                # already persisted by _place_next_ladder before the
+                # venue call, so recovery can engage on the next tick.
                 self._states[key] = result.state
-                # Restore the freeze markers from the engine result.
+                self._save_state()
+            else:
+                # Promote the durable state back to RUNNING — Step0 is
+                # confirmed and TP + Step1 are placed successfully.
+                self._states[key].status = STATUS_RUNNING
+                self._states[key].freeze_reason = None
+                # Clear the in-memory bounded-retry counters so any
+                # subsequent restart / future cycle does not see stale
+                # counts.
+                if hasattr(self, "_step0_position_fallback_attempts"):
+                    self._step0_position_fallback_attempts.pop(key, None)
                 self._save_state()
 
     def _maybe_confirm_step0(self, key: str) -> None:

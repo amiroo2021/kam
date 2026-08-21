@@ -798,6 +798,16 @@ class GoldenFiboEngine:
         self.state.submission_role = ROLE_LADDER
         self.state.submission_attempted_at = None
         self.state.submission_exchange_order_id = None
+
+        # Persist the pending identity BEFORE the venue call so that a
+        # crash between submit and verify still leaves the client_id
+        # recoverable. This is the crash-boundary requirement: the
+        # pending identity must survive a daemon restart.
+        self.state.pending_order_client_id = client_id
+        self.state.pending_order_role = ROLE_LADDER
+        self.state.pending_requested_price = next_price
+        self.state.pending_requested_size = next_size
+
         self.state.submission_phase = SUBMISSION_ATTEMPTED
         self.state.submission_attempted_at = time.time()
 
@@ -812,6 +822,11 @@ class GoldenFiboEngine:
                 reduce_only=False,
             )
         except Exception as exc:
+            # The submit may have succeeded but the immediate verify
+            # timed out (Ondo client-id index lag). The pending identity
+            # is already persisted above; do NOT discard it. Freeze
+            # with a recoverable reason so the daemon can later find
+            # the order via the client-id lookup path.
             self.state.submission_phase = SUBMISSION_NEEDS_RECOVERY
             return self._freeze(
                 f"place ladder step{next_n} attempted but result unknown: {exc}. "
@@ -823,19 +838,15 @@ class GoldenFiboEngine:
             submit.get("exchange_order_id")
         )
 
-        self.state.pending_order_client_id = client_id
         self.state.pending_order_exchange_id = coerce_exchange_order_id(
             submit.get("exchange_order_id")
         )
-        self.state.pending_requested_price = next_price
-        self.state.pending_requested_size = next_size
         self.state.pending_confirmed_price = (
             Decimal(submit["submitted_price"]) if submit.get("submitted_price") is not None else next_price
         )
         self.state.pending_confirmed_size = (
             Decimal(submit["submitted_volume"]) if submit.get("submitted_volume") is not None else next_size
         )
-        self.state.pending_order_role = ROLE_LADDER
         actions.append(
             f"place step{next_n} LIMIT price={next_price} confirmed={self.state.pending_confirmed_price} size={next_size} oid={self.state.pending_order_exchange_id}"
         )
@@ -1020,7 +1031,16 @@ class GoldenFiboEngine:
         # based Step0 promotion (the service's _maybe_confirm_step0 owns
         # that path; Step0 ROLE_ENTRY here just returns without state
         # mutation, so we simply keep the registration parked).
-        if self.state.pending_order_exchange_id is None and self.state.pending_order_client_id is None:
+        # Gate: allow recovery when EITHER the pending identity OR the
+        # submission identity is present. The submission identity is the
+        # fallback for registrations frozen before the pending-identity
+        # persistence fix (pending_order_client_id was not yet persisted
+        # at the submit boundary).
+        if (
+            self.state.pending_order_exchange_id is None
+            and self.state.pending_order_client_id is None
+            and self.state.submission_client_id is None
+        ):
             return TickResult(state=self.state, actions=actions)
         try:
             position = self.adapter.position_state(
@@ -1077,6 +1097,15 @@ class GoldenFiboEngine:
                     )
                     return self._freeze(self.state.freeze_reason)
 
+        # Backfill pending identity fields from the submission record
+        # when the pre-fix freeze left them null. The submission fields
+        # were persisted at the submit boundary; the pending fields were
+        # not (they were only set after a successful submit response).
+        if self.state.pending_order_role is None and self.state.submission_role:
+            self.state.pending_order_role = self.state.submission_role
+        if self.state.pending_order_client_id is None and self.state.submission_client_id is not None:
+            self.state.pending_order_client_id = self.state.submission_client_id
+
         # Backfill pending_order_exchange_id from the client-id lookup
         # BEFORE _handle_confirmed_fill records step_orders[n], so the
         # venue's native id (often alphanumeric on Ondo) is preserved
@@ -1084,6 +1113,23 @@ class GoldenFiboEngine:
         backfilled_oid = pending_state.get("exchange_order_id")
         if backfilled_oid is not None and backfilled_oid != "":
             self.state.pending_order_exchange_id = backfilled_oid
+
+        # Backfill pending_confirmed_price from the lookup when the
+        # original submit raised before persisting it (the verify-
+        # timeout path). The lookup's actual_fill_price is the
+        # canonical price; falling back to pending_requested_price
+        # is safe because the venue accepted the order at that price.
+        if self.state.pending_confirmed_price is None:
+            afp = pending_state.get("actual_fill_price")
+            if afp is not None:
+                try:
+                    self.state.pending_confirmed_price = Decimal(str(afp))
+                except Exception:
+                    pass
+            if self.state.pending_confirmed_price is None:
+                self.state.pending_confirmed_price = self.state.pending_requested_price
+        if self.state.pending_confirmed_size is None:
+            self.state.pending_confirmed_size = self.state.pending_requested_size
 
         actions.append(
             f"reconcile_needs_recovery: pending oid={self.state.pending_order_exchange_id} "
@@ -1220,7 +1266,10 @@ class GoldenFiboEngine:
                 return st
         # Fallback: client-id lookup sees filled orders. Runs even when
         # ``pending_order_exchange_id`` is None — see the method docstring.
-        cid = self.state.pending_order_client_id
+        # Use submission_client_id as fallback when pending_order_client_id
+        # was not persisted (pre-fix registrations frozen at the submit
+        # boundary before the pending-identity persistence patch).
+        cid = self.state.pending_order_client_id or self.state.submission_client_id
         if cid is None:
             return {}
         try:

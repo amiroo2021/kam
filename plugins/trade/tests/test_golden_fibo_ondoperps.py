@@ -2576,5 +2576,387 @@ class OndoStep1LadderRecoveryTests(unittest.TestCase):
             self.assertEqual(res["error"], "NOT_FOUND")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Pending-identity persistence at the ladder submit boundary
+# (incident 2026-08-21 wave 4 — Step1 filled on venue but engine froze
+# with "pending order missing in unexpected state" because the
+# submit-then-verify window expired before the identity was persisted)
+# ---------------------------------------------------------------------------
+
+
+class _OndoVerifyTimeoutAdapter(_OndoLadderStepAdapter):
+    """Adapter whose place_limit raises on the first call (simulating
+    Ondo's immediate post-submit verify timing out), then serves the
+    order via client-id lookup on subsequent ticks."""
+
+    def __init__(self, *, raise_on_place: bool = True):
+        super().__init__()
+        self._raise_on_place = raise_on_place
+        self._place_calls = 0
+
+    def place_limit(self, *, account, instrument, side, size, price, client_order_id, reduce_only=False):
+        self._place_calls += 1
+        if self._raise_on_place and self._place_calls == 1:
+            # Simulate the Ondo agent raising after the bounded verify
+            # window expires (the order IS on the venue, just not yet
+            # indexed for the immediate post-submit check). Record the
+            # attempt so tests can assert exactly-one-submission.
+            self.place_limit_calls.append({
+                "client_order_id": int(client_order_id),
+                "side": side,
+                "size": str(size),
+                "price": str(price),
+                "status": "raised",
+            })
+            raise RuntimeError(
+                "place_limit failed: {'error': {'code': 'VERIFICATION_FAILED'}, "
+                "'order': {'exchange_order_id': 'PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL'}}"
+            )
+        return super().place_limit(
+            account=account, instrument=instrument, side=side, size=size,
+            price=price, client_order_id=client_order_id, reduce_only=reduce_only,
+        )
+
+
+class OndoPendingIdentityPersistenceTests(unittest.TestCase):
+    """Tests A-I for the pending-identity persistence fix at the
+    ladder submit boundary."""
+
+    _STEP0_LOOKUP = {
+        "exchange_order_id": "OBLPHRO7MTAFARPYXORB3RKB2G6IYJHW",
+        "client_order_id": 82738593446912,
+        "side": "buy", "price": "2544.9", "market": "ETH-USD.P",
+        "filledSize": "0.001", "filledCost": "2.5449", "status": "FILLED",
+        "taxonomy": "FILLED", "requested_size": "0.001", "filled_size": "0.001",
+        "actual_fill_price": "2544.9", "symbol": "ETH",
+    }
+
+    def _seed_step0_promoted(self, svc, key, *, step0_volume="0.001", percentage="0.001", cycle_uid=335407):
+        """Seed a registration where Step0 is promoted and the engine
+        is about to place Step1."""
+        state = GoldenFiboState()
+        state.strategy = "golden_fibo"
+        state.schema_version = 1
+        state.registration_key = key
+        state.exchange = "ondoperps"
+        state.account = key.split("/")[1]
+        state.instrument = key.split("/")[2]
+        state.direction = "BUY"
+        state.percentage = Decimal(percentage)
+        state.step0_volume = Decimal(step0_volume)
+        state.cycle_uid = cycle_uid
+        state.highest_cycle_uid = cycle_uid
+        state.client_id_version = 2
+        # Engine state right after Step0 submission but before promotion.
+        # The service's _maybe_confirm_step0 will promote Step0 on this
+        # tick; the engine's _handle_confirmed_fill will then place Step1.
+        state.next_step = 0
+        state.highest_filled_step = -1
+        state.expected_cumulative_size = Decimal("0")
+        state.fill_prices = {}
+        state.step_orders = {}
+        state.current_tp_price = None
+        state.current_tp_size = None
+        state.current_tp_role = None
+        state.current_tp_client_id = None
+        state.current_tp_order_id = None
+        state.submission_phase = SUBMISSION_CONFIRMED
+        state.submission_client_id = 82738593446912
+        state.submission_step = 0
+        state.submission_role = ROLE_ENTRY
+        state.pending_order_role = ROLE_ENTRY
+        state.pending_order_client_id = 82738593446912
+        state.pending_order_exchange_id = "OBLPHRO7MTAFARPYXORB3RKB2G6IYJHW"
+        state.pending_confirmed_price = Decimal("2544.9")
+        state.pending_confirmed_size = Decimal(step0_volume)
+        state.status = "running"
+        svc._states[key] = state
+        return state
+
+    def test_A_verify_timeout_persists_pending_identity(self):
+        """A. Step1 submit succeeds, immediate client-id verify returns
+        not-found (adapter raises), venue later returns FILLED.
+        Pending client_id must remain persisted so the recovery path
+        can find the order."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoVerifyTimeoutAdapter()
+            svc._adapters[key] = adapter
+            self._seed_step0_promoted(svc, key)
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            # Seed the Step0 client-id lookup so _maybe_confirm_step0
+            # promotes Step0 on the first tick, triggering
+            # _handle_confirmed_fill -> _place_next_ladder for Step1.
+            adapter.pending_lookup = {
+                "exchange_order_id": "OBLPHRO7MTAFARPYXORB3RKB2G6IYJHW",
+                "client_order_id": 82738593446912,
+                "side": "buy",
+                "price": "2544.9",
+                "market": "ETH-USD.P",
+                "filledSize": "0.001",
+                "filledCost": "2.5449",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "requested_size": "0.001",
+                "filled_size": "0.001",
+                "actual_fill_price": "2544.9",
+                "symbol": "ETH",
+            }
+
+            # Tick 1: Step0 promotes, engine places Step1, adapter raises,
+            # engine freezes but MUST persist the pending identity.
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIsNotNone(state.pending_order_client_id,
+                                 "pending_order_client_id must be persisted even when place_limit raises")
+            self.assertEqual(state.pending_order_role, ROLE_LADDER)
+            self.assertEqual(state.submission_client_id, state.pending_order_client_id)
+            self.assertEqual(state.submission_role, ROLE_LADDER)
+            self.assertEqual(state.submission_step, 1)
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Step1 not promoted yet — engine froze on verify timeout")
+            place_limit_calls_after_freeze = len(adapter.place_limit_calls)
+            self.assertEqual(place_limit_calls_after_freeze, 1,
+                             "Step1 submitted exactly once")
+
+            # Tick 2: the client-id lookup now returns FILLED (the order
+            # has propagated through Ondo's index). Recovery must engage.
+            adapter.pending_lookup = {
+                "exchange_order_id": "PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL",
+                "client_order_id": state.pending_order_client_id,
+                "side": "buy",
+                "price": "2540.8",
+                "market": "ETH-USD.P",
+                "filledSize": "0.001",
+                "filledCost": "2.5406",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "requested_size": "0.001",
+                "filled_size": "0.001",
+                "actual_fill_price": "2540.6",
+                "symbol": "ETH",
+            }
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 1,
+                             "Step1 must promote via client-id recovery after verify-timeout freeze")
+            self.assertEqual(state.fill_prices.get(1), Decimal("2540.6"))
+            self.assertEqual(state.step_orders[1]["exchange_order_id"],
+                             "PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL")
+            self.assertEqual(state.status, "running")
+            # Tick 1 placed Step1 (raised). Tick 2 recovered Step1 and
+            # placed Step2 (normal ladder advance). No duplicate Step1.
+            step1_calls = [c for c in adapter.place_limit_calls
+                           if c["client_order_id"] == state.step_orders[1]["client_id"]]
+            self.assertEqual(len(step1_calls), 1,
+                             "Step1 submitted exactly once (no duplicate)")
+            self.assertEqual(len(adapter.place_limit_calls), 2,
+                             "Step1 attempt + Step2 placement = 2 total calls")
+
+    def test_B_restart_after_verify_timeout_no_duplicate(self):
+        """B. Daemon restarts after the verify-timeout freeze; the
+        persisted pending identity survives and recovery does NOT
+        re-submit Step1."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            key = "ondoperps/bitget/ETH/BUY"
+            svc1 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter1 = _OndoVerifyTimeoutAdapter()
+            svc1._adapters[key] = adapter1
+            self._seed_step0_promoted(svc1, key)
+            adapter1.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            # Seed the Step0 client-id lookup so _maybe_confirm_step0
+            # promotes Step0 and the engine places Step1.
+            adapter1.pending_lookup = {
+                "exchange_order_id": "OBLPHRO7MTAFARPYXORB3RKB2G6IYJHW",
+                "client_order_id": 82738593446912,
+                "side": "buy", "price": "2544.9", "market": "ETH-USD.P",
+                "filledSize": "0.001", "filledCost": "2.5449", "status": "FILLED",
+                "taxonomy": "FILLED", "requested_size": "0.001", "filled_size": "0.001",
+                "actual_fill_price": "2544.9", "symbol": "ETH",
+            }
+            svc1._drive_one(key)  # freeze with persisted pending identity
+            persisted_client_id = svc1._states[key].pending_order_client_id
+            self.assertIsNotNone(persisted_client_id)
+            svc1._save_state()
+
+            # Restart: fresh service + fresh adapter, same state file.
+            svc2 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter2 = _OndoVerifyTimeoutAdapter(raise_on_place=False)
+            svc2._adapters[key] = adapter2
+            self.assertEqual(svc2._states[key].pending_order_client_id, persisted_client_id,
+                             "pending client_id must survive restart")
+            adapter2.pending_lookup = {
+                "exchange_order_id": "PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL",
+                "client_order_id": persisted_client_id,
+                "side": "buy", "status": "FILLED", "taxonomy": "FILLED",
+                "requested_size": "0.001", "filled_size": "0.001",
+                "actual_fill_price": "2540.6", "symbol": "ETH",
+            }
+            adapter2.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            svc2._drive_one(key)
+            self.assertEqual(svc2._states[key].highest_filled_step, 1)
+            # Recovery promotes Step1 and places Step2 (normal advance).
+            # The key assertion: no duplicate Step1 (same client_id).
+            step1_calls = [c for c in adapter2.place_limit_calls
+                           if c["client_order_id"] == persisted_client_id]
+            self.assertEqual(len(step1_calls), 0,
+                             "Restart recovery must NOT resubmit Step1")
+
+    def test_C_immediate_verify_OPEN_retains_pending(self):
+        """C. Immediate verification returns OPEN (resting limit).
+        Pending state must be retained normally."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()  # normal place_limit succeeds
+            svc._adapters[key] = adapter
+            self._seed_step0_promoted(svc, key)
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.001", "entry_price": "2544.9"}
+            adapter.pending_lookup = dict(self._STEP0_LOOKUP)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "running")
+            self.assertEqual(state.pending_order_role, ROLE_LADDER)
+            self.assertIsNotNone(state.pending_order_client_id)
+            self.assertEqual(state.highest_filled_step, 0)
+            self.assertEqual(len(adapter.place_limit_calls), 1)
+
+    def test_G_conclusive_rejection_no_phantom_pending(self):
+        """G. Submit conclusively rejected (adapter raises with no
+        exchange_order_id and venue has no such order). The engine
+        still persists the pending identity (it cannot distinguish
+        conclusive rejection from verify-timeout at submit time),
+        but recovery must NOT promote when the venue truly has no
+        such order."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoVerifyTimeoutAdapter()
+            svc._adapters[key] = adapter
+            self._seed_step0_promoted(svc, key)
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.001", "entry_price": "2544.9"}
+            adapter.pending_lookup = dict(self._STEP0_LOOKUP)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "needs_recovery")
+            # Venue lookup returns nothing (order truly does not exist).
+            adapter.pending_lookup = {}
+            # Position is still only Step0 size — no fill happened.
+            for _ in range(10):
+                svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "No promotion when the venue truly has no such order")
+            self.assertEqual(len(adapter.place_limit_calls), 1,
+                             "No resubmission")
+            self.assertEqual(state.status, "needs_recovery")
+
+    def test_H_repeated_recovery_no_double_promotion(self):
+        """H. After Step1 promotion via recovery, repeated ticks must
+        not double-promote or re-submit."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoVerifyTimeoutAdapter()
+            svc._adapters[key] = adapter
+            self._seed_step0_promoted(svc, key)
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            adapter.pending_lookup = dict(self._STEP0_LOOKUP)
+            svc._drive_one(key)  # freeze
+            adapter.pending_lookup = {
+                "exchange_order_id": "PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL",
+                "client_order_id": svc._states[key].pending_order_client_id,
+                "side": "buy", "status": "FILLED", "taxonomy": "FILLED",
+                "requested_size": "0.001", "filled_size": "0.001",
+                "actual_fill_price": "2540.6", "symbol": "ETH",
+            }
+            svc._drive_one(key)  # recover
+            self.assertEqual(svc._states[key].highest_filled_step, 1)
+            place_calls = len(adapter.place_limit_calls)
+            tp_calls = len(adapter.set_shared_tp_calls)
+            for _ in range(10):
+                svc._drive_one(key)
+            self.assertEqual(svc._states[key].highest_filled_step, 1)
+            self.assertEqual(len(adapter.place_limit_calls), place_calls,
+                             "No duplicate Step2/Step1 submissions in 10 post-recovery ticks")
+            self.assertEqual(len(adapter.set_shared_tp_calls), tp_calls)
+
+    def test_I_crash_after_submit_before_verify_recovers(self):
+        """I. Crash after submit success but before verification.
+        The persisted pending identity (written BEFORE the venue
+        call) survives the crash and enables recovery."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            key = "ondoperps/bitget/ETH/BUY"
+            svc1 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter1 = _OndoVerifyTimeoutAdapter()
+            svc1._adapters[key] = adapter1
+            self._seed_step0_promoted(svc1, key)
+            adapter1.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            adapter1.pending_lookup = dict(self._STEP0_LOOKUP)
+            # The drive places Step1, adapter raises, engine freezes
+            # with the pending identity persisted.
+            svc1._drive_one(key)
+            cid = svc1._states[key].pending_order_client_id
+            self.assertIsNotNone(cid)
+            # svc1._save_state() is called by _drive_one — simulate crash
+            # by simply discarding svc1 without further action.
+
+            svc2 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter2 = _OndoVerifyTimeoutAdapter(raise_on_place=False)
+            svc2._adapters[key] = adapter2
+            self.assertEqual(svc2._states[key].pending_order_client_id, cid,
+                             "crash-surviving pending client_id")
+            adapter2.pending_lookup = {
+                "exchange_order_id": "PDYD4CMCREM2FKURQBH26BQUJJ7N5DGL",
+                "client_order_id": cid,
+                "side": "buy", "status": "FILLED", "taxonomy": "FILLED",
+                "requested_size": "0.001", "filled_size": "0.001",
+                "actual_fill_price": "2540.6", "symbol": "ETH",
+            }
+            adapter2.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2542.75"}
+            svc2._drive_one(key)
+            self.assertEqual(svc2._states[key].highest_filled_step, 1)
+            # Recovery promotes Step1 and places Step2 (normal advance).
+            # The key assertion: no duplicate Step1 (same client_id).
+            step1_calls = [c for c in adapter2.place_limit_calls
+                           if c["client_order_id"] == cid]
+            self.assertEqual(len(step1_calls), 0,
+                             "Post-crash recovery must NOT resubmit Step1")
+
+
 if __name__ == "__main__":
     unittest.main()

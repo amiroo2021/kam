@@ -245,7 +245,7 @@ class OndoPerpsGoldenFiboAdapter:
             "operation": "get_order_state",
             "account": account,
             "order_id": oid,
-            "order_index": int(order_index),
+            "order_index": order_index if isinstance(order_index, int) else None,
         })
         if not _is_success(resp):
             return {}
