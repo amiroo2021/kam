@@ -2530,12 +2530,14 @@ def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Opti
             remaining = Decimal("0")
     taxonomy = "ACTIVE" if classification in {"OPEN", "PARTIALLY_FILLED"} else classification
     # Ondo documents the average execution price as ``averageFillPrice``
-    # (and aliases ``avgFillPrice`` on older snapshots). Map it into the
-    # canonical GoldenFibo field ``actual_fill_price`` at this venue
-    # boundary so the generic Step0 promotion path can pick it up without
-    # needing per-venue field names. ``average_fill_price`` is preserved
-    # for any caller that prefers the venue-native name.
+    # (and aliases ``avgFillPrice`` on older snapshots). However the
+    # client-id order lookup endpoint (``GET /v1/perps/orders/client:<id>``)
+    # does NOT return ``averageFillPrice`` — it returns ``filledSize`` and
+    # ``filledCost`` instead. Map both sources into the canonical
+    # GoldenFibo fields at this venue boundary so the generic Step0
+    # promotion path can pick them up without per-venue branching.
     avg_fill_raw = order.get("averageFillPrice") or order.get("avgFillPrice")
+    filled_cost_raw = order.get("filledCost")
     return {
         "exchange_order_id": oid,
         "client_order_id": order.get("clientOrderId"),
@@ -2545,6 +2547,11 @@ def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Opti
         "side": str(order.get("side") or "").strip().lower() or None,
         "requested_size": _decimal_text(size) if size is not None else None,
         "filled_size": _decimal_text(filled) if filled is not None else None,
+        # Ondo's filledCost is the venue-native name for the total
+        # quote-currency cost of the fill. Expose it under the canonical
+        # ``filled_quote`` key the engine's price-extractor already
+        # consults, so price = filled_quote / filled_size works generically.
+        "filled_quote": _decimal_text(filled_cost_raw) if filled_cost_raw is not None else None,
         "remaining_size": _decimal_text(remaining) if remaining is not None else None,
         "limit_price": _decimal_text(order.get("price")),
         "average_fill_price": _decimal_text(avg_fill_raw),

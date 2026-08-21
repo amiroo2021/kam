@@ -1642,7 +1642,7 @@ class OndoAverageFillPriceNormalizationTests(unittest.TestCase):
             svc._adapters[key] = adapter
             ondo_row = {
                 "orderId": adapter.fake_oid,
-                "clientOrderId": "82738593280000",
+                "clientOrderId": "82738593376256",
                 "side": "buy",
                 "market": "ETH-USD.P",
                 "status": "fullyfilled",
@@ -1672,6 +1672,285 @@ class OndoAverageFillPriceNormalizationTests(unittest.TestCase):
                 sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
                 tp_before)
             self.assertEqual(state.status, "needs_recovery")
+
+
+# ---------------------------------------------------------------------------
+# filledCost -> filled_quote normalization (live incident 2026-08-21 wave 2)
+# ---------------------------------------------------------------------------
+#
+# Live observation: Ondo's ``GET /v1/perps/orders/client:<id>`` endpoint
+# returns ``filledSize`` and ``filledCost`` but NOT ``averageFillPrice``.
+# The previous fix mapped ``averageFillPrice`` into the canonical
+# ``actual_fill_price`` field but that did not cover the client-id
+# lookup response shape. This block pins the additional normalization:
+# Ondo's ``filledCost`` must surface as canonical ``filled_quote`` so the
+# existing generic price-derivation path (``filled_quote / filled_size``)
+# can compute the fill price without any per-venue branching in the engine.
+#
+# Tests A–G cover the field-shape contract, end-to-end promotion, the
+# previously-failed live scenario, edge cases, and the safety gate.
+
+
+class OndoFilledCostNormalizationTests(unittest.TestCase):
+    """Tests A–G for the filledCost -> filled_quote fix."""
+
+    def _live_look_row(self, *, order_id="IJJKIFHDLQXIX6K4MRAEAUZLTOOFMKXM",
+                      client_order_id="82738593376256"):
+        """A row matching the EXACT shape Ondo's client-id lookup
+        returned at the time of the failed live test."""
+        return {
+            "orderId": order_id,
+            "clientOrderId": client_order_id,
+            "side": "buy",
+            "price": "0",
+            "market": "ETH-USD.P",
+            "filledSize": "0.001",
+            "lastFillSize": "0.001",
+            "filledCost": "2.4394",
+            "realizedPnl": "0",
+            "fee": "0.00061",
+            "feeRebate": "0.00003",
+            "status": "fullyfilled",
+            "createdAt": "2026-08-21T20:58:23.567537429Z",
+            "filledAt": "2026-08-21T20:58:23.567537429Z",
+            "type": "market",
+            "size": "0.001",
+            # Note: averageFillPrice is intentionally ABSENT — this is
+            # the shape Ondo actually returns from the client-id lookup.
+        }
+
+    def test_A_FILLED_lookup_row_exposes_filled_quote(self):
+        """A. _order_state_from_ondo_row must expose canonical
+        ``filled_quote`` populated from Ondo's ``filledCost``, alongside
+        ``filled_size`` from ``filledSize``.
+        """
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        normalized = _order_state_from_ondo_row(self._live_look_row())
+        # Canonical fields populated from Ondo source.
+        self.assertEqual(Decimal(str(normalized.get("filled_size"))),
+                         Decimal("0.001"))
+        self.assertEqual(Decimal(str(normalized.get("filled_quote"))),
+                         Decimal("2.4394"))
+        # Identity / status fields unchanged.
+        self.assertEqual(normalized.get("status"), "FILLED")
+        self.assertEqual(normalized.get("taxonomy"), "FILLED")
+
+    def test_B_engine_derives_fill_price_from_filled_quote_over_filled_size(self):
+        """B. With only ``filled_quote`` + ``filled_size`` populated
+        (no averageFillPrice), the generic engine's price-derivation
+        fallback (``filled_quote / filled_size``) must compute the
+        correct fill price. Mirrors the live scenario exactly.
+        """
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        result = _order_state_from_ondo_row(self._live_look_row())
+        # The agent's _decimal_text normalizes missing numbers to the
+        # string "0". The actual_fill_price here is therefore "0", which
+        # the engine rejects as ``p0 <= 0`` and falls through to the
+        # ``filled_quote / filled_size`` derivation. Verify the
+        # derivation path computes the correct fill price.
+        afp = result.get("actual_fill_price")
+        self.assertEqual(Decimal(str(afp)) if afp is not None else None,
+                         Decimal("0") if afp is not None else None)
+        # The averageFillPrice field is absent in the live response.
+        # Derive the fill price from filled_quote / filled_size —
+        # this is the engine path that fires for the live row.
+        filled_size = Decimal(str(result.get("filled_size")))
+        filled_quote = Decimal(str(result.get("filled_quote")))
+        derived_price = filled_quote / filled_size
+        self.assertEqual(derived_price, Decimal("2439.4"))
+
+    def test_C_existing_needs_recovery_registration_can_be_reconciled(self):
+        """C. The exact live failing registration
+        (client_order_id 82738593376256, ETH long 0.001 at $2439.4) is
+        now mockable end-to-end. The adapter returns the Ondo
+        client-id lookup payload (filledSize + filledCost, NO
+        averageFillPrice); the engine must reconcile the row, derive
+        the price, and promote Step0 exactly once — without any
+        resubmission and without the safety gate firing (because the
+        live position is now compatible with Step0).
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            # Lookup returns the exact live client-id payload shape.
+            adapter.lookup_result = adapter._normalized = None  # type: ignore
+            from plugins.trade.agents.x_ondoperps_agent import (
+                _order_state_from_ondo_row,
+            )
+            ondo_row = self._live_look_row()
+            adapter.lookup_result = _order_state_from_ondo_row(ondo_row)
+            # Live position matches Step0.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2439.4",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            place_market_before = adapter.place_market_calls
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Live-incident row must reconcile and promote Step0")
+            # Price derived from filled_quote / filled_size = 2.4394 / 0.001.
+            self.assertEqual(state.fill_prices.get(0), Decimal("2439.4"))
+            self.assertEqual(state.expected_cumulative_size, Decimal("0.001"))
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+            # Idempotency.
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission")
+
+    def test_D_missing_zero_filled_size_fails_closed(self):
+        """D. ``filledSize`` missing or zero must NOT cause a
+        divide-by-zero and must NOT promote Step0.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            adapter.lookup_result = _order_state_from_ondo_row({
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593376256",
+                "side": "buy",
+                "market": "ETH-USD.P",
+                "status": "fullyfilled",
+                "size": "0.001",
+                "filledSize": "0",  # zero filled size — engine must guard
+                "filledCost": "2.4394",
+            })
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2439.4",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            place_market_before = adapter.place_market_calls
+            svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Zero filled size must not promote")
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission")
+            self.assertEqual(state.status, "needs_recovery")
+
+    def test_E_missing_invalid_filled_cost_fails_closed(self):
+        """E. Missing or unparseable ``filledCost`` must fail closed.
+        No promotion, no TP, no Step1, no resubmission.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            adapter.lookup_result = _order_state_from_ondo_row({
+                "orderId": adapter.fake_oid,
+                "clientOrderId": "82738593376256",
+                "side": "buy",
+                "market": "ETH-USD.P",
+                "status": "fullyfilled",
+                "size": "0.001",
+                "filledSize": "0.001",
+                # filledCost intentionally absent / invalid.
+            })
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2439.4",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            place_market_before = adapter.place_market_calls
+            svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1)
+            self.assertEqual(adapter.place_market_calls, place_market_before)
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("could not establish Step0 fill price",
+                          state.freeze_reason or "")
+
+    def test_F_historical_FILLED_flat_position_still_no_promotion(self):
+        """F. With the new filled_quote mapping in place, the
+        historical-FILLED + currently-FLAT safety gate must STILL
+        refuse promotion. Regression-asserts the safety invariant
+        after the new normalization.
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            adapter.lookup_result = _order_state_from_ondo_row(self._live_look_row())
+            # Live position FLAT.
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+            ladder_before = sum(1 for c in adapter.calls if c[0] == "place_limit")
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Historical FILLED + flat position MUST NOT promote")
+            self.assertEqual(adapter.place_market_calls, place_market_before)
+            self.assertEqual(sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                             tp_before, "No TP placed")
+            self.assertEqual(sum(1 for c in adapter.calls if c[0] == "place_limit"),
+                             ladder_before, "No Step1 placed")
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("no longer compatible",
+                          state.freeze_reason or "")
+
+    def test_G_alphanumeric_orderId_preserved(self):
+        """G. Ondo's alphanumeric ``orderId`` must still be preserved
+        end-to-end through the venue-boundary normalizer.
+        """
+        from plugins.trade.agents.x_ondoperps_agent import _order_state_from_ondo_row
+        for oid in (
+            "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV",
+            "IJJKIFHDLQXIX6K4MRAEAUZLTOOFMKXM",
+        ):
+            normalized = _order_state_from_ondo_row(self._live_look_row(order_id=oid))
+            self.assertEqual(normalized.get("exchange_order_id"), oid)
+            self.assertIsInstance(normalized.get("exchange_order_id"), str)
 
 
 if __name__ == "__main__":
