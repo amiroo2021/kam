@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -141,7 +142,50 @@ def capabilities() -> List[str]:
         "set_sl",
         "close_position",
         "ladder",
+        "resolve_instrument",
     ]
+
+
+def _apex_resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account,
+                            code="MISSING_SYMBOL", message="Symbol is required.")
+    credentials, error = _resolve_credentials(account)
+    if error:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account,
+                            code=error["code"], message=error["message"])
+    assert credentials is not None
+    try:
+        client = _client_for_credentials(credentials)
+        client.set_default_account_type("primary")
+        client.configs_v3()
+        client.get_account_v3()
+        all_contracts = _apex_fetch_supported_markets(client)
+        meta = _apex_resolve_symbol(requested, all_contracts)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                                code="INSTRUMENT_AMBIGUOUS",
+                                message=f"Apex instrument '{requested}' is ambiguous.")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                            code="APEX_ERROR", message=sanitize_error_message(str(exc)))
+    if meta is None:
+        return make_failure(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Apex symbol '{requested}' is not available.")
+    instrument = CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=str(meta.get("symbol") or ""),
+        display_name=str(meta.get("symbolDisplayName") or ""),
+        price_increment=str(meta.get("tickSize") or "") or None,
+        size_increment=str(meta.get("stepSize") or meta.get("lotSize") or "") or None,
+        minimum_size=str(meta.get("minOrderSize") or "") or None,
+    )
+    return make_success(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                        instrument=instrument)
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
@@ -180,6 +224,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _cancel_order_group(request)
         if operation == "positions_management":
             return _apex_position_management(account)
+        if operation == "resolve_instrument":
+            return _apex_resolve_instrument(account, request)
         if operation == "set_tp":
             return _apex_set_tp(request)
         if operation == "set_sl":
@@ -566,17 +612,7 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
         # server side and cheap on the cache.
         client.configs_v3()
         client.get_account_v3()
-        config = client.configV3 or {}
-        contracts = (
-            (config.get("contractConfig") or {}).get("perpetualContract") or []
-        )
-        prelaunch = (
-            (config.get("contractConfig") or {}).get("prelaunchContract") or []
-        )
-        stock = (
-            (config.get("contractConfig") or {}).get("stockContract") or []
-        )
-        all_contracts = list(contracts) + list(prelaunch) + list(stock)
+        all_contracts = _apex_fetch_supported_markets(client)
         meta = _apex_resolve_symbol(symbol_raw, all_contracts)
         if meta is None:
             return make_failure(operation="new_order", exchange=name,
@@ -707,15 +743,8 @@ def _apex_resolve_symbol(requested: str,
       - ``symbol``           = ``"BTC-USDT"`` (canonical, dash-separated)
       - ``symbolDisplayName`` = ``"BTCUSDT"`` (no separator)
 
-    Returns the matching config dict or ``None`` if the symbol is not
-    listed. Apex uses the ``-USDT`` suffix in ``symbol`` for perps; we
-    honour that as the canonical form returned to the wizard.
-
-    Match priority:
-      1. Exact match against ``symbol`` or ``symbolDisplayName``
-      2. Base-asset match: ``ETH`` → ``ETH-USDT`` / ``ETHUSDT``
-      3. ``<BASE>-USDT`` / ``<BASE>USDT`` aliases
-      4. ``<BASE>-USDC`` / ``<BASE>USDC`` aliases (less common on Apex)
+    Returns the matching config dict, raises ``ValueError("INSTRUMENT_AMBIGUOUS")``
+    when more than one contract matches, or ``None`` if nothing matches.
     """
     target = (requested or "").strip().upper()
     if not target:
@@ -740,14 +769,53 @@ def _apex_resolve_symbol(requested: str,
         f"{target_base}-USDC",
         f"{target_base}USDC",
     }
+    exact_symbol_matches: List[Mapping[str, Any]] = []
+    for row in contracts:
+        symbol = str(row.get("symbol") or "").upper()
+        if symbol == target:
+            exact_symbol_matches.append(row)
+    if len(exact_symbol_matches) == 1:
+        return exact_symbol_matches[0]
+    if len(exact_symbol_matches) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    matches: List[Mapping[str, Any]] = []
+    seen_ids = set()
     for row in contracts:
         symbol = str(row.get("symbol") or "").upper()
         display = str(row.get("symbolDisplayName") or "").upper()
-        if symbol in candidates_for_target or display in candidates_for_target:
-            return row
-        if symbol in candidates_for_base or display in candidates_for_base:
-            return row
-    return None
+        row_id = row.get("id") if isinstance(row, Mapping) else None
+        if (symbol == target or display == target
+                or symbol in candidates_for_target or display in candidates_for_target
+                or symbol in candidates_for_base or display in candidates_for_base):
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            matches.append(row)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    return matches[0]
+
+
+def _apex_fetch_supported_markets(client: Any) -> List[Mapping[str, Any]]:
+    """Return the unified Apex contract catalog used by every symbol-sensitive op.
+
+    New writes, ladders, cancels, close and TP/SL helpers all read from this
+    same list so duplicate-underlying disambiguation and ``INSTRUMENT_AMBIGUOUS``
+    apply uniformly. Perps, prelaunch, and stock contracts are merged so the
+    resolver is the single seam.
+    """
+    try:
+        client.configs_v3()
+    except Exception:
+        pass
+    config = client.configV3 or {}
+    cc = config.get("contractConfig") or {}
+    perps = list(cc.get("perpetualContract") or [])
+    prelaunch = list(cc.get("prelaunchContract") or [])
+    stock = list(cc.get("stockContract") or [])
+    return perps + prelaunch + stock
 
 
 def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
@@ -915,17 +983,21 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
         client.set_default_account_type("primary")
         client.configs_v3()
         client.get_account_v3()
-        config = client.configV3 or {}
-        contracts = (
-            (config.get("contractConfig") or {}).get("perpetualContract") or []
-        )
-        meta = _apex_resolve_symbol(symbol, list(contracts))
+        all_contracts = _apex_fetch_supported_markets(client)
+        meta = _apex_resolve_symbol(symbol, all_contracts)
         if meta is None:
             return make_failure(operation="cancel_order_group", exchange=name,
                                 account=credentials["account"],
                                 code="INSTRUMENT_NOT_FOUND",
                                 message=f"Apex symbol '{symbol}' is not available.")
         canonical_symbol = meta["symbol"]
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(operation="cancel_order_group", exchange=name,
+                                account=credentials["account"],
+                                code="INSTRUMENT_AMBIGUOUS",
+                                message=f"Apex instrument '{symbol}' is ambiguous.")
+        raise
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="cancel_order_group", exchange=name,
                             account=credentials["account"],
@@ -1145,10 +1217,7 @@ def _apex_fetch_positions(client: Any) -> List[Mapping[str, Any]]:
     response into a uniform list of Mapping rows so the position-
     management helpers can iterate it.
     """
-    try:
-        client.get_account_v3()
-    except Exception:
-        pass
+    client.get_account_v3()
     account = client.accountV3 or {}
     raw_positions = account.get("positions") or []
     return [p for p in raw_positions if isinstance(p, Mapping)]
@@ -1567,8 +1636,8 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
         client.set_default_account_type("primary")
         client.configs_v3()
         client.get_account_v3()
-        contracts = ((client.configV3 or {}).get("contractConfig") or {}).get("perpetualContract") or []
-        meta_raw = _apex_resolve_symbol(requested_symbol, list(contracts))
+        all_contracts = _apex_fetch_supported_markets(client)
+        meta_raw = _apex_resolve_symbol(requested_symbol, all_contracts)
         if meta_raw is None:
             return make_failure(operation="set_tp", exchange=name,
                                 account=credentials["account"],
@@ -1578,6 +1647,13 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
         tick_size = meta["tick_size"]
         step_size = meta["step_size"]
         symbol = meta["symbol"]
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(operation="set_tp", exchange=name,
+                                account=credentials["account"],
+                                code="INSTRUMENT_AMBIGUOUS",
+                                message=f"Apex instrument '{requested_symbol}' is ambiguous.")
+        raise
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="set_tp", exchange=name,
                             account=credentials["account"],
@@ -1726,8 +1802,8 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
         client.set_default_account_type("primary")
         client.configs_v3()
         client.get_account_v3()
-        contracts = ((client.configV3 or {}).get("contractConfig") or {}).get("perpetualContract") or []
-        meta_raw = _apex_resolve_symbol(requested_symbol, list(contracts))
+        all_contracts = _apex_fetch_supported_markets(client)
+        meta_raw = _apex_resolve_symbol(requested_symbol, all_contracts)
         if meta_raw is None:
             return make_failure(operation="set_sl", exchange=name,
                                 account=credentials["account"],
@@ -1736,6 +1812,13 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
         meta = _apex_normalize_meta(meta_raw)
         tick_size = meta["tick_size"]
         symbol = meta["symbol"]
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(operation="set_sl", exchange=name,
+                                account=credentials["account"],
+                                code="INSTRUMENT_AMBIGUOUS",
+                                message=f"Apex instrument '{requested_symbol}' is ambiguous.")
+        raise
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="set_sl", exchange=name,
                             account=credentials["account"],
@@ -1865,8 +1948,8 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
         client.set_default_account_type("primary")
         client.configs_v3()
         client.get_account_v3()
-        contracts = ((client.configV3 or {}).get("contractConfig") or {}).get("perpetualContract") or []
-        meta_raw = _apex_resolve_symbol(requested_symbol, list(contracts))
+        all_contracts = _apex_fetch_supported_markets(client)
+        meta_raw = _apex_resolve_symbol(requested_symbol, all_contracts)
         if meta_raw is None:
             return make_failure(operation="close_position", exchange=name,
                                 account=credentials["account"],
@@ -1875,14 +1958,32 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
         meta = _apex_normalize_meta(meta_raw)
         tick_size = meta["tick_size"]
         symbol = meta["symbol"]
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(operation="close_position", exchange=name,
+                                account=credentials["account"],
+                                code="INSTRUMENT_AMBIGUOUS",
+                                message=f"Apex instrument '{requested_symbol}' is ambiguous.")
+        raise
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="close_position", exchange=name,
                             account=credentials["account"],
                             code="APEX_ERROR",
                             message=sanitize_error_message(str(exc)))
 
-    # Find the open position
-    positions = _apex_fetch_positions(client)
+    # Fetch positions. A SDK / API failure is explicit — we refuse to treat
+    # "fetch boom → empty list" as "no position".
+    try:
+        positions = _apex_fetch_positions(client)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="close_position", exchange=name,
+                            account=credentials["account"],
+                            code="POSITIONS_UNAVAILABLE",
+                            message=sanitize_error_message(str(exc)),
+                            position_action=_apex_position_action_result(
+                                operation="close_position", symbol=symbol,
+                                verified=False, status="failed",
+                            ))
     position_row = _apex_find_position(positions, symbol)
     if position_row is None:
         return make_failure(operation="close_position", exchange=name,
@@ -2268,7 +2369,7 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
         contracts = (
             (config.get("contractConfig") or {}).get("perpetualContract") or []
         )
-        all_contracts = list(contracts)
+        all_contracts = _apex_fetch_supported_markets(client)
         meta = _apex_resolve_symbol(requested_symbol, all_contracts)
         if meta is None:
             return make_failure(operation="ladder", exchange=name,

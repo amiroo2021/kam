@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -146,7 +147,7 @@ def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
 
 
 def capabilities() -> List[str]:
-    return ["balance", "positions_orders", "new_order", "ladder", "cancel_orders", "positions_management"]
+    return ["balance", "positions_orders", "new_order", "ladder", "cancel_orders", "positions_management", "resolve_instrument"]
 
 
 def _base58_decode(value: str) -> bytes:
@@ -1070,13 +1071,34 @@ def _execute_set_tp_sl(request: Dict[str, Any], *, kind: str) -> CanonicalRespon
     symbol = str(request.get("symbol") or "").strip().upper()
     if not symbol:
         return make_failure(operation=operation, exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    try:
+        metadata = _raydium_resolve_canonical(symbol)
+    except RuntimeError:
+        return make_failure(operation=operation, exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Raydium instrument '{symbol}' is not available.")
+    orderly_symbol = str(metadata.get("symbol") or "")
+    display_symbol = str(metadata.get("display_symbol") or symbol)
     price = _decimal_or_zero(request.get("price"))
-    position = _find_current_position(credentials, symbol)
+    try:
+        positions_payload = _private_get(credentials, "/v1/positions")
+        positions_rows = ((positions_payload.get("data") or {}).get("rows") if isinstance(positions_payload, dict) else None)
+        symbol_rules = _fetch_symbol_rules([orderly_symbol])
+        positions = _normalize_positions(positions_rows, symbol_rules=symbol_rules)
+        position = _raydium_match_position(positions, metadata)
+    except Exception as exc:
+        return make_failure(operation=operation, exchange=name, account=account,
+                            code="POSITIONS_UNAVAILABLE",
+                            message=sanitize_error_message(str(exc)),
+                            position_action=_position_action_result(operation=operation, symbol=display_symbol, verified=False, removed=False, status="failed"))
     if position is None:
-        return make_failure(operation=operation, exchange=name, account=account, code="POSITION_NOT_FOUND", message="Open position was not found.")
+        return make_failure(operation=operation, exchange=name, account=credentials["account"], code="POSITION_NOT_FOUND", message="Open position was not found.")
     closing_side = "SELL" if position.side == "long" else "BUY"
-    algo_orders = _fetch_algo_orders(credentials, symbol)
-    protection = _extract_protection_from_algo_orders(algo_orders, symbol, closing_side)
+    try:
+        algo_orders = _fetch_algo_orders(credentials, orderly_symbol)
+    except Exception:
+        algo_orders = []
+    protection = _extract_protection_from_algo_orders(algo_orders, orderly_symbol, closing_side)
     current_orders = protection[kind]
     if price == 0:
         if not current_orders:
@@ -1084,22 +1106,21 @@ def _execute_set_tp_sl(request: Dict[str, Any], *, kind: str) -> CanonicalRespon
                 operation=operation,
                 exchange=name,
                 account=credentials["account"],
-                position_action=_position_action_result(operation=operation, symbol=symbol, verified=True, removed=False, current_side=position.side, current_size=position.size, message=f"No {'Take Profit' if kind == 'tp' else 'Stop Loss'} was set."),
+                position_action=_position_action_result(operation=operation, symbol=display_symbol, verified=True, removed=False, current_side=position.side, current_size=position.size, message=f"No {'Take Profit' if kind == 'tp' else 'Stop Loss'} was set."),
             )
         target = current_orders[0]
         target_id = int(str(target.get("algo_order_id") or 0))
         try:
-            _signed_delete(credentials, "/v1/algo/order", {"order_id": target_id, "symbol": _orderly_symbol(symbol)})
-            after = _fetch_algo_orders(credentials, symbol)
-            after_state = _extract_protection_from_algo_orders(after, symbol, closing_side)
+            _signed_delete(credentials, "/v1/algo/order", {"order_id": target_id, "symbol": orderly_symbol})
+            after = _fetch_algo_orders(credentials, orderly_symbol)
+            after_state = _extract_protection_from_algo_orders(after, orderly_symbol, closing_side)
             removed = not after_state[kind]
-            action = _position_action_result(operation=operation, symbol=symbol, verified=removed, removed=True, exchange_order_id=target_id, current_side=position.side, current_size=position.size, status="success" if removed else "failed", message=f"{'Take Profit' if kind == 'tp' else 'Stop Loss'} removed." if removed else None)
+            action = _position_action_result(operation=operation, symbol=display_symbol, verified=removed, removed=True, exchange_order_id=target_id, current_side=position.side, current_size=position.size, status="success" if removed else "failed", message=f"{'Take Profit' if kind == 'tp' else 'Stop Loss'} removed." if removed else None)
             if removed:
                 return make_success(operation=operation, exchange=name, account=credentials["account"], position_action=action)
             return make_failure(operation=operation, exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="Protection removal could not be verified.", position_action=action)
         except Exception as exc:
-            return make_failure(operation=operation, exchange=name, account=account, code=f"{'TP' if kind == 'tp' else 'SL'}_REMOVAL_FAILED", message=sanitize_error_message(str(exc)), position_action=_position_action_result(operation=operation, symbol=symbol, verified=False, removed=True, status="failed", current_side=position.side, current_size=position.size))
-    metadata = _resolve_symbol_metadata(symbol)
+            return make_failure(operation=operation, exchange=name, account=account, code=f"{'TP' if kind == 'tp' else 'SL'}_REMOVAL_FAILED", message=sanitize_error_message(str(exc)), position_action=_position_action_result(operation=operation, symbol=display_symbol, verified=False, removed=True, status="failed", current_side=position.side, current_size=position.size))
     existing_tp_price = _decimal_or_zero(current_orders[0].get("trigger_price")) if current_orders else Decimal("0")
     sibling_kind = "sl" if kind == "tp" else "tp"
     sibling_orders = protection[sibling_kind]
@@ -1115,10 +1136,13 @@ def _execute_set_tp_sl(request: Dict[str, Any], *, kind: str) -> CanonicalRespon
         if root_id > 0 and root_id not in existing_root_ids:
             existing_root_ids.append(root_id)
     for root_id in existing_root_ids:
-        _signed_delete(credentials, "/v1/algo/order", {"order_id": root_id, "symbol": _orderly_symbol(symbol)})
-    payload = _build_tp_sl_algo_payload(symbol=symbol, side=closing_side, tp_price=desired_tp_price, sl_price=desired_sl_price, metadata=metadata)
+        try:
+            _signed_delete(credentials, "/v1/algo/order", {"order_id": root_id, "symbol": orderly_symbol})
+        except Exception:
+            pass
+    payload = _build_tp_sl_algo_payload(symbol=orderly_symbol, side=closing_side, tp_price=desired_tp_price, sl_price=desired_sl_price, metadata=metadata)
     if not payload["child_orders"]:
-        return make_failure(operation=operation, exchange=name, account=account, code="INVALID_PROTECTION_REQUEST", message="No TP/SL child orders were available to submit.", position_action=_position_action_result(operation=operation, symbol=symbol, verified=False, removed=False, price=_decimal_text(price), status="failed", current_side=position.side, current_size=position.size))
+        return make_failure(operation=operation, exchange=name, account=account, code="INVALID_PROTECTION_REQUEST", message="No TP/SL child orders were available to submit.", position_action=_position_action_result(operation=operation, symbol=display_symbol, verified=False, removed=False, price=_decimal_text(price), status="failed", current_side=position.side, current_size=position.size))
     try:
         response = _signed_post(credentials, "/v1/algo/order", payload)
         data = response.get("data") if isinstance(response, dict) else None
@@ -1128,17 +1152,50 @@ def _execute_set_tp_sl(request: Dict[str, Any], *, kind: str) -> CanonicalRespon
                 exchange_order_id = int(str(data.get("algo_order_id") or data.get("order_id") or 0))
             except Exception:
                 exchange_order_id = None
-        after = _fetch_algo_orders(credentials, symbol)
-        after_state = _extract_protection_from_algo_orders(after, symbol, closing_side)
+        after = _fetch_algo_orders(credentials, orderly_symbol)
+        after_state = _extract_protection_from_algo_orders(after, orderly_symbol, closing_side)
         verified_orders = after_state[kind]
         target_price = _format_decimal_places(_quantize_down(price, int(metadata.get("price_precision") or 0)), int(metadata.get("price_precision") or 0))
         verified = any(_decimal_text(item.get("trigger_price")) == _decimal_text(target_price) for item in verified_orders)
-        action = _position_action_result(operation=operation, symbol=symbol, verified=verified, removed=False, price=target_price, exchange_order_id=exchange_order_id, current_side=position.side, current_size=position.size, status="success" if verified else "failed")
+        action = _position_action_result(operation=operation, symbol=display_symbol, verified=verified, removed=False, price=target_price, exchange_order_id=exchange_order_id, current_side=position.side, current_size=position.size, status="success" if verified else "failed")
         if verified:
             return make_success(operation=operation, exchange=name, account=credentials["account"], position_action=action)
         return make_failure(operation=operation, exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="Protection submission could not be verified.", position_action=action)
     except Exception as exc:
-        return make_failure(operation=operation, exchange=name, account=account, code=f"{'TP' if kind == 'tp' else 'SL'}_SUBMISSION_FAILED", message=sanitize_error_message(str(exc)), position_action=_position_action_result(operation=operation, symbol=symbol, verified=False, removed=False, price=_decimal_text(price), status="failed", current_side=position.side, current_size=position.size))
+        return make_failure(operation=operation, exchange=name, account=account, code=f"{'TP' if kind == 'tp' else 'SL'}_SUBMISSION_FAILED", message=sanitize_error_message(str(exc)), position_action=_position_action_result(operation=operation, symbol=display_symbol, verified=False, removed=False, price=_decimal_text(price), status="failed", current_side=position.side, current_size=position.size))
+
+
+def _raydium_resolve_canonical(symbol: Any) -> Dict[str, Any]:
+    """Resolve a caller symbol to the Raydium/Orderly canonical metadata.
+
+    Returns a dict with ``symbol`` (Orderly ``PERP_…``), ``display_symbol``
+    (display name, e.g. ``SOL``), and ``price_precision`` /
+    ``size_precision`` fields the rest of the agent expects. Raises
+    ``RuntimeError("INSTRUMENT_NOT_FOUND")`` when the venue's public
+    metadata lookup fails — callers map that to ``INSTRUMENT_NOT_FOUND``
+    or to their own explicit error code.
+    """
+    metadata = _resolve_symbol_metadata(symbol)
+    orderly_symbol = str(metadata.get("symbol") or "")
+    if not orderly_symbol:
+        raise RuntimeError("INSTRUMENT_NOT_FOUND")
+    return metadata
+
+
+def _raydium_match_position(positions: List[Any], metadata: Dict[str, Any]) -> Optional[Any]:
+    """Find a position whose Orderly or display symbol matches the resolved market.
+
+    Venue rows may carry either the Orderly ``PERP_*_USDC`` symbol or the
+    user-facing display; both must match. The position list is the same
+    shape ``_normalize_positions`` emits (CanonicalPosition).
+    """
+    orderly_symbol = str(metadata.get("symbol") or "")
+    display_symbol = str(metadata.get("display_symbol") or "")
+    for position in positions or []:
+        sym = getattr(position, "symbol", None) or ""
+        if sym == orderly_symbol or sym == display_symbol:
+            return position
+    return None
 
 
 def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
@@ -1150,14 +1207,23 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
     if not symbol:
         return make_failure(operation="close_position", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
     try:
-        position = _find_current_position(credentials, symbol)
+        metadata = _raydium_resolve_canonical(symbol)
+    except RuntimeError:
+        return make_failure(operation="close_position", exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Raydium instrument '{symbol}' is not available.")
+    try:
+        positions_payload = _private_get(credentials, "/v1/positions")
+        positions_rows = ((positions_payload.get("data") or {}).get("rows") if isinstance(positions_payload, dict) else None)
+        symbol_rules = _fetch_symbol_rules([metadata["symbol"]])
+        positions = _normalize_positions(positions_rows, symbol_rules=symbol_rules)
+        position = _raydium_match_position(positions, metadata)
         if position is None:
-            return make_failure(operation="close_position", exchange=name, account=account, code="POSITION_NOT_FOUND", message="Open position was not found.")
-        metadata = _resolve_symbol_metadata(symbol)
+            return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="POSITION_NOT_FOUND", message="Open position was not found.")
         side = "sell" if position.side == "long" else "buy"
         submission = _submit_order(credentials, metadata, side=side, order_type="market", requested_volume=_decimal_or_zero(position.size), requested_price=Decimal("1"), reduce_only=True)
-        verified = _find_current_position(credentials, symbol) is None
-        action = _position_action_result(operation="close_position", symbol=symbol, verified=verified, removed=True, exchange_order_id=submission.get("exchange_order_id"), current_side=position.side, current_size=position.size, status="success" if verified else "failed")
+        verified = _raydium_match_position(_normalize_positions(_private_get(credentials, "/v1/positions").get("data", {}).get("rows") if isinstance(_private_get(credentials, "/v1/positions"), dict) else None, symbol_rules=symbol_rules), metadata) is None
+        action = _position_action_result(operation="close_position", symbol=str(metadata.get("display_symbol") or symbol), verified=verified, removed=True, exchange_order_id=submission.get("exchange_order_id"), current_side=position.side, current_size=position.size, status="success" if verified else "failed")
         if verified:
             return make_success(operation="close_position", exchange=name, account=credentials["account"], position_action=action)
         return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="Close position could not be verified.", position_action=action)
@@ -1177,11 +1243,18 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
     if side not in {"buy", "sell"}:
         return make_failure(operation="cancel_order_group", exchange=name, account=account, code="INVALID_SIDE", message="Side must be buy or sell.")
     try:
+        metadata = _raydium_resolve_canonical(symbol)
+    except RuntimeError:
+        return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Raydium instrument '{symbol}' is not available.")
+    target_symbol = str(metadata.get("symbol") or "")
+    display_symbol = str(metadata.get("display_symbol") or symbol)
+    try:
         before = _fetch_open_orders(credentials)
-        target_symbol = _orderly_symbol(symbol)
         targets = [row for row in before if isinstance(row, dict) and _orderly_symbol(row.get("symbol")) == target_symbol and str(row.get("side") or "").strip().upper() == side.upper()]
         if not targets:
-            cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=0, cancelled_order_count=0, confirmed_absent_count=0, remaining_target_count=0, verified=True, partial=False, status="success", batch_count=0)
+            cancel_group = CanonicalCancelGroupResult(symbol=display_symbol, side=side, targeted_order_count=0, cancelled_order_count=0, confirmed_absent_count=0, remaining_target_count=0, verified=True, partial=False, status="success", batch_count=0)
             return make_success(operation="cancel_order_group", exchange=name, account=credentials["account"], cancel_group=cancel_group)
         cancelled = 0
         batches: List[Dict[str, Any]] = []
@@ -1228,18 +1301,55 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
                     continue
                 reason_text = sanitize_error_message(str(fallback_exc or exc))
                 batches.append({"submitted": 1, "accepted": 0, "ok": False, "reason": reason_text})
-                cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=0, remaining_target_count=len(targets) - cancelled, verified=False, partial=cancelled > 0, status="partial" if cancelled > 0 else "failed", batch_count=len(batches), batches=batches)
+                cancel_group = CanonicalCancelGroupResult(symbol=display_symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=0, remaining_target_count=len(targets) - cancelled, verified=False, partial=cancelled > 0, status="partial" if cancelled > 0 else "failed", batch_count=len(batches), batches=batches)
                 return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="CANCEL_FAILED", message=reason_text, cancel_group=cancel_group)
         after = _fetch_open_orders(credentials)
         remaining = [row for row in after if isinstance(row, dict) and _orderly_symbol(row.get("symbol")) == target_symbol and str(row.get("side") or "").strip().upper() == side.upper()]
         confirmed_absent = len(targets) - len(remaining)
         verified = len(remaining) == 0
-        cancel_group = CanonicalCancelGroupResult(symbol=symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=confirmed_absent, remaining_target_count=len(remaining), verified=verified, partial=not verified, status="success" if verified else "partial", batch_count=len(batches), batches=batches)
+        cancel_group = CanonicalCancelGroupResult(symbol=display_symbol, side=side, targeted_order_count=len(targets), cancelled_order_count=cancelled, confirmed_absent_count=confirmed_absent, remaining_target_count=len(remaining), verified=verified, partial=not verified, status="success" if verified else "partial", batch_count=len(batches), batches=batches)
         if verified:
             return make_success(operation="cancel_order_group", exchange=name, account=credentials["account"], cancel_group=cancel_group)
         return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="Cancellation could not be verified.", cancel_group=cancel_group)
     except Exception as exc:
         return make_failure(operation="cancel_order_group", exchange=name, account=account, code="CANCEL_FAILED", message=sanitize_error_message(str(exc)))
+
+
+def _raydium_resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account,
+                            code="MISSING_SYMBOL", message="Symbol is required.")
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="resolve_instrument", exchange=name, account=account,
+                            code="ACCOUNT_NOT_FOUND", message="Raydium account is not configured.")
+    try:
+        metadata = _resolve_symbol_metadata(requested)
+    except Exception as exc:
+        # Unproven aliases like SOL-USDC, SOL_USDC, SOLUSDC do not exist
+        # in the live Raydium/Orderly catalog and the public lookup fails.
+        # Surface this as INSTRUMENT_NOT_FOUND so unknown / unsupported
+        # aliases never collapse into a "no order" success.
+        return make_failure(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Raydium instrument '{requested}' is not available.")
+    orderly_symbol = str(metadata.get("symbol") or "")
+    if not orderly_symbol:
+        return make_failure(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                            code="INSTRUMENT_NOT_FOUND",
+                            message=f"Raydium instrument '{requested}' is not available.")
+    display_symbol = str(metadata.get("display_symbol") or _symbol_from_orderly(orderly_symbol))
+    instrument = CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=orderly_symbol,
+        display_name=display_symbol,
+        price_increment=None,
+        size_increment=None,
+        minimum_size=str(metadata.get("min_quantity") or "") or None,
+    )
+    return make_success(operation="resolve_instrument", exchange=name, account=credentials["account"],
+                        instrument=instrument)
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
@@ -1263,6 +1373,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_close_position(request)
     if operation == "cancel_order_group":
         return _execute_cancel_order_group(request)
+    if operation == "resolve_instrument":
+        return _raydium_resolve_instrument(account, request)
     return make_failure(
         operation=operation or "unknown",
         exchange=name,
