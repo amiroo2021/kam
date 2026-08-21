@@ -192,7 +192,7 @@ def _make_service(tmpdir: str, *, with_stub: bool = True) -> PersistentFiboServi
 
 class TestServiceStart(unittest.TestCase):
     def test_supported_exchanges_includes_lighter_and_arcus(self):
-        self.assertEqual(SUPPORTED_EXCHANGES, ("lighter", "arcus", "rise"))
+        self.assertEqual(SUPPORTED_EXCHANGES, ("lighter", "arcus", "rise", "ondoperps"))
 
     def test_start_creates_registration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,7 +269,7 @@ class TestServiceStart(unittest.TestCase):
             svc = _make_service(tmp)
             r = svc.execute_command({
                 "op": "start",
-                "exchange": "ondoperps",
+                "exchange": "apex",
                 "account": "amiroo",
                 "instrument": "SOL",
                 "direction": "BUY",

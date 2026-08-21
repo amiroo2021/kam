@@ -235,17 +235,17 @@ class TestFiboDiscoveryParityWithTrade(unittest.TestCase):
         self.assertEqual(desk.execute_calls, [])
 
     def test_unsupported_exchange_graceful_no_mutation(self):
-        self.assertFalse(_golden_fibo_supported("ondoperps"))
+        self.assertFalse(_golden_fibo_supported("apex"))
         desk = _FakeDesk(
-            exchanges=["lighter", "ondoperps"],
-            accounts={"ondoperps": ["main"], "lighter": ["amiroo"]},
+            exchanges=["lighter", "apex"],
+            accounts={"apex": ["main"], "lighter": ["amiroo"]},
         )
         svc = _StubFiboService()
         fibo = FiboWizard(tradedesk=desk, service=svc)
         fibo.open(("f", 1))
         s = fibo.handle_callback(("f", 1), "menu:start")
-        self.assertIn("ONDOPERPS", _button_labels(s))  # still shown
-        fibo.handle_callback(("f", 1), "exchange:ondoperps")
+        self.assertIn("APEX", _button_labels(s))  # still shown
+        fibo.handle_callback(("f", 1), "exchange:apex")
         s = fibo.handle_callback(("f", 1), "account:main")
         self.assertEqual(s.state, "unsupported_exchange")
         self.assertIn("GoldenFibo is not yet available on", s.text)
@@ -254,6 +254,24 @@ class TestFiboDiscoveryParityWithTrade(unittest.TestCase):
         # Back returns to exchange list cleanly.
         s = fibo.handle_callback(("f", 1), "back")
         self.assertEqual(s.state, "exchange")
+
+    def test_ondoperps_supported_proceeds_to_instrument(self):
+        self.assertTrue(_golden_fibo_supported("ondoperps"))
+        desk = _FakeDesk(
+            exchanges=["lighter", "ondoperps"],
+            accounts={"ondoperps": ["amiroo"], "lighter": ["amiroo"]},
+        )
+        svc = _StubFiboService()
+        fibo = FiboWizard(tradedesk=desk, service=svc)
+        fibo.open(("f", 1))
+        s = fibo.handle_callback(("f", 1), "menu:start")
+        self.assertIn("ONDOPERPS", _button_labels(s))
+        fibo.handle_callback(("f", 1), "exchange:ondoperps")
+        s = fibo.handle_callback(("f", 1), "account:amiroo")
+        self.assertEqual(s.state, "instrument")
+        self.assertIn("Select instrument", s.text)
+        self.assertEqual(svc.commands, [])
+        self.assertEqual(desk.execute_calls, [])
 
     def test_rise_supported_proceeds_to_instrument(self):
         self.assertTrue(_golden_fibo_supported("rise"))

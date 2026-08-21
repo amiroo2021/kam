@@ -415,6 +415,10 @@ def capabilities() -> List[str]:
         "get_exact_order",
         "ladder",
         "cancel_order_group",
+        "cancel_order",
+        "get_order_state",
+        "get_order_state_by_client_id",
+        "market_constraints",
         "set_tp",
         "set_sl",
         "set_position_protections",
@@ -496,6 +500,14 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _ladder(account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(account, request)
+        if operation == "cancel_order":
+            return _execute_cancel_order(account, request)
+        if operation == "get_order_state":
+            return _execute_get_order_state(account, request)
+        if operation == "get_order_state_by_client_id":
+            return _execute_get_order_state_by_client_id(account, request)
+        if operation == "market_constraints":
+            return _execute_market_constraints(account, request)
         if operation == "set_tp":
             return _set_position_trigger(account, request, kind="takeProfit")
         if operation == "set_sl":
@@ -2468,6 +2480,359 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         if accepted > 0
         else "Ondo Perps rejected the ladder batch.",
         ladder=ladder_result,
+    )
+
+
+# --- Single-order cancel / order-state reads (GoldenFibo) --------------------
+
+_ORDER_ID_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _ondo_order_id_segment(value: Any) -> Optional[str]:
+    """Safe path segment for ``/v1/perps/orders/{id}``. Rejects empty/unsafe ids."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or not _ORDER_ID_SEGMENT.fullmatch(text):
+        return None
+    return text
+
+
+def _classify_ondo_order_status(raw_status: Any) -> str:
+    """Map Ondo order status strings to GoldenFibo taxonomy.
+
+    Never returns FILLED unless Ondo itself reported a filled status.
+    Absence / unknown strings map to UNKNOWN.
+    """
+    status = str(raw_status or "").strip().lower()
+    if status in {"open", "pending", "untriggered"}:
+        return "OPEN"
+    if status in {"partiallyfilled", "partial", "partial_fill", "partially_filled"}:
+        return "PARTIALLY_FILLED"
+    if status in {"fullyfilled", "filled", "fully_filled"}:
+        return "FILLED"
+    if status in {"cancelled", "canceled"}:
+        return "CANCELED"
+    if status in {"rejected"}:
+        return "REJECTED"
+    return "UNKNOWN"
+
+
+def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Optional[str] = None) -> Dict[str, Any]:
+    classification = _classify_ondo_order_status(order.get("status"))
+    oid = str(order.get("orderId") or exchange_order_id or "").strip() or None
+    filled = _decimal_or_none(order.get("filledSize"))
+    size = _decimal_or_none(order.get("size"))
+    remaining = None
+    if size is not None and filled is not None:
+        remaining = size - filled
+        if remaining < 0:
+            remaining = Decimal("0")
+    taxonomy = "ACTIVE" if classification in {"OPEN", "PARTIALLY_FILLED"} else classification
+    return {
+        "exchange_order_id": oid,
+        "client_order_id": order.get("clientOrderId"),
+        "status": classification,
+        "taxonomy": taxonomy,
+        "classification": classification,
+        "side": str(order.get("side") or "").strip().lower() or None,
+        "requested_size": _decimal_text(size) if size is not None else None,
+        "filled_size": _decimal_text(filled) if filled is not None else None,
+        "remaining_size": _decimal_text(remaining) if remaining is not None else None,
+        "limit_price": _decimal_text(order.get("price")),
+        "average_fill_price": _decimal_text(order.get("averageFillPrice") or order.get("avgFillPrice")),
+        "symbol": str(order.get("market") or "").strip() or None,
+        "raw_status": order.get("status"),
+    }
+
+
+def _decimals_from_increment(increment: Optional[Decimal]) -> int:
+    if increment is None or increment <= 0:
+        return 0
+    text = format(increment, "f").rstrip("0")
+    if "." not in text:
+        return 0
+    return len(text.split(".", 1)[1])
+
+
+def _execute_cancel_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Cancel exactly one Ondo order by server order id.
+
+    Uses ``DELETE /v1/perps/orders/{orderId}``. Never expands to a
+    symbol+side group cancel. 404 / already-gone is treated as success
+    (idempotent for GoldenFibo restart/reconciliation).
+    """
+    credentials = _lookup_credentials(account)
+    if not credentials:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    raw_oid = request.get("order_id")
+    if raw_oid is None:
+        raw_oid = request.get("order_index")
+    if raw_oid is None:
+        raw_oid = request.get("exchange_order_id")
+    oid = _ondo_order_id_segment(raw_oid)
+    if not oid:
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account,
+            code="MISSING_ORDER_ID",
+            message="order_id is required for single-order cancellation.",
+        )
+    path = f"{_PATH_PERPS_ORDERS}/{oid}"
+    try:
+        _signed_delete(credentials, path)
+    except OndoHTTPError as exc:
+        body = str(exc.body or "").lower()
+        if exc.status == 404 or any(
+            token in body
+            for token in (
+                "order_not_found",
+                "already_cancelled",
+                "already_canceled",
+                "not_in_cancellable_state",
+                "already_filled",
+            )
+        ):
+            return make_success(
+                operation="cancel_order",
+                exchange=name,
+                account=account,
+                order_state={"outcome": "ALREADY_TERMINAL", "exchange_order_id": oid},
+            )
+        return _map_http_error_to_failure(exc, operation="cancel_order", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order",
+            exchange=name,
+            account=account,
+            code="CANCEL_FAILED",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    return make_success(
+        operation="cancel_order",
+        exchange=name,
+        account=account,
+        order_state={"outcome": "CANCELED", "exchange_order_id": oid},
+    )
+
+
+def _execute_get_order_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Authoritative single-order read: GET /v1/perps/orders/{orderId}.
+
+    Disappearance (404 / order_not_found) is UNKNOWN, never FILLED.
+    """
+    credentials = _lookup_credentials(account)
+    if not credentials:
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    raw_oid = request.get("order_id")
+    if raw_oid is None:
+        raw_oid = request.get("order_index")
+    if raw_oid is None:
+        raw_oid = request.get("exchange_order_id")
+    oid = _ondo_order_id_segment(raw_oid)
+    if not oid:
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account,
+            code="MISSING_ORDER_ID",
+            message="order_id is required.",
+        )
+    path = f"{_PATH_PERPS_ORDERS}/{oid}"
+    try:
+        payload = _signed_get(credentials, path)
+    except OndoHTTPError as exc:
+        body = str(exc.body or "").lower()
+        if exc.status == 404 or "order_not_found" in body:
+            return make_success(
+                operation="get_order_state",
+                exchange=name,
+                account=account,
+                order_state={
+                    "exchange_order_id": oid,
+                    "status": "UNKNOWN",
+                    "taxonomy": "UNKNOWN",
+                    "classification": "UNKNOWN",
+                    "note": "Ondo no longer reports this order id; do not infer FILLED",
+                },
+            )
+        return _map_http_error_to_failure(exc, operation="get_order_state", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_order_state",
+            exchange=name,
+            account=account,
+            code="ONDOPERPS_ERROR",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    order = payload if isinstance(payload, dict) else {}
+    if not order:
+        return make_success(
+            operation="get_order_state",
+            exchange=name,
+            account=account,
+            order_state={
+                "exchange_order_id": oid,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            },
+        )
+    return make_success(
+        operation="get_order_state",
+        exchange=name,
+        account=account,
+        order_state=_order_state_from_ondo_row(order, exchange_order_id=oid),
+    )
+
+
+def _execute_get_order_state_by_client_id(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Authoritative lookup GET /v1/perps/orders/client:{clientOrderId}."""
+    credentials = _lookup_credentials(account)
+    if not credentials:
+        return make_failure(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    raw = request.get("client_order_id")
+    if raw is None:
+        raw = request.get("client_order_index")
+    if raw is None:
+        raw = request.get("clientOrderId")
+    try:
+        client_order_id = _normalize_client_order_id(raw)
+    except ValueError as exc:
+        return make_failure(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account,
+            code="INVALID_CLIENT_ORDER_ID",
+            message=str(exc),
+        )
+    if not client_order_id:
+        return make_failure(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account,
+            code="MISSING_CLIENT_ORDER_ID",
+            message="client_order_id is required.",
+        )
+    try:
+        order = _fetch_order_by_client_order_id(credentials, client_order_id)
+    except OndoHTTPError as exc:
+        body = str(exc.body or "").lower()
+        if exc.status in (400, 404) or "order_not_found" in body:
+            return make_success(
+                operation="get_order_state_by_client_id",
+                exchange=name,
+                account=account,
+                order_state={
+                    "client_order_id": client_order_id,
+                    "status": "UNKNOWN",
+                    "taxonomy": "UNKNOWN",
+                    "classification": "UNKNOWN",
+                    "note": "Ondo clientOrderId lookup did not find this order; do not infer FILLED",
+                },
+            )
+        return _map_http_error_to_failure(exc, operation="get_order_state_by_client_id", account=account)
+    except RuntimeError as exc:
+        if "order_not_found" in str(exc):
+            return make_success(
+                operation="get_order_state_by_client_id",
+                exchange=name,
+                account=account,
+                order_state={
+                    "client_order_id": client_order_id,
+                    "status": "UNKNOWN",
+                    "taxonomy": "UNKNOWN",
+                    "classification": "UNKNOWN",
+                },
+            )
+        return make_failure(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account,
+            code="ONDOPERPS_ERROR",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    if not isinstance(order, dict) or not order:
+        return make_success(
+            operation="get_order_state_by_client_id",
+            exchange=name,
+            account=account,
+            order_state={
+                "client_order_id": client_order_id,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            },
+        )
+    state = _order_state_from_ondo_row(order)
+    state["client_order_id"] = client_order_id
+    return make_success(
+        operation="get_order_state_by_client_id",
+        exchange=name,
+        account=account,
+        order_state=state,
+    )
+
+
+def _execute_market_constraints(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Venue constraints for GoldenFibo preflight (tick/step/decimals)."""
+    credentials = _lookup_credentials(account)
+    if not credentials:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+    requested_symbol = str(request.get("symbol") or "").strip().upper()
+    metadata, error = _resolve_market_metadata(credentials, requested_symbol)
+    if error is not None:
+        return make_failure(
+            operation="market_constraints",
+            exchange=name,
+            account=account,
+            code=error.error.code if error.error else "INSTRUMENT_NOT_FOUND",
+            message=error.error.message if error.error else "Instrument resolution failed.",
+        )
+    assert metadata is not None
+    base_inc = metadata.get("base_increment")
+    quote_inc = metadata.get("quote_increment")
+    constraints = {
+        "symbol": requested_symbol,
+        "market": metadata.get("market"),
+        "tick_size": _decimal_text(quote_inc) if quote_inc is not None else None,
+        "step_size": _decimal_text(base_inc) if base_inc is not None else None,
+        "size_decimals": _decimals_from_increment(base_inc),
+        "price_decimals": _decimals_from_increment(quote_inc),
+        "min_base_amount": _decimal_text(base_inc) if base_inc is not None else None,
+        # Ondo does not document a min-notional on /v1/markets; omit so
+        # GoldenFibo preflight fail-opens on quote (same as Rise).
+    }
+    return make_success(
+        operation="market_constraints",
+        exchange=name,
+        account=account,
+        order_state=constraints,
     )
 
 
