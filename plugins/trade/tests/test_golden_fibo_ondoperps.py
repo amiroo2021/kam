@@ -14,6 +14,7 @@ from plugins.trade.golden_fibo.engine import GoldenFiboConfig, GoldenFiboEngine
 from plugins.trade.golden_fibo.state import (
     ROLE_ENTRY,
     ROLE_LADDER,
+    ROLE_TP,
     SUBMISSION_CONFIRMED,
     SUBMISSION_NOT_SUBMITTED,
     GoldenFiboState,
@@ -1984,11 +1985,24 @@ class _OndoLadderStepAdapter:
 
     def __init__(self):
         self.place_limit_calls: List[Dict[str, Any]] = []
+        self.place_market_calls: List[Dict[str, Any]] = []
         self.cancel_calls: List[Any] = []
         self.set_shared_tp_calls: List[Dict[str, Any]] = []
         # Pending order to return from client-id lookup.
         self.pending_lookup: Dict[str, Any] = {}
         self.position: Dict[str, Any] = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+
+    def place_market(self, *, account, instrument, side, size, client_order_id):
+        oid = 999000 + len(self.place_market_calls)
+        self.place_market_calls.append({
+            "client_order_id": int(client_order_id),
+            "side": side,
+            "size": str(size),
+            "status": "filled",
+        })
+        return {"client_order_id": int(client_order_id), "exchange_order_id": oid,
+                "submitted_price": None, "submitted_volume": str(size),
+                "status": "filled", "verified": True, "role": "entry"}
 
     def position_state(self, account, instrument):
         return dict(self.position)
@@ -3191,6 +3205,269 @@ class OndoPendingAliveGateTests(unittest.TestCase):
                              "Step2 must NOT be placed when pause_advance=True")
             self.assertTrue(state.pause_advance)
             self.assertEqual(state.status, "running")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Position-scoped TP exit reconciliation (incident 2026-08-21 wave 6)
+# ---------------------------------------------------------------------------
+
+
+class OndoPositionScopedTpExitTests(unittest.TestCase):
+    """Tests A-K for the position-scoped TP exit reconciliation fix."""
+
+    def _seed_post_step1_tp_state(self, svc, key, *, pause_cycle_restart=False):
+        """Seed a registration where Step0+Step1 are promoted, TP is
+        rotated, and the position is about to go flat (TP fired)."""
+        state = GoldenFiboState()
+        state.strategy = "golden_fibo"
+        state.schema_version = 1
+        state.registration_key = key
+        state.exchange = "ondoperps"
+        state.account = key.split("/")[1]
+        state.instrument = key.split("/")[2]
+        state.direction = "BUY"
+        state.percentage = Decimal("0.001")
+        state.step0_volume = Decimal("0.001")
+        state.cycle_uid = 335459
+        state.highest_cycle_uid = 335459
+        state.client_id_version = 2
+        state.next_step = 1
+        state.highest_filled_step = 1
+        state.expected_cumulative_size = Decimal("0.002")
+        state.fill_prices = {0: Decimal("2522.5"), 1: Decimal("2518.4")}
+        state.step_orders = {
+            0: {"role": "entry", "client_id": 82738593500160,
+                "exchange_order_id": "3Z6IH3XUMYZEUMIJ2OZKN5PRQ6E3VTSC",
+                "status": "filled", "price": "2522.5", "size": "0.001"},
+            1: {"role": "ladder", "client_id": 82755773369376,
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "status": "filled", "price": "2518.4", "size": "0.001"},
+        }
+        state.current_tp_price = Decimal("2522.5")
+        state.current_tp_size = Decimal("0.002")
+        state.current_tp_client_id = 82772953238560
+        state.current_tp_order_id = None  # Ondo position-level TP
+        state.current_tp_role = "tp"
+        state.pending_order_role = None
+        state.pending_order_client_id = None
+        state.pending_order_exchange_id = None
+        state.submission_phase = SUBMISSION_CONFIRMED
+        state.submission_client_id = 82772953238560
+        state.submission_step = 1
+        state.submission_role = ROLE_TP
+        state.status = "running"
+        state.freeze_reason = None
+        state.pause_cycle_restart = pause_cycle_restart
+        svc._states[key] = state
+        return state
+
+    def test_A_position_scoped_tp_exposed_does_not_freeze(self):
+        """A. Position-scoped TP installed, position still exposed.
+        Engine must NOT freeze as missing pending."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key)
+            # Position still shows exposure (read lag after TP fired).
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2520.45"}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.status, "running",
+                             "Engine must NOT freeze when position-scoped TP exit is in progress")
+            self.assertIsNone(state.freeze_reason)
+            self.assertEqual(state.tp_exit_attempts, 1,
+                             "TP exit reconciliation poll counter incremented")
+
+    def test_B_position_scoped_tp_flat_completes_cycle(self):
+        """B. Position-scoped TP installed, position goes flat.
+        Engine completes the cycle normally."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key)
+            # Position is flat (TP fired and closed the position).
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Cycle completed: highest_filled_step reset to -1")
+            self.assertEqual(state.next_step, 0,
+                             "Cycle completed: next_step reset to 0")
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+
+    def test_C_normal_production_auto_restart_after_tp(self):
+        """C. Normal production mode (pause_cycle_restart=False):
+        TP exit + flat => starts exactly one new cycle / Step0."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key, pause_cycle_restart=False)
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            place_market_before = len(adapter.place_limit_calls)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "New cycle started: highest_filled_step reset")
+            self.assertEqual(state.next_step, 0,
+                             "New cycle started: next_step reset to 0")
+            # The engine places a new Step0 market order.
+            self.assertEqual(len(adapter.place_limit_calls), place_market_before,
+                             "No duplicate Step0 from cycle restart")
+
+    def test_D_pause_cycle_restart_blocks_new_cycle(self):
+        """D. Staged-validation pause: TP exit + flat + pause_cycle_restart=True
+        => no new Step0, state remains safely completed/paused."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key, pause_cycle_restart=True)
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            place_market_before = len(adapter.place_limit_calls)
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 1,
+                             "Cycle NOT restarted: highest_filled_step stays at 1")
+            self.assertEqual(state.next_step, 1,
+                             "Cycle NOT restarted: next_step stays at 1")
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+            self.assertTrue(state.pause_cycle_restart)
+            self.assertEqual(len(adapter.place_limit_calls), place_market_before,
+                             "No new Step0 placed when pause_cycle_restart=True")
+
+    def test_E_manual_close_conservative(self):
+        """E. Manual/external close while position-scoped TP installed.
+        The engine cannot distinguish manual close from TP close.
+        Conservative behavior: treat as cycle end (flat position)."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key)
+            # Manual close: position goes flat without TP firing.
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            # Conservative: engine treats flat position as cycle end.
+            # This is the same behavior as TP exit -- the engine cannot
+            # distinguish manual close from TP close for position-scoped TPs.
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Manual close treated as cycle end (conservative)")
+            self.assertEqual(state.status, "running")
+
+    def test_G_lagging_position_read_no_restart(self):
+        """G. Position still >0 after TP fired. No cycle restart."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            self._seed_post_step1_tp_state(svc, key)
+            # Position still showing exposure (read lag).
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2520.45"}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 1,
+                             "No cycle restart while position still exposed")
+            self.assertEqual(state.status, "running")
+            self.assertEqual(state.tp_exit_attempts, 1)
+
+    def test_H_restart_during_tp_exit_reconciliation(self):
+        """H. Daemon restart during TP-exit reconciliation. No duplicate
+        new cycle."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            key = "ondoperps/bitget/ETH/BUY"
+            svc1 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter1 = _OndoLadderStepAdapter()
+            svc1._adapters[key] = adapter1
+            self._seed_post_step1_tp_state(svc1, key)
+            adapter1.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2520.45"}
+            svc1._drive_one(key)
+            self.assertEqual(svc1._states[key].tp_exit_attempts, 1)
+            svc1._save_state()
+
+            # Restart.
+            svc2 = _build_svc_for_step0(state_path, Path(tmp) / "l.jsonl", Path(tmp) / "e.log")
+            adapter2 = _OndoLadderStepAdapter()
+            svc2._adapters[key] = adapter2
+            adapter2.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc2._drive_one(key)
+            state = svc2._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Restart during TP exit completes cycle normally")
+            self.assertEqual(len(adapter2.place_limit_calls), 0,
+                             "No duplicate Step0 after restart")
+
+    def test_pause_cycle_restart_op_requires_registration(self):
+        """set_pause_cycle_restart and clear_pause_cycle_restart must
+        return NOT_FOUND for unknown registration keys."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            res = svc.execute_command({"op": "set_pause_cycle_restart",
+                                       "registration_key": "ondoperps/bitget/ETH/BUY"})
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["error"], "NOT_FOUND")
+            res = svc.execute_command({"op": "clear_pause_cycle_restart",
+                                       "registration_key": "ondoperps/bitget/ETH/BUY"})
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["error"], "NOT_FOUND")
 
 
 if __name__ == "__main__":

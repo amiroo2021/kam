@@ -171,6 +171,12 @@ class GoldenFiboState:
     # wants to inspect each step's promotion before the next order is
     # submitted. Defaults to False (no behavior change).
     pause_advance: bool = False
+    # Operator-controlled cycle-restart gate. When True, the engine
+    # completes the current cycle on TP exit but does NOT start a new
+    # Step0. Used for staged live validations where the operator wants
+    # to review the completed cycle before any new exposure is taken.
+    # Defaults to False (normal production behavior: auto-restart).
+    pause_cycle_restart: bool = False
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -223,6 +229,7 @@ class GoldenFiboState:
             "emergency_close_submitted_at": self.emergency_close_submitted_at,
             "emergency_close_pre_size": self.emergency_close_pre_size,
             "pause_advance": bool(self.pause_advance),
+            "pause_cycle_restart": bool(self.pause_cycle_restart),
         }
 
     @classmethod
@@ -294,4 +301,5 @@ class GoldenFiboState:
                 else str(data.get("emergency_close_pre_size"))
             ),
             pause_advance=bool(data.get("pause_advance", False)),
+            pause_cycle_restart=bool(data.get("pause_cycle_restart", False)),
         )

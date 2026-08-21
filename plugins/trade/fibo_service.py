@@ -1021,6 +1021,10 @@ class PersistentFiboService:
                 return self._cmd_set_pause_advance(command, value=True)
             if op == "clear_pause_advance":
                 return self._cmd_set_pause_advance(command, value=False)
+            if op == "set_pause_cycle_restart":
+                return self._cmd_set_pause_cycle_restart(command, value=True)
+            if op == "clear_pause_cycle_restart":
+                return self._cmd_set_pause_cycle_restart(command, value=False)
             if op == "stop":
                 return self._cmd_stop(command)
             if op == "smooth_shutdown":
@@ -1212,6 +1216,30 @@ class PersistentFiboService:
             "ok": True,
             "registration_key": key,
             "pause_advance": bool(value),
+        }
+
+    def _cmd_set_pause_cycle_restart(self, command: Dict[str, Any], *, value: bool) -> Dict[str, Any]:
+        """Set or clear the per-registration pause_cycle_restart gate.
+
+        When pause_cycle_restart is True, the engine completes the
+        current cycle on TP exit but does NOT start a new Step0.
+        Used for staged live validations where the operator wants to
+        review the completed cycle before any new exposure is taken.
+
+        This control-plane op is the ONLY way to mutate the gate; the
+        daemon does not set it automatically.
+        """
+        key = str(command.get("registration_key") or "").strip()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return {"ok": False, "error": "NOT_FOUND", "registration_key": key}
+            state.pause_cycle_restart = bool(value)
+            self._save_state()
+        return {
+            "ok": True,
+            "registration_key": key,
+            "pause_cycle_restart": bool(value),
         }
 
     def _cmd_stop(self, command: Dict[str, Any]) -> Dict[str, Any]:

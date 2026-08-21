@@ -887,6 +887,37 @@ class GoldenFiboEngine:
                 f"(live={live_size} expected={expected_size})"
             )
 
+        # Position-scoped TP exit reconciliation. When the strategy has
+        # already promoted at least one step (highest_filled_step >= 0),
+        # a TP was installed (current_tp_client_id / current_tp_price set),
+        # and there is no pending ladder/entry order, a still-exposed
+        # position means the TP has fired but the venue's position read
+        # has not yet caught up. Do NOT freeze -- wait for the position
+        # to read flat, then complete the cycle normally.
+        if (
+            self.state.highest_filled_step >= 0
+            and self.state.current_tp_client_id is not None
+            and self.state.current_tp_price is not None
+            and self.state.current_tp_order_id is None
+            and self.state.pending_order_role is None
+        ):
+            # Bounded reconciliation: allow a few polls for the position
+            # read to go flat. If it doesn't, freeze with a descriptive
+            # reason so the operator knows the exit is stuck.
+            self.state.tp_exit_attempts = int(self.state.tp_exit_attempts or 0) + 1
+            actions.append(
+                f"position-scoped TP exit reconciliation poll "
+                f"{self.state.tp_exit_attempts}/{TP_EXIT_MAX_POLLS} "
+                f"(live_size={live_size})"
+            )
+            if self.state.tp_exit_attempts >= TP_EXIT_MAX_POLLS:
+                return self._freeze(
+                    f"position-scoped TP exit stuck: position still not flat after "
+                    f"{TP_EXIT_MAX_POLLS} polls (size={live_size}). "
+                    f"Reconcile exchange state."
+                )
+            return TickResult(state=self.state, actions=actions)
+
         return self._freeze(
             "pending order missing in unexpected state"
         )
@@ -1194,6 +1225,19 @@ class GoldenFiboEngine:
             self.state.submission_phase = SUBMISSION_NOT_SUBMITTED
             self.state.submission_client_id = None
             self.state.submission_exchange_order_id = None
+        # Operator-controlled cycle-restart gate. When True, the engine
+        # completes the current cycle but does NOT start a new Step0.
+        # Used for staged live validations. The registration stays in a
+        # paused-completed state until the operator clears the gate.
+        pause_cycle_restart = bool(getattr(self.state, "pause_cycle_restart", False))
+        if pause_cycle_restart:
+            actions.append(
+                "pause_cycle_restart=True; NOT starting new cycle. "
+                "Operator must clear pause_cycle_restart to continue."
+            )
+            self.state.status = STATUS_RUNNING
+            self.state.freeze_reason = None
+            return TickResult(state=self.state, actions=actions)
         return self._start_fresh_cycle(actions)
 
     # ------------------------------------------------------------------
