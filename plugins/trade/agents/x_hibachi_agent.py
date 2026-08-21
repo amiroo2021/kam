@@ -795,29 +795,16 @@ def _canonical_symbol_from_request(value: Any) -> str:
     return _CANONICAL_ALIASES.get(base, base)
 
 
-def _build_hibachi_market_index(payload: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Index future contracts by their canonical underlying symbol.
-
-    The Hibachi contract has both ``symbol`` (``"BTC/USDT-P"``) and
-    ``underlyingSymbol`` (``"BTC"``). We key on the underlying because
-    that is the canonical KAM symbol; the contract's full symbol and
-    integer id are preserved on the descriptor for the future write
-    path. If multiple contracts share an underlying (e.g. spot +
-    perp) we keep the one with the smallest ``id`` — by observation
-    Hibachi lists perps first and they are what users trade.
-    """
-    index: Dict[str, Dict[str, Any]] = {}
+def _hibachi_live_descriptors(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Return one descriptor per live Hibachi future contract."""
+    descriptors: List[Dict[str, Any]] = []
     for contract in _extract_future_contracts(payload):
         if not contract.get("live", True):
-            # Skip explicitly-disabled markets. ``live`` is documented
-            # to be ``true`` for tradeable perps; if Hibachi ever
-            # returns ``false`` we want to ignore that contract for
-            # both balance enrichment and future order placement.
             continue
         underlying = str(contract.get("underlyingSymbol") or "").strip().upper()
         if not underlying:
             continue
-        candidate = {
+        descriptors.append({
             "id": contract.get("id"),
             "symbol": str(contract.get("symbol") or "").strip(),
             "display_name": str(contract.get("displayName") or "").strip(),
@@ -829,7 +816,21 @@ def _build_hibachi_market_index(payload: Mapping[str, Any]) -> Dict[str, Dict[st
             "min_notional": str(contract.get("minNotional") or "").strip() or None,
             "underlying_decimals": contract.get("underlyingDecimals"),
             "settlement_decimals": contract.get("settlementDecimals"),
-        }
+        })
+    return descriptors
+
+
+def _build_hibachi_market_index(payload: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Index future contracts by their canonical underlying symbol.
+
+    Used for portfolio/unit display only. Order placement and other
+    symbol-sensitive operations must go through
+    ``_resolve_canonical_instrument``, which refuses to pick a market
+    when more than one live contract shares an underlying.
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    for candidate in _hibachi_live_descriptors(payload):
+        underlying = str(candidate.get("underlying_symbol") or "")
         existing = index.get(underlying)
         if existing is None:
             index[underlying] = candidate
@@ -845,23 +846,54 @@ def _build_hibachi_market_index(payload: Mapping[str, Any]) -> Dict[str, Dict[st
     return index
 
 
+def _normalized_hibachi_contract_key(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", str(value or "")).upper()
+
+
 def _resolve_canonical_instrument(
     requested: str,
     market_index: Optional[Mapping[str, Dict[str, Any]]] = None,
+    payload: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return the Hibachi market descriptor for a canonical symbol, or
-    ``None`` if no live contract matches.
+    """Return the Hibachi market descriptor for a requested symbol.
 
-    The descriptor shape is documented in ``_build_hibachi_market_index``
-    above. This helper is the single seam future write paths will use
-    to translate ``"BTC"`` -> ``"BTC/USDT-P"`` + ``id=2``.
+    Priority:
+    1. Exact venue contract symbol (``BTC/USDT-P``), unique
+    2. Separator-insensitive contract key, unique
+    3. Unique live underlying (``BTC``, ``WBTC``, ``BTCUSDT``)
+    Multiple matches at the chosen rank raise ``ValueError("INSTRUMENT_AMBIGUOUS")``.
+    ``market_index`` is accepted for call-site compatibility but is not
+    used to collapse duplicates.
     """
-    canonical = _canonical_symbol_from_request(requested)
+    requested_raw = str(requested or "").strip()
+    if not requested_raw:
+        return None
+    if payload is None:
+        payload = _MarketCache.get()
+    contracts = _hibachi_live_descriptors(payload)
+    requested_upper = requested_raw.upper()
+    requested_key = _normalized_hibachi_contract_key(requested_raw)
+    exact = [row for row in contracts if str(row.get("symbol") or "").upper() == requested_upper]
+    if not exact and requested_key:
+        exact = [
+            row for row in contracts
+            if _normalized_hibachi_contract_key(row.get("symbol")) == requested_key
+        ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    canonical = _canonical_symbol_from_request(requested_raw)
     if not canonical:
         return None
-    if market_index is None:
-        market_index = _build_hibachi_market_index(_MarketCache.get())
-    return market_index.get(canonical)
+    underlying_matches = [
+        row for row in contracts if str(row.get("underlying_symbol") or "") == canonical
+    ]
+    if len(underlying_matches) == 1:
+        return underlying_matches[0]
+    if len(underlying_matches) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1164,7 +1196,18 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             message=_redact(sanitize_error_message(str(exc))),
         )
 
-    descriptor = _resolve_canonical_instrument(requested_symbol, market_index)
+    try:
+        descriptor = _resolve_canonical_instrument(requested_symbol, payload=market_payload)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"Hibachi instrument '{requested_symbol}' is ambiguous.",
+            )
+        raise
     if descriptor is None:
         return make_failure(
             operation="new_order",
@@ -1665,7 +1708,12 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         except Exception as exc:  # noqa: BLE001
             return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INSTRUMENT_RESOLUTION_UNAVAILABLE", message=_redact(sanitize_error_message(str(exc))))
 
-        descriptor = _resolve_canonical_instrument(requested_symbol, _build_hibachi_market_index(market_payload))
+        try:
+            descriptor = _resolve_canonical_instrument(requested_symbol, payload=market_payload)
+        except ValueError as exc:
+            if str(exc) == "INSTRUMENT_AMBIGUOUS":
+                return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INSTRUMENT_AMBIGUOUS", message=f"Hibachi instrument '{requested_symbol}' is ambiguous.")
+            raise
         if descriptor is None:
             return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INSTRUMENT_NOT_FOUND", message=f"Unknown Hibachi instrument '{requested_symbol}'.")
 
@@ -2420,9 +2468,9 @@ def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalRe
             ),
         )
 
-    requested_symbol = _canonical_symbol_from_request(request.get("symbol"))
+    requested_raw = str(request.get("symbol") or "").strip()
     requested_side = str(request.get("side") or "").strip().lower()
-    if not requested_symbol:
+    if not requested_raw:
         return make_failure(
             operation="cancel_order_group",
             exchange=name,
@@ -2438,6 +2486,35 @@ def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalRe
             code="INVALID_SIDE",
             message="Side must be buy or sell.",
         )
+    try:
+        descriptor = _resolve_canonical_instrument(requested_raw)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(
+                operation="cancel_order_group",
+                exchange=name,
+                account=credentials["account"],
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"Hibachi instrument '{requested_raw}' is ambiguous.",
+            )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_RESOLUTION_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    if descriptor is None:
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Unknown Hibachi instrument '{requested_raw}'.",
+        )
+    requested_symbol = str(descriptor.get("underlying_symbol") or "")
 
     token = _set_current_credentials(credentials)
     try:
@@ -2997,7 +3074,18 @@ def _find_hibachi_position_context(account: str, requested_symbol: str, *, opera
             message=_redact(sanitize_error_message(str(exc))),
         )
     _set_current_credentials(token)
-    descriptor = _resolve_canonical_instrument(requested_symbol, _build_hibachi_market_index(market_payload))
+    try:
+        descriptor = _resolve_canonical_instrument(requested_symbol, payload=market_payload if isinstance(market_payload, Mapping) else None)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return None, make_failure(
+                operation=operation,
+                exchange=name,
+                account=credentials["account"],
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"Hibachi instrument '{requested_symbol}' is ambiguous.",
+            )
+        raise
     if descriptor is None:
         return None, make_failure(
             operation=operation,
@@ -3425,7 +3513,10 @@ def _decimal_places_from_text(value: Any) -> Optional[int]:
 
 
 def _hibachi_price_display_places(symbol: str) -> Optional[int]:
-    descriptor = _resolve_canonical_instrument(symbol)
+    try:
+        descriptor = _resolve_canonical_instrument(symbol)
+    except ValueError:
+        return None
     if not isinstance(descriptor, Mapping):
         return None
     return _decimal_places_from_text(descriptor.get("tick_size"))
@@ -3490,7 +3581,7 @@ def _resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalRespo
             message="Symbol is required.",
         )
     try:
-        market_index = _build_hibachi_market_index(_MarketCache.get())
+        _MarketCache.get()
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation="resolve_instrument",
@@ -3499,7 +3590,18 @@ def _resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalRespo
             code="INSTRUMENT_UNAVAILABLE",
             message=_redact(sanitize_error_message(str(exc))),
         )
-    descriptor = _resolve_canonical_instrument(requested, market_index)
+    try:
+        descriptor = _resolve_canonical_instrument(requested)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(
+                operation="resolve_instrument",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"Hibachi instrument '{requested}' is ambiguous.",
+            )
+        raise
     if descriptor is None:
         return make_failure(
             operation="resolve_instrument",

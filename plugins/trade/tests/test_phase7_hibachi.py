@@ -455,7 +455,7 @@ class TestInstrumentResolver(_HibachiEnvTest):
         self.assertFalse(resp.success)
         self.assertEqual(resp.error.code, "MISSING_SYMBOL")
 
-    def test_duplicate_underlying_keeps_lowest_id(self):
+    def test_duplicate_underlying_is_ambiguous_for_bare_alias(self):
         payload = {"futureContracts": [
             {"id": 50, "symbol": "BTC-OLD", "displayName": "Old",
              "underlyingSymbol": "BTC", "settlementSymbol": "USDT",
@@ -469,8 +469,11 @@ class TestInstrumentResolver(_HibachiEnvTest):
              "underlyingDecimals": 10, "settlementDecimals": 6, "live": True},
         ]}
         with mock.patch.object(hibachi, "_request_json", return_value=payload):
-            d = hibachi._resolve_canonical_instrument("BTC")
-        self.assertEqual(d["id"], 2)
+            with self.assertRaises(ValueError) as ctx:
+                hibachi._resolve_canonical_instrument("BTC")
+            self.assertEqual(str(ctx.exception), "INSTRUMENT_AMBIGUOUS")
+            chosen = hibachi._resolve_canonical_instrument("BTC/USDT-P")
+        self.assertEqual(chosen["id"], 2)
 
 
 class TestRedaction(unittest.TestCase):
@@ -1988,6 +1991,7 @@ class TestCancelOrderGroup(_HibachiEnvTest):
         ]
         post_orders = [pre_orders[2], pre_orders[3]]
         with mock.patch.object(hibachi, "_fetch_open_orders", side_effect=[pre_orders, post_orders]), \
+             mock.patch.object(hibachi, "_request_json", return_value=SAMPLE_EXCHANGE_INFO), \
              mock.patch.object(hibachi, "_submit_cancel_order", side_effect=[{}, {}]) as submit_cancel:
             resp = hibachi.execute({
                 "operation": "cancel_order_group",
@@ -2026,7 +2030,8 @@ class TestCancelOrderGroup(_HibachiEnvTest):
                 "status": "PLACED",
             },
         ]
-        with mock.patch.object(hibachi, "_fetch_open_orders", return_value=pre_orders):
+        with mock.patch.object(hibachi, "_fetch_open_orders", return_value=pre_orders), \
+             mock.patch.object(hibachi, "_request_json", return_value=SAMPLE_EXCHANGE_INFO):
             resp = hibachi.execute({
                 "operation": "cancel_order_group",
                 "exchange": "hibachi",

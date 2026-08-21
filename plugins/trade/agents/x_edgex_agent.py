@@ -39,6 +39,7 @@ from edgex_sdk.quote.client import PriceType
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -116,6 +117,7 @@ def capabilities() -> List[str]:
         "new_order", "ladder",
         "cancel_orders", "cancel_order_group",
         "set_tp", "set_sl", "close_position",
+        "resolve_instrument",
     ]
 
 
@@ -148,20 +150,39 @@ def _request(creds: Mapping[str, str], path: str, params: Mapping[str, Any]) -> 
 
 
 def _metadata() -> Dict[str, str]:
-    """Public metadata — returns contractId -> native symbol."""
-    try:
-        request = urllib.request.Request(
-            BASE_URL + "/api/v2/public/meta/getMetaData",
-            headers={"User-Agent": "curl/8.0", "Accept": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=20) as r:
-            data = json.loads(r.read()).get("data") or {}
-    except Exception:
-        return {}
+    """Public metadata — returns contractId -> native symbol.
+
+    Transport failures raise. Callers that only need display names for
+    listings may catch and fall back to raw contract ids.
+    """
+    data = _metadata_full()
     return {
         str(x.get("contractId")): str(x.get("contractName") or x.get("contractId"))
         for x in data.get("contractList", [])
     }
+
+
+def _resolve_contract(symbol: Any) -> Optional[Tuple[str, str]]:
+    """Map a wizard symbol (e.g. 'SOL', 'SOLUSDC', 'BTC-USDC') to (contractId, native)."""
+    requested = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    if not requested:
+        return None
+    try:
+        metadata = _metadata()
+    except Exception as exc:
+        raise RuntimeError("METADATA_UNAVAILABLE") from exc
+    exact = [(cid, native) for cid, native in metadata.items() if native.upper() == requested]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    candidates = [(cid, native) for cid, native in metadata.items()
+                  if native.upper() in {requested + "USDC", requested + "USDT"}]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError("INSTRUMENT_AMBIGUOUS")
+    return None
 
 
 def _metadata_full() -> Dict[str, Any]:
@@ -174,20 +195,6 @@ def _metadata_full() -> Dict[str, Any]:
     if payload.get("code") != "SUCCESS":
         raise RuntimeError(payload.get("msg") or "metadata unavailable")
     return payload.get("data") or {}
-
-
-def _resolve_contract(symbol: Any) -> Optional[Tuple[str, str]]:
-    """Map a wizard symbol (e.g. 'SOL', 'SOLUSDC', 'BTC-USDC') to (contractId, native)."""
-    requested = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
-    if not requested:
-        return None
-    metadata = _metadata()
-    exact = [(cid, native) for cid, native in metadata.items() if native.upper() == requested]
-    if exact:
-        return exact[0]
-    candidates = [(cid, native) for cid, native in metadata.items()
-                  if native.upper() in {requested + "USDC", requested + "USDT"}]
-    return candidates[0] if len(candidates) == 1 else None
 
 
 def _contract_rules(contract_id: str) -> Tuple[Decimal, Decimal, Decimal]:
@@ -334,7 +341,10 @@ def _positions_orders(account: str) -> CanonicalResponse:
         aid = creds["account_id"]
         data = _request(creds, "/api/v2/private/account/getAccountAsset", {"accountId": aid}) or {}
         active_rows = _active_orders(creds)
-        symbols = _metadata()
+        try:
+            symbols = _metadata()
+        except Exception:
+            symbols = {}
         positions: List[CanonicalPosition] = []
         asset_by_contract = {str(x.get("contractId")): x for x in (data.get("positionAssetList") or [])}
         contract_ids = {str(x.get("contractId")) for x in (data.get("positionList") or [])}
@@ -525,13 +535,42 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
 def _cancel_group(request: Dict[str, Any]) -> CanonicalResponse:
     account = str(request.get("account") or "")
     creds = _credentials(account)
-    side = str(request.get("side") or "").lower()
-    resolved = _resolve_contract(request.get("symbol"))
-    if not creds or not resolved or side not in {"buy", "sell"}:
+    if not creds:
         return make_failure(
             operation="cancel_order_group", exchange=name, account=account,
-            code="INVALID_REQUEST",
-            message="Valid account, symbol and side are required.",
+            code="ACCOUNT_NOT_FOUND",
+            message="Set EDGEX_<account>_ACCOUNTID, APIKEY, APISECRET and APIPASSPHRASE.",
+        )
+    side = str(request.get("side") or "").lower()
+    if side not in {"buy", "sell"}:
+        return make_failure(
+            operation="cancel_order_group", exchange=name, account=account,
+            code="INVALID_SIDE",
+            message="Side must be 'buy' or 'sell'.",
+        )
+    try:
+        resolved = _resolve_contract(request.get("symbol"))
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(
+                operation="cancel_order_group", exchange=name, account=account,
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"EdgeX instrument '{request.get('symbol')}' is ambiguous.",
+            )
+        raise
+    except RuntimeError as exc:
+        if str(exc) == "METADATA_UNAVAILABLE":
+            return make_failure(
+                operation="cancel_order_group", exchange=name, account=account,
+                code="METADATA_UNAVAILABLE",
+                message="EdgeX market metadata is unavailable.",
+            )
+        raise
+    if not resolved:
+        return make_failure(
+            operation="cancel_order_group", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Unknown EdgeX instrument '{request.get('symbol')}'.",
         )
     cid, symbol = resolved
     try:
@@ -781,6 +820,54 @@ def _ladder(request: Dict[str, Any]) -> CanonicalResponse:
         )
 
 
+def _resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="resolve_instrument", exchange=name, account=account,
+            code="MISSING_SYMBOL", message="Symbol is required.",
+        )
+    try:
+        resolved = _resolve_contract(requested)
+    except ValueError as exc:
+        if str(exc) == "INSTRUMENT_AMBIGUOUS":
+            return make_failure(
+                operation="resolve_instrument", exchange=name, account=account,
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"EdgeX instrument '{requested}' is ambiguous.",
+            )
+        raise
+    except RuntimeError as exc:
+        if str(exc) == "METADATA_UNAVAILABLE":
+            return make_failure(
+                operation="resolve_instrument", exchange=name, account=account,
+                code="METADATA_UNAVAILABLE",
+                message="EdgeX market metadata is unavailable.",
+            )
+        raise
+    except Exception as exc:
+        return make_failure(
+            operation="resolve_instrument", exchange=name, account=account,
+            code="METADATA_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if not resolved:
+        return make_failure(
+            operation="resolve_instrument", exchange=name, account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Unknown EdgeX instrument '{requested}'.",
+        )
+    _cid, native = resolved
+    instrument = CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=native,
+        display_name=native,
+    )
+    return make_success(
+        operation="resolve_instrument", exchange=name, account=account, instrument=instrument,
+    )
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     operation = str((request or {}).get("operation") or "")
     account = str((request or {}).get("account") or "")
@@ -796,6 +883,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _cancel_group(request)
     if operation in ("set_tp", "set_sl", "close_position"):
         return _position_action(request)
+    if operation == "resolve_instrument":
+        return _resolve_instrument(account, request)
     return make_failure(
         operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED",
         message=f"EdgeX does not implement '{operation}' yet.",
