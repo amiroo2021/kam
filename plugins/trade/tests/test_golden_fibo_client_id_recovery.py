@@ -434,7 +434,16 @@ class TestStep0ClientIdConfirmation(unittest.TestCase):
             self.assertEqual(len(_entry_submissions(adapter.submit_log)), 1)
 
     def test_never_found_after_bounded_retry(self):
-        """Req 8: missing after bound -> NEEDS_RECOVERY, zero resubmit."""
+        """Req 8: missing after bound + position fallback exhausted ->
+        NEEDS_RECOVERY, zero resubmit.
+
+        With the Step0 position fallback in place (2026-08-21 Ondo
+        incident fix), the freeze budget is the bounded lookup window
+        (8) PLUS ``_STEP0_FALLBACK_MAX_ATTEMPTS`` (4) of inconclusive
+        position-fallback attempts. Beyond that the engine freezes
+        for manual reconciliation. Drive enough ticks to exhaust the
+        full budget; assert exactly one market submission.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             svc = _make_service(tmp)
             key = "lighter/amiroo/SOL/BUY"
@@ -443,9 +452,12 @@ class TestStep0ClientIdConfirmation(unittest.TestCase):
 
             resp = _start(svc, key)
             self.assertTrue(resp["ok"])
-            svc._drive_one(key)  # submit Step0
-            for _ in range(10):
-                svc._drive_one(key)  # bounded retries
+            # Drive enough ticks to exhaust 8 lookup attempts + 4 fallback
+            # attempts = 12 ticks beyond the initial submit. (Total ticks
+            # below = 1 submit + 14 retries.)
+            svc._drive_one(key)
+            for _ in range(14):
+                svc._drive_one(key)
             state = svc._states[key]
             self.assertEqual(state.status, STATUS_NEEDS_RECOVERY)
             self.assertIn("not found", state.freeze_reason or "")

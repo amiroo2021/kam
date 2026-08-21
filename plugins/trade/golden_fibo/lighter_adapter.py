@@ -133,11 +133,12 @@ class LighterGoldenFiboAdapter:
             return {}
         return _get_payload(resp).get("order_state") or {}
 
-    def get_order_state(self, account: str, order_index: int) -> Dict[str, Any]:
+    def get_order_state(self, account: str, order_index: Any) -> Dict[str, Any]:
+        # Accept either int (Lighter) or str (future venues); pass-through.
         resp = lighter_agent.execute({
             "operation": "get_order_state",
             "account": account,
-            "order_index": int(order_index),
+            "order_index": order_index,
         })
         if not _is_success(resp):
             # Treat missing order as empty state
@@ -260,11 +261,11 @@ class LighterGoldenFiboAdapter:
             "role": "tp",
         }
 
-    def cancel_order(self, *, account: str, order_index: int) -> bool:
+    def cancel_order(self, *, account: str, order_index: Any) -> bool:
         resp = lighter_agent.execute({
             "operation": "cancel_order",
             "account": account,
-            "order_index": int(order_index),
+            "order_index": order_index,
         })
         return _is_success(resp)
 

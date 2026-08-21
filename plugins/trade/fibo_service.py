@@ -78,6 +78,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_POLL_SECONDS = 2.0
 _DEFAULT_SOCKET_TIMEOUT = 15.0
 
+# How many post-bounded-retry ticks the position fallback may be retried
+# before the engine freezes the registration. The fallback counter is
+# in-memory and resets on daemon restart, so transient API/venue issues
+# don't permanently disable recovery. Set high enough that intermittent
+# venue hiccups don't immediately freeze; low enough that a stuck venue
+# isn't polled forever.
+_STEP0_FALLBACK_MAX_ATTEMPTS = 4
+
 # ---------------------------------------------------------------------------
 # Path resolvers (kept identical to the legacy service for installer parity)
 # ---------------------------------------------------------------------------
@@ -533,6 +541,208 @@ class PersistentFiboService:
                 # Should not happen but be defensive
                 pass
 
+    def _step0_position_fallback_eligible(self, key: str, state: GoldenFiboState) -> bool:
+        """Return True if all guards for position-based Step0 promotion pass.
+
+        The position fallback is ONLY allowed when the venue's
+        client-id lookup has been unable to confirm FILLED for the
+        persisted deterministic client_order_index, AND:
+
+        - submission_phase == confirmed (the HTTP submit succeeded)
+        - pending_order_role == "entry" (we are still awaiting Step0)
+        - highest_filled_step == -1 (Step0 has not been promoted)
+        - expected_cumulative_size == 0 (we are at the start of the cycle)
+        - a deterministic client_order_index is persisted (idempotency anchor)
+
+        We never treat an arbitrary pre-existing or manual position as
+        proof of OUR Step0. Those guards above + the direction / size
+        checks below are what bind the position evidence to OUR pending
+        order.
+        """
+        with self._lock:
+            if state is None:
+                return False
+            if state.submission_phase != SUBMISSION_CONFIRMED:
+                return False
+            if state.pending_order_role != ROLE_ENTRY:
+                return False
+            if state.highest_filled_step != -1:
+                return False
+            try:
+                if Decimal(str(state.expected_cumulative_size or "0")) != Decimal("0"):
+                    return False
+            except Exception:
+                return False
+            client_id = state.submission_client_id or state.pending_order_client_id
+            if client_id is None:
+                return False
+        return True
+
+    def _step0_position_compatible_with_step0(
+        self, key: str, state: GoldenFiboState
+    ) -> bool:
+        """Return True if the live position is compatible with Step0 promotion.
+
+        Step0 promotion creates a TP and Step1 ladder as side effects.
+        If the live position is FLAT or smaller-than-expected when we are
+        about to promote a (historically) FILLED order, we MUST NOT
+        resurrect downstream orders against a closed position.
+
+        This check guards both the order-lookup FILLED path and the
+        position-fallback path. Without it, a manual close of the
+        position (or a TP-fill that already exited) would leave the
+        engine happily placing a fresh TP against zero inventory.
+
+        Conclusive rejection here means: do NOT promote Step0. The
+        caller will mark the registration as NEEDS_RECOVERY with a
+        descriptive reason so an operator can investigate.
+        """
+        adapter = self._adapter_for(key)
+        try:
+            position = adapter.position_state(state.account, state.instrument)
+        except Exception as exc:
+            # Inconclusive (API error) — fail closed. Refuse to promote
+            # rather than guess. Operator can reconcile manually.
+            logger.warning("step0 promotion gate: position_state failed for %s: %s", key, exc)
+            return False
+        if not isinstance(position, dict):
+            return False
+
+        expected_side = "long" if state.direction == "BUY" else "short"
+        live_side = position.get("side")
+        if live_side != expected_side:
+            return False
+
+        try:
+            live_size = Decimal(str(position.get("size") or "0"))
+        except Exception:
+            live_size = Decimal("0")
+        expected_size = Decimal(str(state.step0_volume or "0"))
+        if expected_size <= 0:
+            # Misconfigured state — refuse to promote.
+            return False
+        # Same tolerance as the position fallback.
+        if live_size + Decimal("0.0000001") < expected_size:
+            return False
+        return True
+
+    def _step0_position_fallback_check(
+        self, key: str, state: GoldenFiboState
+    ) -> Optional[Decimal]:
+        """Try to confirm Step0 via the live venue position.
+
+        Returns the fill price (Decimal) on success, or None on any
+        failure (position absent, wrong side, size mismatch, missing
+        entry price, exception).
+
+        Eligibility is checked in :meth:`_step0_position_fallback_eligible`.
+        Failure modes that DO NOT mark the fallback as conclusive are:
+        - position API error / empty response (transient)
+        - missing entry price on the venue (transient)
+        - wrong side / incompatible size (conclusive mismatch)
+        Inconclusive observations are retried up to
+        ``_STEP0_FALLBACK_MAX_ATTEMPTS`` ticks past the bounded retry
+        window; the caller is responsible for freezing once that budget
+        is exhausted. In-memory counters reset on daemon restart, so a
+        single transient failure does not permanently disable recovery.
+        """
+        if not self._step0_position_fallback_eligible(key, state):
+            return None
+        adapter = self._adapter_for(key)
+        try:
+            position = adapter.position_state(state.account, state.instrument)
+        except Exception as exc:
+            logger.warning("step0 position fallback: position_state failed for %s: %s", key, exc)
+            return None
+        if not isinstance(position, dict):
+            return None
+
+        expected_side = "long" if state.direction == "BUY" else "short"
+        live_side = position.get("side")
+        if live_side != expected_side:
+            return None
+
+        try:
+            live_size = Decimal(str(position.get("size") or "0"))
+        except Exception:
+            live_size = Decimal("0")
+        if live_size <= 0:
+            return None
+
+        expected_size = Decimal(str(state.step0_volume or "0"))
+        if expected_size <= 0:
+            return None
+        # The position evidence must be compatible with the Step0 size
+        # we expected to commit. Allow a tiny tolerance for round-trip
+        # precision drift (< 1 base unit of step_size is enough — but we
+        # are conservative here and require >= expected - tiny epsilon).
+        if live_size + Decimal("0.0000001") < expected_size:
+            return None
+
+        # Fill price: average entry on the venue.
+        entry_raw = position.get("entry_price")
+        try:
+            entry_price = Decimal(str(entry_raw)) if entry_raw is not None else Decimal("0")
+        except Exception:
+            entry_price = Decimal("0")
+        if entry_price <= 0:
+            # Inconclusive (entry price not yet available on the venue).
+            # Caller will retry on next bounded-retry tick.
+            return None
+
+        # Conclusive success — caller will call _promote_step0_and_advance
+        # and reset the per-registration bounded-retry counters.
+        return entry_price
+
+    def _promote_step0_and_advance(
+        self, key: str, p0: Decimal, backfilled_oid: Optional[Any]
+    ) -> None:
+        """Confirm Step0 fill and place TP + Step1 — the terminal step
+        of both the order-lookup path and the position-fallback path.
+
+        Idempotent: refuses to re-promote if Step0 has already been
+        confirmed.
+        """
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return
+            if state.highest_filled_step >= 0:
+                # Already promoted by an earlier tick — never re-promote.
+                return
+            # Reset the bounded-lookup counter on success.
+            if hasattr(self, "_step0_lookup_attempts"):
+                self._step0_lookup_attempts.pop(key, None)
+            from .golden_fibo.engine import GoldenFiboEngine
+            cfg = self._config_for(key, state)
+            adapter = self._adapter_for(key)
+            engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
+            if backfilled_oid is not None and backfilled_oid != "":
+                # Venue-native order identifier — may be int (Lighter/Rise/Arcus)
+                # or alphanumeric string (Ondo). Pass through opaquely.
+                engine.state.pending_order_exchange_id = backfilled_oid
+                engine.state.submission_exchange_order_id = backfilled_oid
+            engine.confirm_step0_filled(p0)
+            result = engine.place_step0_tp_and_step1(p0)
+            self._states[key] = engine.state
+            # Promote the durable state back to RUNNING — Step0 is now
+            # confirmed and TP + Step1 are placed (or queued if the
+            # engine froze during TP/Step1 placement; that freeze is a
+            # separate signal we leave untouched below).
+            self._states[key].status = STATUS_RUNNING
+            self._states[key].freeze_reason = None
+            # Clear the in-memory bounded-retry counters so any subsequent
+            # restart / future cycle does not see stale counts.
+            if hasattr(self, "_step0_position_fallback_attempts"):
+                self._step0_position_fallback_attempts.pop(key, None)
+            self._save_state()
+            if result is not None:
+                # Engine froze during TP/Step1 placement — propagate the
+                # freeze without overwriting it with our success status.
+                self._states[key] = result.state
+                # Restore the freeze markers from the engine result.
+                self._save_state()
+
     def _maybe_confirm_step0(self, key: str) -> None:
         """For Step0 MARKET: confirm fill via the live venue, persist P0.
 
@@ -546,8 +756,14 @@ class PersistentFiboService:
              filled_quote / filled_base)
           -> persist confirmed state and place TP + Step1.
 
-        NEVER resubmits Step0. If the order cannot be found after a
-        bounded number of ticks, NEEDS_RECOVERY is set.
+        Position-fallback path (Ondo et al.):
+          If the bounded client-id lookup exhausts its retry budget
+          (8 attempts) without observing FILLED, attempt a guarded
+          live-position confirmation ONCE. All eligibility guards in
+          :meth:`_step0_position_fallback_eligible` must pass.
+
+        NEVER resubmits Step0. If neither path can confirm, the
+        registration is parked in NEEDS_RECOVERY.
         """
         with self._lock:
             state = self._states.get(key)
@@ -555,36 +771,32 @@ class PersistentFiboService:
                 return
             exchange_order_id = state.pending_order_exchange_id
             client_id = state.submission_client_id or state.pending_order_client_id
+            # Idempotency: never re-attempt confirmation after a successful
+            # promotion. ``highest_filled_step >= 0`` is the durable marker.
+            already_promoted = state.highest_filled_step >= 0
 
-        order_state = None
+        if already_promoted:
+            return
+
+        order_state: Dict[str, Any] = {}
 
         # Path A: exchange_order_id known -> get_order_state.
-        if exchange_order_id is not None:
+        if exchange_order_id is not None and exchange_order_id != "":
             try:
                 order_state = self._adapter_for(key).get_order_state(
-                    state.account, int(exchange_order_id)
+                    state.account, exchange_order_id
                 )
             except Exception as exc:
                 logger.warning("step0 get_order_state failed for %s: %s", key, exc)
                 return
 
-        # Path B: no exchange_order_id (Lighter market orders) ->
-        # look up by persisted client_order_index. This is the normal
-        # Lighter Step0 confirmation path. Bounded read-after-write.
+        # Path B: client_id lookup.
         if not order_state and client_id is not None:
             attempts = getattr(self, "_step0_lookup_attempts", {}).get(key, 0)
-            if attempts >= 8:  # ~8 poll ticks of read-after-write
-                with self._lock:
-                    state = self._states.get(key)
-                    if state is None:
-                        return
-                    state.status = STATUS_NEEDS_RECOVERY
-                    state.freeze_reason = (
-                        f"Step0 order with client_order_index={client_id} "
-                        f"not found in active/inactive surface after bounded retry"
-                    )
-                    self._save_state()
-                return
+            fb_attempts = getattr(self, "_step0_position_fallback_attempts", {}).get(key, 0)
+            # Always attempt the client-id lookup on every poll. If the
+            # venue has finally indexed the filled order, this is what
+            # catches it (test F: late FILLED lookup after >8 polls).
             try:
                 order_state = self._adapter_for(key).get_order_state_by_client_id(
                     state.account, state.instrument, int(client_id)
@@ -596,9 +808,42 @@ class PersistentFiboService:
                 self._step0_lookup_attempts = {}
             self._step0_lookup_attempts[key] = attempts + 1
 
-        if not order_state:
-            # Not found yet — wait for the next poll tick (bounded).
-            return
+            if not order_state:
+                # Venue still hasn't surfaced our order. After the bounded
+                # retry window, give the position fallback up to
+                # _STEP0_FALLBACK_MAX_ATTEMPTS chances — even if every
+                # attempt is inconclusive (e.g. entry_price not yet
+                # exposed by the venue). Once the fallback is also
+                # exhausted, freeze. The in-memory counters reset on
+                # daemon restart, so a transient API/venue hiccup
+                # permanently disabling later recovery is avoided.
+                if attempts >= 8 and fb_attempts >= _STEP0_FALLBACK_MAX_ATTEMPTS:
+                    with self._lock:
+                        state = self._states.get(key)
+                        if state is None:
+                            return
+                        state.status = STATUS_NEEDS_RECOVERY
+                        state.freeze_reason = (
+                            f"Step0 order with client_order_index={client_id} "
+                            f"not found in active/inactive surface after bounded retry"
+                        )
+                        self._save_state()
+                    return
+                if attempts >= 8 and fb_attempts < _STEP0_FALLBACK_MAX_ATTEMPTS:
+                    if not hasattr(self, "_step0_position_fallback_attempts"):
+                        self._step0_position_fallback_attempts = {}
+                    self._step0_position_fallback_attempts[key] = fb_attempts + 1
+                    p0 = self._step0_position_fallback_check(key, state)
+                    if p0 is not None:
+                        # Position fallback already proves the live position
+                        # is compatible (direction + size + entry_price all
+                        # match within the helper's own gates), so we can
+                        # promote without an additional position check.
+                        self._promote_step0_and_advance(key, p0, backfilled_oid=None)
+                        return
+                # Not yet at the bounded boundary, or the fallback
+                # attempt was inconclusive — wait for the next poll.
+                return
 
         # Ownership verification: client_order_index must match.
         rec_client = order_state.get("client_order_index")
@@ -659,8 +904,38 @@ class PersistentFiboService:
                 self._save_state()
             return
 
-        # FILLED only.
+        # FILLED only — but if the venue returned UNKNOWN (i.e. we
+        # reached the lookup result but it isn't actually FILLED), this
+        # is the same case as a missing record: the bounded-retry path
+        # applies. Once we've burned the bounded window AND the position
+        # fallback has already been attempted, freeze; if we haven't
+        # yet attempted the fallback, try it now; otherwise just wait
+        # for the next poll.
         if taxonomy != "FILLED" and status != "filled":
+            attempts = getattr(self, "_step0_lookup_attempts", {}).get(key, 0)
+            fb_attempts = getattr(self, "_step0_position_fallback_attempts", {}).get(key, 0)
+            if attempts >= 8 and fb_attempts >= _STEP0_FALLBACK_MAX_ATTEMPTS:
+                with self._lock:
+                    state = self._states.get(key)
+                    if state is None:
+                        return
+                    state.status = STATUS_NEEDS_RECOVERY
+                    state.freeze_reason = (
+                        f"Step0 order with client_order_index={client_id} "
+                        f"not found in active/inactive surface after bounded retry"
+                    )
+                    self._save_state()
+                return
+            if attempts >= 8 and fb_attempts < _STEP0_FALLBACK_MAX_ATTEMPTS:
+                if not hasattr(self, "_step0_position_fallback_attempts"):
+                    self._step0_position_fallback_attempts = {}
+                self._step0_position_fallback_attempts[key] = fb_attempts + 1
+                p0 = self._step0_position_fallback_check(key, state)
+                if p0 is not None:
+                    self._promote_step0_and_advance(key, p0, backfilled_oid=None)
+                    return
+            # Either before the bounded boundary, or the fallback
+            # attempt did not match — wait for the next poll.
             return
 
         # Backfill exchange order_index discovered via client-id lookup.
@@ -706,32 +981,28 @@ class PersistentFiboService:
                 self._save_state()
             return
 
-        # Promote P0, backfill exchange identity, place TP + Step1.
-        with self._lock:
-            state = self._states.get(key)
-            if state is None:
-                return
-            # Reset the bounded-lookup counter on success.
-            if hasattr(self, "_step0_lookup_attempts"):
-                self._step0_lookup_attempts.pop(key, None)
-            from .golden_fibo.engine import GoldenFiboEngine
-            cfg = self._config_for(key, state)
-            adapter = self._adapter_for(key)
-            engine = GoldenFiboEngine(cfg, state, adapter, self._client_id_factory(key))
-            if backfilled_oid is not None:
-                try:
-                    engine.state.pending_order_exchange_id = int(backfilled_oid)
-                    engine.state.submission_exchange_order_id = int(backfilled_oid)
-                except (TypeError, ValueError):
-                    pass
-            engine.confirm_step0_filled(p0)
-            result = engine.place_step0_tp_and_step1(p0)
-            self._states[key] = engine.state
-            self._save_state()
-            if result is not None:
-                # Engine froze — propagate
-                self._states[key] = result.state
+        # Safety gate: a historical FILLED order is NOT sufficient evidence
+        # to promote Step0 if the live position is no longer compatible
+        # with the Step0 we expected to commit. A manual close, a TP-fill
+        # that already exited, or any other external position-changing
+        # event must NOT result in a TP + Step1 resurrection against
+        # the historical order alone.
+        if not self._step0_position_compatible_with_step0(key, state):
+            with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return
+                state.status = STATUS_NEEDS_RECOVERY
+                state.freeze_reason = (
+                    f"Step0 order {client_id} observed FILLED but live position "
+                    f"is no longer compatible with Step0 size={expected_size}; "
+                    f"refusing to place TP/Step1 against a missing/closed position"
+                )
                 self._save_state()
+            return
+
+        # Promote P0, backfill exchange identity, place TP + Step1.
+        self._promote_step0_and_advance(key, p0, backfilled_oid=backfilled_oid)
         return
 
     def execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
@@ -1031,7 +1302,7 @@ class PersistentFiboService:
                 try:
                     adapter.cancel_order(
                         account=state.account,
-                        order_index=int(state.pending_order_exchange_id),
+                        order_index=state.pending_order_exchange_id,
                     )
                 except Exception as exc:
                     state.status = STATUS_NEEDS_RECOVERY

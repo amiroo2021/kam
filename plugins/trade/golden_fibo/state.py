@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 
 # Strategy names
@@ -52,6 +52,30 @@ class GoldenFiboState:
     trust the live venue to reflect it.
     """
 
+    @staticmethod
+    def _decode_exchange_order_id(raw: Any) -> Optional[Union[int, str]]:
+        """Decode a persisted exchange_order_id from JSON.
+
+        Tolerates both numeric (Lighter / Rise / Arcus) and alphanumeric
+        string (Ondo) forms. Returns None for missing / empty / zero.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            # bool is a subclass of int — treat True/False as no id.
+            return None
+        if isinstance(raw, int):
+            return int(raw) if raw != 0 else None
+        text = str(raw).strip()
+        if not text:
+            return None
+        # Try numeric first; fall back to opaque string.
+        try:
+            as_int = int(text, 10)
+        except (TypeError, ValueError):
+            return text
+        return as_int if as_int != 0 else None
+
     # versioning + ownership
     strategy: str = STRATEGY_GOLDENFIBO
     schema_version: int = 1
@@ -84,7 +108,11 @@ class GoldenFiboState:
     # current shared TP
     current_tp_price: Optional[Decimal] = None
     current_tp_size: Optional[Decimal] = None  # TP volume, synced to live position
-    current_tp_order_id: Optional[int] = None
+    # Venue-native order identifier — may be int (Lighter, Rise, Arcus) or
+    # alphanumeric string (Ondo). The engine stores it opaquely and never
+    # coerces it; the adapter is responsible for routing it back to the
+    # venue endpoint.
+    current_tp_order_id: Optional[Union[int, str]] = None
     current_tp_client_id: Optional[int] = None
     current_tp_role: Optional[str] = None  # ROLE_TP
     # Bounded reconciliation counter for a FILLED TP whose position read has
@@ -94,7 +122,9 @@ class GoldenFiboState:
     # next pending ladder order
     next_step: int = 0
     pending_order_client_id: Optional[int] = None
-    pending_order_exchange_id: Optional[int] = None
+    # Venue-native order identifier — int (Lighter/Rise/Arcus) or
+    # alphanumeric string (Ondo). See current_tp_order_id above.
+    pending_order_exchange_id: Optional[Union[int, str]] = None
     pending_requested_price: Optional[Decimal] = None
     pending_requested_size: Optional[Decimal] = None
     pending_confirmed_price: Optional[Decimal] = None
@@ -121,7 +151,7 @@ class GoldenFiboState:
     submission_step: Optional[int] = None
     submission_role: Optional[str] = None
     submission_attempted_at: Optional[float] = None
-    submission_exchange_order_id: Optional[int] = None
+    submission_exchange_order_id: Optional[Union[int, str]] = None
 
     # status
     status: str = STATUS_NEVER_STARTED
@@ -131,7 +161,7 @@ class GoldenFiboState:
     # Emergency close submission tracking (exactly-once close + patient verify)
     emergency_close_phase: str = ""  # "" | "submitted" | "verified"
     emergency_close_client_id: Optional[int] = None
-    emergency_close_exchange_id: Optional[int] = None
+    emergency_close_exchange_id: Optional[Union[int, str]] = None
     emergency_close_submitted_at: Optional[float] = None
     emergency_close_pre_size: Optional[str] = None
 
@@ -216,13 +246,13 @@ class GoldenFiboState:
             expected_cumulative_size=Decimal(str(data.get("expected_cumulative_size", "0"))),
             current_tp_price=None if data.get("current_tp_price") is None else Decimal(str(data.get("current_tp_price"))),
             current_tp_size=None if data.get("current_tp_size") is None else Decimal(str(data.get("current_tp_size"))),
-            current_tp_order_id=None if data.get("current_tp_order_id") is None else int(data.get("current_tp_order_id") or 0),
+            current_tp_order_id=cls._decode_exchange_order_id(data.get("current_tp_order_id")),
             current_tp_client_id=None if data.get("current_tp_client_id") is None else int(data.get("current_tp_client_id") or 0),
             current_tp_role=data.get("current_tp_role"),
             tp_exit_attempts=int(data.get("tp_exit_attempts", 0) or 0),
             next_step=int(data.get("next_step", 0) or 0),
             pending_order_client_id=None if data.get("pending_order_client_id") is None else int(data.get("pending_order_client_id") or 0),
-            pending_order_exchange_id=None if data.get("pending_order_exchange_id") is None else int(data.get("pending_order_exchange_id") or 0),
+            pending_order_exchange_id=cls._decode_exchange_order_id(data.get("pending_order_exchange_id")),
             pending_requested_price=None if data.get("pending_requested_price") is None else Decimal(str(data.get("pending_requested_price"))),
             pending_requested_size=None if data.get("pending_requested_size") is None else Decimal(str(data.get("pending_requested_size"))),
             pending_confirmed_price=None if data.get("pending_confirmed_price") is None else Decimal(str(data.get("pending_confirmed_price"))),
@@ -234,7 +264,7 @@ class GoldenFiboState:
             submission_step=None if data.get("submission_step") is None else int(data.get("submission_step") or 0),
             submission_role=data.get("submission_role"),
             submission_attempted_at=None if data.get("submission_attempted_at") is None else float(data.get("submission_attempted_at") or 0.0),
-            submission_exchange_order_id=None if data.get("submission_exchange_order_id") is None else int(data.get("submission_exchange_order_id") or 0),
+            submission_exchange_order_id=cls._decode_exchange_order_id(data.get("submission_exchange_order_id")),
             status=str(data.get("status", STATUS_NEVER_STARTED)),
             freeze_reason=data.get("freeze_reason"),
             shutdown_mode=str(data.get("shutdown_mode") or SHUTDOWN_MODE_NONE),
@@ -244,11 +274,7 @@ class GoldenFiboState:
                 if data.get("emergency_close_client_id") is None
                 else int(data.get("emergency_close_client_id") or 0)
             ),
-            emergency_close_exchange_id=(
-                None
-                if data.get("emergency_close_exchange_id") is None
-                else int(data.get("emergency_close_exchange_id") or 0)
-            ),
+            emergency_close_exchange_id=cls._decode_exchange_order_id(data.get("emergency_close_exchange_id")),
             emergency_close_submitted_at=(
                 None
                 if data.get("emergency_close_submitted_at") is None

@@ -71,6 +71,26 @@ TP_EXIT_MAX_POLLS = 4
 OrderIdentity = Tuple[Optional[int], Optional[int]]  # (client_order_id, exchange_order_id)
 
 
+def coerce_exchange_order_id(value: Any) -> Optional[Any]:
+    """Return ``value`` as the venue-native exchange_order_id, opaquely.
+
+    Most venues (Lighter, Rise, Arcus) hand back decimal-int ids that fit
+    directly into GoldenFiboState's ``Optional[Union[int, str]]`` slot.
+    Ondo Perps hands back 32-char alphanumeric strings — we MUST preserve
+    them verbatim because the venue rejects anything else on cancel /
+    lookup. Returning the value unchanged (after stripping) is the
+    safest portable behaviour across both kinds of venue.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    text = str(value).strip()
+    return text or None
+
+
 @dataclass
 class TickResult:
     """Outcome of one engine tick."""
@@ -507,9 +527,12 @@ class GoldenFiboEngine:
         self.state.submission_phase = SUBMISSION_CONFIRMED
         actions.append(f"Step0 MARKET submit={submit}")
         exchange_oid = submit.get("exchange_order_id")
-        if exchange_oid is not None:
-            self.state.pending_order_exchange_id = int(exchange_oid)
-            self.state.submission_exchange_order_id = int(exchange_oid)
+        if exchange_oid is not None and exchange_oid != "":
+            # Venue-native order identifier: store opaquely. The adapter
+            # is responsible for producing the right form for its venue
+            # (decimal int for Lighter/Rise/Arcus, alphanumeric for Ondo).
+            self.state.pending_order_exchange_id = exchange_oid
+            self.state.submission_exchange_order_id = exchange_oid
         self.state.pending_confirmed_size = submit.get("submitted_volume") or str(size)
         return TickResult(state=self.state, actions=actions)
 
@@ -630,7 +653,7 @@ class GoldenFiboEngine:
             try:
                 canceled = self.adapter.cancel_order(
                     account=self.config.account,
-                    order_index=int(old_tp_oid),
+                    order_index=old_tp_oid,
                 )
             except Exception as exc:
                 return self._freeze(
@@ -673,15 +696,15 @@ class GoldenFiboEngine:
         # The resting LIMIT TP submit + verify is done inside the generic
         # new_order path; a failure is surfaced as an exception above.
         self.state.submission_phase = SUBMISSION_CONFIRMED
-        self.state.submission_exchange_order_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.submission_exchange_order_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
 
         self.state.current_tp_price = Decimal(str(submit.get("submitted_price") or tp_price))
         self.state.current_tp_size = Decimal(str(submit.get("submitted_volume") or tp_size))
         self.state.current_tp_client_id = tp_client_id
-        self.state.current_tp_order_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.current_tp_order_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
         self.state.current_tp_role = ROLE_TP
         actions.append(
@@ -785,13 +808,13 @@ class GoldenFiboEngine:
             )
 
         self.state.submission_phase = SUBMISSION_CONFIRMED
-        self.state.submission_exchange_order_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.submission_exchange_order_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
 
         self.state.pending_order_client_id = client_id
-        self.state.pending_order_exchange_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.pending_order_exchange_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
         self.state.pending_requested_price = next_price
         self.state.pending_requested_size = next_size
@@ -910,7 +933,7 @@ class GoldenFiboEngine:
         try:
             self.adapter.cancel_order(
                 account=self.config.account,
-                order_index=int(self.state.pending_order_exchange_id),
+                order_index=self.state.pending_order_exchange_id,
             )
             actions.append(f"cancel orphan pending oid={self.state.pending_order_exchange_id}")
         except Exception as exc:
@@ -963,7 +986,17 @@ class GoldenFiboEngine:
         Must NOT send START, must NOT create Step0, must NOT delete the
         registration.
         """
-        if self.state.pending_order_exchange_id is None:
+        # We allow recovery to proceed even when pending_order_exchange_id
+        # is None — Ondo's orderId is alphanumeric and cannot fit the
+        # legacy int slot; relying on it alone would freeze every Ondo
+        # registration in needs_recovery forever. The fallback-aware
+        # client-id lookup path inside _read_pending_order_state still
+        # gets a chance to find the order. If it cannot, this method is
+        # a no-op and the caller is expected to fall back to position-
+        # based Step0 promotion (the service's _maybe_confirm_step0 owns
+        # that path; Step0 ROLE_ENTRY here just returns without state
+        # mutation, so we simply keep the registration parked).
+        if self.state.pending_order_exchange_id is None and self.state.pending_order_client_id is None:
             return TickResult(state=self.state, actions=actions)
         try:
             position = self.adapter.position_state(
@@ -1100,7 +1133,7 @@ class GoldenFiboEngine:
         if oid is None:
             return {}
         try:
-            st = self.adapter.get_order_state(self.config.account, int(oid))
+            st = self.adapter.get_order_state(self.config.account, oid)
         except Exception:
             st = {}
         if st:
@@ -1169,7 +1202,7 @@ class GoldenFiboEngine:
         # Cancel the exact old TP.
         try:
             canceled = self.adapter.cancel_order(
-                account=self.config.account, order_index=int(old_oid)
+                account=self.config.account, order_index=old_oid
             )
         except Exception as exc:
             return self._freeze(f"TP volume sync: cancel old TP oid={old_oid} failed: {exc}")
@@ -1211,12 +1244,12 @@ class GoldenFiboEngine:
                 "Reconcile exchange before any resubmission."
             )
         self.state.submission_phase = SUBMISSION_CONFIRMED
-        self.state.submission_exchange_order_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.submission_exchange_order_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
         self.state.current_tp_client_id = tp_client_id
-        self.state.current_tp_order_id = (
-            int(submit["exchange_order_id"]) if submit.get("exchange_order_id") is not None else None
+        self.state.current_tp_order_id = coerce_exchange_order_id(
+            submit.get("exchange_order_id")
         )
         self.state.current_tp_size = Decimal(str(submit.get("submitted_volume") or live_size))
         # TP price unchanged.

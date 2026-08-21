@@ -154,7 +154,7 @@ class ArcusGoldenFiboAdapter:
     def market_constraints(self, account: str, instrument: str) -> Dict[str, Any]:
         return self.get_venue_constraints(account, instrument)
 
-    def get_order_state(self, account: str, order_index: int) -> Dict[str, Any]:
+    def get_order_state(self, account: str, order_index: Any) -> Dict[str, Any]:
         resp = arcus_agent.execute(
             {
                 "operation": "get_order_state",
@@ -282,7 +282,7 @@ class ArcusGoldenFiboAdapter:
             "role": "tp",
         }
 
-    def cancel_order(self, *, account: str, order_index: int) -> bool:
+    def cancel_order(self, *, account: str, order_index: Any) -> bool:
         resp = arcus_agent.execute(
             {
                 "operation": "cancel_order",

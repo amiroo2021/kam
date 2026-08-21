@@ -11,7 +11,13 @@ from typing import Any, Dict, List, Optional
 from unittest import mock
 
 from plugins.trade.golden_fibo.engine import GoldenFiboConfig, GoldenFiboEngine
-from plugins.trade.golden_fibo.state import GoldenFiboState
+from plugins.trade.golden_fibo.state import (
+    ROLE_ENTRY,
+    ROLE_LADDER,
+    SUBMISSION_CONFIRMED,
+    SUBMISSION_NOT_SUBMITTED,
+    GoldenFiboState,
+)
 from plugins.trade.golden_fibo.ondoperps_adapter import (
     OndoPerpsGoldenFiboAdapter,
     encode_gf_client_order_id,
@@ -559,6 +565,799 @@ class AdapterForWiringTests(unittest.TestCase):
         # Must not silently fall back to Lighter.
         from plugins.trade.golden_fibo.lighter_adapter import LighterGoldenFiboAdapter
         self.assertNotIsInstance(adapter, LighterGoldenFiboAdapter)
+
+
+# ---------------------------------------------------------------------------
+# OndoPerps Step0 confirmation / recovery (incident 2026-08-21 ETH 0.001)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the gap where Ondo's GET /v1/perps/orders/client:<id>
+# index takes longer than the bounded retry window to surface a freshly-
+# filled market order, and where Ondo's alphanumeric orderId previously
+# bypassed the existing recovery path entirely (no int = no reconciliation).
+#
+# The fix introduces:
+#   * a guarded live-position fallback (runs at most once per registration)
+#   * tolerant storage of exchange_order_id (str or int)
+#   * a recovery path that consults client_id even when no exchange_order_id
+#
+# Tests A–I below are regression coverage for the new path; J is the
+# cross-venue "everything else still works" smoke test.
+
+
+class _OndoStep0Adapter:
+    """Programmable adapter for Step0 confirmation / recovery scenarios.
+
+    Each instance owns its own state for: market-side place_market,
+    get_order_state_by_client_id (default UNKNOWN unless set), and
+    position_state. The class also tracks every call so tests can assert
+    idempotency (no duplicate Step0 submission, single position fallback).
+    """
+
+    def __init__(self):
+        self.calls: List[tuple] = []
+        self.place_market_calls = 0
+        self.client_id_lookups = 0
+        self.position_lookups = 0
+        # Order-record-by-client_id lookup result. Empty dict == UNKNOWN.
+        self.lookup_result: Dict[str, Any] = {}
+        # Order-record-by-exchange_id lookup result (Path A).
+        self.oid_lookup_result: Dict[str, Any] = {}
+        # Position snapshot.
+        self.position = {
+            "symbol": "ETH",
+            "side": None,
+            "size": "0",
+            "entry_price": None,
+        }
+        # Alphanumeric Ondo orderId, mimicking the live incident.
+        self.fake_oid = "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV"
+
+    # -- position / lookup read paths
+    def position_state(self, account, instrument):
+        self.position_lookups += 1
+        self.calls.append(("position_state", account, instrument))
+        return dict(self.position)
+
+    def get_order_state(self, account, order_index):
+        self.calls.append(("get_order_state", order_index))
+        return dict(self.oid_lookup_result)
+
+    def get_order_state_by_client_id(self, account, instrument, client_order_index):
+        self.client_id_lookups += 1
+        self.calls.append(("get_order_state_by_client_id", int(client_order_index)))
+        return dict(self.lookup_result)
+
+    # -- write paths
+    def place_market(self, *, account, instrument, side, size, client_order_id):
+        self.place_market_calls += 1
+        self.calls.append(("place_market", client_order_id, str(size), side))
+        # Adapter returns the alphanumeric Ondo orderId verbatim.
+        return {
+            "client_order_id": int(client_order_id),
+            "exchange_order_id": self.fake_oid,  # STRING, not int.
+            "submitted_price": None,
+            "submitted_volume": str(size),
+            "status": "submitted",
+            "verified": False,
+            "role": "entry",
+            "raw": {},
+        }
+
+    def set_shared_tp(self, *, account, instrument, price, side=None, size=None, client_order_id=None):
+        self.calls.append(("set_shared_tp", client_order_id, str(price), str(size or "")))
+        return {
+            "client_order_id": client_order_id,
+            "exchange_order_id": None,
+            "submitted_price": str(price),
+            "submitted_volume": str(size or ""),
+            "status": "submitted",
+            "verified": False,
+            "role": "tp",
+        }
+
+    def place_limit(self, *, account, instrument, side, size, price, client_order_id, reduce_only=False):
+        self.calls.append(("place_limit", client_order_id, str(size), str(price), side))
+        return {
+            "client_order_id": client_order_id,
+            "exchange_order_id": 9999,
+            "submitted_price": str(price),
+            "submitted_volume": str(size),
+            "status": "submitted",
+            "verified": False,
+        }
+
+    def cancel_order(self, *, account, order_index):
+        self.calls.append(("cancel_order", order_index))
+        return True
+
+
+def _build_svc_for_step0(state_path, ledger_path, event_path):
+    """PersistentFiboService wired with auto-discovery but NO poll thread.
+
+    Tests drive ``_maybe_confirm_step0(key)`` directly so we can exercise
+    exact post-submit / post-retry behaviour without wall-clock waits.
+    """
+    import threading
+    from plugins.trade.fibo_service import PersistentFiboService
+    svc = PersistentFiboService(
+        state_path=state_path,
+        ledger_path=ledger_path,
+        event_log_path=event_path,
+        start_thread=False,
+    )
+    return svc
+
+
+def _seed_step0_state(svc, key, *,
+                       client_id=82738593280000,
+                       step0_volume="0.001",
+                       cycle_uid=335244,
+                       direction="BUY",
+                       submission_phase=SUBMISSION_CONFIRMED,
+                       pending_order_exchange_id=None,
+                       position_lookups_used=0,
+                       lookup_result=None):
+    """Seed a registration in the 'Step0 submitted but not yet promoted' state.
+
+    Mirrors the live ETH 0.001 incident exactly (cycle_uid, client_id,
+    submission_attempted_at, submission_phase=confirmed).
+    """
+    from plugins.trade.golden_fibo.client_id_v2 import allocate_client_id
+    # V2 deterministic client_id (24-bit cycle_uid + role + step + seq).
+    actual_cid = int(client_id)
+    state = GoldenFiboState()
+    state.strategy = "golden_fibo"
+    state.schema_version = 1
+    state.registration_key = key
+    state.exchange = "ondoperps"
+    state.account = key.split("/")[1]
+    state.instrument = key.split("/")[2]
+    state.direction = direction
+    state.percentage = Decimal("0.001")
+    state.step0_volume = Decimal(step0_volume)
+    state.cycle_uid = cycle_uid
+    state.highest_cycle_uid = cycle_uid
+    state.client_id_version = 2
+    state.next_step = 0
+    state.highest_filled_step = -1
+    state.expected_cumulative_size = Decimal("0")
+    state.pending_order_role = ROLE_ENTRY
+    state.pending_order_client_id = actual_cid
+    state.pending_order_exchange_id = pending_order_exchange_id
+    state.submission_phase = submission_phase
+    state.submission_client_id = actual_cid
+    state.submission_step = 0
+    state.submission_role = ROLE_ENTRY
+    state.submission_attempted_at = 1787340277.0025623
+    state.submission_exchange_order_id = pending_order_exchange_id
+    state.status = "needs_recovery" if submission_phase == SUBMISSION_CONFIRMED else "running"
+    if submission_phase == SUBMISSION_CONFIRMED and pending_order_exchange_id is None:
+        # The exact live incident: still flagged needs_recovery because the
+        # early-retry window expired without the client-id lookup seeing FILLED.
+        state.freeze_reason = (
+            f"Step0 order with client_order_index={actual_cid} "
+            "not found in active/inactive surface after bounded retry"
+        )
+    svc._states[key] = state
+    # Pre-load position-lookup and lookup counters if the test wants to
+    # simulate a registration that has already burned its bounded retries.
+    if position_lookups_used > 0:
+        # Drive the counter up via repeated _maybe_confirm_step0 calls.
+        svc._step0_lookup_attempts = {key: position_lookups_used}
+    return state
+
+
+class OndoStep0ConfirmationTests(unittest.TestCase):
+    """Step0 confirmation + position-fallback + recovery regression tests."""
+
+    # ---------------- A. Happy path: client-id lookup FILLED immediately ----
+
+    def test_A_submit_then_client_id_filled_promotes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            # Lookup returns FILLED with the actual_fill_price.
+            adapter.lookup_result = {
+                "exchange_order_id": adapter.fake_oid,
+                "client_order_id": 82738593280000,
+                "side": "buy",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "filled_size": "0.001",
+                "requested_size": "0.001",
+                "actual_fill_price": "2412.60",
+                "symbol": "ETH",
+            }
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            # The new Step0-promotion safety gate requires the live
+            # position to be compatible with the historical Step0 size.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Step0 must be promoted after FILLED client-id lookup")
+            self.assertEqual(state.expected_cumulative_size, Decimal("0.001"))
+            self.assertEqual(state.fill_prices.get(0), Decimal("2412.60"))
+            # step_orders[0] reflects the ENTRY identity with the
+            # alphanumeric Ondo orderId preserved.
+            self.assertEqual(state.step_orders[0]["client_id"], 82738593280000)
+            self.assertEqual(state.step_orders[0]["exchange_order_id"], adapter.fake_oid)
+            self.assertEqual(state.step_orders[0]["role"], "entry")
+            self.assertEqual(state.step_orders[0]["price"], "2412.60")
+            # Submission tracking now reflects the in-flight TP / Step1
+            # ladder, not Step0 any more. Step0 itself is fully closed out:
+            # pending_order_role advanced from "entry" → "ladder".
+            self.assertEqual(state.pending_order_role, "ladder",
+                             "Step0 promotion must advance pending_order_role to 'ladder'")
+            # Step0's deterministic client_order_index no longer drives a
+            # pending entry; the ladder now owns the pending slot.
+            self.assertNotEqual(state.pending_order_client_id, 82738593280000,
+                                "Step0 client_order_index must not remain as the pending client id")
+            # Status returns to running (TP + Step1 placed by engine).
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+
+    # ---------------- B. Position fallback after bounded retry window -----
+
+    def test_B_unknown_for_8_polls_then_matching_position_promotes_once(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            # client-id lookup never returns FILLED.
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+                "note": "Ondo clientOrderId lookup did not find this order; do not infer FILLED",
+            }
+            # Live position exactly matches the submitted Step0.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            svc._adapters[key] = adapter
+            # Pretend 8 polls already burned the bounded retry budget.
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None,
+                              position_lookups_used=8)
+
+            # The next call hits the position fallback at attempts >= 8.
+            # The position already matches Step0; the safety gate
+            # in _promote_step0_and_advance is satisfied by the same
+            # matching position that the fallback helper just verified.
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Position fallback must promote Step0 exactly once")
+            self.assertEqual(state.expected_cumulative_size, Decimal("0.001"))
+            self.assertEqual(state.fill_prices.get(0), Decimal("2412.60"))
+            self.assertEqual(state.step_orders[0]["price"], "2412.60")
+            self.assertEqual(state.step_orders[0]["role"], "entry")
+            # Status returns to running (TP + Step1 placed by engine).
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+
+            # Idempotency: subsequent ticks must NOT re-promote and must NOT
+            # place another Step0.
+            place_market_before = adapter.place_market_calls
+            svc._maybe_confirm_step0(key)
+            svc._maybe_confirm_step0(key)
+            svc._maybe_confirm_step0(key)
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "Position fallback must not resubmit Step0 on later ticks")
+
+    # ---------------- C. No live position: must NOT promote ---------------
+
+    def test_C_unknown_lookups_no_position_no_resubmit_no_promotion(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # No position.
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              position_lookups_used=8)
+
+            svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Without matching position, Step0 must NOT promote")
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("not found in active/inactive surface", state.freeze_reason or "")
+            # No second Step0 submission.
+            self.assertEqual(adapter.place_market_calls, 0)
+
+    # ---------------- D. Wrong-side live position: must NOT promote --------
+
+    def test_D_wrong_side_position_no_promotion(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # The direction is BUY but the live position is short.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "short",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              position_lookups_used=8)
+
+            svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Opposite-side position must NOT promote Step0")
+            self.assertEqual(state.status, "needs_recovery")
+
+    # ---------------- E. Size-incompatible position: must NOT promote ------
+
+    def test_E_position_smaller_than_expected_no_promotion(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # Half the expected size — not a proof of OUR Step0.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.0005",
+                "entry_price": "2412.60",
+            }
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              position_lookups_used=8)
+
+            svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Position smaller than expected Step0 must NOT promote")
+            self.assertEqual(state.status, "needs_recovery")
+
+    # ---------------- F. needs_recovery + client_id + later FILLED --------
+
+    def test_F_needs_recovery_recovery_via_late_client_id_FILLED(self):
+        """The original live incident: client-id lookup returns UNKNOWN at
+        submit time, but later (after several retries) returns FILLED.
+        The service MUST promote Step0 without resubmission.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key,
+                              submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            # Build the exact frozen state from the live incident.
+            state = svc._states[key]
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("not found in active/inactive surface", state.freeze_reason or "")
+            # Drive 8 ticks while client-id lookup keeps returning UNKNOWN
+            # (simulating the live propagation latency).
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # No matching position yet (only the order lookup evidence).
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            for _ in range(8):
+                svc._maybe_confirm_step0(key)
+            # The state must still be needs_recovery but with a healthy
+            # in-memory counter that has hit the bound.
+            self.assertEqual(svc._states[key].status, "needs_recovery")
+
+            # Now the venue's orders-by-client-id index catches up: the
+            # same lookup returns a FILLED record. The 9th tick must
+            # promote without resubmitting Step0.
+            place_market_before = adapter.place_market_calls
+            adapter.lookup_result = {
+                "exchange_order_id": adapter.fake_oid,
+                "client_order_id": 82738593280000,
+                "side": "buy",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "filled_size": "0.001",
+                "requested_size": "0.001",
+                "actual_fill_price": "2412.60",
+                "symbol": "ETH",
+            }
+            # Mirror the live incident: the FILLED order was followed by
+            # a corresponding live position. The new Step0 safety gate
+            # refuses promotion if the live position is missing/smaller.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Late FILLED client-id lookup must promote Step0")
+            self.assertEqual(state.fill_prices.get(0), Decimal("2412.60"))
+            self.assertEqual(state.status, "running")
+            self.assertIsNone(state.freeze_reason)
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "Late FILLED lookup must never resubmit Step0")
+
+    # ---------------- G. Service restart while Step0 unresolved ------------
+
+    def test_G_restart_during_unresolved_step0_no_duplicate_submission(self):
+        """If the fibo daemon is restarted while Step0 is in
+        submission_phase=confirmed but unpromoted, the engine MUST NOT
+        resubmit Step0. The deterministic client_order_index is the
+        idempotency anchor.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            ledger_path = Path(tmp) / "ledger.jsonl"
+            events_path = Path(tmp) / "events.log"
+            key = "ondoperps/bitget/ETH/BUY"
+
+            svc1 = _build_svc_for_step0(state_path, ledger_path, events_path)
+            adapter1 = _OndoStep0Adapter()
+            svc1._adapters[key] = adapter1
+            _seed_step0_state(svc1, key,
+                               submission_phase=SUBMISSION_CONFIRMED,
+                               pending_order_exchange_id=None)
+            # Persist.
+            svc1._save_state()
+
+            # Restart: new PersistentFiboService reading the same file.
+            svc2 = _build_svc_for_step0(state_path, ledger_path, events_path)
+            adapter2 = _OndoStep0Adapter()
+            svc2._adapters[key] = adapter2
+            # Adapter lookup keeps returning UNKNOWN.
+            adapter2.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # No position evidence either.
+            adapter2.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+
+            # The post-restart ticks must NEVER submit another Step0.
+            place_calls_before = adapter2.place_market_calls
+            for _ in range(12):
+                svc2._maybe_confirm_step0(key)
+            self.assertEqual(adapter2.place_market_calls, place_calls_before,
+                             "Restart during unresolved Step0 must NOT resubmit")
+            # The state remains needs_recovery, idempotent.
+            state = svc2._states[key]
+            self.assertEqual(state.highest_filled_step, -1)
+            self.assertEqual(state.submission_phase, SUBMISSION_CONFIRMED)
+
+    # ---------------- H. Alphanumeric exchange_order_id round-trip ---------
+
+    def test_H_alphanumeric_exchange_order_id_persists_through_round_trip(self):
+        """The Ondo 32-char alphanumeric orderId MUST survive to_dict /
+        from_dict and the engine's state model.
+        """
+        from plugins.trade.golden_fibo.state import GoldenFiboState
+        s = GoldenFiboState()
+        s.pending_order_exchange_id = "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV"
+        s.submission_exchange_order_id = "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV"
+        s.current_tp_order_id = "ABCDEF1234567890ABCDEF1234567890"
+        s.emergency_close_exchange_id = "XYZ0123456789ABCDEF0123456789ABCD"
+        d = s.to_dict()
+        # JSON round-trip.
+        import json
+        blob = json.dumps(d)
+        restored = GoldenFiboState.from_dict(json.loads(blob))
+        self.assertEqual(restored.pending_order_exchange_id, "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV")
+        self.assertEqual(restored.submission_exchange_order_id, "EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV")
+        self.assertEqual(restored.current_tp_order_id, "ABCDEF1234567890ABCDEF1234567890")
+        self.assertEqual(restored.emergency_close_exchange_id, "XYZ0123456789ABCDEF0123456789ABCD")
+
+    def test_H_numeric_exchange_order_id_still_works(self):
+        """Backward compatibility: legacy int ids (Lighter / Rise / Arcus)
+        still round-trip as ints, not str(int).
+        """
+        s = GoldenFiboState()
+        s.pending_order_exchange_id = 1125898831127290
+        s.submission_exchange_order_id = 1125898831127290
+        s.current_tp_order_id = 844426024069104
+        import json
+        restored = GoldenFiboState.from_dict(json.loads(json.dumps(s.to_dict())))
+        self.assertEqual(restored.pending_order_exchange_id, 1125898831127290)
+        self.assertIsInstance(restored.pending_order_exchange_id, int)
+        self.assertEqual(restored.current_tp_order_id, 844426024069104)
+        self.assertIsInstance(restored.current_tp_order_id, int)
+
+    # ---------------- I. Repeated ticks after promotion are idempotent ------
+
+    def test_I_repeated_ticks_after_promotion_no_duplicate(self):
+        """After Step0 promotion, subsequent ticks MUST NOT submit another
+        Step0 and MUST NOT advance highest_filled_step.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            adapter.lookup_result = {
+                "exchange_order_id": adapter.fake_oid,
+                "client_order_id": 82738593280000,
+                "side": "buy",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "filled_size": "0.001",
+                "requested_size": "0.001",
+                "actual_fill_price": "2412.60",
+                "symbol": "ETH",
+            }
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+            # The new Step0-promotion safety gate requires a matching
+            # live position before placing TP/Step1.
+            adapter.position = {
+                "symbol": "ETH",
+                "side": "long",
+                "size": "0.001",
+                "entry_price": "2412.60",
+            }
+
+            # First call promotes.
+            svc._maybe_confirm_step0(key)
+            self.assertEqual(svc._states[key].highest_filled_step, 0)
+            place_market_calls_after_first = adapter.place_market_calls
+            client_lookups_after_first = adapter.client_id_lookups
+
+            # Subsequent calls are no-ops on the engine state.
+            for _ in range(20):
+                svc._maybe_confirm_step0(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, 0,
+                             "Promotion must not advance further")
+            self.assertEqual(adapter.place_market_calls, place_market_calls_after_first,
+                             "After promotion, no further market submissions")
+            # Lookup may still happen (the path is idempotent due to the
+            # already_promoted guard); we only assert the promotion count.
+            self.assertGreaterEqual(adapter.client_id_lookups, client_lookups_after_first)
+
+
+class OndoRecoveryGateTests(unittest.TestCase):
+    """The engine.reconcile_needs_recovery_pending_fill gate fix."""
+
+    def test_recovery_proceeds_when_only_client_id_persisted(self):
+        """A registration with pending_order_exchange_id=None and a valid
+        pending_order_client_id must be able to enter the engine's recovery
+        path (which then consults the client-id lookup / position state).
+        """
+        import tempfile
+        from pathlib import Path
+        from plugins.trade.golden_fibo.engine import GoldenFiboEngine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key,
+                              submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None,
+                              cycle_uid=335244)
+
+            state = svc._states[key]
+            cfg = svc._config_for(key, state)
+            engine = GoldenFiboEngine(cfg, state, adapter,
+                                       svc._client_id_factory(key))
+            # Pre-condition: the recovery path must NOT early-return on
+            # pending_order_exchange_id is None alone (the bug we're fixing).
+            result = engine.reconcile_needs_recovery_pending_fill([])
+            # The recovery path is a no-op for Step0 (it returns without
+            # state mutation; the service's _maybe_confirm_step0 owns the
+            # actual promotion). The critical thing is: no exception, no
+            # "early return before doing anything useful" — and critically
+            # it did NOT raise.
+            self.assertIsNotNone(result)
+            self.assertEqual(result.state.highest_filled_step, -1,
+                             "Engine.reconcile path must not promote Step0 itself")
+            # Status unchanged.
+            self.assertEqual(result.state.status, "needs_recovery")
+
+    def test_K_historical_FILLED_with_flat_position_does_not_promote(self):
+        """Safety regression (incident 2026-08-21 second wave).
+
+        A historical Step0 client-id lookup that returns FILLED is NOT
+        sufficient evidence to promote Step0 when the live position is
+        absent (manually closed externally). The engine MUST refuse to
+        place TP or Step1 against a closed position. This guards against
+        "resurrecting" downstream orders for a position that no longer
+        exists.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            svc._adapters[key] = adapter
+            # Client-id lookup returns the historical FILLED record (the
+            # venue has it indexed, e.g. days later).
+            adapter.lookup_result = {
+                "exchange_order_id": adapter.fake_oid,
+                "client_order_id": 82738593280000,
+                "side": "buy",
+                "status": "FILLED",
+                "taxonomy": "FILLED",
+                "filled_size": "0.001",
+                "requested_size": "0.001",
+                "actual_fill_price": "2412.60",
+                "symbol": "ETH",
+            }
+            # The live position is FLAT — the user manually closed it.
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None)
+
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+            ladder_before = sum(1 for c in adapter.calls if c[0] == "place_limit")
+
+            svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            # MUST NOT promote Step0.
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Historical FILLED + flat position MUST NOT promote Step0")
+            # MUST NOT place TP or Step1.
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                tp_before,
+                "No TP must be placed against a flat position")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "place_limit"),
+                ladder_before,
+                "No Step1 ladder must be placed against a flat position")
+            self.assertIsNone(state.current_tp_order_id)
+            self.assertIsNone(state.step_orders.get(0))
+            # MUST mark as NEEDS_RECOVERY with a descriptive reason.
+            self.assertEqual(state.status, "needs_recovery")
+            self.assertIn("no longer compatible", state.freeze_reason or "")
+            self.assertIn("0.001", state.freeze_reason or "")
+
+    def test_K_flat_position_with_lookups_remaining_UNKNOWN(self):
+        """The bounded-retry path with a flat position must also NOT
+        trigger the position fallback (the fallback requires live_size
+        >= expected_size, so flat is a conclusive mismatch). The
+        registration must remain in needs_recovery with no orders placed.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoStep0Adapter()
+            adapter.lookup_result = {
+                "client_order_id": 82738593280000,
+                "status": "UNKNOWN",
+                "taxonomy": "UNKNOWN",
+                "classification": "UNKNOWN",
+            }
+            # Flat position; no fallback will ever succeed because size mismatch.
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._adapters[key] = adapter
+            _seed_step0_state(svc, key, submission_phase=SUBMISSION_CONFIRMED,
+                              pending_order_exchange_id=None, position_lookups_used=8)
+
+            place_market_before = adapter.place_market_calls
+            tp_before = sum(1 for c in adapter.calls if c[0] == "set_shared_tp")
+            ladder_before = sum(1 for c in adapter.calls if c[0] == "place_limit")
+
+            for _ in range(15):
+                svc._maybe_confirm_step0(key)
+
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Flat position MUST NOT promote Step0 even after many ticks")
+            self.assertEqual(adapter.place_market_calls, place_market_before,
+                             "No Step0 resubmission across many ticks")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "set_shared_tp"),
+                tp_before, "No TP placed")
+            self.assertEqual(
+                sum(1 for c in adapter.calls if c[0] == "place_limit"),
+                ladder_before, "No Step1 placed")
 
 
 if __name__ == "__main__":

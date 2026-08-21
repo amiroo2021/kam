@@ -11,8 +11,11 @@ string ``clientOrderId`` matching ``[A-Za-z0-9_-]{1,64}``. The adapter
 converts with :func:`encode_gf_client_order_id` (decimal representation of
 the integer) at this venue boundary only. ``/trade`` is unchanged.
 
-Ondo exchange order ids are decimal strings; they round-trip through the
-engine's ``Optional[int]`` slot via :func:`_oid_to_int` / :func:`_oid_to_str`.
+Ondo exchange order ids are alphanumeric strings (32-char base32-ish ids
+such as ``EDGPTJP3FMDFIMSCPF4W4G5XRH4G6EFV``). They are stored opaquely as
+the venue's native string form — the engine never inspects them as numbers
+and never coerces them with ``int(...)``. Cancels look them up via
+:func:`_oid_to_str` and pass the string straight through to the venue.
 
 Cancellation
 ============
@@ -292,9 +295,22 @@ class OndoPerpsGoldenFiboAdapter:
         if not _is_success(resp):
             raise RuntimeError(f"place_market failed: {payload}")
         order = payload.get("order") or {}
+        # Ondo's orderId is an alphanumeric string. Pass it through opaquely
+        # to the engine; do NOT coerce it via ``int(...)`` (would raise and
+        # silently null out the exchange identity).
+        eoid_raw = order.get("exchange_order_id")
+        if eoid_raw is None or eoid_raw == "":
+            eoid_out: Optional[Any] = None
+        elif isinstance(eoid_raw, bool):
+            eoid_out = None
+        elif isinstance(eoid_raw, int):
+            eoid_out = int(eoid_raw)
+        else:
+            text = str(eoid_raw).strip()
+            eoid_out = text or None
         return {
             "client_order_id": int(client_order_id),
-            "exchange_order_id": _oid_to_int(order.get("exchange_order_id")),
+            "exchange_order_id": eoid_out,
             "submitted_price": order.get("submitted_price"),
             "submitted_volume": order.get("submitted_volume"),
             "status": str(order.get("status") or "filled"),
@@ -330,7 +346,17 @@ class OndoPerpsGoldenFiboAdapter:
         resp = _get_ondo_agent().execute(req)
         payload = _get_payload(resp)
         order = payload.get("order") or {}
-        eoid = _oid_to_int(order.get("exchange_order_id"))
+        # Alphanumeric exchange_order_id tolerance — see place_market.
+        eoid_raw = order.get("exchange_order_id")
+        if eoid_raw is None or eoid_raw == "":
+            eoid: Optional[Any] = None
+        elif isinstance(eoid_raw, bool):
+            eoid = None
+        elif isinstance(eoid_raw, int):
+            eoid = int(eoid_raw)
+        else:
+            text = str(eoid_raw).strip()
+            eoid = text or None
         if not _is_success(resp) and eoid is None:
             raise RuntimeError(f"place_limit failed: {payload}")
 
@@ -387,9 +413,20 @@ class OndoPerpsGoldenFiboAdapter:
         if not _is_success(resp):
             raise RuntimeError(f"set_shared_tp failed: {payload}")
         action = payload.get("position_action") or {}
+        # Alphanumeric exchange_order_id tolerance — see place_market.
+        eoid_raw = action.get("exchange_order_id")
+        if eoid_raw is None or eoid_raw == "":
+            tp_eoid: Optional[Any] = None
+        elif isinstance(eoid_raw, bool):
+            tp_eoid = None
+        elif isinstance(eoid_raw, int):
+            tp_eoid = int(eoid_raw)
+        else:
+            text = str(eoid_raw).strip()
+            tp_eoid = text or None
         return {
             "client_order_id": int(client_order_id),
-            "exchange_order_id": _oid_to_int(action.get("exchange_order_id")),
+            "exchange_order_id": tp_eoid,
             "submitted_price": action.get("price") or str(price),
             "submitted_volume": action.get("current_size") or str(size),
             "status": action.get("status") or "submitted",
@@ -398,15 +435,18 @@ class OndoPerpsGoldenFiboAdapter:
             "raw": payload,
         }
 
-    def cancel_order(self, *, account: str, order_index: int) -> bool:
+    def cancel_order(self, *, account: str, order_index: Any) -> bool:
+        # Ondo's orderId is an alphanumeric string; accept it opaquely.
         oid = _oid_to_str(order_index)
         if oid is None:
             return False
+        # ``order_index`` is forwarded to the agent so the URL path segment
+        # is built from the native string form (not coerced through int).
         resp = _get_ondo_agent().execute({
             "operation": "cancel_order",
             "account": account,
             "order_id": oid,
-            "order_index": int(order_index),
+            "order_index": order_index,
         })
         if _is_success(resp):
             return True
@@ -434,6 +474,17 @@ class OndoPerpsGoldenFiboAdapter:
         success = _is_success(resp)
         verified = bool(action.get("verified")) if isinstance(action, dict) else False
         status = action.get("status") if isinstance(action, dict) else None
+        # Alphanumeric exchange_order_id tolerance — see place_market.
+        close_eoid_raw = action.get("exchange_order_id") if isinstance(action, dict) else None
+        if close_eoid_raw is None or close_eoid_raw == "":
+            close_eoid: Optional[Any] = None
+        elif isinstance(close_eoid_raw, bool):
+            close_eoid = None
+        elif isinstance(close_eoid_raw, int):
+            close_eoid = int(close_eoid_raw)
+        else:
+            text = str(close_eoid_raw).strip()
+            close_eoid = text or None
         return {
             "success": success,
             "verified": verified,
@@ -442,6 +493,6 @@ class OndoPerpsGoldenFiboAdapter:
             "message": action.get("message") if isinstance(action, dict) else None,
             "error": getattr(getattr(resp, "error", None), "code", None),
             "client_order_id": client_order_id,
-            "exchange_order_id": _oid_to_int(action.get("exchange_order_id") if isinstance(action, dict) else None),
+            "exchange_order_id": close_eoid,
             "raw": payload,
         }
