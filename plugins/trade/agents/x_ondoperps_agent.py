@@ -647,7 +647,31 @@ def _signed_request(
                 body=error_body or str(exc.reason),
             ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Ondo Perps API unreachable: {exc.reason}") from exc
+            # Distinguish DNS / TLS / connection-refused / timeout by
+            # looking at the URLError reason type. These are
+            # TRANSPORT_ERROR outcomes: the POST was not acknowledged.
+            reason = getattr(exc, "reason", None)
+            reason_cls = type(reason).__name__ if reason is not None else ""
+            raise OndoSubmitFailure(
+                outcome=OndoSubmitOutcome.TRANSPORT_ERROR,
+                message=(
+                    f"Ondo Perps API unreachable on {path_with_query}: "
+                    f"{reason_cls}: {reason}"
+                ),
+                safe_response=f"{reason_cls}: {reason}"[:500],
+            ) from exc
+        except (TimeoutError, ConnectionError) as exc:
+            raise OndoSubmitFailure(
+                outcome=OndoSubmitOutcome.TRANSPORT_ERROR,
+                message=f"Ondo Perps API timeout/connection error on {path_with_query}: {exc}",
+                safe_response=str(exc)[:500],
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise OndoSubmitFailure(
+                outcome=OndoSubmitOutcome.TRANSPORT_ERROR,
+                message=f"Ondo Perps API transport error on {path_with_query}: {type(exc).__name__}: {exc}",
+                safe_response=f"{type(exc).__name__}: {exc}"[:500],
+            ) from exc
     return _parse_response(raw_text, path=path_with_query)
 
 
@@ -659,27 +683,90 @@ class OndoHTTPError(RuntimeError):
         super().__init__(f"HTTP {status} on {path}: {body[:200]}")
 
 
+class OndoSubmitOutcome:
+    """Structured outcome of a new_order submit attempt.
+
+    The engine uses these to distinguish a conclusive venue rejection
+    (do not retry automatically) from a transient transport / index-lag
+    failure (persist identity, freeze, reconcile later).
+    """
+    NOT_ACKNOWLEDGED = "SUBMIT_NOT_ACKNOWLEDGED"
+    ACKNOWLEDGED_VERIFY_UNKNOWN = "SUBMIT_ACKNOWLEDGED_VERIFY_UNKNOWN"
+    REJECTED = "SUBMIT_REJECTED"
+    RATE_LIMITED = "RATE_LIMITED"
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
+
+
+class OndoSubmitFailure(RuntimeError):
+    """Raised by _new_order when the submit outcome is known with certainty.
+
+    Carries the structured outcome code, safe metadata, and (when
+    available) the orderId/clientOrderId from a successful POST so the
+    caller can persist identity and recover later.
+    """
+    def __init__(
+        self,
+        outcome: str,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        error_code: Optional[str] = None,
+        order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        safe_response: Optional[str] = None,
+    ):
+        self.outcome = outcome
+        self.status = status
+        self.error_code = error_code
+        self.order_id = order_id
+        self.client_order_id = client_order_id
+        self.safe_response = safe_response
+        super().__init__(message)
+
+
 def _parse_response(raw_text: str, *, path: str) -> Any:
     """Parse an Ondo Perps response body.
 
     Ondo wraps successful payloads in ``{"success": true, "result": …}``
     (per the integration guide's ``parseResponse`` helper). Failures are
     ``{"success": false, "error": …, "error_code": …}`` and surface as a
-    runtime error carrying both the human message and the semantic
-    error_code so the wizard can show codes like ``auth_missing`` or
-    ``signature_mismatch`` verbatim.
+    typed :class:`OndoSubmitFailure` carrying both the outcome code and
+    safe metadata so callers can distinguish venue rejections from
+    transport / malformed-response errors.
     """
+    safe_raw = _redact(raw_text or "")
+    stripped = (raw_text or "").strip()
+    if not stripped:
+        raise OndoSubmitFailure(
+            outcome=OndoSubmitOutcome.MALFORMED_RESPONSE,
+            message=f"Ondo Perps returned empty body on {path}",
+            safe_response="<empty body>",
+        )
     try:
-        payload = json.loads(raw_text)
+        payload = json.loads(stripped)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Ondo Perps returned invalid JSON on {path}") from exc
+        raise OndoSubmitFailure(
+            outcome=OndoSubmitOutcome.MALFORMED_RESPONSE,
+            message=f"Ondo Perps returned invalid JSON on {path}: {exc.msg}",
+            safe_response=safe_raw[:500],
+        )
     if isinstance(payload, dict) and "success" in payload:
         if not payload.get("success"):
             error_code = str(payload.get("error_code") or "").strip()
             error_message = str(payload.get("error") or "").strip() or "Unknown error"
             if error_code:
-                raise RuntimeError(f"{error_code}: {error_message}")
-            raise RuntimeError(error_message)
+                raise OndoSubmitFailure(
+                    outcome=OndoSubmitOutcome.REJECTED,
+                    message=f"{error_code}: {error_message}",
+                    error_code=error_code or None,
+                    safe_response=safe_raw[:500],
+                )
+            raise OndoSubmitFailure(
+                outcome=OndoSubmitOutcome.REJECTED,
+                message=error_message,
+                safe_response=safe_raw[:500],
+            )
         return payload.get("result")
     # If the server returned a bare object/array (some endpoints), accept
     # it verbatim rather than failing.
@@ -1873,6 +1960,33 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
 
     try:
         response = _signed_post(credentials, _PATH_PERPS_ORDERS, body)
+    except OndoSubmitFailure as exc:
+        # Typed submit-path failure (transport, malformed, rejection).
+        code_map = {
+            OndoSubmitOutcome.TRANSPORT_ERROR: "ORDER_SUBMISSION_FAILED",
+            OndoSubmitOutcome.MALFORMED_RESPONSE: "MALFORMED_RESPONSE",
+            OndoSubmitOutcome.REJECTED: exc.error_code or "ORDER_REJECTED",
+        }
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code=code_map.get(exc.outcome, "ORDER_SUBMISSION_FAILED"),
+            message=_redact(sanitize_error_message(
+                f"{exc.outcome}: {exc.message}"
+            )),
+            order=CanonicalOrderResult(
+                symbol=requested_symbol,
+                side=requested_side,
+                order_type=order_type,
+                requested_volume=_decimal_text(requested_volume),
+                requested_price=_decimal_text(requested_price) if requested_price is not None else None,
+                submitted_volume=_decimal_text(submitted_volume),
+                submitted_price=_decimal_text(submitted_price) if submitted_price is not None else None,
+                verified=False,
+                status="failed",
+            ),
+        )
     except OndoHTTPError as exc:
         return _map_http_error_to_failure(exc, operation="new_order", account=account)
     except Exception as exc:  # noqa: BLE001
@@ -1895,13 +2009,21 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             ),
         )
 
-    if not isinstance(response, dict):
+    if response is None or response == {} or not isinstance(response, dict):
+        # POST appeared to succeed but the body is empty / a bare None.
+        # This is NOT a conclusive rejection and NOT a transport error:
+        # we did receive a response. Classify it as malformed so the
+        # caller can persist identity and freeze for manual review.
         return make_failure(
             operation="new_order",
             exchange=name,
             account=account,
             code="MALFORMED_RESPONSE",
-            message="Ondo Perps order response was not an object.",
+            message=(
+                f"Ondo Perps POST {order_type} {requested_side} "
+                f"{requested_volume}@{requested_price} returned empty/malformed "
+                f"body (transport acknowledged but body unparseable)"
+            ),
             order=CanonicalOrderResult(
                 symbol=requested_symbol,
                 side=requested_side,
@@ -1911,7 +2033,7 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 submitted_volume=_decimal_text(submitted_volume),
                 submitted_price=_decimal_text(submitted_price) if submitted_price is not None else None,
                 verified=False,
-                status="failed",
+                status="submitted",
             ),
         )
 
