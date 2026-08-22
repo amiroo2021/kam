@@ -435,8 +435,11 @@ class TestExactLiveStep1Transition(unittest.TestCase):
         submits_before = len(adapter.submit_log)
         cancels_before = len(adapter.cancel_log)
         result = eng.reconcile_needs_recovery_pending_fill([])
-        # Stays in needs_recovery (unchanged), no mutations.
-        self.assertEqual(result.state.status, "needs_recovery")
+        # With the ACTIVE-pending recovery fix, the reconciler clears the
+        # stale freeze and returns to running when the pending is confirmed
+        # OPEN. No new orders are submitted.
+        self.assertEqual(result.state.status, "running")
+        self.assertIsNone(result.state.freeze_reason)
         self.assertEqual(len(adapter.submit_log), submits_before)
         self.assertEqual(len(adapter.cancel_log), cancels_before)
 

@@ -1093,6 +1093,39 @@ class GoldenFiboEngine:
             return TickResult(state=self.state, actions=actions)
         pending_state = self._read_pending_order_state()
         pending_taxonomy = str(pending_state.get("taxonomy") or "")
+        if pending_taxonomy == "ACTIVE":
+            # The pending order is confirmed OPEN on the venue. The
+            # original submit succeeded; the freeze was from the
+            # immediate verification window. Clear the stale freeze
+            # and return to RUNNING so the engine can wait for the
+            # fill normally.
+            self.state.status = STATUS_RUNNING
+            self.state.freeze_reason = None
+            self.state.submission_phase = SUBMISSION_CONFIRMED
+            # Backfill the exchange orderId from the lookup.
+            backfilled_oid = pending_state.get("exchange_order_id")
+            if backfilled_oid is not None and backfilled_oid != "":
+                self.state.pending_order_exchange_id = backfilled_oid
+            # Backfill confirmed price/size from the lookup.
+            if self.state.pending_confirmed_price is None:
+                ap = pending_state.get("limit_price") or pending_state.get("price")
+                if ap is not None:
+                    try:
+                        self.state.pending_confirmed_price = Decimal(str(ap))
+                    except Exception:
+                        pass
+            if self.state.pending_confirmed_size is None:
+                rs = pending_state.get("requested_size") or pending_state.get("size")
+                if rs is not None:
+                    try:
+                        self.state.pending_confirmed_size = Decimal(str(rs))
+                    except Exception:
+                        pass
+            actions.append(
+                f"reconcile_needs_recovery: pending order confirmed OPEN; "
+                f"cleared stale freeze, backfilled oid={backfilled_oid}"
+            )
+            return TickResult(state=self.state, actions=actions)
         if pending_taxonomy != "FILLED":
             return TickResult(state=self.state, actions=actions)
 
