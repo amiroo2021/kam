@@ -1306,6 +1306,21 @@ class GoldenFiboEngine:
         # paused-completed state until the operator clears the gate.
         pause_cycle_restart = bool(getattr(self.state, "pause_cycle_restart", False))
         if pause_cycle_restart:
+            # Clear the pending identity so the tick path does not see
+            # the cancelled order as an unexpected terminal state.
+            self.state.pending_order_role = None
+            self.state.pending_order_client_id = None
+            self.state.pending_order_exchange_id = None
+            self.state.pending_requested_price = None
+            self.state.pending_requested_size = None
+            self.state.pending_confirmed_price = None
+            self.state.pending_confirmed_size = None
+            self.state.current_tp_client_id = None
+            self.state.current_tp_order_id = None
+            self.state.current_tp_role = None
+            self.state.current_tp_price = None
+            self.state.current_tp_size = None
+            self.state.tp_exit_attempts = 0
             actions.append(
                 "pause_cycle_restart=True; NOT starting new cycle. "
                 "Operator must clear pause_cycle_restart to continue."
