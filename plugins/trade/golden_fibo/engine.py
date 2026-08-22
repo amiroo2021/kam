@@ -1206,6 +1206,64 @@ class GoldenFiboEngine:
         actions.append("reconcile_needs_recovery: status -> RUNNING")
         return result
 
+    def _cancel_pending_ladder_for_cycle_end(self, actions: List[str]) -> bool:
+        """Cancel any remaining pending ladder order owned by the
+        completed cycle. Returns True if cleanup succeeded (or no
+        pending ladder exists), False if cancellation failed.
+
+        Uses the persisted pending identity (client_id preferred,
+        exchange_order_id as fallback). For Ondo, resolves the
+        exchange orderId from the client-id lookup before cancelling.
+        """
+        cid = self.state.pending_order_client_id
+        if cid is None:
+            # No pending ladder to cancel.
+            return True
+
+        # Resolve the exchange orderId from the client-id lookup
+        # (Ondo's alphanumeric ids are not persisted in
+        # pending_order_exchange_id).
+        oid = self.state.pending_order_exchange_id
+        if oid is None:
+            try:
+                st = self.adapter.get_order_state_by_client_id(
+                    self.config.account, self.config.instrument, int(cid)
+                )
+                oid = st.get("exchange_order_id")
+            except Exception as exc:
+                actions.append(
+                    f"cycle-end cleanup: client-id lookup failed for cid={cid}: {exc}"
+                )
+                return False
+
+        if oid is None:
+            actions.append(
+                f"cycle-end cleanup: no exchange orderId found for cid={cid}; "
+                f"order may already be terminal"
+            )
+            return True
+
+        # Cancel the exact owned order.
+        try:
+            canceled = self.adapter.cancel_order(
+                account=self.config.account,
+                order_index=oid,
+            )
+        except Exception as exc:
+            actions.append(
+                f"cycle-end cleanup: cancel_order failed for oid={oid}: {exc}"
+            )
+            return False
+
+        if not canceled:
+            actions.append(
+                f"cycle-end cleanup: cancel_order returned False for oid={oid}"
+            )
+            return False
+
+        actions.append(f"cycle-end cleanup: canceled pending ladder oid={oid} cid={cid}")
+        return True
+
     def _handle_cycle_end(self, actions: List[str]) -> TickResult:
         # Already flat and no pending — start fresh cycle, unless Smooth Shutdown.
         if self._is_smooth_shutdown():
@@ -1225,6 +1283,23 @@ class GoldenFiboEngine:
             self.state.submission_phase = SUBMISSION_NOT_SUBMITTED
             self.state.submission_client_id = None
             self.state.submission_exchange_order_id = None
+
+        # Cycle-end cleanup: cancel any remaining pending ladder order
+        # owned by the completed cycle BEFORE starting the next Step0.
+        # A new GoldenFibo cycle MUST NEVER submit its new Step0 while
+        # a still-live ladder order from the completed cycle remains on
+        # the venue.
+        #
+        # The engine only tracks one pending ladder at a time
+        # (pending_order_client_id). When the cycle ends, that pending
+        # order may still be live on the venue. Cancel it first.
+        cleanup_ok = self._cancel_pending_ladder_for_cycle_end(actions)
+        if not cleanup_ok:
+            return self._freeze(
+                "cycle-end ladder cleanup failed; refusing to start new cycle. "
+                "Reconcile exchange state."
+            )
+
         # Operator-controlled cycle-restart gate. When True, the engine
         # completes the current cycle but does NOT start a new Step0.
         # Used for staged live validations. The registration stays in a

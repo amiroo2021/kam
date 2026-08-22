@@ -3470,5 +3470,208 @@ class OndoPositionScopedTpExitTests(unittest.TestCase):
             self.assertEqual(res["error"], "NOT_FOUND")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Cycle-end ladder cleanup (incident 2026-08-22 wave 7)
+# ---------------------------------------------------------------------------
+
+
+class OndoCycleEndCleanupTests(unittest.TestCase):
+    """Tests A-L for the cycle-end ladder cleanup fix."""
+
+    def test_A_tp_exit_cancels_pending_ladder(self):
+        """A. TP exit + one OPEN current-cycle ladder.
+        Cancel ladder, verify cancellation, then new cycle may start."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Step1 is OPEN on the venue.
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0", "filledCost": "0", "status": "ACTIVE",
+                "taxonomy": "ACTIVE", "requested_size": "0.001", "filled_size": "0",
+                "symbol": "ETH",
+            }
+            # Position is flat (TP fired).
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Cycle completed after TP exit + ladder cleanup")
+            self.assertEqual(state.next_step, 0)
+            self.assertEqual(len(adapter.cancel_calls), 1,
+                             "Pending ladder was cancelled")
+            self.assertEqual(adapter.cancel_calls[0], "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4")
+
+    def test_D_pending_exchange_id_none_uses_client_id(self):
+        """D. TP exit + pending exchange id None + client id present.
+        Resolve/cancel using client-id path."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Ensure pending_order_exchange_id is None (Ondo alphanumeric).
+            svc._states[key].pending_order_exchange_id = None
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0", "filledCost": "0", "status": "ACTIVE",
+                "taxonomy": "ACTIVE", "requested_size": "0.001", "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1)
+            self.assertEqual(len(adapter.cancel_calls), 1)
+            # The cancel used the resolved exchange_order_id from client-id lookup.
+            self.assertEqual(adapter.cancel_calls[0], "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4")
+
+    def test_E_alphanumeric_orderId_preserved_in_cancel(self):
+        """E. Alphanumeric Ondo exchange orderId is preserved in cancel."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0", "filledCost": "0", "status": "ACTIVE",
+                "taxonomy": "ACTIVE", "requested_size": "0.001", "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            self.assertEqual(adapter.cancel_calls[0], "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4")
+            self.assertIsInstance(adapter.cancel_calls[0], str)
+
+    def test_J_no_pending_ladder_at_tp_exit_normal_restart(self):
+        """J. No pending ladder at TP exit. Normal cycle restart."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Clear the pending identity — no pending ladder.
+            svc._states[key].pending_order_client_id = None
+            svc._states[key].pending_order_role = None
+            svc._states[key].pending_order_exchange_id = None
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            self.assertEqual(state.highest_filled_step, -1,
+                             "Cycle completed without pending ladder cleanup")
+            self.assertEqual(len(adapter.cancel_calls), 0,
+                             "No cancellation when no pending ladder")
+
+    def test_K_position_not_flat_no_cleanup(self):
+        """K. Position not actually flat. No cleanup completion / no new cycle."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Position still exposed.
+            adapter.position = {"symbol": "ETH", "side": "long", "size": "0.002", "entry_price": "2520.45"}
+            svc._drive_one(key)
+            state = svc._states[key]
+            # The engine promotes Step1 because the position delta matches
+            # (Step1 filled on the venue). The cycle does NOT end because
+            # the position is still exposed.
+            self.assertEqual(state.highest_filled_step, 1,
+                             "Step1 promoted when position delta matches")
+            self.assertEqual(state.status, "running")
+            self.assertEqual(len(adapter.cancel_calls), 0,
+                             "No cancellation while position still exposed")
+
+    def test_L_pause_cycle_restart_still_cancels_ladder(self):
+        """L. pause_cycle_restart=True still cancels the stale current-cycle
+        ladder but blocks the new Step0."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _build_svc_for_step0(
+                Path(tmp) / "state.json",
+                Path(tmp) / "ledger.jsonl",
+                Path(tmp) / "events.log",
+            )
+            key = "ondoperps/bitget/ETH/BUY"
+            adapter = _OndoLadderStepAdapter()
+            svc._adapters[key] = adapter
+            _seed_step1_running_state(svc, key)
+            # Seed with Step1 already promoted (hfs=1) and pending ladder.
+            svc._states[key].highest_filled_step = 1
+            svc._states[key].expected_cumulative_size = Decimal("0.002")
+            svc._states[key].fill_prices = {0: Decimal("2522.5"), 1: Decimal("2518.4")}
+            svc._states[key].pause_cycle_restart = True
+            adapter.pending_lookup = {
+                "exchange_order_id": "R4K5EQNOSH2AEGZTQRGABEC77XJPU2O4",
+                "client_order_id": 82755773369376,
+                "side": "buy", "price": "2518.4", "market": "ETH-USD.P",
+                "filledSize": "0", "filledCost": "0", "status": "ACTIVE",
+                "taxonomy": "ACTIVE", "requested_size": "0.001", "filled_size": "0",
+                "symbol": "ETH",
+            }
+            adapter.position = {"symbol": "ETH", "side": None, "size": "0", "entry_price": None}
+            svc._drive_one(key)
+            state = svc._states[key]
+            # The cycle ends (position flat). With pause_cycle_restart=True,
+            # the engine cancels the pending ladder but does NOT start a new cycle.
+            # The state stays paused (highest_filled_step stays at 1) until
+            # the operator clears pause_cycle_restart.
+            self.assertEqual(state.highest_filled_step, 1,
+                             "Cycle paused: highest_filled_step stays at 1")
+            self.assertEqual(state.next_step, 1,
+                             "Cycle paused: next_step stays at 1")
+            self.assertEqual(len(adapter.cancel_calls), 1,
+                             "Pending ladder was cancelled even with pause_cycle_restart=True")
+            self.assertEqual(len(adapter.place_limit_calls), 0,
+                             "No new Step0 placed when pause_cycle_restart=True")
+
+
 if __name__ == "__main__":
     unittest.main()
