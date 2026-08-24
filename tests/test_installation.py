@@ -277,7 +277,6 @@ class TestFreshInstall(FixtureCase):
         # payload landed
         for rel in (
             "wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml",
-            "fibo_service.py", "fibo_wizard.py", "fibo_daemon.py",
         ):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
 
@@ -356,7 +355,7 @@ class TestFreshInstall(FixtureCase):
         for entry in manifest["copied_files"]:
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
-        self.assertEqual(len(patched), 7, patched)
+        self.assertEqual(len(patched), 4, patched)
         seams = {p["seam"] for p in patched}
         self.assertEqual(
             seams,
@@ -364,9 +363,6 @@ class TestFreshInstall(FixtureCase):
                 "callback dispatch",
                 "wizard text interception",
                 "slash command dispatch",
-                "fibo callback dispatch",
-                "fibo text interception",
-                "fibo slash command dispatch",
                 "inline keyboard helper",
             },
         )
@@ -381,19 +377,6 @@ class TestFreshInstall(FixtureCase):
         self.assertEqual(len(backups), 1, backups)
         # backup is the PRE-patch content
         self.assertNotIn("handle_trade_command", backups[0].read_text())
-
-    def test_fibo_service_unit_and_runtime_layout_installed(self):
-        run_installer(self.hermes)
-        unit = self.hermes.parent / "systemd" / "fibo.service"
-        self.assertTrue(unit.is_file(), unit)
-        text = unit.read_text(encoding="utf-8")
-        self.assertIn("-m plugins.trade.fibo_daemon", text)
-        self.assertIn("service.sock", text)
-        self.assertIn("service_state.json", text)
-        runtime_dir = Path("/root/.hermes/fibo")
-        # synthetic fixture runs with host-default HERMES_HOME; verify installer records the intended runtime dir
-        manifest = K.read_manifest(K.installed_manifest_path(self.hermes))
-        self.assertEqual(manifest["fibo_service_unit"]["runtime_dir"], str(runtime_dir))
 
     def test_state_layout_is_manifest_plus_backups_subdir(self):
         run_installer(self.hermes)
@@ -424,19 +407,21 @@ class TestFreshInstall(FixtureCase):
 
 
 class TestSystemdUnitIsolation(FixtureCase):
-    def test_installer_rejects_tmp_fixture_paths_for_real_systemd_dir(self):
+    def test_installer_does_not_install_fibo_service_unit(self):
+        """The /fibo capability is no longer shipped. The installer must NOT
+        write a fibo.service unit even when systemd_dir is the real /etc/systemd/system.
+        """
         real_unit = Path("/etc/systemd/system/fibo.service")
-        before = K.sha256_file(real_unit) if real_unit.is_file() else None
+        before_exists = real_unit.is_file()
         proc = subprocess.run(
             [PY, str(INSTALLER / "install_trade.py"),
              "--hermes-root", str(self.hermes), "--skip-deps", "--no-restart"],
             capture_output=True, text=True,
         )
-        self.assertNotEqual(proc.returncode, 0)
-        combined = proc.stdout + proc.stderr
-        self.assertIn("suspicious temporary/test paths", combined)
-        after = K.sha256_file(real_unit) if real_unit.is_file() else None
-        self.assertEqual(after, before)
+        # installer should succeed (it doesn't install fibo)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # and must not have created the unit
+        self.assertFalse(real_unit.is_file() and not before_exists)
 
 
 # ---------------------------------------------------------------------------

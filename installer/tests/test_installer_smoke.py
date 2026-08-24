@@ -14,21 +14,17 @@ The fix enforces:
 Each test uses a fresh isolated root pair. The driver captures
 stdout/stderr and asserts on the final filesystem layout.
 
-Matrix (A–F matches the user's gate requirements; G–H are new):
+Matrix (A matches the user's gate requirements; B–J are new):
   A. fresh --trade
-  B. fresh --fibo
-  C. fresh --trade --fibo
-  D. additive: --trade then --fibo; --fibo then --trade
-  E. partial uninstall: --trade from both; --fibo from both
-  F. legacy .kam-trade/ migration
-  G. --help: zero mutations, exit 0
-  H. unknown flag: exit 2, zero mutations
-  I. --dry-run: zero mutations, prints plan
-  J. explicit --hermes-root routes files to that root
-  K. hermes-root + isolated hermes-home go to two separate trees
-  L. uninstall uses the same explicit hermes-root
-  M. verify uses the same explicit hermes-root
-  N. additive installs with explicit root are idempotent
+  B. legacy .kam-trade/ migration
+  C. --help: zero mutations, exit 0
+  D. unknown flag: exit 2, zero mutations
+  E. --dry-run: zero mutations, prints plan
+  F. explicit --hermes-root routes files to that root
+  G. hermes-root + isolated hermes-home go to two separate trees
+  H. uninstall uses the same explicit hermes-root
+  I. verify uses the same explicit hermes-root
+  J. additive installs with explicit root are idempotent
 """
 
 from __future__ import annotations
@@ -41,7 +37,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -70,17 +66,6 @@ SHARED_FILES = [
 SHARED_PATHS = [f"agents/{n}" for n in SHARED_AGENT_NAMES] + SHARED_FILES
 
 TRADE_ONLY_PATHS = ["wizard.py"]
-FIBO_ONLY_PATHS = [
-    "fibo_service.py",
-    "fibo_daemon.py",
-    "fibo_wizard.py",
-    "golden_fibo/__init__.py",
-    "golden_fibo/config.py",
-    "golden_fibo/engine.py",
-    "golden_fibo/lighter_adapter.py",
-    "golden_fibo/preflight.py",
-    "golden_fibo/state.py",
-]
 
 
 def _run_script(
@@ -115,9 +100,9 @@ def _run_script(
 def _make_fresh_root_pair() -> Tuple[Path, Path, Path]:
     """Return (tmpdir, hermes_root, hermes_home) for a fresh isolated run.
 
-    Plants a pristine Telegram adapter (no /trade or /fibo seams) so the
-    modular installer can apply capability-aware dispatch wiring the same
-    way it must on a genuine fresh Hermes install (Lodo contract).
+    Plants a pristine Telegram adapter (no /trade seams) so the modular
+    installer can apply capability-aware dispatch wiring the same way it
+    must on a genuine fresh Hermes install (Lodo contract).
     """
     tmp = Path(tempfile.mkdtemp(prefix="kam-smoke-"))
     hermes_root = tmp / "hermes_root"
@@ -199,15 +184,11 @@ class TestATradeOnly(_FreshRoot):
         self.assertEqual(rc, 0, f"install --trade failed: {out}\n{err}")
         m = _load_manifest(self.hermes_home)
         self.assertTrue(m["capabilities"]["trade"])
-        self.assertFalse(m["capabilities"]["fibo"])
         self.assertTrue((self.hermes_home / "trade").is_dir())
-        self.assertFalse((self.hermes_home / "fibo").is_dir())
         paths = _installed_plugin_paths(self.hermes_root)
         for sp in SHARED_PATHS:
             self.assertIn(sp, paths, f"missing shared path {sp}")
         self.assertIn("wizard.py", paths)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertNotIn(fp, paths, f"trade-only should NOT contain {fp}")
         for n in SHARED_AGENT_NAMES:
             matches = [p for p in paths if p.endswith(f"agents/{n}")]
             self.assertEqual(len(matches), 1, f"duplicate shared agent {n}")
@@ -223,157 +204,14 @@ class TestATradeOnly(_FreshRoot):
 
 
 # ============================================================================
-# Test B — FIBO ONLY
+# Test B — LEGACY MIGRATION
 # ============================================================================
-class TestBFiboOnly(_FreshRoot):
-    def test_B_fibo_only(self):
-        rc, out, err = _run_script(INSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0, f"install --fibo failed: {out}\n{err}")
-        m = _load_manifest(self.hermes_home)
-        self.assertFalse(m["capabilities"]["trade"])
-        self.assertTrue(m["capabilities"]["fibo"])
-        self.assertTrue((self.hermes_home / "fibo").is_dir())
-        self.assertFalse((self.hermes_home / "trade").is_dir())
-        paths = _installed_plugin_paths(self.hermes_root)
-        for sp in SHARED_PATHS:
-            self.assertIn(sp, paths, f"missing shared path {sp}")
-        for fp in FIBO_ONLY_PATHS:
-            self.assertIn(fp, paths, f"missing fibo path {fp}")
-        self.assertNotIn("wizard.py", paths, "fibo-only should NOT contain wizard.py")
-        self.assertEqual(_registered_commands(self.hermes_home), ["fibo"])
-        rc, _, _ = _run_script(VERIFY_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        rc, _, _ = _run_script(UNINSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        self.assertFalse((self.hermes_home / "fibo").is_dir())
-        self.assertFalse((self.hermes_home / "kam").is_dir())
-
-
-# ============================================================================
-# Test C — BOTH
-# ============================================================================
-class TestCBoth(_FreshRoot):
-    def test_C_both(self):
-        rc, out, err = _run_script(INSTALL_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0, f"install both failed: {out}\n{err}")
-        m = _load_manifest(self.hermes_home)
-        self.assertTrue(m["capabilities"]["trade"])
-        self.assertTrue(m["capabilities"]["fibo"])
-        self.assertTrue((self.hermes_home / "trade").is_dir())
-        self.assertTrue((self.hermes_home / "fibo").is_dir())
-        paths = _installed_plugin_paths(self.hermes_root)
-        for sp in SHARED_PATHS:
-            self.assertIn(sp, paths)
-        self.assertIn("wizard.py", paths)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertIn(fp, paths)
-        for n in SHARED_AGENT_NAMES:
-            matches = [p for p in paths if p.endswith(f"agents/{n}")]
-            self.assertEqual(len(matches), 1, f"duplicate shared agent {n}")
-        self.assertEqual(sorted(_registered_commands(self.hermes_home)), ["fibo", "trade"])
-        rc, _, _ = _run_script(VERIFY_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-
-
-# ============================================================================
-# Test D — ADDITIVE
-# ============================================================================
-class TestDAdditive(unittest.TestCase):
+class TestBLegacyMigration(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp, self.hermes_root, self.hermes_home = _make_fresh_root_pair()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def test_D_trade_then_fibo(self):
-        rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        self.assertEqual(_registered_commands(self.hermes_home), ["trade"])
-        paths_after_trade = _installed_plugin_paths(self.hermes_root)
-        rc, _, _ = _run_script(INSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        paths_after_both = _installed_plugin_paths(self.hermes_root)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertNotIn(fp, paths_after_trade)
-            self.assertIn(fp, paths_after_both)
-        self.assertIn("wizard.py", paths_after_trade)
-        self.assertIn("wizard.py", paths_after_both)
-        rc, _, _ = _run_script(VERIFY_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sorted(_registered_commands(self.hermes_home)), ["fibo", "trade"])
-
-    def test_D_fibo_then_trade(self):
-        rc, _, _ = _run_script(INSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        self.assertEqual(_registered_commands(self.hermes_home), ["fibo"])
-        paths_after_fibo = _installed_plugin_paths(self.hermes_root)
-        rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        paths_after_both = _installed_plugin_paths(self.hermes_root)
-        self.assertNotIn("wizard.py", paths_after_fibo)
-        self.assertIn("wizard.py", paths_after_both)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertIn(fp, paths_after_fibo)
-            self.assertIn(fp, paths_after_both)
-        rc, _, _ = _run_script(VERIFY_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        self.assertEqual(sorted(_registered_commands(self.hermes_home)), ["fibo", "trade"])
-
-
-# ============================================================================
-# Test E — PARTIAL UNINSTALL
-# ============================================================================
-class TestEPartialUninstall(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp, self.hermes_root, self.hermes_home = _make_fresh_root_pair()
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-
-    def test_E_uninstall_trade_keeps_fibo(self):
-        rc, _, _ = _run_script(INSTALL_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        rc, _, _ = _run_script(UNINSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        m = _load_manifest(self.hermes_home)
-        self.assertFalse(m["capabilities"]["trade"])
-        self.assertTrue(m["capabilities"]["fibo"])
-        self.assertFalse((self.hermes_home / "trade").is_dir())
-        self.assertTrue((self.hermes_home / "fibo").is_dir())
-        self.assertTrue((self.hermes_home / "kam").is_dir())
-        paths = _installed_plugin_paths(self.hermes_root)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertIn(fp, paths)
-        self.assertNotIn("wizard.py", paths)
-        for sp in SHARED_PATHS:
-            self.assertIn(sp, paths)
-        self.assertEqual(_registered_commands(self.hermes_home), ["fibo"])
-
-    def test_E_uninstall_fibo_keeps_trade(self):
-        rc, _, _ = _run_script(INSTALL_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        rc, _, _ = _run_script(UNINSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        m = _load_manifest(self.hermes_home)
-        self.assertTrue(m["capabilities"]["trade"])
-        self.assertFalse(m["capabilities"]["fibo"])
-        self.assertTrue((self.hermes_home / "trade").is_dir())
-        self.assertFalse((self.hermes_home / "fibo").is_dir())
-        self.assertTrue((self.hermes_home / "kam").is_dir())
-        paths = _installed_plugin_paths(self.hermes_root)
-        self.assertIn("wizard.py", paths)
-        for fp in FIBO_ONLY_PATHS:
-            self.assertNotIn(fp, paths)
-        for sp in SHARED_PATHS:
-            self.assertIn(sp, paths)
-        self.assertEqual(_registered_commands(self.hermes_home), ["trade"])
-
-
-# ============================================================================
-# Test F — LEGACY MIGRATION
-# ============================================================================
-class TestFLegacyMigration(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp, self.hermes_root, self.hermes_home = _make_fresh_root_pair()
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-
-    def test_F_legacy_kam_trade_migrated_safely(self):
+    def test_B_legacy_kam_trade_migrated_safely(self):
         legacy_dir = self.hermes_home / ".kam-trade"
         legacy_dir.mkdir(parents=True)
         legacy_manifest = {
@@ -395,15 +233,13 @@ class TestFLegacyMigration(unittest.TestCase):
         m = _load_manifest(self.hermes_home)
         self.assertNotIn("api_key", json.dumps(m).lower())
         self.assertNotIn("secret", json.dumps(m).lower())
-        self.assertFalse(m["capabilities"]["fibo"])
-        self.assertFalse((self.hermes_home / "fibo").is_dir())
 
 
 # ============================================================================
-# Test G — --help: zero mutations, exit 0
+# Test C — --help: zero mutations, exit 0
 # ============================================================================
-class TestGHelp(_FreshRoot):
-    def test_G_help_zero_mutation(self):
+class TestCHelp(_FreshRoot):
+    def test_C_help_zero_mutation(self):
         # Pre-state: nothing installed.
         paths_before = _installed_plugin_paths(self.hermes_root)
         rc, out, err = _run_script(INSTALL_SH, ["--help"], self.hermes_root, self.hermes_home)
@@ -421,10 +257,10 @@ class TestGHelp(_FreshRoot):
 
 
 # ============================================================================
-# Test H — unknown flag: exit 2, zero mutations
+# Test D — unknown flag: exit 2, zero mutations
 # ============================================================================
-class TestHUnknownFlag(_FreshRoot):
-    def test_H_unknown_flag_exits_2_zero_mutation(self):
+class TestDUnknownFlag(_FreshRoot):
+    def test_D_unknown_flag_exits_2_zero_mutation(self):
         paths_before = _installed_plugin_paths(self.hermes_root)
         rc, out, err = _run_script(INSTALL_SH, ["--garbage"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 2, f"install --garbage should exit 2: {out}\n{err}")
@@ -439,12 +275,12 @@ class TestHUnknownFlag(_FreshRoot):
 
 
 # ============================================================================
-# Test I — --dry-run: zero mutations, prints plan
+# Test E — --dry-run: zero mutations, prints plan
 # ============================================================================
-class TestIDryRun(_FreshRoot):
-    def test_I_dry_run_zero_mutation(self):
+class TestEDryRun(_FreshRoot):
+    def test_E_dry_run_zero_mutation(self):
         paths_before = _installed_plugin_paths(self.hermes_root)
-        rc, out, err = _run_script(INSTALL_SH, ["--trade", "--fibo", "--dry-run"], self.hermes_root, self.hermes_home)
+        rc, out, err = _run_script(INSTALL_SH, ["--trade", "--dry-run"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0, f"install --dry-run should exit 0: {out}\n{err}")
         self.assertIn("DRY", out.upper())
         # No files installed.
@@ -454,13 +290,12 @@ class TestIDryRun(_FreshRoot):
         self.assertFalse((self.hermes_home / "kam").is_dir())
         # No capability folders.
         self.assertFalse((self.hermes_home / "trade").is_dir())
-        self.assertFalse((self.hermes_home / "fibo").is_dir())
 
 
 # ============================================================================
-# Test J — explicit --hermes-root routes to that root
+# Test F — explicit --hermes-root routes to that root
 # ============================================================================
-class TestJExplicitHermesRoot(unittest.TestCase):
+class TestFExplicitHermesRoot(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp, self.hermes_root, self.hermes_home = _make_fresh_root_pair()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -469,7 +304,7 @@ class TestJExplicitHermesRoot(unittest.TestCase):
         self.other_root.mkdir(parents=True, exist_ok=True)
         (self.other_root / "plugins").mkdir(exist_ok=True)
 
-    def test_J_explicit_hermes_root(self):
+    def test_F_explicit_hermes_root(self):
         rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
         # Files exist under the explicit hermes_root.
@@ -482,10 +317,10 @@ class TestJExplicitHermesRoot(unittest.TestCase):
 
 
 # ============================================================================
-# Test K — explicit hermes-root + isolated hermes-home go to two trees
+# Test G — explicit hermes-root + isolated hermes-home go to two trees
 # ============================================================================
-class TestKTwoTrees(_FreshRoot):
-    def test_K_two_trees(self):
+class TestGTwoTrees(_FreshRoot):
+    def test_G_two_trees(self):
         rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
         # Code under hermes_root.
@@ -500,10 +335,10 @@ class TestKTwoTrees(_FreshRoot):
 
 
 # ============================================================================
-# Test L — uninstall uses the same explicit hermes-root
+# Test H — uninstall uses the same explicit hermes-root
 # ============================================================================
-class TestLUninstallRoot(_FreshRoot):
-    def test_L_uninstall_explicit_root(self):
+class TestHUninstallRoot(_FreshRoot):
+    def test_H_uninstall_explicit_root(self):
         rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
         rc, _, _ = _run_script(UNINSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
@@ -515,10 +350,10 @@ class TestLUninstallRoot(_FreshRoot):
 
 
 # ============================================================================
-# Test M — verify uses the same explicit hermes-root
+# Test I — verify uses the same explicit hermes-root
 # ============================================================================
-class TestMVerifyRoot(_FreshRoot):
-    def test_M_verify_explicit_root(self):
+class TestIVerifyRoot(_FreshRoot):
+    def test_I_verify_explicit_root(self):
         rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
         rc, _, _ = _run_script(VERIFY_SH, ["--trade"], self.hermes_root, self.hermes_home)
@@ -526,28 +361,20 @@ class TestMVerifyRoot(_FreshRoot):
 
 
 # ============================================================================
-# Test N — additive installs with explicit root are idempotent
+# Test J — additive installs with explicit root are idempotent
 # ============================================================================
-class TestNIdempotentExplicit(_FreshRoot):
-    def test_N_additive_idempotent(self):
-        # Install --trade, then --fibo, then --trade --fibo.
-        # Each subsequent run must be idempotent (no new files, no errors).
+class TestJIdempotentExplicit(_FreshRoot):
+    def test_J_additive_idempotent(self):
+        # Install --trade twice. The second run must be idempotent
+        # (no new files, no errors, byte-identical tree).
         rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
-        paths_after_trade = sorted(_installed_plugin_paths(self.hermes_root))
-        rc, _, _ = _run_script(INSTALL_SH, ["--fibo"], self.hermes_root, self.hermes_home)
+        paths_after_first = sorted(_installed_plugin_paths(self.hermes_root))
+        rc, _, _ = _run_script(INSTALL_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)
-        paths_after_fibo = sorted(_installed_plugin_paths(self.hermes_root))
-        rc, _, _ = _run_script(INSTALL_SH, ["--trade", "--fibo"], self.hermes_root, self.hermes_home)
-        self.assertEqual(rc, 0)
-        paths_after_both = sorted(_installed_plugin_paths(self.hermes_root))
-        # --trade --fibo install should be a no-op (every file already present
-        # and byte-identical), so the file set is identical to the previous
-        # state.
-        self.assertEqual(paths_after_both, paths_after_fibo)
-        # The set should contain both trade and fibo paths.
-        self.assertIn("wizard.py", paths_after_both)
-        self.assertIn("fibo_service.py", paths_after_both)
+        paths_after_second = sorted(_installed_plugin_paths(self.hermes_root))
+        self.assertEqual(paths_after_second, paths_after_first)
+        self.assertIn("wizard.py", paths_after_second)
 
 
 if __name__ == "__main__":

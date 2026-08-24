@@ -3,13 +3,6 @@
 Installs ONLY the /trade capability:
   - ``plugins/trade/wizard.py`` (/trade wizard)
 
-Does NOT install:
-  - fibo files (golden_fibo/, fibo_service.py, fibo_daemon.py, fibo_wizard.py)
-  - fibo.service
-  - fibo runtime state (~/.hermes/fibo/)
-
-Does NOT touch fibo.service or fibo files even if they exist (Decision 3).
-
 Takes EXPLICIT ``hermes_root`` (the installed app tree) and
 ``hermes_home`` (the persistent state). The two are independent.
 """

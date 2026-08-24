@@ -2,8 +2,8 @@
 
 The modular installer historically copied plugin payload files and wrote
 ``install_state.json`` but never applied the Telegram adapter dispatch
-seams. On a fresh Hermes tree that left ``/trade`` and ``/fibo`` as
-unknown commands even though the feature modules were present.
+seams. On a fresh Hermes tree that left ``/trade`` as an unknown
+command even though the feature modules were present.
 
 This module is the single place that:
 
@@ -29,7 +29,6 @@ import kamlib as K  # noqa: E402
 import kamconfig as C  # noqa: E402
 from patchspecs import (  # noqa: E402
     TELEGRAM_ADAPTER,
-    fibo_adapter_specs,
     helper_specs,
     specs_for_capabilities,
     trade_adapter_specs,
@@ -61,7 +60,7 @@ def apply_adapter_wiring(
 
     Idempotent: re-running leaves already-installed KAM markers untouched.
     """
-    caps = [c for c in ("trade", "fibo") if c in {str(x).lower() for x in capabilities}]
+    caps = [c for c in ("trade",) if c in {str(x).lower() for x in capabilities}]
     record: Dict[str, Any] = {
         "capabilities": caps,
         "dry_run": dry_run,
@@ -70,7 +69,7 @@ def apply_adapter_wiring(
         "ok": True,
     }
     if not caps:
-        record["detail"] = "no trade/fibo capabilities requested"
+        record["detail"] = "no trade capability requested"
         return record
 
     specs = specs_for_capabilities(caps, hermes_root)
@@ -149,9 +148,9 @@ def apply_adapter_wiring(
             tmp.replace(target)
 
     # Plugin API registration requires plugins.enabled to include "trade"
-    # (the package name). Both /trade and /fibo handlers live in that package.
+    # (the package name). The /trade handler lives in that package.
     # Also raise Telegram BotCommand menu capacity so published slash menus
-    # include /trade and /fibo (dispatch alone is not enough).
+    # include /trade (dispatch alone is not enough).
     try:
         config_path = C.find_config(hermes_home)
         if config_path is None:
@@ -197,7 +196,7 @@ def remove_adapter_wiring(
 ) -> Dict[str, Any]:
     """Remove adapter seams for capabilities being uninstalled.
 
-    Shared helper is removed only when neither trade nor fibo remains.
+    Shared helper is removed only when no trade capability remains.
     """
     removing = {str(c).lower() for c in capabilities}
     remaining = {str(c).lower() for c in remaining_capabilities}
@@ -212,9 +211,7 @@ def remove_adapter_wiring(
     specs: List = []
     if "trade" in removing:
         specs.extend(trade_adapter_specs())
-    if "fibo" in removing:
-        specs.extend(fibo_adapter_specs())
-    if not (remaining & {"trade", "fibo"}):
+    if not (remaining & {"trade"}):
         # Last capability gone — drop helper too.
         specs.extend(helper_specs(hermes_root))
 
@@ -262,18 +259,12 @@ def remove_adapter_wiring(
     return record
 
 
-# Sentinels that MUST appear in the installed adapter for each capability.
+# Sentinels that MUST appear in the installed adapter for the /trade capability.
 TRADE_ADAPTER_SENTINELS = {
     "command": "from plugins.trade.wizard import handle_trade_command",
     "callback": "from plugins.trade.wizard import handle_trade_callback",
     "text": "from plugins.trade.wizard import handle_trade_text",
     "namespace": 'data.startswith("trade:")',
-}
-FIBO_ADAPTER_SENTINELS = {
-    "command": "from plugins.trade.fibo_wizard import handle_fibo_command",
-    "callback": "from plugins.trade.fibo_wizard import handle_fibo_callback",
-    "text": "from plugins.trade.fibo_wizard import handle_fibo_text",
-    "namespace": 'data.startswith("fibo:")',
 }
 
 
@@ -313,13 +304,6 @@ def verify_adapter_wiring(
             else:
                 ok = False
                 messages.append(f"[FAIL] trade {kind} seam missing: {needle}")
-    if "fibo" in caps:
-        for kind, needle in FIBO_ADAPTER_SENTINELS.items():
-            if needle in text:
-                messages.append(f"[ok] fibo {kind} seam present")
-            else:
-                ok = False
-                messages.append(f"[FAIL] fibo {kind} seam missing: {needle}")
     return ok, messages
 
 
@@ -327,12 +311,11 @@ def assert_capability_seams(
     text: str,
     *,
     trade: Optional[bool] = None,
-    fibo: Optional[bool] = None,
 ) -> List[str]:
     """Return list of assertion failures for presence/absence expectations.
 
     ``trade=True`` requires trade seams; ``trade=False`` requires them absent;
-    ``trade=None`` skips the check. Same for ``fibo``.
+    ``trade=None`` skips the check.
     """
     failures: List[str] = []
 
@@ -346,8 +329,6 @@ def assert_capability_seams(
 
     if trade is not None:
         _req("trade", TRADE_ADAPTER_SENTINELS, trade)
-    if fibo is not None:
-        _req("fibo", FIBO_ADAPTER_SENTINELS, fibo)
     return failures
 
 
@@ -360,8 +341,8 @@ def verify_command_menu_publication(
     caps = {str(c).lower() for c in capabilities}
     messages: List[str] = []
     ok = True
-    if not (caps & {"trade", "fibo"}):
-        return True, ["[ok] no trade/fibo caps; menu publication N/A"]
+    if not (caps & {"trade"}):
+        return True, ["[ok] no trade cap; menu publication N/A"]
 
     config_path = C.find_config(hermes_home)
     if config_path is None:
@@ -389,7 +370,7 @@ def verify_command_menu_publication(
         ok = False
         messages.append(
             f"[FAIL] platforms.telegram.extra.command_menu.max_commands={max_cmds} "
-            f"< {minimum}; /trade and/or /fibo may be trimmed from BotCommand menu"
+            f"< {minimum}; /trade may be trimmed from BotCommand menu"
         )
     else:
         messages.append(
@@ -400,7 +381,6 @@ def verify_command_menu_publication(
 
 __all__ = [
     "TRADE_ADAPTER_SENTINELS",
-    "FIBO_ADAPTER_SENTINELS",
     "apply_adapter_wiring",
     "remove_adapter_wiring",
     "verify_adapter_wiring",

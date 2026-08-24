@@ -48,7 +48,7 @@ SHARED_REL_PATHS = [
     # REQUIRED for Hermes PluginManager discovery. Without plugin.yaml the
     # package may import and adapter seams may dispatch, but discover_plugins()
     # never loads `trade` → get_plugin_commands() stays empty → Telegram
-    # setMyCommands never publishes /trade or /fibo (Lodo 2026-08-19).
+    # setMyCommands never publishes /trade (Lodo 2026-08-19).
     Path("plugins") / "trade" / "plugin.yaml",
     Path("plugins") / "trade" / "agents" / "__init__.py",
     Path("plugins") / "trade" / "agents" / "x_apex_agent.py",

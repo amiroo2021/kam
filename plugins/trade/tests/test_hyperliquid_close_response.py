@@ -126,7 +126,7 @@ class ClosePositionResponseRegressionTests(TestPositionManagementWrites):
         response = hl.execute({
             "operation": "close_position",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "HYPE",
         })
         return response, exchange

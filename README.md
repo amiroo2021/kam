@@ -1,9 +1,8 @@
-# KAM — `/trade` + `/fibo` add-on for Hermes
+# KAM — `/trade` add-on for Hermes
 
-KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
+KAM is an installable `/trade` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
 
 - `/trade`: the Telegram trading console wizard backed by a pluggable set of exchange agents
-- `/fibo`: the Telegram Fibo control wizard backed by a persistent multi-registration `fibo.service`
 
 **There is no enable flag.** If the add-on is installed, `/trade` is enabled. If you remove it, `/trade` is gone.
 
@@ -32,7 +31,7 @@ sudo ./install.sh --hermes-root /path/to/hermes
 
 If Hermes is in a standard location you may omit `--hermes-root` and let it auto-detect. If several installations are found, the installer stops and asks you to choose one explicitly.
 
-After installation and a gateway restart, send `/trade` or `/fibo` in Telegram. `fibo.service` is installed from the repository, enabled on a normal install, and owns all Fibo registrations independently of Telegram session lifetime.
+After installation and a gateway restart, send `/trade` in Telegram.
 
 ### Options
 
@@ -92,8 +91,8 @@ Removes only add-on-owned files and only the marked KAM blocks from shared Herme
 
 There is no `TRADE_ENABLED` flag, and none is supported.
 
-- Add-on installed → `/trade` and `/fibo` enabled
-- Add-on removed → `/trade` and `/fibo` disabled
+- Add-on installed → `/trade` enabled
+- Add-on removed → `/trade` disabled
 
 An exchange appears in the wizard when its agent file is present. An *account* appears when its credentials are present in your existing Hermes environment.
 

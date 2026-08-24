@@ -12,21 +12,18 @@ Schema::
       "kam_version": "1.0.0",
       "last_install_at": "2026-08-18T...",
       "capabilities": {
-        "trade": true,
-        "fibo": false
+        "trade": true
       },
       "by_capability": {
-        "trade": {...},
-        "fibo":  {...}
+        "trade": {...}
       },
       "shared": {...}
     }
 
 The manifest is the authoritative source of "what is installed on this
-server". Each capability owns exactly one folder under ``~/.hermes/``:
+server". The /trade capability owns exactly one folder under ``~/.hermes/``:
 
-    ~/.hermes/trade/    -- TRADE_ONLY state
-    ~/.hermes/fibo/     -- FIBO_ONLY state
+    ~/.hermes/trade/    -- /trade runtime/state
 
 The folder is the owned runtime/state namespace; the manifest is the
 authoritative installation status. Verifiers must check both for
@@ -54,7 +51,6 @@ KAM_VERSION = "2.0.0"
 # Capability identifier -> owned state folder under ~/.hermes/.
 KNOWN_CAPABILITIES: Dict[str, str] = {
     "trade": "trade",
-    "fibo": "fibo",
 }
 
 
@@ -170,8 +166,8 @@ def _empty_manifest() -> Dict[str, Any]:
         "installer_version": INSTALLER_VERSION,
         "kam_version": KAM_VERSION,
         "last_install_at": None,
-        "capabilities": {"trade": False, "fibo": False},
-        "by_capability": {"trade": {}, "fibo": {}},
+        "capabilities": {"trade": False},
+        "by_capability": {"trade": {}},
         "shared": {},
     }
 
@@ -268,13 +264,13 @@ def capability_folder_consistent(hermes_home: Path, capability: str) -> Tuple[bo
 # CLI flag parsing helpers
 # ---------------------------------------------------------------------------
 
-CAPABILITY_FLAGS = ("--trade", "--fibo")
+CAPABILITY_FLAGS = ("--trade",)
 
 
 def parse_capability_flags(argv: List[str]) -> Tuple[List[str], List[str]]:
     """Split argv into (capabilities, rest).
 
-    Recognized flags: ``--trade``, ``--fibo``. Each may appear at most once.
+    Recognized flags: ``--trade``. Each may appear at most once.
 
     Returns:
         (capabilities, rest)
@@ -287,7 +283,7 @@ def parse_capability_flags(argv: List[str]) -> Tuple[List[str], List[str]]:
     seen = set()
     caps: List[str] = []
     rest: List[str] = []
-    flag_to_cap = {"--trade": "trade", "--fibo": "fibo"}
+    flag_to_cap = {"--trade": "trade"}
     for arg in argv:
         if arg in flag_to_cap:
             cap = flag_to_cap[arg]

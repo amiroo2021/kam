@@ -83,7 +83,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
             seen["lookup_path"] = path
             return {
                 "orderId": "124",
-                "clientOrderId": "FIBO_amiroo_ONDO_CB_A7K9_Y1_C1",
+                "clientOrderId": "TRADE_amiroo_ONDO_CB_A7K9_Y1_C1",
                 "market": "ONDO-USD.P",
                 "side": "buy",
                 "type": "market",
@@ -100,7 +100,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
                 "order_type": "market",
                 "volume": "1",
                 "reduce_only": False,
-                "client_order_id": "FIBO_amiroo_ONDO_CB_A7K9_Y1_C1",
+                "client_order_id": "TRADE_amiroo_ONDO_CB_A7K9_Y1_C1",
             })
 
         self.assertTrue(response.success)
@@ -109,9 +109,9 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
             "side": "buy",
             "type": "market",
             "size": "1",
-            "clientOrderId": "FIBO_amiroo_ONDO_CB_A7K9_Y1_C1",
+            "clientOrderId": "TRADE_amiroo_ONDO_CB_A7K9_Y1_C1",
         })
-        self.assertEqual(seen["lookup_path"], "/v1/perps/orders/client:FIBO_amiroo_ONDO_CB_A7K9_Y1_C1")
+        self.assertEqual(seen["lookup_path"], "/v1/perps/orders/client:TRADE_amiroo_ONDO_CB_A7K9_Y1_C1")
         self.assertNotIn("timeInForce", seen["body"])
         self.assertNotIn("price", seen["body"])
         self.assertNotIn("reduceOnly", seen["body"])
@@ -129,7 +129,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
             seen["lookup_path"] = path
             return {
                 "orderId": "125",
-                "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
                 "market": "ONDO-USD.P",
                 "side": "sell",
                 "type": "market",
@@ -146,7 +146,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
                 "order_type": "market",
                 "volume": "1",
                 "reduce_only": False,
-                "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
 
         self.assertTrue(response.success)
@@ -155,9 +155,9 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
             "side": "sell",
             "type": "market",
             "size": "1",
-            "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+            "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
         })
-        self.assertEqual(seen["lookup_path"], "/v1/perps/orders/client:FIBO_amiroo_ONDO_CS_A7K9_Y1_C1")
+        self.assertEqual(seen["lookup_path"], "/v1/perps/orders/client:TRADE_amiroo_ONDO_CS_A7K9_Y1_C1")
         self.assertNotIn("timeInForce", seen["body"])
         self.assertNotIn("price", seen["body"])
         self.assertNotIn("reduceOnly", seen["body"])
@@ -167,13 +167,13 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
         with mock.patch.object(ondo, "_signed_post", return_value={"orderId": "125", "size": "1"}), \
              mock.patch.object(ondo, "_signed_get", return_value={
-                 "orderId": "125", "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                 "orderId": "125", "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
                  "market": "BTC-USD.P", "side": "sell", "type": "market",
                  "size": "1", "filledSize": "1", "status": "fullyfilled",
              }):
             response = ondo._new_order("amiroo", {
                 "symbol": "ONDO", "side": "sell", "order_type": "market",
-                "volume": "1", "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "volume": "1", "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "VERIFICATION_FAILED")
@@ -183,13 +183,13 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
         with mock.patch.object(ondo, "_signed_post", return_value={"orderId": "125", "size": "1"}), \
              mock.patch.object(ondo, "_signed_get", return_value={
-                 "orderId": "125", "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                 "orderId": "125", "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
                  "market": "ONDO-USD.P", "side": "buy", "type": "market",
                  "size": "1", "filledSize": "1", "status": "fullyfilled",
              }):
             response = ondo._new_order("amiroo", {
                 "symbol": "ONDO", "side": "sell", "order_type": "market",
-                "volume": "1", "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "volume": "1", "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "VERIFICATION_FAILED")
@@ -199,13 +199,13 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
         with mock.patch.object(ondo, "_signed_post", return_value={"orderId": "125", "size": "1"}), \
              mock.patch.object(ondo, "_signed_get", return_value={
-                 "orderId": "125", "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                 "orderId": "125", "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
                  "market": "ONDO-USD.P", "side": "sell", "type": "market",
                  "size": "2", "filledSize": "2", "status": "fullyfilled",
              }):
             response = ondo._new_order("amiroo", {
                 "symbol": "ONDO", "side": "sell", "order_type": "market",
-                "volume": "1", "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "volume": "1", "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "VERIFICATION_FAILED")
@@ -215,7 +215,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
         with mock.patch.object(ondo, "_signed_get", return_value={
             "orderId": "555",
-            "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+            "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             "market": "ONDO-USD.P",
             "side": "sell",
             "type": "market",
@@ -230,7 +230,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
                 "symbol": "ONDO",
                 "side": "sell",
                 "volume": "1",
-                "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
         self.assertTrue(response.success)
         self.assertEqual(response.order.exchange_order_id, 555)
@@ -241,7 +241,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
         with mock.patch.object(ondo, "_signed_get", return_value={
             "orderId": "555",
-            "clientOrderId": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+            "clientOrderId": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             "market": "BTC-USD.P",
             "side": "sell",
             "type": "market",
@@ -256,7 +256,7 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
                 "symbol": "ONDO",
                 "side": "sell",
                 "volume": "1",
-                "client_order_id": "FIBO_amiroo_ONDO_CS_A7K9_Y1_C1",
+                "client_order_id": "TRADE_amiroo_ONDO_CS_A7K9_Y1_C1",
             })
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "ORDER_VERIFY_FAILED")
@@ -290,8 +290,8 @@ class OndoPerpsOrderBodyTests(unittest.TestCase):
 
     def test_lookup_request_format_uses_client_prefix(self):
         self.assertEqual(
-            ondo._client_order_lookup_path("FIBO_amiroo_ONDO_CS_A7K9_Y2_C3"),
-            "/v1/perps/orders/client:FIBO_amiroo_ONDO_CS_A7K9_Y2_C3",
+            ondo._client_order_lookup_path("TRADE_amiroo_ONDO_CS_A7K9_Y2_C3"),
+            "/v1/perps/orders/client:TRADE_amiroo_ONDO_CS_A7K9_Y2_C3",
         )
 
     def test_invalid_client_order_id_chars_are_rejected_before_submit(self):

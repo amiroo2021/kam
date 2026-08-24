@@ -411,13 +411,13 @@ def ensure_telegram_menu_capacity(
     dry_run: bool = False,
     minimum: int = MINIMUM_TELEGRAM_MENU_MAX,
 ) -> Dict[str, Any]:
-    """Ensure Telegram BotCommand menu capacity can hold /trade and /fibo.
+    """Ensure Telegram BotCommand menu capacity can hold /trade.
 
     Hermes defaults to 60 slots. With a full native command set, plugin
     commands at the end of the menu are trimmed from ``setMyCommands`` even
     though dispatch still works when typed. Raising
     ``platforms.telegram.extra.command_menu.max_commands`` to *minimum*
-    (default 61) is the smallest config change that publishes both.
+    (default 61) is the smallest config change that publishes it.
     """
     if yaml is None:
         raise ConfigError("PyYAML unavailable; cannot adjust Telegram menu capacity")

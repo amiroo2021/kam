@@ -71,7 +71,7 @@ class SequenceDesk:
         return ["hyperliquid"]
 
     def list_accounts(self, exchange: str) -> List[str]:
-        return ["FIBO"] if exchange == "hyperliquid" else []
+        return ["TRADE"] if exchange == "hyperliquid" else []
 
     def execute(self, request: Dict[str, Any]):
         self.requests.append(dict(request))
@@ -135,7 +135,7 @@ def _position_action_response(operation: str, symbol: str, *, price: str | None 
     return make_success(
         operation=operation,
         exchange="hyperliquid",
-        account="FIBO",
+        account="TRADE",
         position_action=CanonicalPositionActionResult(
             operation=operation,
             symbol=symbol,
@@ -156,7 +156,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         first = make_success(
             operation="positions_orders",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             open_order_count=3,
             order_groups=[
                 _group("BTC", "buy", 1, "1", "65000", "65000", "65000"),
@@ -166,7 +166,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         second = make_success(
             operation="positions_orders",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             open_order_count=1,
             order_groups=[
                 _group("SOL", "buy", 1, "1", "50", "50", "50"),
@@ -177,7 +177,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         key = ("chat",)
         wizard.open(key)
         wizard.handle_callback(key, "exchange:hyperliquid")
-        wizard.handle_callback(key, "account:FIBO")
+        wizard.handle_callback(key, "account:TRADE")
 
         screen = wizard.handle_callback(key, "action:cancel_orders")
         self.assertIn("Cancel Orders", screen.text)
@@ -191,7 +191,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "positions_orders",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
         })
 
         refreshed = wizard.handle_callback(key, "refresh")
@@ -204,7 +204,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         response = make_success(
             operation="positions_orders",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             open_order_count=0,
             order_groups=[],
         )
@@ -213,10 +213,10 @@ class TestCancelOrdersWizard(unittest.TestCase):
         key = ("chat",)
         wizard.open(key)
         wizard.handle_callback(key, "exchange:hyperliquid")
-        wizard.handle_callback(key, "account:FIBO")
+        wizard.handle_callback(key, "account:TRADE")
 
         screen = wizard.handle_callback(key, "action:cancel_orders")
-        self.assertIn("❌ Cancel Orders -- hyperliquid / FIBO", screen.text)
+        self.assertIn("❌ Cancel Orders -- hyperliquid / TRADE", screen.text)
         self.assertIn("Open orders: 0", screen.text)
         self.assertIn("No open orders.", screen.text)
         self.assertEqual(len([btn for row in screen.buttons for btn in row if btn["text"] == "↻ Refresh"]), 0)
@@ -225,7 +225,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         response = make_success(
             operation="positions_orders",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             open_order_count=2,
             order_groups=[_group("HYPE", "sell", 2, "2", "8", "7", "9")],
         )
@@ -234,7 +234,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         key = ("chat",)
         wizard.open(key)
         wizard.handle_callback(key, "exchange:hyperliquid")
-        wizard.handle_callback(key, "account:FIBO")
+        wizard.handle_callback(key, "account:TRADE")
         wizard.handle_callback(key, "action:cancel_orders")
 
         selected = wizard.handle_callback(key, "cancel_group:HYPE:sell")
@@ -252,7 +252,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "cancel_order_group",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "HYPE",
             "side": "sell",
         })
@@ -261,7 +261,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         response = make_success(
             operation="positions_orders",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             open_order_count=1,
             order_groups=[_group("HYPE", "sell", 1, "1", "8", "8", "8")],
         )
@@ -270,7 +270,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
         key = ("chat",)
         wizard.open(key)
         wizard.handle_callback(key, "exchange:hyperliquid")
-        wizard.handle_callback(key, "account:FIBO")
+        wizard.handle_callback(key, "account:TRADE")
         screen = wizard.handle_callback(key, "action:cancel_orders")
         for token in ["123456", "987654", "oid", "order id"]:
             self.assertNotIn(token, screen.text.lower())
@@ -284,14 +284,14 @@ class TestPositionsManagementWizard(unittest.TestCase):
         key = ("chat",)
         wizard.open(key)
         wizard.handle_callback(key, "exchange:hyperliquid")
-        wizard.handle_callback(key, "account:FIBO")
+        wizard.handle_callback(key, "account:TRADE")
         return wizard, key
 
     def _positions_response(self, positions):
         return make_success(
             operation="positions_management",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             positions=positions,
         )
 
@@ -304,7 +304,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         wizard, key = self._open_positions_management(desk)
 
         screen = wizard.handle_callback(key, "action:positions_management")
-        self.assertIn("💼 Positions Management — hyperliquid / FIBO", screen.text)
+        self.assertIn("💼 Positions Management — hyperliquid / TRADE", screen.text)
         self.assertIn("Current Positions", screen.text)
         self.assertIn("🔴 HYPE", screen.text)
         self.assertIn("🔵 BTC", screen.text)
@@ -318,7 +318,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "positions_management",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
         })
 
     def test_positions_management_handles_empty_state(self):
@@ -339,7 +339,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         wizard.handle_callback(key, "action:positions_management")
 
         detail = wizard.handle_callback(key, "position:HYPE:short")
-        self.assertIn("💼 HYPE Position — hyperliquid / FIBO", detail.text)
+        self.assertIn("💼 HYPE Position — hyperliquid / TRADE", detail.text)
         self.assertIn("🔴 Short", detail.text)
         self.assertIn("Size: 319.84", detail.text)
         self.assertIn("Entry: 71.075", detail.text)
@@ -386,7 +386,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "set_tp",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "HYPE",
             "price": "65",
         })
@@ -420,7 +420,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "set_tp",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "HYPE",
             "price": "0",
         })
@@ -457,7 +457,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "set_sl",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "price": "62000",
         })
@@ -491,7 +491,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "set_sl",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "price": "0",
         })
@@ -523,7 +523,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertEqual(desk.requests[-1], {
             "operation": "close_position",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "HYPE",
         })
 
@@ -583,7 +583,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (fake_exchange, "0x1111111111111111111111111111111111111111", "secret"))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_open_orders_snapshot", mock.Mock(side_effect=[pre_orders, post_orders]))
 
-        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "side": "sell"})
+        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "side": "sell"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.cancel_group)
         self.assertTrue(response.cancel_group.verified)
@@ -620,7 +620,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (fake_exchange, "0x1111111111111111111111111111111111111111", "secret"))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_open_orders_snapshot", mock.Mock(side_effect=[pre_orders, post_orders]))
 
-        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "side": "sell"})
+        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "side": "sell"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.cancel_group)
         self.assertTrue(response.cancel_group.partial)
@@ -660,7 +660,7 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_perp_market_candidates", lambda: [candidate])
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (fake_exchange, "0x1111111111111111111111111111111111111111", "secret"))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_open_orders_snapshot", mock.Mock(side_effect=[pre_orders, post_orders]))
-        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "side": "sell"})
+        response = hl.execute({"operation": "cancel_order_group", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "side": "sell"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.cancel_group)
         self.assertFalse(response.cancel_group.verified)
@@ -698,11 +698,11 @@ class TestLadderExecution(unittest.TestCase):
                 order_groups=[],
             ),
         )
-        response = hl.execute({"operation": "positions_management", "exchange": "hyperliquid", "account": "FIBO"})
+        response = hl.execute({"operation": "positions_management", "exchange": "hyperliquid", "account": "TRADE"})
         self.assertTrue(response.success)
         self.assertEqual(response.operation, "positions_management")
         self.assertEqual(response.exchange, "hyperliquid")
-        self.assertEqual(response.account, "FIBO")
+        self.assertEqual(response.account, "TRADE")
         self.assertIsNotNone(response.positions)
         self.assertEqual([(p.symbol, p.side, p.tp, p.sl) for p in response.positions], [("HYPE", "short", "65", None), ("BTC", "long", "67500", "62000")])
 
@@ -789,7 +789,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "buy",
             "distribution": "uniform",
@@ -840,7 +840,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -881,7 +881,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -905,7 +905,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -937,7 +937,7 @@ class TestLadderExecution(unittest.TestCase):
                 response = hl.execute({
                     "operation": "ladder",
                     "exchange": "hyperliquid",
-                    "account": "FIBO",
+                    "account": "TRADE",
                     "symbol": "BTC",
                     "side": scenario["side"],
                     "distribution": "half_gaussian",
@@ -961,7 +961,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -999,7 +999,7 @@ class TestLadderExecution(unittest.TestCase):
                 response = hl.execute({
                     "operation": "ladder",
                     "exchange": "hyperliquid",
-                    "account": "FIBO",
+                    "account": "TRADE",
                     "symbol": "BTC",
                     "side": "buy",
                     "distribution": "uniform",
@@ -1026,7 +1026,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -1056,7 +1056,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -1087,7 +1087,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -1116,7 +1116,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -1144,7 +1144,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1184,7 +1184,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "new_order",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "order_type": "limit",
@@ -1214,7 +1214,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "sell",
             "distribution": "uniform",
@@ -1241,7 +1241,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "buy",
             "distribution": "uniform",
@@ -1276,7 +1276,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1307,7 +1307,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1343,7 +1343,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1388,7 +1388,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1435,7 +1435,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1480,7 +1480,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1505,7 +1505,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "BTC",
             "side": "buy",
             "distribution": "uniform",
@@ -1530,7 +1530,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1566,7 +1566,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1596,7 +1596,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1623,7 +1623,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1650,7 +1650,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "uniform",
@@ -1681,7 +1681,7 @@ class TestLadderExecution(unittest.TestCase):
         response = hl.execute({
             "operation": "ladder",
             "exchange": "hyperliquid",
-            "account": "FIBO",
+            "account": "TRADE",
             "symbol": "SOL",
             "side": "sell",
             "distribution": "half_gaussian",
@@ -1758,7 +1758,7 @@ class TestNewOrderExecution(unittest.TestCase):
             {
                 "operation": "new_order",
                 "exchange": "hyperliquid",
-                "account": "FIBO",
+                "account": "TRADE",
                 "symbol": "SOL",
                 "side": "sell",
                 "order_type": "limit",
@@ -1810,7 +1810,7 @@ class TestNewOrderExecution(unittest.TestCase):
             {
                 "operation": "new_order",
                 "exchange": "hyperliquid",
-                "account": "FIBO",
+                "account": "TRADE",
                 "symbol": "GOLD",
                 "side": "buy",
                 "order_type": "limit",
@@ -1842,7 +1842,7 @@ class TestNewOrderExecution(unittest.TestCase):
             {
                 "operation": "new_order",
                 "exchange": "hyperliquid",
-                "account": "FIBO",
+                "account": "TRADE",
                 "symbol": "ABCXYZ",
                 "side": "sell",
                 "order_type": "limit",
@@ -1872,7 +1872,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         return patcher.start()
 
     def _position_response(self, positions):
-        return make_success(operation="positions_orders", exchange="hyperliquid", account="FIBO", positions=positions, open_order_count=0, order_groups=[])
+        return make_success(operation="positions_orders", exchange="hyperliquid", account="TRADE", positions=positions, open_order_count=0, order_groups=[])
 
     def _candidate(self, symbol: str = "HYPE", price_increment: str = "0.1", size_increment: str = "0.01"):
         return {
@@ -1937,7 +1937,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         post_orders = pre_orders + [{"coin": "BTC", "side": "A", "limitPx": "75000.0", "sz": "82.81931", "oid": 503559177280, "origSz": "82.81931", "reduceOnly": True}]
         self._patch_context([self._position_response(pre_positions), self._position_response(post_positions)], [pre_orders, post_orders], exchange)
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "75000"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "75000"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertTrue(response.position_action.verified)
@@ -1954,7 +1954,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         pre_orders = [{"symbol": "HYPE", "side": "sell", "oid": oid} for oid in range(488362783478, 488362783663)]
         self._patch_context([self._position_response(pre_positions), self._position_response(pre_positions)], [pre_orders, pre_orders], exchange)
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "59.25"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "59.25"})
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "POSITION_ACTION_RESPONSE_AMBIGUOUS")
         self.assertEqual(len(exchange.requests), 1)
@@ -1971,7 +1971,7 @@ class TestPositionManagementWrites(unittest.TestCase):
 
         result = hl._verify_position_protection_submission(
             "set_tp",
-            "FIBO",
+            "TRADE",
             "HYPE",
             "tp",
             Decimal("59.25"),
@@ -1993,7 +1993,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         post_orders = pre_orders + [{"coin": "HYPE", "side": "A", "limitPx": "80.0", "sz": "2.15", "oid": 78, "origSz": "2.15", "reduceOnly": True}]
         self._patch_context([self._position_response(pre_positions), self._position_response(post_positions)], [pre_orders, post_orders], exchange)
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "80"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "80"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertTrue(response.position_action.verified)
@@ -2031,7 +2031,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(pre_positions), self._position_response(post_positions)], [pre_orders, post_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "55000"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "55000"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertTrue(response.position_action.verified)
@@ -2065,7 +2065,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), mock.patch.object(hl, "_lookup_credentials", return_value=("0x1111111111111111111111111111111111111111", "secret")), \
             mock.patch.object(hl, "_discover_perp_dex_names", return_value=[""]), \
             mock.patch.object(hl, "_post_info", side_effect=[positions_raw, open_orders_raw, {}]):
-            response = hl._execute_positions_orders("FIBO", {"operation": "positions_orders", "exchange": "hyperliquid", "account": "FIBO"})
+            response = hl._execute_positions_orders("TRADE", {"operation": "positions_orders", "exchange": "hyperliquid", "account": "TRADE"})
         self.assertTrue(response.success)
         self.assertEqual(response.open_order_count, 5)
         self.assertEqual(len(response.positions), 1)
@@ -2080,7 +2080,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         response = make_success(
             operation="positions_management",
             exchange="hyperliquid",
-            account="FIBO",
+            account="TRADE",
             positions=[
                 CanonicalPosition(symbol="BTC", side="long", size="82.81931", entry_price="64491.5", pnl="+14857.95012", tp="75000", sl="55000", tp_count=1, sl_count=4),
             ],
@@ -2105,7 +2105,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "55000"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "55000"})
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "AMBIGUOUS_PROTECTION_STATE")
         self.assertEqual(len(exchange.requests), 0)
@@ -2121,7 +2121,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "56000"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "56000"})
         self.assertTrue(response.success)
         self.assertEqual(len(exchange.requests), 1)
         self.assertEqual(exchange.requests[0][0]["oid"], 503651661973)
@@ -2136,7 +2136,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [pre_orders, post_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "55000"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "55000"})
         self.assertTrue(response.success)
         self.assertEqual(len(exchange.requests), 1)
         self.assertNotIn("oid", exchange.requests[0][0])
@@ -2153,7 +2153,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "75000"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "75000"})
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "AMBIGUOUS_PROTECTION_STATE")
         self.assertEqual(len(exchange.requests), 0)
@@ -2169,7 +2169,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "76000"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "76000"})
         self.assertTrue(response.success)
         self.assertEqual(len(exchange.requests), 1)
         self.assertEqual(exchange.requests[0][0]["oid"], 503559177280)
@@ -2184,7 +2184,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
         self.patch("plugins.trade.agents.x_hyperliquid_agent._fetch_candidate_mark_price", lambda candidate: Decimal("64595"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "55000"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "55000"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.error)
         self.assertNotEqual(response.error.code, "POSITION_ACTION_RESPONSE_AMBIGUOUS")
@@ -2211,8 +2211,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         ]
         post_orders = [order for order in pre_orders if order["oid"] != btc_tp_oid]
         context_before = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions_before),
@@ -2227,7 +2227,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context_before, None), (context_after, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertTrue(response.position_action.removed)
@@ -2258,8 +2258,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         ]
         post_orders = [order for order in pre_orders if order["oid"] != btc_sl_oid]
         context_before = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions_before),
@@ -2274,7 +2274,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context_before, None), (context_after, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertTrue(response.position_action.removed)
@@ -2308,8 +2308,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         positions = [CanonicalPosition(symbol="BTC", side="long", size="82.81931", entry_price="64491.5", pnl="+14857.95012", tp="75000", sl=None)]
         open_orders = [{"symbol": "BTC", "side": "sell", "size": Decimal("82.81931"), "price": Decimal("76000.0"), "oid": 6001, "reduce_only": False, "is_trigger": False, "is_position_tpsl": False}]
         context = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions),
@@ -2323,7 +2323,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.error)
         self.assertIn(response.error.code, {"TP_REMOVAL_TARGET_NOT_FOUND", "AMBIGUOUS_PROTECTION_STATE"})
@@ -2335,8 +2335,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         positions = [CanonicalPosition(symbol="BTC", side="long", size="82.81931", entry_price="64491.5", pnl="+14857.95012", tp=None, sl=None)]
         open_orders = [{"symbol": "BTC", "side": "sell", "size": Decimal("82.81931"), "price": Decimal("76000.0"), "oid": 6001, "reduce_only": False, "is_trigger": False, "is_position_tpsl": False}]
         context = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions),
@@ -2350,7 +2350,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertFalse(response.position_action.removed)
@@ -2363,8 +2363,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         positions = [CanonicalPosition(symbol="BTC", side="long", size="82.81931", entry_price="64491.5", pnl="+14857.95012", tp=None, sl="64000")]
         open_orders = [{"symbol": "BTC", "side": "sell", "size": Decimal("82.81931"), "price": Decimal("76000.0"), "oid": 6001, "reduce_only": False, "is_trigger": False, "is_position_tpsl": False}]
         context = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions),
@@ -2378,7 +2378,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.error)
         self.assertIn(response.error.code, {"SL_REMOVAL_TARGET_NOT_FOUND", "AMBIGUOUS_PROTECTION_STATE"})
@@ -2390,8 +2390,8 @@ class TestPositionManagementWrites(unittest.TestCase):
         positions = [CanonicalPosition(symbol="BTC", side="long", size="82.81931", entry_price="64491.5", pnl="+14857.95012", tp=None, sl=None)]
         open_orders = [{"symbol": "BTC", "side": "sell", "size": Decimal("82.81931"), "price": Decimal("76000.0"), "oid": 6001, "reduce_only": False, "is_trigger": False, "is_position_tpsl": False}]
         context = {
-            "alias": "FIBO",
-            "account": "FIBO",
+            "alias": "TRADE",
+            "account": "TRADE",
             "wallet": "0x1111111111111111111111111111111111111111",
             "candidate": self._candidate("BTC"),
             "positions_response": self._position_response(positions),
@@ -2405,7 +2405,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         self.patch("plugins.trade.agents.x_hyperliquid_agent._current_position_management_context", mock.Mock(side_effect=[(context, None)]))
         self.patch("plugins.trade.agents.x_hyperliquid_agent._build_exchange_client", lambda account: (exchange, "0x1111111111111111111111111111111111111111", "secret"))
 
-        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "0"})
+        response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "BTC", "price": "0"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertFalse(response.position_action.removed)
@@ -2422,7 +2422,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         open_orders = [{"symbol": "BTC", "side": "buy", "oid": 88, "reduce_only": False, "is_position_tpsl": False, "price": "65000"}]
         self._patch_context([self._position_response(pre_positions), self._position_response(post_positions)], [open_orders, open_orders], exchange)
 
-        response = hl.execute({"operation": "close_position", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE"})
+        response = hl.execute({"operation": "close_position", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE"})
         self.assertTrue(response.success)
         self.assertIsNotNone(response.position_action)
         self.assertEqual(response.position_action.status, "success")
@@ -2436,7 +2436,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         pre_positions = [CanonicalPosition(symbol="BTC", side="long", size="1", entry_price="65000", pnl="+1", tp=None, sl=None)]
         self._patch_context([self._position_response(pre_positions)], [[{"symbol": "BTC", "side": "buy", "oid": 88, "reduce_only": False, "is_position_tpsl": False, "price": "65000"}]], exchange)
 
-        response = hl.execute({"operation": "close_position", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE"})
+        response = hl.execute({"operation": "close_position", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE"})
         self.assertFalse(response.success)
         self.assertIsNotNone(response.error)
         self.assertEqual(response.error.code, "POSITION_NOT_FOUND")
@@ -2449,12 +2449,12 @@ class TestPositionManagementWrites(unittest.TestCase):
         open_orders = []
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
 
-        tp_response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "120"})
+        tp_response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "120"})
         self.assertFalse(tp_response.success)
         self.assertEqual(tp_response.error.code, "INVALID_TP_PRICE")
         self.assertEqual(exchange.requests, [])
 
-        sl_response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "90"})
+        sl_response = hl.execute({"operation": "set_sl", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "90"})
         self.assertFalse(sl_response.success)
         self.assertEqual(sl_response.error.code, "INVALID_SL_PRICE")
         self.assertEqual(exchange.requests, [])
@@ -2466,7 +2466,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         open_orders = []
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "65"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "65"})
         self.assertFalse(response.success)
         self.assertEqual(len(exchange.requests), 1)
 
@@ -2480,7 +2480,7 @@ class TestPositionManagementWrites(unittest.TestCase):
         ]
         self._patch_context([self._position_response(positions), self._position_response(positions)], [open_orders, open_orders], exchange)
 
-        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "FIBO", "symbol": "HYPE", "price": "65"})
+        response = hl.execute({"operation": "set_tp", "exchange": "hyperliquid", "account": "TRADE", "symbol": "HYPE", "price": "65"})
         self.assertFalse(response.success)
         self.assertEqual(response.error.code, "AMBIGUOUS_PROTECTION_STATE")
         self.assertEqual(exchange.requests, [])

@@ -2983,13 +2983,13 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
         return make_failure(operation="cancel_order_group", exchange=name, account=account, code="CANCEL_FAILED", message=sanitize_error_message(str(exc)))
 
 
-# ---------------------------------------------------------------------------
-# GoldenFibo / generic single-order helpers (read + market + cancel)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Generic single-order helpers (read + market + cancel)
+# --------------------------------------------------------------------------
 def _arcus_normalize_client_id(raw: Any, *, default_prefix: str = "arcus-") -> str:
     """Normalize caller client id to Arcus clientId string.
 
-    Accepts int V2 GoldenFibo ids, numeric strings, or free-form strings.
+    Accepts int client ids, numeric strings, or free-form strings.
     When *raw* is empty, mint a unique default (legacy /trade behavior).
     """
     if raw is None:
@@ -3179,7 +3179,7 @@ def _arcus_place_market_order(
 
 
 def _arcus_normalize_open_order_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Map an Arcus openOrders row into the GoldenFibo order_state shape."""
+    """Map an Arcus openOrders row into the canonical order_state shape."""
     oid_raw = row.get("orderId") or row.get("order_id")
     oid = _coerce_order_id(oid_raw)
     side = str(row.get("side") or "").strip().lower()
@@ -3258,7 +3258,7 @@ def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
         size_increment=_decimal_text(market.get("step_size")),
         minimum_size=_decimal_text(market.get("step_size")),
     )
-    # Attach venue constraint extras for GoldenFibo adapter via order_state twin
+    # Attach venue constraint extras via order_state twin
     # (CanonicalInstrument is narrow; market_constraints carries full set.)
     return make_success(operation="resolve_instrument", exchange=name, account=account, instrument=instrument)
 
@@ -3423,8 +3423,8 @@ def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalR
                 order_state=_arcus_normalize_open_order_row(row),
             )
     # Filled market orders leave openOrders. If a live position exists for the
-    # symbol, synthesize a FILLED record using average entry as P0 so GoldenFibo
-    # Step0 confirmation can proceed without inventing a fill.
+    # symbol, synthesize a FILLED record using average entry as P0 so the
+    # Step0 confirmation path can proceed without inventing a fill.
     if symbol and identity is not None:
         try:
             acc = _public_get(credentials, "/v1/account")

@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 name = "rise"
 
-# GoldenFibo V2 client_order_id canonical format.
+# V2 client_order_id canonical format.
 # The V2 integer is 48 bits, packed as (magic | version | direction | role | cycle_uid | step | seq).
 # We accept caller-supplied IDs as decimal strings within [0, 2**48 - 1].
 RISE_V2_MAX_INT = (1 << 48) - 1
@@ -1441,7 +1441,7 @@ def _submit_rise_limit_order(
     verify_after_submit: bool = True,
     client_order_id: Optional[str] = None,
 ) -> Tuple[CanonicalResponse, Dict[str, Any], Decimal, Decimal]:
-    # Caller-supplied GoldenFibo V2 client ID; None ⇒ /trade default.
+    # Caller-supplied V2 client ID; None ⇒ /trade default.
     _submitted_client_id = (
         client_order_id if client_order_id is not None else RISE_V2_DEFAULT_ID
     )
@@ -2008,7 +2008,7 @@ def _execute_market_immediate(account: str, request: Dict[str, Any]) -> Canonica
     wallet, signer_private = wallet_signer
     expected_fill_side = "long" if requested_side == "buy" else "short"
 
-    # Phase 3: optional caller-supplied GoldenFibo V2 client_order_id.
+    # Phase 3: optional caller-supplied V2 client_order_id.
     raw_cid_mi = (
         request.get("client_order_id")
         if "client_order_id" in request
@@ -2880,7 +2880,7 @@ def _public_cancel_id_or_none(request: Dict[str, Any]) -> Optional[str]:
 def _rise_market_metadata(requested_symbol: str) -> Optional[Dict[str, Any]]:
     """Return normalized market metadata for *requested_symbol*.
 
-    Single source of truth for GoldenFibo resolve_instrument /
+    Single source of truth for resolve_instrument /
     market_constraints / market_price reads. Raises on read failure so the
     caller can map it to a canonical failure.
 
@@ -2928,7 +2928,7 @@ def _rise_market_metadata(requested_symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def _market_constraints_fields(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Normalize GoldenFibo preflight constraint fields from metadata."""
+    """Normalize preflight constraint fields from metadata."""
     if not meta:
         return {}
     market = meta.get("market") or {}
@@ -3022,7 +3022,7 @@ def _execute_market_constraints(request: Dict[str, Any]) -> CanonicalResponse:
             message=f"Instrument not found: {requested_symbol}",
         )
     fields = _market_constraints_fields(meta)
-    # GoldenFibo preflight treats missing mandatory metadata as a hard fail.
+    # Preflight treats missing mandatory metadata as a hard fail.
     # (Rise's market cache defaults absent steps to "0", so treat non-positive
     # step values as missing rather than fabricating them.)
     step_tick_d = _decimal_or_none(fields.get("price_tick"))
@@ -3315,7 +3315,7 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
     requested_tif = str(request.get("time_in_force") or "GTC").strip().upper() or "GTC"
     reduce_only = _coerce_bool(request.get("reduce_only"))
 
-    # Phase 3: optional caller-supplied GoldenFibo V2 client_order_id.
+    # Phase 3: optional caller-supplied V2 client_order_id.
     raw_cid = (
         request.get("client_order_id")
         if "client_order_id" in request
@@ -3501,8 +3501,8 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
         )
         # ALWAYS preserve the raw Rise exchange order id across every accepted
         # submit path. Even if a post-submit verifier cannot find the order in
-        # openOrders (instant fill / partial / gone), GoldenFibo still needs the
-        # raw id for pending ownership, exact cancel, and restart reconciliation.
+        # openOrders (instant fill / partial / gone), the raw id is still
+        # needed for pending ownership, exact cancel, and restart reconciliation.
         if not exchange_order_id and response_order_id:
             exchange_order_id = response_order_id
 
@@ -3511,8 +3511,8 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
         if verified:
             classification = "OPEN"
         elif reconcile_on_unverified:
-            # Gate-only: classify via position evidence so GoldenFibo always
-            # receives a usable result instead of a VERIFICATION_FAILED raise.
+            # Gate-only: classify via position evidence so the verification path
+            # always returns a usable classification instead of VERIFICATION_FAILED.
             post_position = _rise_position_snapshot(wallet, requested_symbol)
             still_active = (
                 _order_id_in_open_orders(wallet, cache, str(market_id), exchange_order_id)
@@ -3558,7 +3558,7 @@ def _execute_new_order(account: str, request: Dict[str, Any]) -> CanonicalRespon
         if verified:
             return make_success(operation="new_order", exchange=name, account=account, order=result)
         if reconcile_on_unverified and classification:
-            # GoldenFibo gated path: return a usable success even when the order
+            # Gated path: return a usable success even when the order
             # was not found in openOrders, so reconcile-from-position can proceed.
             return make_success(
                 operation="new_order",
@@ -3855,7 +3855,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
 # Phase 1 / 2 / 4 wiring:
 # Bounded-limit + IOC slip for immediate execution (market_immediate).
 # Single-order cancel-by-id (cancel_order).
-# Read-only wrappers required by GoldenFibo adapter contract.
+# Read-only wrappers required by the canonical adapter contract.
 # ---------------------------------------------------------------------------
 
 RISE_DEFAULT_IMMEDIATE_SLIP_PCT = Decimal("0.01")  # 1.00% of reference mark

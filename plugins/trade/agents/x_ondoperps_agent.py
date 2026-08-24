@@ -2605,7 +2605,7 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     )
 
 
-# --- Single-order cancel / order-state reads (GoldenFibo) --------------------
+# --- Single-order cancel / order-state reads --------------------
 
 _ORDER_ID_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -2621,7 +2621,7 @@ def _ondo_order_id_segment(value: Any) -> Optional[str]:
 
 
 def _classify_ondo_order_status(raw_status: Any) -> str:
-    """Map Ondo order status strings to GoldenFibo taxonomy.
+    """Map Ondo order status strings to the canonical taxonomy.
 
     Never returns FILLED unless Ondo itself reported a filled status.
     Absence / unknown strings map to UNKNOWN.
@@ -2655,9 +2655,9 @@ def _order_state_from_ondo_row(order: Dict[str, Any], *, exchange_order_id: Opti
     # (and aliases ``avgFillPrice`` on older snapshots). However the
     # client-id order lookup endpoint (``GET /v1/perps/orders/client:<id>``)
     # does NOT return ``averageFillPrice`` — it returns ``filledSize`` and
-    # ``filledCost`` instead. Map both sources into the canonical
-    # GoldenFibo fields at this venue boundary so the generic Step0
-    # promotion path can pick them up without per-venue branching.
+    # ``filledCost`` instead. Map both sources into the canonical fields
+    # at this venue boundary so the generic Step0 promotion path can pick
+    # them up without per-venue branching.
     avg_fill_raw = order.get("averageFillPrice") or order.get("avgFillPrice")
     filled_cost_raw = order.get("filledCost")
     return {
@@ -2697,7 +2697,7 @@ def _execute_cancel_order(account: str, request: Dict[str, Any]) -> CanonicalRes
 
     Uses ``DELETE /v1/perps/orders/{orderId}``. Never expands to a
     symbol+side group cancel. 404 / already-gone is treated as success
-    (idempotent for GoldenFibo restart/reconciliation).
+    (idempotent for restart/reconciliation).
     """
     credentials = _lookup_credentials(account)
     if not credentials:
@@ -2931,7 +2931,7 @@ def _execute_get_order_state_by_client_id(account: str, request: Dict[str, Any])
 
 
 def _execute_market_constraints(account: str, request: Dict[str, Any]) -> CanonicalResponse:
-    """Venue constraints for GoldenFibo preflight (tick/step/decimals)."""
+    """Venue constraints for preflight (tick/step/decimals)."""
     credentials = _lookup_credentials(account)
     if not credentials:
         return make_failure(
@@ -2963,7 +2963,7 @@ def _execute_market_constraints(account: str, request: Dict[str, Any]) -> Canoni
         "price_decimals": _decimals_from_increment(quote_inc),
         "min_base_amount": _decimal_text(base_inc) if base_inc is not None else None,
         # Ondo does not document a min-notional on /v1/markets; omit so
-        # GoldenFibo preflight fail-opens on quote (same as Rise).
+        # preflight fail-opens on quote (same as Rise).
     }
     return make_success(
         operation="market_constraints",
@@ -3837,18 +3837,8 @@ def _position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         tp_count=1 if tp_text else None,
         sl_count=1 if sl_text else None,
     )
-    # We surface markPrice via the instrument descriptor's price_increment?
-    # No — price_increment is the quote tick, not a live price. Instead we
-    # pack markPrice into the position's ``entry_price`` is wrong too. We
-    # carry it as a side-channel: re-attach via a hidden ``order_groups``
-    # list — but that's a misuse. The cleanest option is to expose a new
-    # canonical position field; for v1 we use the existing CanonicalPosition
-    # and let Fibo parse ``pnl`` / ``entry_price`` from the row, and
-    # additionally fetch markPrice separately via the existing
-    # ``positions_orders`` read path. For the Fibo adapter's needs, the
-    # call to ``_signed_get(_PATH_PERPS_POSITIONS)`` directly inside the
-    # OndoPerps quote source provides the markPrice. See
-    # ``plugins/trade/fibo/quote_ondoperps.py``.
+    # markPrice is not currently exposed on CanonicalPosition; callers that
+    # need it should use the positions/orders read path directly.
     return make_success(
         operation="position_state",
         exchange=name,

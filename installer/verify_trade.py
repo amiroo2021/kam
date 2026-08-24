@@ -127,7 +127,7 @@ def main(argv: List[str]) -> int:
     c.run("no invented plugin entry points", check_no_plugin_py)
 
     def check_register_registers_trade() -> str:
-        """register() must advertise /trade and /fibo via the supported plugin API."""
+        """register() must advertise /trade via the supported plugin API."""
         import json
         import os
         import tempfile
@@ -144,12 +144,12 @@ def main(argv: List[str]) -> int:
                 seen.append({"name": name, "handler": handler, "description": description})
 
         # Capability-aware register() reads ~/.hermes/kam/install_state.json.
-        # Provide a temp installed-both manifest for the dry-run-source gate.
+        # Provide a temp installed manifest for the dry-run-source gate.
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             (home / "kam").mkdir(parents=True)
             (home / "kam" / "install_state.json").write_text(
-                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                json.dumps({"capabilities": {"trade": True}})
             )
             old = os.environ.get("HERMES_HOME")
             os.environ["HERMES_HOME"] = str(home)
@@ -164,17 +164,15 @@ def main(argv: List[str]) -> int:
         names = [s["name"] for s in seen]
         if names.count("trade") != 1:
             raise AssertionError(f"expected one 'trade' registration, got {names}")
-        if names.count("fibo") != 1:
-            raise AssertionError(f"expected one 'fibo' registration, got {names}")
 
         class _Bare:
             pass
 
         mod.register(_Bare())
         mod.register(None)
-        return "registers 'trade' and 'fibo' once each; tolerates old contexts"
+        return "registers 'trade' once; tolerates old contexts"
 
-    c.run("plugin register() advertises /trade + /fibo", check_register_registers_trade)
+    c.run("plugin register() advertises /trade", check_register_registers_trade)
 
     # --- 7-8: exchange discovery -----------------------------------------
     discovered: List[str] = []
@@ -211,17 +209,14 @@ def main(argv: List[str]) -> int:
 
     # --- 9-11: Telegram integration --------------------------------------
     def check_entry_points() -> str:
-        from plugins.trade import fibo_wizard, wizard
+        from plugins.trade import wizard
 
         for fn in ("handle_trade_command", "handle_trade_callback", "handle_trade_text"):
             if not callable(getattr(wizard, fn, None)):
                 raise AssertionError(f"wizard.{fn} missing or not callable")
-        for fn in ("handle_fibo_command", "handle_fibo_callback", "handle_fibo_text"):
-            if not callable(getattr(fibo_wizard, fn, None)):
-                raise AssertionError(f"fibo_wizard.{fn} missing or not callable")
-        return "all /trade and /fibo adapter entry points present"
+        return "all /trade adapter entry points present"
 
-    c.run("/trade + /fibo entry points exist", check_entry_points)
+    c.run("/trade entry points exist", check_entry_points)
 
     def check_initial_screen_has_keyboard() -> str:
         """The first /trade screen must carry text AND a non-empty keyboard.
@@ -284,9 +279,9 @@ def main(argv: List[str]) -> int:
             ]
             if missing:
                 raise AssertionError(f"adapter seams not wired: {missing}")
-            return "all /trade and /fibo adapter seams present"
+            return "all /trade adapter seams present"
 
-        c.run("Telegram adapter dispatches /trade + /fibo", check_adapter_wired)
+        c.run("Telegram adapter dispatches /trade", check_adapter_wired)
 
         def check_no_double_registration() -> str:
             adapter = hermes_root / adapter_specs()[0].relative_path
@@ -302,7 +297,7 @@ def main(argv: List[str]) -> int:
         c.run("handlers not registered twice", check_no_double_registration)
 
         def check_command_menu() -> str:
-            """/trade and /fibo must be advertised via the plugin API, not a commands.py patch."""
+            """/trade must be advertised via the plugin API, not a commands.py patch."""
             import inspect as _inspect
             import json
             import os
@@ -329,7 +324,7 @@ def main(argv: List[str]) -> int:
                 home = Path(td)
                 (home / "kam").mkdir(parents=True)
                 (home / "kam" / "install_state.json").write_text(
-                    json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                    json.dumps({"capabilities": {"trade": True}})
                 )
                 old = os.environ.get("HERMES_HOME")
                 os.environ["HERMES_HOME"] = str(home)
@@ -344,14 +339,12 @@ def main(argv: List[str]) -> int:
             names = [r["name"] for r in recorded]
             if names.count("trade") != 1:
                 raise AssertionError(f"register() registered 'trade' {names.count('trade')}x")
-            if names.count("fibo") != 1:
-                raise AssertionError(f"register() registered 'fibo' {names.count('fibo')}x")
             missing_desc = [entry["name"] for entry in recorded if not callable(entry["handler"]) or not entry["description"].strip()]
             if missing_desc:
                 raise AssertionError(f"registered commands missing callable/description: {missing_desc}")
-            return "register_command('trade') and register_command('fibo') both present"
+            return "register_command('trade') present"
 
-        c.run("/trade + /fibo registered via plugin API exactly once", check_command_menu)
+        c.run("/trade registered via plugin API exactly once", check_command_menu)
 
         def check_register_tolerates_old_context() -> str:
             """An older Hermes whose context lacks register_command must not crash."""
@@ -480,8 +473,8 @@ def main(argv: List[str]) -> int:
 
         c.run("Hermes config enables trade exactly once", check_config_enables_trade)
 
-        def check_telegram_menu_includes_trade_and_fibo() -> str:
-            """Telegram command-menu config must leave room for both plugin commands."""
+        def check_telegram_menu_includes_trade() -> str:
+            """Telegram command-menu config must leave room for the plugin command."""
             sys.path.insert(0, str(hermes_root))
             import hermes_cli.commands as HC  # type: ignore
             import hermes_cli.plugins as HP  # type: ignore
@@ -503,7 +496,7 @@ def main(argv: List[str]) -> int:
                 max_commands = 60
             if max_commands < 61:
                 raise AssertionError(
-                    f"Telegram command menu max_commands={max_commands} leaves /fibo trimmed; expected >= 61"
+                    f"Telegram command menu max_commands={max_commands} leaves /trade trimmed; expected >= 61"
                 )
 
             recorded: Dict[str, Dict[str, Any]] = {}
@@ -525,12 +518,12 @@ def main(argv: List[str]) -> int:
             finally:
                 HP.get_plugin_commands = original
             names = [name for name, _desc in commands]
-            missing = [name for name in ("trade", "fibo") if name not in names]
+            missing = [name for name in ("trade",) if name not in names]
             if missing:
                 raise AssertionError(f"Telegram menu still missing commands: {missing} (names={names[-5:]})")
-            return f"max_commands={max_commands}; Telegram menu includes /trade and /fibo"
+            return f"max_commands={max_commands}; Telegram menu includes /trade"
 
-        c.run("Telegram menu publishes /trade and /fibo", check_telegram_menu_includes_trade_and_fibo)
+        c.run("Telegram menu publishes /trade", check_telegram_menu_includes_trade)
 
         def check_other_commands_intact() -> str:
             spec = legacy_commands_specs()[0]
@@ -541,47 +534,6 @@ def main(argv: List[str]) -> int:
             return "unrelated Hermes commands intact"
 
         c.run("existing commands preserved", check_other_commands_intact)
-
-        def check_fibo_service_unit() -> str:
-            unit = Path(args.systemd_dir) / "fibo.service"
-            if not unit.is_file():
-                raise AssertionError(f"missing fibo.service unit: {unit}")
-            text = unit.read_text(encoding="utf-8")
-            for required in (
-                "-m plugins.trade.fibo_daemon",
-                "Environment=PYTHONPATH=",
-                "Environment=HERMES_HOME=",
-                "service.sock",
-                "service_state.json",
-            ):
-                if required not in text:
-                    raise AssertionError(f"fibo.service missing required token: {required}")
-            return str(unit)
-
-        c.run("fibo.service unit installed", check_fibo_service_unit)
-
-        def check_fibo_service_empty_startup() -> str:
-            from plugins.trade import fibo_daemon
-            from plugins.trade.fibo_service import PersistentFiboService
-
-            with tempfile.TemporaryDirectory(prefix="kam-fibo-verify-") as tmp:
-                tmpdir = Path(tmp)
-                service = PersistentFiboService(
-                    state_path=tmpdir / "service_state.json",
-                    event_log_path=tmpdir / "events.jsonl",
-                    start_thread=False,
-                )
-                listed = service.execute_command({"op": "list"})
-                if not listed.get("ok"):
-                    raise AssertionError(f"list failed: {listed}")
-                if listed.get("registrations") != []:
-                    raise AssertionError(f"expected empty registration list, got {listed.get('registrations')}")
-                service.shutdown()
-                if not callable(getattr(fibo_daemon, "main", None)):
-                    raise AssertionError("plugins.trade.fibo_daemon.main missing")
-            return "service imports and starts empty; LIST returns []"
-
-        c.run("fibo service imports and starts empty", check_fibo_service_empty_startup)
 
     # --- 12: no enable flag ----------------------------------------------
     def check_no_trade_enabled() -> str:

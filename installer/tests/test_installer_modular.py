@@ -3,17 +3,16 @@
 These tests use EXPLICIT ``hermes_root`` and ``hermes_home`` arguments.
 The hermes_root is the installed application tree (plugins/trade/); the
 hermes_home is the persistent state directory (~/.hermes/kam/,
-~/.hermes/trade/, ~/.hermes/fibo/).
+~/.hermes/trade/).
 
 Matrix (test classes):
-  A. fresh --trade / --fibo / --trade --fibo
+  A. fresh --trade
   B. additive installs
-  C. partial uninstall
-  D. last-capability uninstall
-  E. capability-aware command registration
-  F. capability flag parsing
-  G. manifest schema
-  H. unknown-flag / help / dry-run
+  C. last-capability uninstall
+  D. capability-aware command registration
+  E. capability flag parsing
+  F. manifest schema
+  G. unknown-flag / help / dry-run
 """
 
 from __future__ import annotations
@@ -38,13 +37,10 @@ sys.path.insert(0, str(REPO_ROOT / "installer"))
 import capabilities as C  # noqa: E402
 import installer_shared as IS  # noqa: E402
 import install_trade_capability as IT  # noqa: E402
-import install_fibo_capability as IF  # noqa: E402
 import uninstall_trade_capability as UT  # noqa: E402
-import uninstall_fibo_capability as UF  # noqa: E402
 import uninstall_shared as US  # noqa: E402
 import verify_shared as VS  # noqa: E402
 import verify_trade_capability as VT  # noqa: E402
-import verify_fibo_capability as VF  # noqa: E402
 # Import the installer dispatcher via its module name (avoids collision
 # with the ``installer`` namespace package on sys.path).
 import importlib
@@ -76,11 +72,6 @@ def _do_install(caps: List[str], hermes_root: Path, hermes_home: Path) -> Dict[s
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 shared=shared, dry_run=False,
             )
-        elif cap == "fibo":
-            results[cap] = IF.run(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
-                shared=shared, dry_run=False,
-            )
         else:
             raise ValueError(f"unknown capability {cap!r}")
     m = C.load_manifest(hermes_home)
@@ -95,8 +86,6 @@ def _do_uninstall(caps: List[str], hermes_root: Path, hermes_home: Path) -> None
     for cap in reversed(caps):
         if cap == "trade":
             UT.run(argv=[], hermes_root=hermes_root, hermes_home=hermes_home, dry_run=False)
-        elif cap == "fibo":
-            UF.run(argv=[], hermes_root=hermes_root, hermes_home=hermes_home, dry_run=False)
     m = C.load_manifest(hermes_home)
     for cap in caps:
         C.clear_capability(m, cap)
@@ -115,8 +104,6 @@ def _do_verify(caps: List[str], hermes_root: Path, hermes_home: Path):
     for cap in caps:
         if cap == "trade":
             ok = VT.run(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
-        elif cap == "fibo":
-            ok = VF.run(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
         else:
             raise ValueError(f"unknown capability {cap!r}")
         cap_results.append(ok)
@@ -132,64 +119,10 @@ class TestFreshInstall(unittest.TestCase):
     def test_A_fresh_trade(self):
         _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         self.assertTrue(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertFalse(C.is_installed(self.env["hermes_home"], "fibo"))
         self.assertTrue((self.env["hermes_home"] / "trade").is_dir())
-        self.assertFalse((self.env["hermes_home"] / "fibo").is_dir())
         self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        # No fibo files
-        for fp in IF.FIBO_REL_PATHS:
-            self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / fp).is_file(),
-                             f"fibo file {fp} should NOT be present in trade-only")
         # Shared agents present
         self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "agents" / "x_lighter_agent.py").is_file())
-
-    # B. fresh --fibo
-    def test_B_fresh_fibo(self):
-        _do_install(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertFalse(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertFalse((self.env["hermes_home"] / "trade").is_dir())
-        self.assertTrue((self.env["hermes_home"] / "fibo").is_dir())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "golden_fibo").is_dir())
-        # Trade wizard NOT present
-        self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        # Shared tradedesk IS present
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "tradedesk.py").is_file())
-
-    # C. fresh --trade --fibo
-    def test_C_fresh_trade_and_fibo(self):
-        _do_install(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-        # No duplicates of shared agents
-        agents = list((self.env["hermes_root"] / "plugins" / "trade" / "agents").glob("x_*_agent.py"))
-        names = [a.name for a in agents]
-        self.assertEqual(len(names), len(set(names)))
-
-
-class TestAdditive(unittest.TestCase):
-    def setUp(self) -> None:
-        self.env = _fresh()
-        self.addCleanup(shutil.rmtree, self.env["tmp"], ignore_errors=True)
-
-    def test_D_trade_then_fibo(self):
-        _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
-        _do_install(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-
-    def test_E_fibo_then_trade(self):
-        _do_install(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
 
 
 class TestIdempotent(unittest.TestCase):
@@ -204,44 +137,16 @@ class TestIdempotent(unittest.TestCase):
         after = json.loads(C.install_state_path(self.env["hermes_home"]).read_text())
         self.assertEqual(before["capabilities"], after["capabilities"])
 
-    def test_G_repeated_fibo_idempotent(self):
-        _do_install(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        _do_install(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-
 
 class TestPartialUninstall(unittest.TestCase):
     def setUp(self) -> None:
         self.env = _fresh()
         self.addCleanup(shutil.rmtree, self.env["tmp"], ignore_errors=True)
 
-    def test_H_uninstall_fibo_from_both(self):
-        _do_install(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        _do_uninstall(["fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertFalse(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-        self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / "golden_fibo").is_dir())
-        self.assertTrue((self.env["hermes_home"] / "trade").is_dir())
-        self.assertFalse((self.env["hermes_home"] / "fibo").is_dir())
-
-    def test_I_uninstall_trade_from_both_preserves_fibo(self):
-        _do_install(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
+    def test_J_uninstall_last_cleans_shared(self):
+        _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         _do_uninstall(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         self.assertFalse(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertTrue(C.is_installed(self.env["hermes_home"], "fibo"))
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "fibo_service.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "golden_fibo").is_dir())
-        self.assertTrue((self.env["hermes_home"] / "fibo").is_dir())
-        self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / "wizard.py").is_file())
-        self.assertTrue((self.env["hermes_root"] / "plugins" / "trade" / "tradedesk.py").is_file())
-
-    def test_J_uninstall_last_cleans_shared(self):
-        _do_install(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        _do_uninstall(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
-        self.assertFalse(C.is_installed(self.env["hermes_home"], "trade"))
-        self.assertFalse(C.is_installed(self.env["hermes_home"], "fibo"))
         self.assertFalse((self.env["hermes_root"] / "plugins" / "trade" / "agents").is_dir())
         self.assertFalse((self.env["hermes_home"] / "kam").is_dir())
 
@@ -290,22 +195,12 @@ class TestCapabilityAwareRegistration(unittest.TestCase):
 
     def test_trade_only_registers_trade_only(self):
         mod = self._load_plugin()
-        registered = self._register_against(mod, {"trade": True, "fibo": False})
+        registered = self._register_against(mod, {"trade": True})
         self.assertEqual(registered, ["trade"])
-
-    def test_fibo_only_registers_fibo_only(self):
-        mod = self._load_plugin()
-        registered = self._register_against(mod, {"trade": False, "fibo": True})
-        self.assertEqual(registered, ["fibo"])
-
-    def test_both_registers_both(self):
-        mod = self._load_plugin()
-        registered = self._register_against(mod, {"trade": True, "fibo": True})
-        self.assertEqual(set(registered), {"trade", "fibo"})
 
     def test_no_capabilities_registers_nothing(self):
         mod = self._load_plugin()
-        registered = self._register_against(mod, {"trade": False, "fibo": False})
+        registered = self._register_against(mod, {"trade": False})
         self.assertEqual(registered, [])
 
     def test_missing_manifest_registers_nothing(self):
@@ -318,28 +213,15 @@ class TestCapabilityAwareRegistration(unittest.TestCase):
         mod.register(_FakeCtx())
         self.assertEqual(registered, [])
 
-    def test_uninstall_trade_keeps_only_fibo(self):
-        mod = self._load_plugin()
-        self._register_against(mod, {"trade": True, "fibo": True})
-        registered = self._register_against(mod, {"trade": False, "fibo": True})
-        self.assertEqual(registered, ["fibo"])
-
-    def test_uninstall_fibo_keeps_only_trade(self):
-        mod = self._load_plugin()
-        self._register_against(mod, {"trade": True, "fibo": True})
-        registered = self._register_against(mod, {"trade": True, "fibo": False})
-        self.assertEqual(registered, ["trade"])
-
 
 class TestCapabilityFlagParsing(unittest.TestCase):
     def test_no_flag_returns_trade(self):
         self.assertTrue(C.is_no_flag([]))
         self.assertFalse(C.is_no_flag(["--trade"]))
-        self.assertFalse(C.is_no_flag(["--fibo"]))
 
     def test_parse_capability_flags(self):
-        caps, rest = C.parse_capability_flags(["--trade", "--hermes-root", "/path", "--fibo"])
-        self.assertEqual(caps, ["trade", "fibo"])
+        caps, rest = C.parse_capability_flags(["--trade", "--hermes-root", "/path"])
+        self.assertEqual(caps, ["trade"])
         self.assertEqual(rest, ["--hermes-root", "/path"])
 
 
@@ -349,10 +231,10 @@ class TestManifestSchema(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.env["tmp"], ignore_errors=True)
 
     def test_manifest_schema_v1(self):
-        _do_install(["trade", "fibo"], self.env["hermes_root"], self.env["hermes_home"])
+        _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         m = C.load_manifest(self.env["hermes_home"])
         self.assertEqual(m["schema_version"], C.SCHEMA_VERSION)
-        self.assertEqual(m["capabilities"], {"trade": True, "fibo": True})
+        self.assertEqual(m["capabilities"], {"trade": True})
         self.assertIn("by_capability", m)
 
     def test_atomic_write_no_leftover(self):

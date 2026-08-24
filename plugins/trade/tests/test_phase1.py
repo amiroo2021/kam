@@ -358,7 +358,7 @@ class TestErrorSafety(unittest.TestCase):
         response = make_failure(
             operation="balance",
             exchange="hyperliquid",
-            account="fibo",
+            account="trade",
             code="BALANCE_UNAVAILABLE",
             message="Connection refused",
         )
@@ -369,7 +369,7 @@ class TestErrorSafety(unittest.TestCase):
                 "success": False,
                 "operation": "balance",
                 "exchange": "hyperliquid",
-                "account": "fibo",
+                "account": "trade",
                 "error": {
                     "code": "BALANCE_UNAVAILABLE",
                     "message": "Connection refused",
@@ -382,7 +382,7 @@ class TestErrorSafety(unittest.TestCase):
         response = make_failure(
             operation="ladder",
             exchange="hyperliquid",
-            account="fibo",
+            account="trade",
             code="EXCHANGE_REJECTED",
             message="Hyperliquid rejected the ladder.",
             exchange_reason="Insufficient margin for order placement.",
@@ -610,7 +610,7 @@ class TestHermesIntegration(unittest.TestCase):
             home = Path(td)
             (home / "kam").mkdir(parents=True)
             (home / "kam" / "install_state.json").write_text(
-                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                json.dumps({"capabilities": {"trade": True}})
             )
             old = os.environ.get("HERMES_HOME")
             os.environ["HERMES_HOME"] = str(home)

@@ -12,8 +12,8 @@ Takes EXPLICIT ``hermes_root`` and ``hermes_home``. The two are
 independent (the application tree is at hermes_root; the persistent
 state is at hermes_home).
 
-This module NEVER fails because of a missing /trade or /fibo. That is
-the job of the per-capability verifiers.
+This module NEVER fails because of a missing /trade. That is
+the job of the per-capability verifier.
 """
 
 from __future__ import annotations

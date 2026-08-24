@@ -3,11 +3,6 @@
 Removes the /trade capability:
   - removes the trade-specific plugin files from <hermes_root>/plugins/trade/
   - removes ~/.hermes/trade/ (the owned state folder)
-
-NEVER touches:
-  - fibo files
-  - ~/.hermes/fibo/
-  - fibo.service
 """
 
 from __future__ import annotations
@@ -15,7 +10,7 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -52,9 +47,7 @@ def run(
             if not dry_run:
                 dst.unlink()
     # Note: we do NOT remove plugins/trade/__init__.py because it is the
-    # plugin marker that ALSO carries the fibo slash-command registration.
-    # If fibo is still installed, /fibo must still route. Removing
-    # __init__.py would break fibo registration.
+    # plugin marker that carries the /trade slash-command registration.
     # Owned folder.
     own_dir = capability_dir(hermes_home, "trade")
     if own_dir.is_dir():

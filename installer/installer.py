@@ -4,9 +4,7 @@ This module is the entry point for ./install.sh, ./verify.sh, and
 ./uninstall.sh. It dispatches to per-capability installers based on the
 CLI flags:
 
-  --trade            install/verify/uninstall only the /trade capability
-  --fibo             install/verify/uninstall only the /fibo capability
-  --trade --fibo     install/verify/uninstall both capabilities
+  --trade            install/verify/uninstall the /trade capability
 
 No flags = TRADE ONLY (locked backward-compatibility policy, Decision 1).
 
@@ -63,7 +61,7 @@ from capabilities import (  # noqa: E402
 
 # Recognized non-capability flags. Anything outside this set is rejected.
 RECOGNIZED_FLAGS = {
-    "--trade", "--fibo",
+    "--trade",
     "--hermes-root", "--hermes-home",
     "--dry-run", "--help", "-h",
     "--systemd-dir",
@@ -120,7 +118,6 @@ def _parse_args(argv: List[str], action: str) -> argparse.Namespace:
         add_help=False,
     )
     parser.add_argument("--trade", action="store_true")
-    parser.add_argument("--fibo", action="store_true")
     parser.add_argument("--hermes-root", default=None)
     parser.add_argument("--hermes-home", default=None)
     parser.add_argument("--systemd-dir", default=None)
@@ -139,7 +136,6 @@ def _print_usage(action: str) -> None:
     print()
     print("Capabilities (at least one required for non-help invocations):")
     print("  --trade              install/verify/uninstall the /trade capability")
-    print("  --fibo               install/verify/uninstall the /fibo capability")
     print("  (no capability flag = TRADE ONLY, legacy compat)")
     print()
     print("Target paths:")
@@ -165,11 +161,8 @@ def _resolve_capabilities(args: argparse.Namespace) -> List[str]:
     caps: List[str] = []
     if args.trade:
         caps.append("trade")
-    if args.fibo:
-        caps.append("fibo")
     if not caps:
         caps = ["trade"]  # Decision 1: legacy no-flag = trade
-    # Stable order: trade before fibo (legacy stable ordering).
     return [c for c in KNOWN_CAPABILITIES if c in caps]
 
 
@@ -197,7 +190,6 @@ def cmd_install(args: argparse.Namespace) -> int:
     # Lazy imports (avoid pulling capability modules unless needed).
     from installer_shared import install_shared as _install_shared
     from install_trade_capability import run as run_trade
-    from install_fibo_capability import run as run_fibo
 
     # Migrate legacy .kam-trade/ directory if present (once per install).
     if not dry_run:
@@ -251,28 +243,12 @@ def cmd_install(args: argparse.Namespace) -> int:
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 shared=shared_record, dry_run=dry_run,
             )
-        elif cap == "fibo":
-            res = run_fibo(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
-                shared=shared_record, dry_run=dry_run,
-                systemd_dir=systemd_dir,
-                no_restart=bool(args.no_restart),
-                backup_dir=hermes_home / "kam" / "backups",
-            )
-            if not res.get("ok", True):
-                print(f"ERROR: fibo capability install failed: {res.get('service_error') or res}", file=sys.stderr)
-                if not dry_run:
-                    return 1
-            else:
-                unit = res.get("service_unit") or {}
-                act = res.get("service_activation") or {}
-                print(f"fibo.service: {unit.get('action')} -> {unit.get('path')}; activation={act.get('action')}")
         else:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
 
     # Telegram adapter dispatch seams + plugins.enabled (REQUIRED for
-    # /trade and /fibo to work on a fresh Hermes install). Payload copy
+    # /trade to work on a fresh Hermes install). Payload copy
     # alone is not enough — the adapter must route slash/callback/text.
     from adapter_wiring import apply_adapter_wiring as _apply_adapter_wiring
 
@@ -329,7 +305,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     from verify_shared import run as run_verify_shared
     from verify_trade_capability import run as verify_trade
-    from verify_fibo_capability import run as verify_fibo
     from adapter_wiring import verify_adapter_wiring
 
     systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
@@ -344,13 +319,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for cap in caps:
         if cap == "trade":
             ok = verify_trade(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
-        elif cap == "fibo":
-            ok = verify_fibo(
-                argv=[],
-                hermes_root=hermes_root,
-                hermes_home=hermes_home,
-                systemd_dir=systemd_dir,
-            )
         else:
             raise SystemExit(f"unknown capability: {cap}")
         if not ok:
@@ -398,7 +366,6 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     _print_banner("uninstall", caps, hermes_root, hermes_home, dry_run)
 
     from uninstall_trade_capability import run as uninstall_trade
-    from uninstall_fibo_capability import run as uninstall_fibo
     from uninstall_shared import run as uninstall_shared
     from adapter_wiring import remove_adapter_wiring
     from capabilities import is_installed as _is_installed
@@ -410,13 +377,6 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             res = uninstall_trade(
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 dry_run=dry_run,
-            )
-        elif cap == "fibo":
-            res = uninstall_fibo(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
-                dry_run=dry_run,
-                systemd_dir=systemd_dir,
-                no_restart=bool(args.no_restart),
             )
         else:
             raise SystemExit(f"unknown capability: {cap}")

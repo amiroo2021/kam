@@ -3677,8 +3677,8 @@ def _execute_new_order(request: Dict[str, Any]) -> CanonicalResponse:
     #   - On definite success the loop exits with the matched order.
     #   - On exhaustion return VERIFICATION_FAILED — never resubmit.
     try:
-        # Optional deterministic client identity supplied by the caller
-        # (e.g. GoldenFibo). When present, it is honored verbatim; when
+        # Optional deterministic client identity supplied by the caller.
+        # When present, it is honored verbatim; when
         # absent, _submit_new_order falls back to time-based generation.
         requested_client_order_id = request.get("client_order_id")
         if requested_client_order_id is None:
@@ -4476,7 +4476,7 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
     requested_symbol = str(request.get('symbol') or '').strip().upper()
     if not requested_symbol:
         return make_failure(operation='close_position', exchange=name, account=account_name, code='MISSING_SYMBOL', message='Symbol is required.')
-    # Optional GoldenFibo V2 (or any caller-supplied) client_order_index.
+    # Optional caller-supplied client_order_index.
     # When omitted, _submit_close_position keeps the legacy time_ns id
     # so /trade and other callers are unchanged.
     coi_raw = request.get("client_order_id")
@@ -4519,17 +4519,15 @@ def _execute_close_position(request: Dict[str, Any]) -> CanonicalResponse:
 
 
 # ---------------------------------------------------------------------------
-# GoldenFibo-required generic ops
+# Generic single-order ops required by strategy adapters
 #
 # These are exchange-agnostic surfaces that any compliant perpetual-Dex
-# adapter must expose for the GoldenFibo strategy to be implementable.
-# GoldenFibo itself is not coded here — only the agent-level surface
-# used by GoldenFibo's engine.
+# adapter must expose for order-state-driven strategies to be implementable.
 # ---------------------------------------------------------------------------
 
-# Status taxonomy for the get_order_state op. The GoldenFibo engine
-# uses these to decide whether to advance the cycle, hold (active),
-# freeze (terminal failure), or clear (filled and position flat).
+# Status taxonomy for the get_order_state op. Strategies use these
+# to decide whether to advance, hold (active), freeze (terminal failure),
+# or clear (filled and position flat).
 _LIGHTER_ORDER_STATUS_ACTIVE = "ACTIVE"
 _LIGHTER_ORDER_STATUS_FILLED = "FILLED"
 _LIGHTER_ORDER_STATUS_CANCELED = "CANCELED"
@@ -4539,7 +4537,7 @@ _LIGHTER_ORDER_STATUS_UNKNOWN = "UNKNOWN"
 
 
 # State literals we use to interpret the venue's `status` field and
-# transform it into the GoldenFibo taxonomy. The mapping is conservative:
+# transform it into the canonical taxonomy. The mapping is conservative:
 # when the venue status is not in the known set, we fall back to
 # UNKNOWN rather than guessing.
 _LIGHTER_VENUE_STATUS_TO_TAXONOMY = {
@@ -4595,7 +4593,7 @@ def _actual_fill_price(
 
 
 def _classify_order_status(order: Dict[str, Any]) -> str:
-    """Map a Lighter Order object to the GoldenFibo status taxonomy.
+    """Map a Lighter Order object to the canonical status taxonomy.
 
     The mapping is intentionally conservative: any unrecognized status
     returns UNKNOWN so the engine freezes rather than acting on a
@@ -4672,7 +4670,7 @@ def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
 def _execute_market_constraints(request: Dict[str, Any]) -> CanonicalResponse:
     """Generic read of full venue constraints for a symbol.
 
-    Not GoldenFibo-specific. Returns min_base_amount, min_quote_amount,
+    Returns min_base_amount, min_quote_amount,
     size_decimals, price_decimals, tick_size, market_id. Read-only.
     """
     account_name = str(request.get("account") or "").strip()
@@ -5219,8 +5217,8 @@ def _fetch_lighter_inactive_orders_page(
 def _execute_get_order_state_by_client_id(request: Dict[str, Any]) -> CanonicalResponse:
     """Generic lookup of an order by its deterministic client_order_index.
 
-    Not GoldenFibo-specific. Searches active orders first, then inactive
-    history, and returns the normalized record.
+    Searches active orders first, then inactive history, and returns the
+    normalized record.
     """
     account_name = str(request.get("account") or "").strip()
     credentials = _lookup_credentials(account_name)
@@ -5275,7 +5273,7 @@ def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
     Reads active + inactive orders, picks the matching record, and
     surfaces the actual fill price (computed from filled_quote /
     filled_base) when the order is FILLED. Classifies the status into
-    the GoldenFibo taxonomy.
+    the canonical taxonomy.
     """
     account_name = str(request.get("account") or "").strip()
     credentials = _lookup_credentials(account_name)
@@ -5395,9 +5393,9 @@ def _execute_get_order_state(request: Dict[str, Any]) -> CanonicalResponse:
 def _execute_cancel_order(request: Dict[str, Any]) -> CanonicalResponse:
     """Cancel exactly one order by ``order_index``.
 
-    Used by GoldenFibo to cancel an orphan pending limit when a
-    shared TP closes the position out from under it. Verifies by
-    re-reading the active orders list.
+    Cancels an orphan pending limit when a shared TP closes the
+    position out from under it. Verifies by re-reading the active
+    orders list.
     """
     account_name = str(request.get("account") or "").strip()
     credentials = _lookup_credentials(account_name)

@@ -13,8 +13,8 @@ Takes EXPLICIT ``hermes_root`` and ``hermes_home`` arguments. The
 function ``run`` is a no-op when at least one capability is still
 installed; this is enforced by the dispatcher.
 
-NEVER touches ~/.hermes/trade/ or ~/.hermes/fibo/ -- those belong to
-the per-capability uninstallers.
+NEVER touches ~/.hermes/trade/ -- that belongs to
+the per-capability uninstaller.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Minimal pristine TelegramAdapter fixture for installer patch tests.
 
 Contains EXACTLY the anchor lines required by installer/patchspecs.py and
-NO pre-existing /trade or /fibo dispatch seams. Used to prove fresh-install
+NO pre-existing /trade dispatch seams. Used to prove fresh-install
 wiring on a clean Hermes tree (Lodo regression).
 """
 
