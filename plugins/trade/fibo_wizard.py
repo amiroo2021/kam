@@ -2,8 +2,9 @@
 
 This is a LIGHTWEIGHT placeholder wizard. It owns:
 
-* a single entry screen with three buttons,
-* three callback placeholders (``fibo:start``, ``fibo:running``, ``fibo:stop``),
+* a single entry screen with four buttons,
+* four callback placeholders (``fibo:start``, ``fibo:running``,
+  ``fibo:stop``, ``fibo:exit``),
 * text interception for the ``/fibo`` slash command.
 
 It does NOT:
@@ -11,6 +12,12 @@ It does NOT:
 * touch the shared ``plugins.trade.agents.x_*_agent`` exchange layer yet,
 * run any background service, daemon, or runtime state,
 * depend on ``plugins.trade.wizard`` (the /trade wizard).
+
+``fibo:exit`` is a UI-only close action: it deletes (or strips) the
+wizard message and never stops any Fibo registration, never invokes an
+exchange agent, never touches ``.env``. Any future Fibo runtime that
+the user has registered (e.g. via the planned start/stop flow) keeps
+running — Exit is purely a way to dismiss the wizard UI.
 
 Future iterations may reuse the shared exchange-agent layer for actual
 Fibo strategy execution. The package placement (``plugins/trade/``) is
@@ -38,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Public menu / callback contract
 # ---------------------------------------------------------------------------
 
-# The entry screen header. Three buttons follow, in this exact order.
+# The entry screen header. Four buttons follow, in this exact order.
 SCREEN_HEADER = "Fibo"
 
 # (label, callback_data) pairs in the order they appear on the entry screen.
@@ -47,9 +54,13 @@ SCREEN_BUTTONS: List[Tuple[str, str]] = [
     ("▶️ Start Fibo",   "fibo:start"),
     ("📋 Running Fibo", "fibo:running"),
     ("⛔️ Stop Fibo",    "fibo:stop"),
+    ("❌ Exit",          "fibo:exit"),
 ]
 
 # Placeholder body text for each action. Buttons do nothing except display.
+# ``fibo:exit`` is intentionally absent — Exit does NOT route through the
+# placeholder path. It closes the wizard UI directly (delete or strip
+# keyboard) via ``handle_fibo_callback``'s dedicated branch.
 SCREEN_TEXT: dict = {
     "fibo:start":   "Start Fibo",
     "fibo:running": "Running Fibo",
@@ -95,7 +106,7 @@ def _build_placeholder_screen(callback_data: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # Renderer method name on the live Hermes Telegram adapter. The wizard
-# uses the plugin-facing inline-keyboard sender so the three /fibo buttons
+# uses the plugin-facing inline-keyboard sender so the four /fibo buttons
 # are sent as a single Telegram message with a proper InlineKeyboardMarkup.
 # This is the SAME pattern as plugins/trade/wizard.py:2267-2300.
 _TELEGRAM_SEND_INLINE_KEYBOARD = "send_inline_keyboard"
@@ -282,6 +293,84 @@ def _answer(query: Any) -> bool:
     return True
 
 
+# Minimal text left behind when Exit cannot delete the wizard message
+# (e.g. adapter lacks ``delete_message``, or PTB raised ``TelegramError``).
+# No buttons — the wizard is closed.
+_CLOSED_TEXT = "Fibo closed."
+
+
+async def _close(query: Any) -> bool:
+    """Close the wizard UI for the Exit button.
+
+    Strategy (best-effort, never raises):
+
+      1. Prefer ``query.delete_message()`` (PTB native) so the message
+         vanishes entirely. This is what the Exit button should do.
+      2. If ``delete_message`` is absent, falls back to
+         ``edit_message_text("Fibo closed.", reply_markup=None)`` —
+         the message remains but the inline keyboard is stripped so
+         no button remains tappable.
+      3. If even the edit fails (stub adapter, mock context), logs at
+         WARNING and returns ``False``. The user's loading indicator
+         still clears via ``_answer(query)`` in the caller.
+
+    This helper MUST NEVER raise — the wizard is UI-only and a
+    best-effort close beats an exception that escapes the callback
+    path. It also MUST NEVER touch exchange agents, runtime state, or
+    ``.env``; if those concerns need wiring later they belong in their
+    own start/stop callbacks.
+    """
+    # Best path: delete the wizard message outright.
+    delete = getattr(query, "delete_message", None)
+    if callable(delete):
+        try:
+            result = delete()
+            import asyncio as _aio
+            if _aio.iscoroutine(result):
+                await result
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "fibo_wizard: delete_message failed; falling back to "
+                "edit-strip-keyboard: %s", exc,
+            )
+            # Fall through to the edit path below.
+    # Fallback: edit the message with no reply_markup so the keyboard
+    # disappears. PTB's edit_message_text accepts reply_markup=None.
+    edit = getattr(query, "edit_message_text", None)
+    if callable(edit):
+        try:
+            result = edit(text=_CLOSED_TEXT, reply_markup=None)
+            import asyncio as _aio
+            if _aio.iscoroutine(result):
+                await result
+            return True
+        except TypeError:
+            # Stub adapter (tests / mock) where edit_message_text is a
+            # sync mock without reply_markup support — try without it.
+            try:
+                result = edit(text=_CLOSED_TEXT)
+                import asyncio as _aio
+                if _aio.iscoroutine(result):
+                    await result
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fibo_wizard: edit-strip-keyboard fallback failed: %s", exc,
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "fibo_wizard: edit-strip-keyboard failed: %s", exc,
+            )
+            return False
+    logger.warning(
+        "fibo_wizard: query exposes neither delete_message nor "
+        "edit_message_text; cannot close wizard UI."
+    )
+    return False
+
+
 def _strip_namespace(data: str, prefix: str) -> str:
     """Strip ``prefix:`` from the front of *data* if present."""
     token = f"{prefix}:"
@@ -344,6 +433,14 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
     maps the suffix to a placeholder screen, edits the originating
     message, and acknowledges the query.
 
+    ``fibo:exit`` is special-cased: it does NOT route through the
+    placeholder path (which would re-render all four buttons and keep
+    the wizard open). Instead, it closes the wizard UI directly via
+    ``_close`` — preferring ``query.delete_message()`` and falling
+    back to ``edit_message_text(text, reply_markup=None)``. Exit
+    performs no exchange work, no registration stop, no ``.env``
+    mutation; it is a UI-only dismiss action.
+
     Logs at WARNING/ERROR when edit or ack fails; the user still sees
     the loading indicator clear (best-effort answer()) so the chat
     doesn't appear frozen.
@@ -351,6 +448,19 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
     try:
         suffix = _strip_namespace(data, "fibo")
         callback_data = f"fibo:{suffix}" if suffix else data
+        # Exit is a UI-only close: bypass the placeholder path entirely.
+        if callback_data == "fibo:exit":
+            closed = await _close(query)
+            answered = _answer(query)
+            if closed and answered:
+                logger.info("fibo_wizard: callback fibo:exit closed wizard")
+            else:
+                logger.warning(
+                    "fibo_wizard: callback fibo:exit partially closed "
+                    "(closed=%s, answered=%s)",
+                    closed, answered,
+                )
+            return
         screen = _build_placeholder_screen(callback_data)
         edited = await _edit(query, screen)
         answered = _answer(query)

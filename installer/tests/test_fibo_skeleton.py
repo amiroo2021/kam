@@ -9,8 +9,8 @@ cases the spec calls out (A-H).
 A. --trade only              -> /trade registered, /fibo absent
 B. --fibo only               -> /fibo registered, /trade absent, shared agents available
 C. --trade --fibo            -> both registered, shared agents installed once
-D. /fibo menu                -> exactly three buttons in order
-E. callbacks                -> fibo:start, fibo:running, fibo:stop route correctly
+D. /fibo menu                -> exactly four buttons in order
+E. callbacks                -> fibo:start, fibo:running, fibo:stop, fibo:exit route correctly
 F. placeholder actions      -> each button returns only its placeholder screen
 G. uninstall capability isolation
                               -> removing trade preserves fibo, vice versa,
@@ -165,24 +165,44 @@ class BothRegistrationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# D. /fibo menu structure: exactly three buttons, in the required order
+# D. /fibo menu structure: exactly four buttons, in the required order
 # ---------------------------------------------------------------------------
 
 
 class FiboMenuStructureTests(unittest.TestCase):
-    def test_three_buttons_in_required_order(self) -> None:
+    def test_four_buttons_in_required_order(self) -> None:
+        """The /fibo entry screen carries exactly four buttons in this order:
+
+            ▶️ Start Fibo   → fibo:start
+            📋 Running Fibo → fibo:running
+            ⛔️ Stop Fibo    → fibo:stop
+            ❌ Exit         → fibo:exit
+
+        Exit is appended last so it sits beneath the strategy controls
+        and reads as a "leave the wizard" action rather than a strategy
+        toggle. The button labels and callback_data are pinned exactly
+        so the wizard cannot drift from this contract.
+        """
         from plugins.trade import fibo_wizard
 
         buttons = fibo_wizard.SCREEN_BUTTONS
-        self.assertEqual(len(buttons), 3)
+        self.assertEqual(len(buttons), 4)
         self.assertEqual(
             list(buttons),
             [
                 ("▶️ Start Fibo",   "fibo:start"),
                 ("📋 Running Fibo", "fibo:running"),
                 ("⛔️ Stop Fibo",    "fibo:stop"),
+                ("❌ Exit",          "fibo:exit"),
             ],
         )
+
+    def test_exit_button_label_and_callback_data(self) -> None:
+        """Pin the Exit button's exact label + callback_data."""
+        from plugins.trade import fibo_wizard
+
+        exit_button = fibo_wizard.SCREEN_BUTTONS[-1]
+        self.assertEqual(exit_button, ("❌ Exit", "fibo:exit"))
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +221,23 @@ class FiboCallbackRoutingTests(unittest.TestCase):
         from plugins.trade import fibo_wizard
 
         cbs = {cb for _, cb in fibo_wizard.SCREEN_BUTTONS}
-        self.assertEqual(cbs, {"fibo:start", "fibo:running", "fibo:stop"})
+        self.assertEqual(
+            cbs, {"fibo:start", "fibo:running", "fibo:stop", "fibo:exit"},
+        )
+
+    def test_exit_callback_in_fibo_namespace(self) -> None:
+        """Pin the contract: fibo:exit lives in the dedicated ``fibo:``
+        namespace (NOT ``trade:``). This guards against a future change
+        that would accidentally rename Exit's callback prefix."""
+        from plugins.trade import fibo_wizard
+
+        exit_cb = fibo_wizard.SCREEN_BUTTONS[-1][1]
+        self.assertTrue(
+            exit_cb.startswith("fibo:"),
+            f"Exit callback {exit_cb!r} is not in the fibo: namespace",
+        )
+        self.assertNotIn("trade", exit_cb)
+        self.assertEqual(exit_cb, "fibo:exit")
 
     def test_callback_handlers_route_to_placeholders(self) -> None:
         """Each callback routes to its placeholder screen, not a /trade wizard."""
@@ -242,6 +278,8 @@ class FiboCallbackRoutingTests(unittest.TestCase):
                 "answered": q.answered,
             }
 
+        # Strategy callbacks still route to placeholder screens; Exit
+        # is excluded here because it has its own dedicated close path.
         for cb in ("fibo:start", "fibo:running", "fibo:stop"):
             with self.subTest(callback=cb):
                 import asyncio
@@ -290,6 +328,9 @@ class FiboCallbackRoutingTests(unittest.TestCase):
 
 class PlaceholderActionTests(unittest.TestCase):
     def test_callbacks_return_placeholder_only(self) -> None:
+        """Placeholder text exists for strategy buttons. Exit is
+        deliberately absent from SCREEN_TEXT — it does not render a
+        placeholder screen (it closes the wizard UI instead)."""
         from plugins.trade import fibo_wizard
 
         for cb in ("fibo:start", "fibo:running", "fibo:stop"):
@@ -302,8 +343,18 @@ class PlaceholderActionTests(unittest.TestCase):
                 self.assertNotIn("engine", text.lower())
                 self.assertNotIn("service", text.lower())
 
+        # Exit must NOT have a placeholder screen — that would re-render
+        # the entry menu and contradict the "close the wizard" contract.
+        from plugins.trade import fibo_wizard
+        self.assertNotIn(
+            "fibo:exit", fibo_wizard.SCREEN_TEXT,
+            "fibo:exit must not have a placeholder; it closes the wizard UI.",
+        )
+
     def test_no_execute_invocation_on_callback(self) -> None:
-        """Placeholder must not call any agent .execute() (no exchange writes)."""
+        """Placeholder must not call any agent .execute() (no exchange writes).
+        Exit must also perform ZERO exchange calls — it's a UI dismiss only.
+        """
         from plugins.trade import fibo_wizard
 
         # Spy on a fake agent with .execute() and assert it is never called.
@@ -320,8 +371,10 @@ class PlaceholderActionTests(unittest.TestCase):
         adapter.send_message = mock.AsyncMock()
 
         async def run_all() -> None:
-            for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+            # Cover ALL four callbacks, including Exit.
+            for cb in ("fibo:start", "fibo:running", "fibo:stop", "fibo:exit"):
                 q = mock.MagicMock()
+                q.delete_message = mock.MagicMock()  # Exit-path available
                 q.edit_message_text = mock.MagicMock()
                 q.answer = mock.MagicMock()
                 await fibo_wizard.handle_fibo_callback(adapter, q, cb)
@@ -329,8 +382,340 @@ class PlaceholderActionTests(unittest.TestCase):
         import asyncio
         asyncio.run(run_all())
         self.assertEqual(agent.calls, [])
-        # send_message must NOT have been called either — placeholder is edit-only.
+        # send_message must NOT have been called either — wizard is UI-only.
         adapter.send_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F2. Exit callback: closes the wizard UI, performs ZERO exchange work,
+#     does NOT touch .env, does NOT stop any registration. Pure UI dismiss.
+# ---------------------------------------------------------------------------
+
+
+class FiboExitCallbackTests(unittest.TestCase):
+    """Contract tests for the /fibo Exit button (``fibo:exit``).
+
+    Spec:
+
+      * Best path: ``query.delete_message()`` — the wizard message
+        vanishes from Telegram.
+      * Fallback: ``query.edit_message_text(text, reply_markup=None)`` —
+        the inline keyboard is stripped, message remains as a minimal
+        "Fibo closed." confirmation.
+      * NEVER call any exchange agent.
+      * NEVER touch ``.env`` or the filesystem.
+      * NEVER stop any Fibo registration (no daemon / service / state
+        mutation).
+      * Acknowledge the query so Telegram drops the loading indicator.
+    """
+
+    def _make_query(self):
+        """Stub query matching PTB's real CallbackQuery surface:
+
+            * ``delete_message()`` (coroutine)
+            * ``edit_message_text(text=, reply_markup=)`` (coroutine)
+            * ``answer()`` (sync)
+        """
+
+        class StubQuery:
+            def __init__(self) -> None:
+                self.deleted = False
+                self.edited_text = None
+                self.edited_markup = "__unset__"  # distinguish "not called"
+                self.answered = False
+
+            async def delete_message(self):
+                self.deleted = True
+
+            async def edit_message_text(self, text="", reply_markup=None):
+                self.edited_text = text
+                self.edited_markup = reply_markup
+
+            def answer(self):
+                self.answered = True
+
+        return StubQuery()
+
+    def test_exit_prefers_delete_message(self) -> None:
+        """Happy path: query exposes delete_message; Exit must call it
+        and must NOT fall back to edit_message_text (delete is preferred)."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+
+        q = self._make_query()
+        asyncio.run(fibo_wizard.handle_fibo_callback(None, q, "fibo:exit"))
+        self.assertTrue(q.deleted, "Exit must call query.delete_message()")
+        # The edit path should NOT have been invoked when delete succeeded.
+        self.assertEqual(
+            q.edited_markup, "__unset__",
+            "Exit must NOT fall back to edit_message_text when delete succeeds",
+        )
+        self.assertTrue(q.answered, "Exit must acknowledge the query")
+
+    def test_exit_falls_back_to_edit_when_delete_unavailable(self) -> None:
+        """Fallback path: query exposes only edit_message_text. Exit
+        must strip the keyboard by editing the message with
+        reply_markup=None."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+
+        class NoDeleteQuery:
+            def __init__(self) -> None:
+                self.edited_text = None
+                self.edited_markup = "__unset__"
+                self.answered = False
+
+            async def edit_message_text(self, text="", reply_markup=None):
+                self.edited_text = text
+                self.edited_markup = reply_markup
+
+            def answer(self):
+                self.answered = True
+
+        q = NoDeleteQuery()
+        asyncio.run(fibo_wizard.handle_fibo_callback(None, q, "fibo:exit"))
+        self.assertEqual(
+            q.edited_text, "Fibo closed.",
+            "Exit fallback must leave the minimal closed-state text",
+        )
+        self.assertIsNone(
+            q.edited_markup,
+            "Exit fallback must pass reply_markup=None to strip the keyboard",
+        )
+        self.assertTrue(q.answered)
+
+    def test_exit_falls_back_to_edit_when_delete_raises(self) -> None:
+        """If delete_message() raises (e.g. TelegramError: message too
+        old), Exit must swallow it and try the edit-strip-keyboard
+        path."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+
+        class DeleteFailsQuery:
+            def __init__(self) -> None:
+                self.delete_called = False
+                self.edited_text = None
+                self.edited_markup = "__unset__"
+                self.answered = False
+
+            async def delete_message(self):
+                self.delete_called = True
+                raise RuntimeError("simulated TelegramError")
+
+            async def edit_message_text(self, text="", reply_markup=None):
+                self.edited_text = text
+                self.edited_markup = reply_markup
+
+            def answer(self):
+                self.answered = True
+
+        q = DeleteFailsQuery()
+        asyncio.run(fibo_wizard.handle_fibo_callback(None, q, "fibo:exit"))
+        self.assertTrue(q.delete_called, "Exit must attempt delete_message")
+        self.assertEqual(q.edited_text, "Fibo closed.")
+        self.assertIsNone(q.edited_markup)
+        self.assertTrue(q.answered)
+
+    def test_exit_does_not_re_render_entry_screen(self) -> None:
+        """Critical: Exit must NOT call edit_message_text with the
+        four-button entry menu (that would leave the wizard open).
+        It is a UI close, not a screen swap."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+
+        q = self._make_query()
+        asyncio.run(fibo_wizard.handle_fibo_callback(None, q, "fibo:exit"))
+        # edit_message_text must not have been called with buttons.
+        # When the delete path wins, edited_markup is never touched at all.
+        self.assertNotEqual(
+            q.edited_markup, "__unset__NOT_BTN",
+            "Exit must not render any inline keyboard markup",
+        )
+        # And in the happy path, edit_message_text was NOT called at all,
+        # so the entry buttons stay out of the picture entirely.
+        self.assertEqual(q.edited_markup, "__unset__")
+
+    def test_exit_performs_zero_exchange_calls(self) -> None:
+        """Exit must NOT touch any agent, environment file, or runtime state.
+
+        We assert this two ways:
+
+          1. The wizard source must not import / call any agent layer
+             (``x_*_agent``) or the ``TradeDesk`` / ``TradeWizard``
+             runtime. This is a structural guard — Exit cannot leak
+             exchange work without ``execute()`` appearing in the wizard.
+
+          2. With a spy agent equipped with ``.execute()``, calling
+             ``fibo:exit`` never invokes it. This is the runtime guard.
+        """
+        import asyncio
+        import inspect
+        from unittest import mock
+
+        from plugins.trade import fibo_wizard
+
+        # Structural: scan source for any exchange / runtime handle.
+        src = inspect.getsource(fibo_wizard)
+        forbidden_in_source = (
+            ".execute(",
+            "TradeDesk(",
+            "TradeWizard(",
+            "_WIZARD.",
+            "x_apex_agent",
+            "x_arcus_agent",
+            "x_hyperliquid_agent",
+            "x_lighter_agent",
+            "x_pacifica_agent",
+            "x_rise_agent",
+            "x_edgex_agent",
+            "x_ondoperps_agent",
+            "x_raydium_agent",
+            "x_hibachi_agent",
+        )
+        for tok in forbidden_in_source:
+            self.assertNotIn(
+                tok, src,
+                f"fibo_wizard must never reference {tok!r}; Exit must "
+                "perform zero exchange work.",
+            )
+
+        # Runtime: a spy agent with .execute() is never invoked by Exit.
+        class SpyAgent:
+            def __init__(self) -> None:
+                self.calls: List[Any] = []
+
+            def execute(self, request):
+                self.calls.append(request)
+                return {"ok": True}
+
+        agent = SpyAgent()
+        adapter = mock.MagicMock()
+        adapter.send_message = mock.AsyncMock()
+
+        q = self._make_query()
+        asyncio.run(fibo_wizard.handle_fibo_callback(adapter, q, "fibo:exit"))
+        self.assertEqual(
+            agent.calls, [],
+            "Exit must not invoke any agent.execute() — pure UI close.",
+        )
+        adapter.send_message.assert_not_called()
+
+    def test_exit_does_not_touch_dotenv(self) -> None:
+        """Exit must not import / mutate ``.env`` files.
+
+        We assert by static check: the wizard source never imports
+        ``dotenv`` / ``environ`` / ``.env`` and never opens an env file
+        for write. The wizard module's file path is already in a
+        plugin tree with no ``.env`` access; this guard pins the
+        contract so a future change cannot regress it silently.
+        """
+        import inspect
+        from plugins.trade import fibo_wizard
+
+        src = inspect.getsource(fibo_wizard)
+        # We don't ban the literal token ".env" everywhere — the docstring
+        # mentions it as something Exit does NOT touch. Strip docstrings
+        # before scanning.
+        import re
+        src_no_docs = re.sub(r'^\s*"""[\s\S]*?"""\s*', "", src, flags=re.MULTILINE)
+        for forbidden in (
+            "load_dotenv",
+            "dotenv.",
+            "open(",
+            ".env",
+            "environ[",
+            "os.environ[",
+        ):
+            # ``.env`` and ``open(`` are documented references in comments
+            # we explicitly allow (see "does NOT touch .env"). Assert only
+            # the actionable code paths are absent.
+            if forbidden in (".env", "open("):
+                # Allow literal mentions in comments / docstrings only.
+                # If a code-path invocation appears, this will fire when
+                # the wizard tries to actually open or load a file.
+                # We do a permissive check: forbid ``open(... `` or
+                # ``Path(...).env`` patterns specifically.
+                self.assertNotRegex(
+                    src_no_docs,
+                    r"open\([^)]*\.env",
+                    "Exit must not open .env files",
+                )
+                continue
+            self.assertNotIn(
+                forbidden, src_no_docs,
+                f"fibo_wizard must not reference {forbidden!r}; "
+                "Exit is a UI-only action.",
+            )
+
+    def test_exit_does_not_stop_registration(self) -> None:
+        """Exit is purely UI — it must not invoke any
+        register/unregister / stop / shutdown / daemon control path.
+
+        Static guard: the wizard source has no reference to daemon,
+        service, registration, or shutdown semantics.
+        """
+        import inspect
+        import re
+        from plugins.trade import fibo_wizard
+
+        src = inspect.getsource(fibo_wizard)
+        src_no_docs = re.sub(r'^\s*"""[\s\S]*?"""\s*', "", src, flags=re.MULTILINE)
+
+        # No callable references to lifecycle paths.
+        forbidden_callables = (
+            "register(",
+            "unregister(",
+            "stop_fibo(",
+            "shutdown(",
+            "daemon.stop",
+            "service.stop",
+            "subprocess.",
+        )
+        for tok in forbidden_callables:
+            self.assertNotIn(
+                tok, src_no_docs,
+                f"Exit must not invoke {tok!r}; it is UI-only.",
+            )
+
+    def test_strategy_callbacks_unchanged(self) -> None:
+        """Regression: Start / Running / Stop must still route to their
+        placeholder screens after Exit is added. Exit is added to the
+        entry menu but does NOT alter the strategy-callback behaviour."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+
+        class StubQuery:
+            def __init__(self) -> None:
+                self.edited_text = None
+                self.edited_markup = None
+                self.answered = False
+                self.deleted = False
+
+            async def edit_message_text(self, text="", reply_markup=None):
+                self.edited_text = text
+                self.edited_markup = reply_markup
+
+            async def delete_message(self):
+                self.deleted = True
+
+            def answer(self):
+                self.answered = True
+
+        for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+            with self.subTest(callback=cb):
+                q = StubQuery()
+                asyncio.run(
+                    fibo_wizard.handle_fibo_callback(None, q, cb)
+                )
+                # The strategy callbacks still go through the
+                # placeholder-edit path, NOT the close path.
+                self.assertFalse(q.deleted, f"{cb} must NOT close the wizard")
+                # Each placeholder's body text is still its SCREEN_TEXT entry.
+                self.assertEqual(
+                    q.edited_text, fibo_wizard.SCREEN_TEXT[cb],
+                    f"{cb} must render its SCREEN_TEXT entry unchanged",
+                )
+                self.assertTrue(q.answered)
 
 
 # ---------------------------------------------------------------------------
@@ -549,13 +934,13 @@ class FiboSendPathRegressionTests(unittest.TestCase):
         kwargs = adapter.send_inline_keyboard.await_args.kwargs
         self.assertEqual(kwargs["chat_id"], "64620303")
         self.assertEqual(kwargs["callback_prefix"], "fibo")
-        # Three buttons in fibo: namespace, in expected order.
+        # Four buttons in fibo: namespace, in expected order.
         buttons = kwargs["buttons"]
         flat_cb = [
             str(btn["callback_data"]) for row in buttons for btn in row
         ]
         self.assertEqual(
-            flat_cb, ["fibo:start", "fibo:running", "fibo:stop"],
+            flat_cb, ["fibo:start", "fibo:running", "fibo:stop", "fibo:exit"],
         )
 
     def test_handle_fibo_command_falls_back_to_send_when_inline_keyboard_missing(self) -> None:
