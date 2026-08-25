@@ -3,6 +3,12 @@
 Removes the /trade capability:
   - removes the trade-specific plugin files from <hermes_root>/plugins/trade/
   - removes ~/.hermes/trade/ (the owned state folder)
+
+Does NOT touch:
+  - fibo files (fibo_wizard.py and any future fibo-specific payloads —
+    owned by the fibo uninstaller)
+  - x_* exchange agents (shared between /trade and /fibo)
+  - plugins/trade/__init__.py (the shared plugin marker)
 """
 
 from __future__ import annotations

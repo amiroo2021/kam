@@ -277,6 +277,7 @@ class TestFreshInstall(FixtureCase):
         # payload landed
         for rel in (
             "wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml",
+            "fibo_wizard.py",
         ):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
 
@@ -355,7 +356,7 @@ class TestFreshInstall(FixtureCase):
         for entry in manifest["copied_files"]:
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
-        self.assertEqual(len(patched), 4, patched)
+        self.assertEqual(len(patched), 7, patched)
         seams = {p["seam"] for p in patched}
         self.assertEqual(
             seams,
@@ -363,6 +364,9 @@ class TestFreshInstall(FixtureCase):
                 "callback dispatch",
                 "wizard text interception",
                 "slash command dispatch",
+                "fibo callback dispatch",
+                "fibo text interception",
+                "fibo slash command dispatch",
                 "inline keyboard helper",
             },
         )

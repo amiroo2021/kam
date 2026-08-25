@@ -234,7 +234,8 @@ class TestManifestSchema(unittest.TestCase):
         _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         m = C.load_manifest(self.env["hermes_home"])
         self.assertEqual(m["schema_version"], C.SCHEMA_VERSION)
-        self.assertEqual(m["capabilities"], {"trade": True})
+        # /trade-only install: trade=True, fibo=False (the unused peer capability).
+        self.assertEqual(m["capabilities"], {"trade": True, "fibo": False})
         self.assertIn("by_capability", m)
 
     def test_atomic_write_no_leftover(self):

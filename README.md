@@ -1,10 +1,11 @@
-# KAM — `/trade` add-on for Hermes
+# KAM — `/trade` + `/fibo` add-on for Hermes
 
-KAM is an installable `/trade` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
+KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
 
 - `/trade`: the Telegram trading console wizard backed by a pluggable set of exchange agents
+- `/fibo`: the Telegram Fibo control wizard (lightweight UI skeleton; future iterations will reuse the shared exchange-agent layer)
 
-**There is no enable flag.** If the add-on is installed, `/trade` is enabled. If you remove it, `/trade` is gone.
+**There is no enable flag.** If the add-on is installed, `/trade` and/or `/fibo` is enabled. If you remove it, the commands are gone.
 
 ---
 
@@ -31,7 +32,7 @@ sudo ./install.sh --hermes-root /path/to/hermes
 
 If Hermes is in a standard location you may omit `--hermes-root` and let it auto-detect. If several installations are found, the installer stops and asks you to choose one explicitly.
 
-After installation and a gateway restart, send `/trade` in Telegram.
+After installation and a gateway restart, send `/trade` or `/fibo` in Telegram.
 
 ### Options
 
@@ -91,8 +92,8 @@ Removes only add-on-owned files and only the marked KAM blocks from shared Herme
 
 There is no `TRADE_ENABLED` flag, and none is supported.
 
-- Add-on installed → `/trade` enabled
-- Add-on removed → `/trade` disabled
+- Add-on installed → `/trade` and `/fibo` enabled
+- Add-on removed → `/trade` and `/fibo` disabled
 
 An exchange appears in the wizard when its agent file is present. An *account* appears when its credentials are present in your existing Hermes environment.
 
@@ -236,8 +237,11 @@ kam/
 ├── .env.example            # documentation only
 ├── installer/
 │   ├── install_trade.py
+│   ├── install_fibo_capability.py
 │   ├── verify_trade.py
+│   ├── verify_fibo_capability.py
 │   ├── uninstall_trade.py
+│   ├── uninstall_fibo_capability.py
 │   ├── kamlib.py           # discovery, patching, manifest
 │   ├── patchspecs.py       # approved anchor definitions
 │   ├── requirements.txt
@@ -248,7 +252,8 @@ kam/
 │       ├── plugin.yaml
 │       ├── canonical.py
 │       ├── tradedesk.py
-│       ├── wizard.py
+│       ├── wizard.py       # /trade wizard
+│       ├── fibo_wizard.py  # /fibo Telegram UI skeleton
 │       ├── agents/
 │       └── tests/
 └── tests/

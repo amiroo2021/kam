@@ -1,16 +1,20 @@
 """Hermes KAM trade plugin package — capability-aware bootstrap.
 
-This package is installed whenever the KAM /trade capability is
-installed. The package marker itself is the /trade capability marker.
+This package is the marker for both /trade and /fibo KAM capabilities.
+A future server may install --trade only, --fibo only, or both; the
+package's ``register`` function reads the manifest and registers
+slash commands for whichever capabilities are currently installed.
 
 Capability-aware slash-command registration:
 
-  --trade installed  -> /trade registered
+  --trade installed  -> /trade registered, /fibo NOT registered
+  --fibo installed   -> /fibo registered, /trade NOT registered
+  both installed     -> both registered
 
 The authoritative source is ``~/.hermes/kam/install_state.json``'s
 ``capabilities`` map. This package's ``register`` function reads that
-manifest at registration time and registers /trade for the
-currently-installed capability.
+manifest at registration time and registers only the commands for
+currently-installed capabilities.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import Any, Dict, List
 
 
 # ---------------------------------------------------------------------------
-# Slash-command handler (non-Telegram surfaces only)
+# Slash-command handlers (non-Telegram surfaces only)
 # ---------------------------------------------------------------------------
 
 
@@ -43,6 +47,25 @@ def _handle_trade_slash(raw_args: str) -> str:
     return (
         "`/trade` is a Telegram-only wizard. "
         "Open Hermes on Telegram and type /trade to start."
+    )
+
+
+def _handle_fibo_slash(raw_args: str) -> str:
+    """Handler invoked by the gateway when ``/fibo`` is dispatched via the
+    plugin-command registry.
+
+    Mirrors ``/trade``: the real wizard lives on Telegram and is routed
+    by the Telegram adapter directly.
+    """
+    suffix = (raw_args or "").strip()
+    if suffix:
+        return (
+            "`/fibo` is a Telegram-only wizard. "
+            "Open Hermes on Telegram and type /fibo to use it."
+        )
+    return (
+        "`/fibo` is a Telegram-only wizard. "
+        "Open Hermes on Telegram and type /fibo to start."
     )
 
 
@@ -116,6 +139,12 @@ def register(ctx: Any) -> None:
     Capability-aware slash-command registration:
 
       - if ``capabilities.trade`` is True, register /trade.
+      - if ``capabilities.fibo`` is True, register /fibo.
+
+    A /fibo-only installation does NOT register /trade, and a
+    /trade-only installation does NOT register /fibo — at the actual
+    handler-registration layer, not just in Telegram's menu
+    presentation.
 
     If the install manifest is missing or unreadable, NO commands are
     registered (the conservative-safe choice: don't expose a command
@@ -128,6 +157,13 @@ def register(ctx: Any) -> None:
             "trade",
             handler=_handle_trade_slash,
             description="Open the trading wizard",
+        )
+    if caps.get("fibo"):
+        _try_register_command(
+            ctx,
+            "fibo",
+            handler=_handle_fibo_slash,
+            description="Open the Fibo wizard",
         )
 
 
@@ -147,6 +183,8 @@ def registered_commands() -> List[str]:
     out: List[str] = []
     if caps.get("trade"):
         out.append("trade")
+    if caps.get("fibo"):
+        out.append("fibo")
     return out
 
 
@@ -154,4 +192,5 @@ __all__ = [
     "register",
     "registered_commands",
     "_handle_trade_slash",
+    "_handle_fibo_slash",
 ]

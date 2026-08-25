@@ -1,0 +1,88 @@
+"""Capability-specific installer: FIBO (lightweight UI skeleton).
+
+Installs ONLY the /fibo Telegram wizard skeleton and the
+Telegram adapter seams that route ``/fibo``, ``fibo:`` callbacks,
+and (when supported) /fibo free-text interception.
+
+This module installs the shared agent layer only via the caller's
+``shared`` record (produced by ``installer_shared.install_shared``);
+this module itself owns ZERO shared files. The /trade installer is
+responsible for ``wizard.py``; /fibo is responsible for
+``fibo_wizard.py`` only.
+
+It does NOT install:
+
+* ``fibo.service`` (no systemd unit),
+* ``fibo_daemon.py`` (no runtime daemon),
+* ``fibo_service.py`` (no runtime state machine),
+* ``golden_fibo/`` (no old strategy engine),
+* ``~/.hermes/fibo/`` (no runtime directory yet — empty phase).
+
+Future iterations that bring up a real Fibo strategy may extend this
+module to also install those files. For now, the wizard is a static
+placeholder.
+
+Takes EXPLICIT ``hermes_root`` (the installed app tree) and
+``hermes_home`` (the persistent state). The two are independent.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any, Dict, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Files owned exclusively by the /fibo capability.
+# Wizard lives alongside the /trade wizard so the package stays a
+# single Python import path under ``plugins.trade``.
+FIBO_REL_PATHS = [
+    Path("plugins") / "trade" / "fibo_wizard.py",
+]
+
+
+def run(
+    *,
+    argv: Sequence[str],
+    hermes_root: Path,
+    hermes_home: Path,
+    shared: Dict[str, Any],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Install /fibo capability payload into *hermes_root*.
+
+    The caller (dispatcher) has already invoked
+    ``installer_shared.install_shared`` for the shared agent layer; we
+    only copy fibo-specific files.
+    """
+    plugin_root = hermes_root / "plugins" / "trade"
+    record: Dict[str, Any] = {
+        "copied_files": [],
+        "dry_run": dry_run,
+        "ok": True,
+    }
+    for rel in FIBO_REL_PATHS:
+        try:
+            rel_under_plugin_trade = rel.relative_to(Path("plugins") / "trade")
+        except ValueError:
+            rel_under_plugin_trade = rel
+        src = REPO_ROOT / rel
+        dst = plugin_root / rel_under_plugin_trade
+        if not src.is_file():
+            record["ok"] = False
+            record.setdefault("missing", []).append(str(rel))
+            continue
+        if dry_run:
+            record["copied_files"].append({"path": str(rel), "action": "would-copy"})
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            record["copied_files"].append({"path": str(rel), "action": "copied"})
+    return record
+
+
+__all__ = ["run", "FIBO_REL_PATHS"]
