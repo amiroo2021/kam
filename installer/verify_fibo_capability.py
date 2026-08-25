@@ -7,12 +7,15 @@ and behaves as a placeholder. Asserts ONLY public behavior:
 * ``handle_fibo_command`` is importable and callable;
 * ``handle_fibo_callback`` is importable and callable;
 * ``handle_fibo_text`` is importable and callable;
-* the entry menu exposes EXACTLY three actions — Start Fibo, Running
-  Fibo, Stop Fibo — with callback namespaces ``fibo:start``,
-  ``fibo:running``, ``fibo:stop``;
-* each action routes to a placeholder screen whose text is the
-  action label;
-* no exchange calls happen when the user clicks a placeholder.
+* the entry menu exposes EXACTLY four actions — Start Fibo, Running
+  Fibo, Stop Fibo, Exit — with callback namespaces ``fibo:start``,
+  ``fibo:running``, ``fibo:stop``, ``fibo:exit``;
+* each strategy action (start / running / stop) routes to a placeholder
+  screen whose text is the action label;
+* ``fibo:exit`` is a UI-only close action (deletes the wizard message
+  or strips the inline keyboard) — it MUST NOT have a placeholder
+  screen entry;
+* no exchange calls happen when the user clicks any button.
 
 This verifier does NOT import or assert against internal helper
 functions in ``fibo_wizard``.
@@ -26,7 +29,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-REQUIRED_CALLBACKS = ("fibo:start", "fibo:running", "fibo:stop")
+REQUIRED_CALLBACKS = ("fibo:start", "fibo:running", "fibo:stop", "fibo:exit")
+# Callbacks whose placeholder screens must exist (Exit is UI-only and
+# has no placeholder).
+PLACEHOLDER_CALLBACKS = ("fibo:start", "fibo:running", "fibo:stop")
 
 
 def _load_fibo_wizard(hermes_root: Path) -> Any:
@@ -75,21 +81,23 @@ def run(*, argv, hermes_root: Path, hermes_home: Path) -> bool:  # noqa: ARG001
             return False
         print(f"    [ok] fibo_wizard.{fn_name} present and callable")
 
-    # Menu structure: exactly three buttons with the required labels
-    # and the dedicated ``fibo:`` callback namespace.
+    # Menu structure: exactly four buttons with the required labels
+    # and the dedicated ``fibo:`` callback namespace. Exit is appended
+    # last so it sits beneath the strategy controls.
     buttons = getattr(mod, "SCREEN_BUTTONS", None)
-    if not isinstance(buttons, (list, tuple)) or len(buttons) != 3:
-        print(f"    [FAIL] SCREEN_BUTTONS must have exactly 3 entries, got {buttons!r}")
+    if not isinstance(buttons, (list, tuple)) or len(buttons) != 4:
+        print(f"    [FAIL] SCREEN_BUTTONS must have exactly 4 entries, got {buttons!r}")
         return False
     expected = [
         ("▶️ Start Fibo",   "fibo:start"),
         ("📋 Running Fibo", "fibo:running"),
         ("⛔️ Stop Fibo",    "fibo:stop"),
+        ("❌ Exit",          "fibo:exit"),
     ]
     if list(buttons) != expected:
         print(f"    [FAIL] SCREEN_BUTTONS mismatch.\n      got:      {list(buttons)!r}\n      expected: {expected!r}")
         return False
-    print(f"    [ok] /fibo entry menu exposes exactly 3 actions in the required order")
+    print(f"    [ok] /fibo entry menu exposes exactly 4 actions in the required order")
 
     # Callback namespace hygiene.
     for label, cb in buttons:
@@ -100,20 +108,30 @@ def run(*, argv, hermes_root: Path, hermes_home: Path) -> bool:  # noqa: ARG001
     if set(callbacks) != set(REQUIRED_CALLBACKS):
         print(f"    [FAIL] callbacks {callbacks!r} != required {REQUIRED_CALLBACKS!r}")
         return False
-    print(f"    [ok] callback namespace fibo: with start/running/stop")
+    print(f"    [ok] callback namespace fibo: with start/running/stop/exit")
 
-    # Placeholder screens: each callback maps to a non-empty label,
-    # all equal to the user-visible action title.
+    # Placeholder screens: each STRATEGY callback maps to a non-empty
+    # label equal to the user-visible action title. ``fibo:exit`` is a
+    # UI-only close action and intentionally has no SCREEN_TEXT entry.
     screen_text = getattr(mod, "SCREEN_TEXT", None)
     if not isinstance(screen_text, dict):
         print(f"    [FAIL] SCREEN_TEXT missing or wrong type: {type(screen_text).__name__}")
         return False
-    for cb in REQUIRED_CALLBACKS:
+    for cb in PLACEHOLDER_CALLBACKS:
         body = screen_text.get(cb)
         if not isinstance(body, str) or not body.strip():
             print(f"    [FAIL] placeholder text for {cb!r} missing")
             return False
-    print(f"    [ok] all three placeholders render a non-empty screen")
+    print(f"    [ok] all three strategy placeholders render a non-empty screen")
+    # Exit must NOT be a placeholder (it would re-render the entry menu
+    # and contradict the "close the wizard" contract).
+    if "fibo:exit" in screen_text:
+        print(
+            f"    [FAIL] fibo:exit must not appear in SCREEN_TEXT "
+            f"(Exit is UI-only); got body={screen_text['fibo:exit']!r}"
+        )
+        return False
+    print(f"    [ok] fibo:exit is a UI-only close (no placeholder text)")
 
     # No exchange writes: the placeholder handlers must not call any
     # agent ``execute`` method. We assert by inspecting the module
