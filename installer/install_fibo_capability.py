@@ -40,8 +40,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Files owned exclusively by the /fibo capability.
 # Wizard lives alongside the /trade wizard so the package stays a
 # single Python import path under ``plugins.trade``.
+# Phase 1 also ships the ``fibo/`` sub-package (Start Fibo sub-flow,
+# MT4 Reader, snapshot/store/session/flow modules). Each file is
+# listed explicitly so the install/uninstall capability mirrors
+# without walking the tree.
 FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo_wizard.py",
+    Path("plugins") / "trade" / "fibo" / "__init__.py",
+    Path("plugins") / "trade" / "fibo" / "_atomic.py",
+    Path("plugins") / "trade" / "fibo" / "snapshot.py",
+    Path("plugins") / "trade" / "fibo" / "store.py",
+    Path("plugins") / "trade" / "fibo" / "session.py",
+    Path("plugins") / "trade" / "fibo" / "flow.py",
+    Path("plugins") / "trade" / "fibo" / "mt4_reader.py",
 ]
 
 

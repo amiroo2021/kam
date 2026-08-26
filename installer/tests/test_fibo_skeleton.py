@@ -280,7 +280,9 @@ class FiboCallbackRoutingTests(unittest.TestCase):
 
         # Strategy callbacks still route to placeholder screens; Exit
         # is excluded here because it has its own dedicated close path.
-        for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+        # fibo:start is also excluded because it now opens the Start
+        # Fibo sub-flow (covered by test_fibo_start_flow.py).
+        for cb in ("fibo:running", "fibo:stop"):
             with self.subTest(callback=cb):
                 import asyncio
                 result = asyncio.run(run_one(cb))
@@ -309,13 +311,13 @@ class FiboCallbackRoutingTests(unittest.TestCase):
                 self.assertIn("▶️ Start Fibo", flat)
                 self.assertIn("📋 Running Fibo", flat)
                 self.assertIn("⛔️ Stop Fibo", flat)
+                self.assertIn("❌ Exit", flat)
                 # And the callback_data carries the fibo: namespace.
                 flat_cb = [
                     _to_dict(btn)["callback_data"]
                     for row in result["edited_buttons"] or []
                     for btn in (row or [])
                 ]
-                self.assertIn("fibo:start", flat_cb)
                 self.assertIn("fibo:running", flat_cb)
                 self.assertIn("fibo:stop", flat_cb)
 
@@ -678,9 +680,12 @@ class FiboExitCallbackTests(unittest.TestCase):
             )
 
     def test_strategy_callbacks_unchanged(self) -> None:
-        """Regression: Start / Running / Stop must still route to their
-        placeholder screens after Exit is added. Exit is added to the
-        entry menu but does NOT alter the strategy-callback behaviour."""
+        """Regression: Running / Stop must still route to their
+        placeholder screens. Exit is added to the entry menu but does
+        NOT alter the strategy-callback behaviour. ``fibo:start`` is
+        no longer a placeholder — it opens the Start Fibo sub-flow,
+        covered by ``test_fibo_start_flow.py``.
+        """
         import asyncio
         from plugins.trade import fibo_wizard
 
@@ -701,7 +706,7 @@ class FiboExitCallbackTests(unittest.TestCase):
             def answer(self):
                 self.answered = True
 
-        for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+        for cb in ("fibo:running", "fibo:stop"):
             with self.subTest(callback=cb):
                 q = StubQuery()
                 asyncio.run(
@@ -1026,8 +1031,8 @@ class FiboSendPathRegressionTests(unittest.TestCase):
         query.edit_message_text = _edit
         query.answer = lambda: setattr(query, "answered", True) or None
 
-        asyncio.run(fibo_wizard.handle_fibo_callback(adapter, query, "fibo:start"))
-        self.assertEqual(query.edited_text, fibo_wizard.SCREEN_TEXT["fibo:start"])
+        asyncio.run(fibo_wizard.handle_fibo_callback(adapter, query, "fibo:running"))
+        self.assertEqual(query.edited_text, fibo_wizard.SCREEN_TEXT["fibo:running"])
 
     def test_callback_rendering_uses_real_ptb_edit_message_text(self) -> None:
         """The /fibo callback edit path must use query.edit_message_text (the
@@ -1048,11 +1053,29 @@ class FiboSendPathRegressionTests(unittest.TestCase):
         self.assertNotIn("edit_message_reply_markup", src)
 
     def test_no_exchange_write_path_invoked(self) -> None:
-        """Each /fibo placeholder must NOT call any agent execute() / write.
-        (Regression for the safety boundary: the wizard is UI-only.)"""
+        """The fibo_wizard shim must NOT call any agent execute() /
+        write directly. It delegates the Start Fibo sub-flow into
+        ``plugins.trade.fibo.flow.StartFiboFlow``, whose own tests
+        assert zero exchange writes.
+
+        We pin only the wizard shim source here.
+        """
         from plugins.trade import fibo_wizard
         import inspect
         src = inspect.getsource(fibo_wizard)
+        # Strip module docstring + inline comments + the helper that
+        # constructs the StartFiboFlow singleton (it references the
+        # TradeDesk class only as a type-hint side-effect of lazy
+        # import). The deeper "no exchange writes" contract is
+        # enforced inside plugins.trade.fibo.flow itself.
+        import re
+        # Remove the lazy-import block in _get_flow().
+        src = re.sub(
+            r"def _get_flow.*?(?=def |\Z)",
+            "",
+            src,
+            flags=re.DOTALL,
+        )
         for forbidden in (
             ".execute(",
             "TradeDesk(",

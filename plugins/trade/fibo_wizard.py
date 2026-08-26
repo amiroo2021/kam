@@ -380,6 +380,119 @@ def _strip_namespace(data: str, prefix: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Start-Fibo sub-flow wiring (delegated to plugins.trade.fibo.flow)
+# ---------------------------------------------------------------------------
+
+
+def _query_chat_id(query: Any) -> Optional[str]:
+    """Extract chat_id from a PTB ``CallbackQuery``.
+
+    Prefers ``query.message.chat_id`` (PTB) and falls back to a manual
+    walk of ``query.message.chat.id`` so this works with both real
+    PTB objects and test stubs.
+    """
+    message = getattr(query, "message", None)
+    if message is None:
+        return None
+    direct = getattr(message, "chat_id", None)
+    if direct is not None:
+        return str(direct)
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return None
+    cid = getattr(chat, "id", None)
+    return str(cid) if cid is not None else None
+
+
+def _query_user_id(query: Any) -> Optional[str]:
+    """Extract ``user_id`` from a PTB ``CallbackQuery``."""
+    sender = getattr(query, "from_user", None)
+    if sender is None:
+        return None
+    uid = getattr(sender, "id", None)
+    return str(uid) if uid is not None else None
+
+
+def _msg_chat_id(msg: Any) -> Optional[str]:
+    chat = getattr(msg, "chat", None)
+    if chat is None:
+        return None
+    cid = getattr(chat, "id", None)
+    return str(cid) if cid is not None else None
+
+
+def _msg_user_id(msg: Any) -> Optional[str]:
+    sender = getattr(msg, "from_user", None)
+    if sender is None:
+        return None
+    uid = getattr(sender, "id", None)
+    return str(uid) if uid is not None else None
+
+
+def _get_flow() -> "Any":
+    """Return the process-wide ``StartFiboFlow`` singleton.
+
+    Lazy-imports the heavy modules so a unit test that only exercises
+    the skeleton (no flow) does not pay the import cost. Production
+    usage goes through this helper.
+    """
+    global _FLOW_SINGLETON  # noqa: PLW0603 - intentional process singleton
+    if _FLOW_SINGLETON is None:
+        from .fibo.flow import StartFiboFlow
+        from .fibo.snapshot import Mt4SnapshotStore
+        from .fibo.store import FiboRegistrationStore
+        from .tradedesk import get_tradedesk
+
+        hermes_home = _resolve_hermes_home_for_flow()
+        snapshot_store = Mt4SnapshotStore(
+            hermes_home / "fibo" / "mt4_snapshot.json"
+        )
+        registration_store = FiboRegistrationStore(
+            hermes_home / "fibo" / "registrations.jsonl"
+        )
+        desk = get_tradedesk()
+        _FLOW_SINGLETON = StartFiboFlow(
+            snapshot_store=snapshot_store,
+            registration_store=registration_store,
+            list_exchanges_fn=desk.list_exchanges,
+            list_accounts_fn=desk.list_accounts,
+        )
+    return _FLOW_SINGLETON
+
+
+_FLOW_SINGLETON = None
+
+
+def _resolve_hermes_home_for_flow():
+    import os
+    from pathlib import Path
+    env = os.environ.get("HERMES_HOME")
+    if env and env.strip():
+        return Path(env).expanduser()
+    return Path("~/.hermes").expanduser()
+
+
+def _render_screen_to_buttons(screen: dict) -> dict:
+    """Translate a flow ``Screen`` to the wire shape the wizard sends.
+
+    The wizard's existing ``_send`` / ``_edit`` helpers already accept
+    the ``{"text": str, "buttons": rows}`` dict shape; the flow
+    returns a richer dataclass, so we project it here.
+    """
+    return {
+        "text": screen["text"] if isinstance(screen, dict) else screen.text,
+        "buttons": (
+            screen["buttons"] if isinstance(screen, dict) else screen.buttons
+        ),
+    }
+
+
+# Dataclass mirror of ``Screen`` so the renderer above works with
+# either a dict or a dataclass. ``_render_screen_to_buttons`` accepts
+# both. This keeps the shim dependency-free.
+
+
+# ---------------------------------------------------------------------------
 # Slash-command entry point: /fibo
 # ---------------------------------------------------------------------------
 
@@ -433,12 +546,16 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
     maps the suffix to a placeholder screen, edits the originating
     message, and acknowledges the query.
 
-    ``fibo:exit`` is special-cased: it does NOT route through the
-    placeholder path (which would re-render all four buttons and keep
-    the wizard open). Instead, it closes the wizard UI directly via
-    ``_close`` — preferring ``query.delete_message()`` and falling
-    back to ``edit_message_text(text, reply_markup=None)``. Exit
-    performs no exchange work, no registration stop, no ``.env``
+    Three dispatch paths:
+
+    * ``fibo:exit`` — UI-only close (delete or strip keyboard).
+    * ``fibo:start`` — opens the Start Fibo sub-flow.
+    * ``fibo:s:*`` — Start Fibo sub-flow callbacks (handled by
+      ``StartFiboFlow``).
+    * any other ``fibo:*`` — placeholder render (Running / Stop), kept
+      from the skeleton.
+
+    Exit performs no exchange work, no registration stop, no ``.env``
     mutation; it is a UI-only dismiss action.
 
     Logs at WARNING/ERROR when edit or ack fails; the user still sees
@@ -450,6 +567,15 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
         callback_data = f"fibo:{suffix}" if suffix else data
         # Exit is a UI-only close: bypass the placeholder path entirely.
         if callback_data == "fibo:exit":
+            # Also drop any in-flight Start Fibo session for this user.
+            cid = _query_chat_id(query)
+            uid = _query_user_id(query)
+            if cid and uid:
+                try:
+                    _get_flow().reset(cid, uid)
+                except Exception:
+                    # Best-effort; never let cleanup crash the wizard.
+                    pass
             closed = await _close(query)
             answered = _answer(query)
             if closed and answered:
@@ -461,6 +587,53 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
                     closed, answered,
                 )
             return
+
+        # Start Fibo — open the sub-flow.
+        if callback_data == "fibo:start":
+            cid = _query_chat_id(query)
+            uid = _query_user_id(query)
+            if not cid or not uid:
+                logger.warning(
+                    "fibo_wizard: fibo:start missing chat_id/user_id"
+                )
+                _answer(query)
+                return
+            try:
+                screen = _get_flow().open(cid, uid)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "fibo_wizard: flow.open failed: %s", exc, exc_info=True
+                )
+                _answer(query)
+                return
+            await _edit(query, _screen_to_dict(screen))
+            _answer(query)
+            return
+
+        # Start Fibo sub-flow callbacks.
+        if callback_data.startswith("fibo:s:"):
+            cid = _query_chat_id(query)
+            uid = _query_user_id(query)
+            if not cid or not uid:
+                logger.warning(
+                    "fibo_wizard: fibo:s:* missing chat_id/user_id"
+                )
+                _answer(query)
+                return
+            try:
+                screen = _get_flow().handle_callback(cid, uid, callback_data)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "fibo_wizard: flow.handle_callback failed: %s",
+                    exc, exc_info=True,
+                )
+                _answer(query)
+                return
+            await _edit(query, _screen_to_dict(screen))
+            _answer(query)
+            return
+
+        # Placeholder path for the other two buttons (Running / Stop).
         screen = _build_placeholder_screen(callback_data)
         edited = await _edit(query, screen)
         answered = _answer(query)
@@ -479,14 +652,51 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
         _answer(query)
 
 
+def _screen_to_dict(screen) -> dict:
+    """Translate a flow ``Screen`` dataclass to the existing wizard
+    wire shape ``{"text": str, "buttons": rows}``.
+    """
+    try:
+        text = screen.text
+        buttons = screen.buttons
+    except AttributeError:
+        # Already a dict.
+        return {"text": screen["text"], "buttons": screen["buttons"]}
+    return {"text": text, "buttons": buttons}
+
+
 # ---------------------------------------------------------------------------
 # Text-interception entry point (no-op for the skeleton)
 # ---------------------------------------------------------------------------
 
 
 async def handle_fibo_text(adapter: Any, msg: Any) -> bool:
-    """Placeholder text interception. Returns ``False`` (not consumed)."""
-    return False
+    """Free-text interception for the /fibo wizard.
+
+    Per spec §6: returns ``True`` ONLY when the sender's Start Fibo
+    session is in AWAITING_VOLUME (volume input). All other text
+    passes through (``return False``) so other handlers — including
+    the regular Hermes text pipeline — receive the message.
+
+    This is intentionally narrow: it never touches exchanges, never
+    reads the snapshot, never mutates state.
+    """
+    try:
+        chat_id = _msg_chat_id(msg)
+        user_id = _msg_user_id(msg)
+        if not chat_id or not user_id:
+            return False
+        text = (getattr(msg, "text", "") or "")
+        screen = _get_flow().handle_text(chat_id, user_id, text)
+        if screen is None:
+            return False
+        await _send(adapter, chat_id, _screen_to_dict(screen))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "fibo_wizard: text interception failed: %s", exc, exc_info=True
+        )
+        return False
 
 
 __all__ = [

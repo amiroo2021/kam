@@ -15,6 +15,9 @@ and behaves as a placeholder. Asserts ONLY public behavior:
 * ``fibo:exit`` is a UI-only close action (deletes the wizard message
   or strips the inline keyboard) — it MUST NOT have a placeholder
   screen entry;
+* the Phase 1 sub-package ``plugins/trade/fibo/`` ships with the
+  expected modules (``snapshot``, ``store``, ``session``, ``flow``,
+  ``mt4_reader``, ``_atomic``);
 * no exchange calls happen when the user clicks any button.
 
 This verifier does NOT import or assert against internal helper
@@ -33,6 +36,16 @@ REQUIRED_CALLBACKS = ("fibo:start", "fibo:running", "fibo:stop", "fibo:exit")
 # Callbacks whose placeholder screens must exist (Exit is UI-only and
 # has no placeholder).
 PLACEHOLDER_CALLBACKS = ("fibo:start", "fibo:running", "fibo:stop")
+# Phase 1 sub-package modules that MUST be present in the install tree.
+FIBO_SUBPACKAGE_FILES = (
+    "__init__.py",
+    "_atomic.py",
+    "snapshot.py",
+    "store.py",
+    "session.py",
+    "flow.py",
+    "mt4_reader.py",
+)
 
 
 def _load_fibo_wizard(hermes_root: Path) -> Any:
@@ -67,6 +80,15 @@ def run(*, argv, hermes_root: Path, hermes_home: Path) -> bool:  # noqa: ARG001
         print(f"    [FAIL] fibo_wizard.py missing at {wizard_path}")
         return False
     print(f"    [ok] fibo_wizard.py present ({wizard_path})")
+
+    # Phase 1 sub-package files (Start Fibo sub-flow, Reader, etc.).
+    sub_dir = hermes_root / "plugins" / "trade" / "fibo"
+    for fname in FIBO_SUBPACKAGE_FILES:
+        fpath = sub_dir / fname
+        if not fpath.is_file():
+            print(f"    [FAIL] fibo/{fname} missing at {fpath}")
+            return False
+    print(f"    [ok] fibo/ sub-package present ({sub_dir})")
 
     mod = _load_fibo_wizard(hermes_root)
     if mod is None:

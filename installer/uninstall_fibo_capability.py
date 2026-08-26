@@ -2,7 +2,10 @@
 
 Removes the /fibo capability payload:
 
-* ``plugins/trade/fibo_wizard.py`` (only this wizard file).
+* ``plugins/trade/fibo_wizard.py`` (the wizard itself)
+* ``plugins/trade/fibo/`` (the Phase 1 sub-package: Start Fibo
+  sub-flow, MT4 Reader, snapshot/store/session modules, atomic
+  write helper, package marker)
 
 It does NOT:
 
@@ -11,10 +14,11 @@ It does NOT:
   /trade),
 * remove any other /trade-owned file.
 
-In this lightweight-skeleton phase there is no ``~/.hermes/fibo/``
-runtime directory to delete — none has been created. Future iterations
-that introduce Fibo runtime state may extend this module to remove
-that directory when ``--purge-state`` is supplied.
+In Phase 1 there is no ``~/.hermes/fibo/`` runtime directory
+created by the capability — the snapshot/state/registrations files
+under ``~/.hermes/fibo/`` are produced by the Reader process (which
+the user launches manually) and by the wizard as user data. The
+uninstall does NOT delete those files — they are user data.
 """
 
 from __future__ import annotations
@@ -30,6 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Must mirror ``FIBO_REL_PATHS`` in install_fibo_capability.py.
 FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo_wizard.py",
+    Path("plugins") / "trade" / "fibo" / "__init__.py",
+    Path("plugins") / "trade" / "fibo" / "_atomic.py",
+    Path("plugins") / "trade" / "fibo" / "snapshot.py",
+    Path("plugins") / "trade" / "fibo" / "store.py",
+    Path("plugins") / "trade" / "fibo" / "session.py",
+    Path("plugins") / "trade" / "fibo" / "flow.py",
+    Path("plugins") / "trade" / "fibo" / "mt4_reader.py",
 ]
 
 
