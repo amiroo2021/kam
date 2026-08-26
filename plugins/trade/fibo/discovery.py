@@ -1,129 +1,185 @@
-"""Read-only venue-instrument discovery.
+"""Phase 2.4 — exchange-agnostic venue-instrument discovery.
 
-Phase 2.1: the Start Fibo flow needs a per-exchange, per-account
-list of actual venue instruments so the user can pick the exact
-contract (e.g. Ondo's ``ETH-USD.P``) the registration will target.
+Public API (callable by the Fibo flow):
 
-Phase 2.3: we also expose the raw catalog (with display name /
-longName / tags / pair) and a per-market price read. Both are pure
-GETs via the existing agent helpers — no new HTTP clients.
+* ``list_market_catalog(exchange, account)``
+* ``get_market_price(exchange, account, instrument)``
 
-This module is read-only. The only HTTP calls it makes are
-``GET /v1/markets`` (catalog) and ``GET /v1/perps/mark_prices``
-(price) via the existing ``_signed_get`` helper in the Ondo agent.
-No ``new_order`` / ``market_order`` / ``limit_order`` / ``cancel`` /
-``close_position`` / ``stop_order`` / POST / PUT / PATCH / DELETE
-methods exist here.
+Both functions go through the SINGLE public boundary — the
+``TradeDesk.execute({...})`` operation handler on the relevant
+``x_<exchange>_agent``. The agents implement:
+
+  * ``resolve_instrument`` — already public across all agents.
+  * ``list_instruments``    — public when the agent can enumerate
+                              a real venue catalog.
+  * ``market_price``        — public when the agent exposes a
+                              reliable read.
+
+If an agent does NOT advertise / implement a given operation the
+TradeDesk returns the normal ``NOT_IMPLEMENTED`` / ``UNSUPPORTED``
+canonical failure. We surface that here as:
+
+  * ``list_market_catalog`` returns ``"unavailable"`` (a sentinel
+    string, NOT ``[]``) so Fibo can distinguish "no catalog
+    adapter implemented" from "the catalog is genuinely empty".
+
+  * ``get_market_price`` returns ``None``.
+
+Fibo itself never branches on exchange name — see
+``plugins/trade/fibo/candidates.py`` and ``flow.py`` for the
+downstream consumers.
 """
 from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 
+CATALOG_UNAVAILABLE = "unavailable"   # sentinel, NOT a list
+
+
 # ---------------------------------------------------------------------------
-# Ondo helpers — pure GETs via the agent boundary
+# TradeDesk binding (overridable for tests)
+# ---------------------------------------------------------------------------
+
+# Production imports TradeDesk lazily so tests can monkey-patch
+# ``plugins.trade.fibo.discovery._get_desk`` (or
+# ``plugins.trade.fibo.discovery._td_module``) to substitute a fake
+# desk and stay fully offline. No production path ever bypasses this
+# indirection.
+import plugins.trade.tradedesk as _td_module  # noqa: E402
+
+
+def _get_desk():
+    """Return the configured TradeDesk.
+
+    Production: returns ``_td_module.get_tradedesk()`` which lazily
+    builds the real, agent-registered TradeDesk singleton.
+
+    Tests: monkey-patch ``discovery._get_desk`` (preferred) OR
+    ``discovery._td_module.get_tradedesk`` (also supported) to a
+    callable returning a fake desk. The fake must NOT import real
+    exchange agents — see ``plugins/trade/tests/fake_tradedesk.py``.
+    """
+    return _td_module.get_tradedesk()
+
+
+# ---------------------------------------------------------------------------
+# Public API
 # ---------------------------------------------------------------------------
 
 
-def list_ondoperps_instruments(account: str) -> List[str]:
-    """Read-only fetch of Ondo Perps instrument identifiers.
+def list_market_catalog(
+    exchange: str, account: str
+) -> Union[List[Dict[str, Any]], str]:
+    """Read-only fetch of the venue's instrument catalog.
 
-    Returns the list of ``market`` field values from
-    ``GET /v1/markets`` for the given account. Empty list on any
-    error (network, auth, empty payload).
+    Returns a list of normalized records (common schema) on
+    success, or ``CATALOG_UNAVAILABLE`` when the agent does not
+    implement ``list_instruments`` for this exchange.
+
+    Distinguishing these two outcomes is critical — Fibo needs
+    to know whether to show the candidate picker (real list
+    available) or fall back to the manual-resolution screen
+    (no enumeration possible).
+
+    The common record schema (only ``instrument`` is required):
+
+        {
+            "instrument": "<venue-native canonical id>",   # required
+            "display_name": "...",                         # optional
+            "description": "...",                          # optional
+            "market_type": "...",                          # optional
+            "base": "...",                                 # optional
+            "quote": "...",                                # optional
+            "price": "..."                                  # optional
+        }
     """
-    return [m["market"] for m in list_ondoperps_markets(account)]
-
-
-def list_ondoperps_markets(account: str) -> List[Dict[str, Any]]:
-    """Phase 2.3: read-only fetch of the full Ondo Perps catalog.
-
-    Returns the raw catalog entries (``market``, ``displayName``,
-    ``longName``, ``pair``, ``underlyingMarket``, ``tags``, ...).
-    The flow MUST NOT reach into the exchange-specific fields —
-    it should use ``candidates.rank_candidates`` which is generic.
-
-    Pure GET of ``/v1/markets``. No price field is populated here;
-    call ``get_ondoperps_price`` separately and pass the result to
-    ``candidates.attach_price`` if needed.
-    """
+    if not exchange or not account:
+        return CATALOG_UNAVAILABLE
+    desk = _get_desk()
     try:
-        from plugins.trade.agents import x_ondoperps_agent as A
-        creds = A._lookup_credentials(account)
-        if creds is None:
-            logger.warning(
-                "fibo_discovery: no credentials for account=%s", account
-            )
-            return []
-        payload = A._signed_get(creds, A._PATH_MARKETS)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "fibo_discovery: Ondo market fetch failed: %s", exc
-        )
-        return []
-
-    if not isinstance(payload, dict):
-        return []
-    perps = payload.get("perps")
-    entries: List[Dict[str, Any]] = []
-    if isinstance(perps, dict):
-        for value in perps.values():
-            if isinstance(value, dict):
-                entries.append(value)
-            elif isinstance(value, list):
-                entries.extend(
-                    item for item in value if isinstance(item, dict)
-                )
-    elif isinstance(perps, list):
-        entries.extend(item for item in perps if isinstance(item, dict))
-
-    return [e for e in entries if isinstance(e, dict) and e.get("market")]
-
-
-def get_ondoperps_price(account: str, market: str) -> Optional[Decimal]:
-    """Phase 2.3: read-only fetch of the live mark price for one
-    market on Ondo Perps.
-
-    Returns the ``markPrice`` Decimal from the agent's
-    ``market_price`` operation, or ``None`` if the read fails or
-    the market is not present.
-
-    Uses ONLY the public agent boundary — no private helpers.
-
-    Pure GET of ``/v1/perps/mark_prices``. No write methods.
-    """
-    market = (market or "").strip()
-    if not market:
-        return None
-    try:
-        from plugins.trade.tradedesk import get_tradedesk
-        desk = get_tradedesk()
         resp = desk.execute({
-            "operation": "market_price",
-            "exchange": "ondoperps",
+            "operation": "list_instruments",
+            "exchange": exchange,
             "account": account,
-            "symbol": market,
         })
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "fibo_discovery: market_price(%r) failed: %s", market, exc
+            "fibo_discovery: list_instruments(%s/%s) raised: %s",
+            exchange, account, exc,
+        )
+        return CATALOG_UNAVAILABLE
+    if not getattr(resp, "success", False):
+        # Distinguish: did the agent actually return
+        # NOT_IMPLEMENTED, or did the catalog genuinely come back
+        # empty? TradeDesk returns success=True with
+        # data["instruments"]=[] for an empty successful list.
+        err = getattr(resp, "error", None)
+        if err is not None and getattr(err, "code", None) in (
+            "NOT_IMPLEMENTED", "UNSUPPORTED_OPERATION",
+        ):
+            logger.info(
+                "fibo_discovery: list_instruments unsupported on %s",
+                exchange,
+            )
+            return CATALOG_UNAVAILABLE
+        logger.warning(
+            "fibo_discovery: list_instruments(%s/%s) failed: %s",
+            exchange, account,
+            getattr(err, "message", None) if err else None,
+        )
+        return CATALOG_UNAVAILABLE
+    data = getattr(resp, "data", None)
+    if not isinstance(data, dict):
+        return CATALOG_UNAVAILABLE
+    records = data.get("instruments")
+    if not isinstance(records, list):
+        return CATALOG_UNAVAILABLE
+    return [_validate_record(r) for r in records]
+
+
+def get_market_price(
+    exchange: str, account: str, instrument: str
+) -> Optional[Decimal]:
+    """Read-only fetch of the live market price for ``instrument``.
+
+    Returns the ``Decimal`` price on success, or ``None`` if the
+    agent does not implement ``market_price`` or the read fails.
+    Missing prices NEVER block candidate selection.
+    """
+    if not exchange or not account or not instrument:
+        return None
+    desk = _get_desk()
+    try:
+        resp = desk.execute({
+            "operation": "market_price",
+            "exchange": exchange,
+            "account": account,
+            "symbol": instrument,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fibo_discovery: market_price(%s/%s/%s) raised: %s",
+            exchange, account, instrument, exc,
         )
         return None
     if not getattr(resp, "success", False):
         return None
-    # The agent exposes the price in two locations depending on
-    # version: ``market_price.mark_price`` (newer) and
-    # ``instrument.price`` (older fallback).
-    mp_obj = getattr(resp, "market_price", None)
-    inst = getattr(resp, "instrument", None)
+    # The agent exposes the price in one of several places
+    # depending on version:
+    #   - market_price.mark_price  (newer agents)
+    #   - market_price.price
+    #   - instrument.price         (older agents)
     candidates: List[Any] = []
+    mp_obj = getattr(resp, "market_price", None)
     if mp_obj is not None:
         candidates.append(getattr(mp_obj, "mark_price", None))
         candidates.append(getattr(mp_obj, "price", None))
+    inst = getattr(resp, "instrument", None)
     if inst is not None:
         candidates.append(getattr(inst, "price", None))
     for raw in candidates:
@@ -139,78 +195,38 @@ def get_ondoperps_price(account: str, market: str) -> Optional[Decimal]:
 
 
 # ---------------------------------------------------------------------------
-# Per-exchange dispatch (kept for backward compatibility with
-# Phase 2.1 / 2.2 — they consume List[str]).
+# Internals
 # ---------------------------------------------------------------------------
 
 
-INSTRUMENT_LISTERS: Dict[str, Callable[[str], List[str]]] = {
-    "ondoperps": list_ondoperps_instruments,
-}
+def _validate_record(raw: Any) -> Dict[str, Any]:
+    """Normalize a single catalog record to the common schema.
 
-
-def list_instruments(exchange: str, account: str) -> List[str]:
-    """Dispatch to the per-exchange instrument lister.
-
-    Unknown exchanges return ``[]``. The flow must handle empty
-    lists gracefully (e.g. show a "type the instrument name" prompt
-    instead of a button grid).
+    Only ``instrument`` is required; everything else may be
+    missing or empty and is replaced with ``None``.
     """
-    lister = INSTRUMENT_LISTERS.get((exchange or "").strip().lower())
-    if lister is None:
-        return []
-    try:
-        return lister(account)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "fibo_discovery: lister for %s failed: %s", exchange, exc
-        )
-        return []
-
-
-# Phase 2.3: full catalog fetcher dispatch. Future exchanges plug in
-# here.
-MARKET_CATALOG_LISTERS: Dict[str, Callable[[str], List[Dict[str, Any]]]] = {
-    "ondoperps": list_ondoperps_markets,
-}
-
-
-def list_market_catalog(exchange: str, account: str) -> List[Dict[str, Any]]:
-    """Phase 2.3: dispatch to the per-exchange catalog fetcher.
-
-    Returns raw exchange-specific catalog entries. The flow MUST
-    pass these through ``candidates.rank_candidates`` rather than
-    reach into exchange-specific fields.
-    """
-    lister = MARKET_CATALOG_LISTERS.get((exchange or "").strip().lower())
-    if lister is None:
-        return []
-    try:
-        return lister(account)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "fibo_discovery: catalog lister for %s failed: %s",
-            exchange, exc,
-        )
-        return []
-
-
-def get_market_price(
-    exchange: str, account: str, market: str
-) -> Optional[Decimal]:
-    """Phase 2.3: per-exchange price read. Returns None when the
-    exchange / market has no price reader or the read fails."""
-    key = (exchange or "").strip().lower()
-    if key == "ondoperps":
-        return get_ondoperps_price(account, market)
-    return None
+    if not isinstance(raw, dict):
+        return {"instrument": ""}
+    instrument = raw.get("instrument")
+    if not isinstance(instrument, str) or not instrument:
+        # Records without a canonical id are unusable for Fibo.
+        # Keep the slot empty so the caller can decide to skip.
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    for key in ("display_name", "description", "market_type",
+                "base", "quote", "price"):
+        val = raw.get(key)
+        if isinstance(val, str) and val:
+            out[key] = val
+        elif val is not None:
+            out[key] = val
+        else:
+            out[key] = None
+    return out
 
 
 __all__ = [
-    "list_ondoperps_instruments",
-    "list_ondoperps_markets",
-    "get_ondoperps_price",
-    "list_instruments",
+    "CATALOG_UNAVAILABLE",
     "list_market_catalog",
     "get_market_price",
 ]

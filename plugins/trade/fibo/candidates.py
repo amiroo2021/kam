@@ -63,16 +63,30 @@ class InstrumentCandidate:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def to_compact_block(self, idx: int) -> str:
-        """Render the candidate for the wizard screen (spec §3)."""
+        """Render the candidate for the wizard screen (spec §3).
+
+        Format:
+            1. ETH-USD.P
+               Ethereum [crypto]
+               Price: 2462.44
+
+        The market-type tag is rendered exactly once — inside the
+        description line where the candidate builder already
+        appends ``[type]`` to the longName. The previous version
+        printed ``[crypto]`` twice (once in description, once on its
+        own line); the second copy is suppressed here. Internal
+        ranking score and reasons are deliberately omitted from
+        the Telegram screen — they remain available on the
+        ``InstrumentCandidate`` dataclass for tests and logging.
+        """
         lines = [f"{idx + 1}. {self.instrument}"]
-        if self.display_name and self.display_name != self.instrument:
-            lines.append(f"   {self.display_name}")
+        # Description already carries ``[market_type]`` at the end
+        # (see ``build_candidates_from_catalog``); do not repeat it.
         if self.description:
             lines.append(f"   {self.description}")
-        if self.market_type:
-            lines.append(f"   [{self.market_type}]")
         if self.price is not None:
-            lines.append(f"   Price: {self.price}")
+            # Trim trailing zeros for compact display.
+            lines.append(f"   Price: {format(self.price.normalize(), 'f')}")
         return "\n".join(lines)
 
 
@@ -185,15 +199,45 @@ def rank_candidates(
 
     out: List[InstrumentCandidate] = []
     for entry in raw_entries:
-        instrument = str(entry.get("market") or "").strip()
+        # Phase 2.4: support BOTH the new common schema
+        # (``instrument`` / ``display_name`` / ``description`` /
+        # ``base`` / ``quote`` / ``market_type``) AND the legacy
+        # Ondo ``market`` / ``displayName`` / ``longName`` /
+        # ``pair.base`` shape produced by older code paths.
+        instrument = (
+            str(entry.get("instrument") or "").strip()
+            or str(entry.get("market") or "").strip()
+        )
         if not instrument:
             continue
-        display_name = str(entry.get("displayName") or "").strip()
-        long_name = str(entry.get("longName") or "").strip()
-        underlying = str(entry.get("underlyingMarket") or "").strip()
-        pair = entry.get("pair") or {}
-        base = str(pair.get("base") or "").strip() if isinstance(pair, dict) else ""
-        market_type = _infer_market_type(entry)
+        display_name = (
+            str(entry.get("display_name") or "").strip()
+            or str(entry.get("displayName") or "").strip()
+        )
+        long_name = (
+            str(entry.get("long_name") or "").strip()
+            or str(entry.get("description") or "").strip()
+            or str(entry.get("longName") or "").strip()
+        )
+        underlying = (
+            str(entry.get("underlying_symbol") or "").strip()
+            or str(entry.get("underlyingMarket") or "").strip()
+        )
+        # ``base`` may be carried at the top level (common schema)
+        # or inside ``pair.base`` (legacy Ondo).
+        base_top = str(entry.get("base") or "").strip()
+        if base_top:
+            base = base_top
+        else:
+            pair = entry.get("pair") or {}
+            base = (
+                str(pair.get("base") or "").strip()
+                if isinstance(pair, dict) else ""
+            )
+        market_type = (
+            str(entry.get("market_type") or "").strip()
+            or _infer_market_type(entry)
+        )
 
         score = 0
         reasons: List[str] = []
@@ -206,7 +250,7 @@ def rank_candidates(
         if src_up and display_name and src_up == display_name.upper():
             score += 80
             reasons.append("exact display_name match")
-        # 3. exact longName.
+        # 3. exact longName / description.
         if src_up and long_name and src_up == long_name.upper():
             score += 60
             reasons.append("exact longName match")
@@ -312,7 +356,12 @@ def attach_price(
     """
     out: List[Dict[str, Any]] = []
     for entry in raw_entries:
-        market = str(entry.get("market") or "").strip()
+        # Phase 2.4: support both the new common schema
+        # (``instrument``) and the legacy Ondo shape (``market``).
+        market = (
+            str(entry.get("instrument") or "").strip()
+            or str(entry.get("market") or "").strip()
+        )
         if not market:
             continue
         enriched = dict(entry)

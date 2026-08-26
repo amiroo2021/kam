@@ -386,6 +386,8 @@ def capabilities() -> List[str]:
         "set_tp",
         "set_sl",
         "resolve_instrument",
+        # Phase 2.4: read-only catalog enumeration.
+        "list_instruments",
     ]
 
 
@@ -442,6 +444,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _set_position_trigger(account, request, operation="set_sl")
         if operation == "resolve_instrument":
             return _resolve_instrument(account, request)
+        if operation == "list_instruments":
+            return _execute_list_instruments(account, request)
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation=operation,
@@ -818,6 +822,96 @@ def _hibachi_live_descriptors(payload: Mapping[str, Any]) -> List[Dict[str, Any]
             "settlement_decimals": contract.get("settlementDecimals"),
         })
     return descriptors
+
+
+def _normalize_hibachi_market(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Hibachi future-contract entry to the
+    Fibo common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. Hibachi carries
+    ``symbol`` (the venue-native id, e.g. ``ETHUSD-PERP``),
+    ``displayName``, ``underlyingSymbol`` (base), and
+    ``settlementSymbol`` (quote).
+    """
+    if not isinstance(contract, dict):
+        return {"instrument": ""}
+    instrument = str(contract.get("symbol") or "").strip()
+    if not instrument:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    base = str(contract.get("underlyingSymbol") or "").strip()
+    if base:
+        out["base"] = base
+    quote = str(contract.get("settlementSymbol") or "").strip()
+    if quote:
+        out["quote"] = quote
+    desc = str(contract.get("displayName") or "").strip()
+    if desc:
+        out["description"] = desc
+    # Hibachi exposes perps in this catalog.
+    if contract.get("contractType") or "PERP" in instrument.upper():
+        out["market_type"] = "perp"
+    # No bundled price in exchange-info — Fibo will call
+    # ``market_price`` separately when supported (Hibachi does
+    # not currently expose that operation).
+    return out
+
+
+def _execute_list_instruments(
+    account: str, request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Hibachi.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id. No price is attached —
+    Hibachi does not currently expose a market_price operation.
+    """
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        payload = _fetch_exchange_info()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    if not isinstance(payload, dict):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="Hibachi exchange-info returned an unexpected payload shape.",
+        )
+    instruments: List[Dict[str, Any]] = []
+    for contract in _extract_future_contracts(payload):
+        if not isinstance(contract, dict):
+            continue
+        # Skip non-live contracts (the resolver layer does the
+        # same filter when building market metadata).
+        if not contract.get("live", True):
+            continue
+        norm = _normalize_hibachi_market(contract)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
 
 
 def _build_hibachi_market_index(payload: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:

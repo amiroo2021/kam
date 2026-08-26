@@ -154,6 +154,16 @@ class FiboSession:
     # Set ONLY after the candidate is revalidated through the
     # exchange agent; never trusted from raw button payload.
     selected_candidate_canonical: Optional[str] = None
+    # Phase 2.3 UI polish: which path staged the current
+    # proposal? Drives the proposal screen's "Your input:" /
+    # "Learned alias:" / (omitted) label. Possible values:
+    #   "auto"       — fresh ``resolve_instrument(source_symbol)`` succeeded
+    #   "alias"      — user typed something via Other, agent resolved it
+    #   "cached"     — proposal came from the alias-memory cache
+    #   "candidate"  — user picked a candidate from the picker
+    # The proposal screen MUST omit the alias line for "auto" /
+    # "candidate" because there is no user-typed input to show.
+    proposal_origin: Optional[str] = None
     starting_volume: Optional[Decimal] = None
     # Snapshot metadata captured at confirmation time so Create can
     # re-validate against the latest snapshot atomically.

@@ -319,6 +319,8 @@ def capabilities() -> List[str]:
         "position_state",
         "get_order_state",
         "get_order_state_by_client_id",
+        # Phase 2.4: read-only catalog enumeration.
+        "list_instruments",
     ]
 
 
@@ -1072,6 +1074,99 @@ def _market_cache_credentials() -> Dict[str, Any]:
 def _good_til_time_us(market_id: int) -> int:
     now_ms = int(time.time() * 1000)
     return (now_ms + _ARCUS_GOOD_TIL_TIME_MIN_FUTURE_MS) * 1000
+
+
+def _normalize_arcus_market(market: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Arcus ``/v1/markets`` entry to the Fibo
+    common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. Arcus payloads carry
+    ``marketDisplayName`` (e.g. ``ETH-USD.P``) and ``baseAsset``
+    (e.g. ``ETH``). We preserve those plus an optional description.
+    """
+    if not isinstance(market, dict):
+        return {"instrument": ""}
+    display = _normalize_symbol(market.get("marketDisplayName"))
+    if not display:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": display}
+    base = _normalize_symbol(market.get("baseAsset"))
+    if base:
+        out["base"] = base
+    quote = _normalize_symbol(market.get("quoteAsset"))
+    if quote:
+        out["quote"] = quote
+    if market.get("marketType") in ("perp", "perpetual"):
+        out["market_type"] = "perp"
+    elif market.get("marketType") in ("spot",):
+        out["market_type"] = "spot"
+    if market.get("description"):
+        out["description"] = str(market["description"])
+    if market.get("quoteDisplayName"):
+        out["display_name"] = str(market["quoteDisplayName"])
+    return out
+
+
+def _fetch_arcus_markets_payload() -> List[Dict[str, Any]]:
+    """Read the full Arcus market catalog via the public
+    ``GET /v1/markets`` endpoint.
+
+    The catalog is shared across all Arcus accounts — it is
+    unauthenticated, cached in-memory by the agent, and used by
+    ``_resolve_market`` for symbol lookups. We re-use that same
+    cache here so ``list_instruments`` and ``resolve_instrument``
+    never disagree about what the venue exposes.
+    """
+    payload = _public_get(_market_cache_credentials(), "/v1/markets")
+    if not isinstance(payload, dict):
+        raise RuntimeError("ARCUS_MARKETS_PAYLOAD_INVALID")
+    markets = payload.get("markets")
+    if not isinstance(markets, list):
+        raise RuntimeError("ARCUS_MARKETS_PAYLOAD_INVALID")
+    return [m for m in markets if isinstance(m, dict)]
+
+
+def _execute_list_instruments(
+    request: Dict[str, Any],
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Arcus.
+
+    The catalog endpoint is unauthenticated — same payload powers
+    ``resolve_instrument``. ``account`` is required for the
+    response envelope but does not affect what the catalog
+    returns.
+    """
+    account = str(request.get("account") or "").strip()
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        catalog = _fetch_arcus_markets_payload()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    instruments: List[Dict[str, Any]] = []
+    for entry in catalog:
+        norm = _normalize_arcus_market(entry)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
 
 
 def _build_new_order_payload(*, credentials: Dict[str, Any], market: Dict[str, Any], side: str, quantity: Decimal, price: Decimal, reduce_only: bool, client_id: str) -> Dict[str, Any]:
@@ -3603,6 +3698,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_cancel_order(request)
     if operation == "resolve_instrument":
         return _execute_resolve_instrument(request)
+    if operation == "list_instruments":
+        return _execute_list_instruments(request)
     if operation == "market_constraints":
         return _execute_market_constraints(request)
     if operation == "market_price":

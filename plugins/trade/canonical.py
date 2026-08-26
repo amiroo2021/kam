@@ -441,6 +441,12 @@ class CanonicalResponse:
     # callers use it via get_order_state() on the agent and the
     # canonical helpers extract fields defensively.
     order_state: Optional[Dict[str, Any]] = None
+    # Phase 2.4: free-form payload slot for read-only operations
+    # that return an exchange-shaped dict (catalog, market price
+    # payload, etc.). Always read-only metadata; never an order
+    # placement or position mutation.
+    order_state: Optional[Dict[str, Any]] = None
+    data: Optional[Dict[str, Any]] = None
     error: Optional[CanonicalError] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -474,6 +480,8 @@ class CanonicalResponse:
             data["position_action"] = self.position_action.to_dict()
         if self.order_state is not None:
             data["order_state"] = self.order_state
+        if self.data is not None:
+            data["data"] = self.data
         if self.error is not None:
             data["error"] = self.error.to_dict()
         return data
@@ -495,6 +503,7 @@ def make_success(
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
     position_action: Optional[CanonicalPositionActionResult] = None,
     order_state: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
 ) -> CanonicalResponse:
     return CanonicalResponse(
         success=True,
@@ -513,6 +522,7 @@ def make_success(
         cancel_group=cancel_group,
         position_action=position_action,
         order_state=order_state,
+        data=data,
         error=None,
     )
 

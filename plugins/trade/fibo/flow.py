@@ -369,6 +369,7 @@ class StartFiboFlow:
         if snap is None:
             return self._render_no_data(sess)
         sess.resolution_input = raw
+        sess.proposal_origin = "alias"
         canonical = self._safe_resolve(
             sess.exchange or "", sess.account or "", raw,
         )
@@ -498,6 +499,7 @@ class StartFiboFlow:
         # the gate between account pick and the proposal screen).
         sess.exchange_instrument = None
         sess.resolution_input = sess.symbol  # default input
+        sess.proposal_origin = None  # set later by the proposal path
         sess.choices_instruments = []
         sess.instrument_page = 0
         sess.awaiting = None
@@ -519,22 +521,57 @@ class StartFiboFlow:
         ``"ETH-USD.P"``) on success, ``None`` on failure or when
         no resolver is wired. NEVER raises — all exceptions are
         swallowed so a broken resolver never crashes the wizard.
+
+        Resolution order (Phase 2.4):
+        1. If a ``resolve_instrument_fn`` was supplied at
+           construction time, use it (legacy path).
+        2. Otherwise, dispatch through the public TradeDesk
+           boundary (``fibo.discovery.list_market_catalog`` is
+           NOT used here — this is a single-symbol resolve).
+           Falls back to ``None`` if the desk rejects the call.
         """
-        if self._resolve_instrument is None:
-            return None
+        # 1. Legacy: injected resolver (used by older tests and
+        # by callers that want a non-TradeDesk resolve path).
+        if self._resolve_instrument is not None:
+            try:
+                result = self._resolve_instrument(
+                    str(exchange), str(account), str(symbol)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fibo_flow: resolve_instrument(%r,%r,%r) raised: %s",
+                    exchange, account, symbol, exc,
+                )
+                return None
+            if not result:
+                return None
+            return str(result).strip() or None
+        # 2. Public boundary: route through the same TradeDesk
+        # singleton that ``discovery`` uses. This guarantees the
+        # Fibo flow reads the same canonical contract id the
+        # user would see from a live wizard session.
         try:
-            result = self._resolve_instrument(
-                str(exchange), str(account), str(symbol)
-            )
+            from . import discovery as _discovery
+            desk = _discovery._get_desk()
+            resp = desk.execute({
+                "operation": "resolve_instrument",
+                "exchange": exchange,
+                "account": account,
+                "symbol": symbol,
+            })
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "fibo_flow: resolve_instrument(%r,%r,%r) raised: %s",
-                exchange, account, symbol, exc,
+                "fibo_flow: resolve_instrument(via desk) raised: %s",
+                exc,
             )
             return None
-        if not result:
+        if not getattr(resp, "success", False):
             return None
-        return str(result).strip() or None
+        inst = getattr(resp, "instrument", None)
+        canonical = getattr(inst, "symbol", None) if inst is not None else None
+        if not canonical:
+            return None
+        return str(canonical).strip() or None
 
     def _propose_exchange_instrument(
         self,
@@ -574,6 +611,7 @@ class StartFiboFlow:
                 # proposal canonical in sess.awaiting so Agree
                 # can find it.
                 sess.resolution_input = cached.resolution_input or sess.symbol
+                sess.proposal_origin = "cached"
                 sess.awaiting = "proposal:" + cached.exchange_instrument
                 sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
                 return self._render_instrument_proposal(sess, snap)
@@ -589,6 +627,7 @@ class StartFiboFlow:
             return self._propose_via_candidates(sess, snap)
         # Resolution succeeded → render proposal.
         sess.resolution_input = sess.symbol
+        sess.proposal_origin = "auto"
         sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
         # We stage the proposal here. session.exchange_instrument
         # is still None — only the user's Agree commits it.
@@ -638,12 +677,25 @@ class StartFiboFlow:
             logger.warning(
                 "fibo_flow: catalog fetch failed: %s", exc
             )
-            catalog = []
+            catalog = discovery.CATALOG_UNAVAILABLE
 
+        # CATALOG_UNAVAILABLE sentinel means the chosen agent
+        # doesn't implement list_instruments (resolve-only exchange
+        # such as Apex, Pacifica or Raydium, or a transient
+        # failure). Fall back to the manual-resolution screen —
+        # never fabricate an empty catalog.
+        if (
+            catalog == discovery.CATALOG_UNAVAILABLE
+            or not isinstance(catalog, list)
+        ):
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_instrument_unresolved(sess, snap)
+
+        # A truly empty list (``[]``) means the agent successfully
+        # returned zero markets for this account — extremely rare
+        # but legal. Treat it the same as unavailable so the user
+        # doesn't see a 0-candidate picker.
         if not catalog:
-            # Discovery failed entirely — fall back to the original
-            # Phase 2.2 unresolved screen (Other / Browse / Back /
-            # Cancel).
             sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
             return self._render_instrument_unresolved(sess, snap)
 
@@ -807,6 +859,7 @@ class StartFiboFlow:
             sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
             return self._render_alias_failure(sess, snap, candidate)
         sess.resolution_input = candidate
+        sess.proposal_origin = "candidate"
         sess.awaiting = "proposal:" + canonical
         sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
         return self._render_instrument_proposal(sess, snap)
@@ -879,6 +932,7 @@ class StartFiboFlow:
         # Stage the proposal. session.exchange_instrument stays
         # None — only Agree commits.
         sess.resolution_input = candidate.instrument
+        sess.proposal_origin = "candidate"
         sess.selected_candidate_canonical = canonical
         sess.awaiting = "proposal:" + canonical
         return self._render_instrument_proposal(sess, snap)
@@ -1366,18 +1420,46 @@ class StartFiboFlow:
                 {"text": "❌ Cancel", "callback_data": CB_CANCEL},
             ],
         ]
-        # Show resolution_input distinctly only when it differs
-        # from the source symbol.
-        alias_line = ""
-        ri = sess.resolution_input or src
-        if ri.strip() and ri.strip() != src:
-            alias_line = f"Your alias:   {ri}\n"
+        # Decide whether (and how) to show the alias line. UI polish:
+        # the label depends on which path staged the proposal so we
+        # never show a confusing blank or ambiguous "Your alias: …"
+        # when there is no user-typed input to disclose.
+        #   auto      → omit (fresh resolve_instrument succeeded)
+        #   candidate → omit (user picked from picker)
+        #   alias     → "Your input: …" (user typed via Other)
+        #   cached    → "Learned alias: …" (alias memory hit)
+        ri = (sess.resolution_input or "").strip()
+        origin = sess.proposal_origin
+        if origin in ("auto", "candidate") or not ri or ri == src:
+            alias_line = ""
+        elif origin == "alias":
+            alias_line = f"Your input:    {ri}\n"
+        elif origin == "cached":
+            alias_line = f"Learned alias: {ri}\n"
+        else:
+            # Defensive fallback (unknown origin) — show as user
+            # input rather than risk an empty labelled line.
+            alias_line = f"Your input:    {ri}\n"
+        # Show the live price when the canonical came with one.
+        # For fresh proposals the price is on the candidate object;
+        # for alias / cached paths we read it from the resolved
+        # candidate if still in the session.
+        price_text = ""
+        if sess.candidates:
+            for c in sess.candidates:
+                if c.instrument == canonical and c.price is not None:
+                    price_text = (
+                        f"Price:        "
+                        f"{format(c.price.normalize(), 'f')}\n"
+                    )
+                    break
         text = (
             f"{header}"
             f"🔎 Instrument translation\n\n"
             f"MT4 source:  {src}\n"
             f"{alias_line}"
-            f"OndoPerps:   {canonical}\n\n"
+            f"OndoPerps:   {canonical}\n"
+            f"{price_text}\n"
             f"Does this look correct?"
         )
         return Screen(text=text, buttons=rows)
@@ -1775,45 +1857,57 @@ class StartFiboFlow:
         desired_exchange_size: Decimal,
         snapshot_age: str,
     ) -> str:
-        """Spec §6: the canonical venue contract is the prominent
-        Symbol line; MT4 source appears as its own line.
+        """UI polish (Phase 2.3): the final confirmation labels the
+        two identities unambiguously.
 
-        The layout matches the spec example exactly:
-            Symbol:       <canonical venue>
-            MT4 source:   <source_symbol>
-            Variant:      <variant>
-            Side:         <side>
-            Exchange:     <exchange>
-            Account:      <account>
-            Volume:       <vol>
-            MT4 feed:     <source> (seq <seq>)
-            MT4 cycle:    <cycle_id>
-            MT4 weight:   <weight>
-            MT4 %:        <percentage>
-            Calc target:  <desired_size>
-            Snapshot age: <age>
+        ``Source symbol``       — the MT4 / Observer symbol.
+        ``Exchange instrument``  — the canonical OndoPerps contract.
+
+        It is impossible to confuse the MT4 symbol with the venue
+        contract on this screen.
+
+        Layout:
+            Source symbol:       <source_symbol>
+            Exchange instrument: <canonical venue>
+            Variant:             <variant>
+            Side:                <side>
+            Exchange:            <exchange>
+            Account:             <account>
+            Volume:              <vol>
+
+            MT4 feed:            <source> (seq <seq>)
+            MT4 cycle:           <cycle_id>
+            MT4 weight:          <weight>
+            MT4 %:               <percentage>
+
+            Calc target:         <desired_size>
+            Snapshot age:        <age>
         """
         vol = "?" if starting_volume is None else _fmt_decimal(starting_volume)
-        symbol_line = (
-            f"Symbol:       {exchange_instrument}\n"
-            if exchange_instrument
-            else "Symbol:       ⚠ not selected (NEEDS_INSTRUMENT_SELECTION)\n"
-        )
+        if exchange_instrument:
+            instrument_line = (
+                f"Exchange instrument: {exchange_instrument}\n"
+            )
+        else:
+            instrument_line = (
+                "Exchange instrument: ⚠ not selected "
+                "(NEEDS_INSTRUMENT_SELECTION)\n"
+            )
         return (
             f"📋 Confirm registration:\n\n"
-            f"{symbol_line}"
-            f"MT4 source:   {source_symbol}\n"
-            f"Variant:      {variant}\n"
-            f"Side:         {side}\n"
-            f"Exchange:     {exchange}\n"
-            f"Account:      {account}\n"
-            f"Volume:       {vol}\n\n"
-            f"MT4 feed:     {source} (seq {source_seq})\n"
-            f"MT4 cycle:    {cycle_id}\n"
-            f"MT4 weight:   {_fmt_decimal(cumulative_weight)}\n"
-            f"MT4 %:        {_fmt_decimal(percentage)}\n\n"
-            f"Calc target:  {_fmt_decimal(desired_exchange_size)}\n"
-            f"Snapshot age: {snapshot_age}"
+            f"Source symbol:       {source_symbol}\n"
+            f"{instrument_line}"
+            f"Variant:             {variant}\n"
+            f"Side:                {side}\n"
+            f"Exchange:            {exchange}\n"
+            f"Account:             {account}\n"
+            f"Volume:              {vol}\n\n"
+            f"MT4 feed:            {source} (seq {source_seq})\n"
+            f"MT4 cycle:           {cycle_id}\n"
+            f"MT4 weight:          {_fmt_decimal(cumulative_weight)}\n"
+            f"MT4 %:               {_fmt_decimal(percentage)}\n\n"
+            f"Calc target:         {_fmt_decimal(desired_exchange_size)}\n"
+            f"Snapshot age:        {snapshot_age}"
         )
 
     @staticmethod

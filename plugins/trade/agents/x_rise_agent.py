@@ -235,6 +235,8 @@ def capabilities() -> List[str]:
         "get_order_state",
         "get_order_state_by_client_id",
         "close_position",
+        # Phase 2.4: read-only catalog enumeration.
+        "list_instruments",
     ]
 
 
@@ -525,6 +527,115 @@ def _fetch_markets_payload() -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError("Rise markets response missing data")
     return data
+
+
+def _normalize_rise_market(market: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Rise ``/v1/markets`` entry to the Fibo
+    common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. Rise payload items
+    include ``config.name`` (the on-chain market name, e.g.
+    ``ETH-PERP``), ``display_name``, ``base_asset_symbol``, and
+    ``last_price``. We preserve all of those.
+    """
+    if not isinstance(market, dict):
+        return {"instrument": ""}
+    cfg = market.get("config") if isinstance(market.get("config"), dict) else {}
+    instrument = (
+        (cfg.get("name") if isinstance(cfg, dict) else None)
+        or market.get("name")
+        or market.get("symbol")
+    )
+    if not isinstance(instrument, str) or not instrument:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    base = (
+        market.get("base_asset_symbol")
+        or (cfg.get("base_asset_symbol") if isinstance(cfg, dict) else None)
+    )
+    if isinstance(base, str) and base:
+        out["base"] = base
+    quote = (
+        market.get("quote_asset_symbol")
+        or (cfg.get("quote_asset_symbol") if isinstance(cfg, dict) else None)
+    )
+    if isinstance(quote, str) and quote:
+        out["quote"] = quote
+    if isinstance(cfg, dict) and cfg.get("market_type") == "perp":
+        out["market_type"] = "perp"
+    desc = (
+        market.get("display_name")
+        or (cfg.get("display_name") if isinstance(cfg, dict) else None)
+    )
+    if isinstance(desc, str) and desc:
+        out["description"] = desc
+    # Bundled price (last_price is documented as the top-level
+    # field per Rise's API).
+    last_price = market.get("last_price")
+    if last_price is not None:
+        try:
+            from decimal import Decimal as _D
+            d = _D(str(last_price))
+            if d.is_finite():
+                out["price"] = format(d.normalize(), "f")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _execute_list_instruments(
+    request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Rise.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id and (when available) the
+    last_price from the catalog payload.
+    """
+    account = str(request.get("account") or "").strip()
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        payload = _fetch_markets_payload()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    raw_markets = payload.get("markets")
+    if not isinstance(raw_markets, list):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="Rise markets payload missing 'markets' list.",
+        )
+    instruments: List[Dict[str, Any]] = []
+    for entry in raw_markets:
+        if not isinstance(entry, dict):
+            continue
+        norm = _normalize_rise_market(entry)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
 
 
 def _fetch_system_config() -> Dict[str, Any]:
@@ -3828,6 +3939,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_close_position(account, normalized_request)
     if operation == "resolve_instrument":
         return _execute_resolve_instrument(normalized_request)
+    if operation == "list_instruments":
+        return _execute_list_instruments(normalized_request)
     if operation == "market_constraints":
         return _execute_market_constraints(normalized_request)
     if operation == "market_price":

@@ -426,6 +426,8 @@ def capabilities() -> List[str]:
         "market_price",
         "close_position",
         "resolve_instrument",
+        # Phase 2.4: read-only catalog enumeration.
+        "list_instruments",
     ]
 
 
@@ -518,6 +520,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _position_state(account, request)
         if operation == "market_price":
             return _market_price(account, request)
+        if operation == "list_instruments":
+            return _execute_list_instruments(account, request)
         if operation == "close_position":
             return _close_position(account, request)
     except Exception as exc:  # noqa: BLE001
@@ -3858,6 +3862,134 @@ def _position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             price_increment=_decimal_text(metadata.get("quote_increment")),
             size_increment=_decimal_text(metadata.get("base_increment")),
         ),
+    )
+
+
+def _fetch_ondoperps_trading_pairs() -> List[Dict[str, Any]]:
+    """Walk the Ondo Perps ``/v1/markets`` payload and return the
+    raw ``tradingPairs`` list. Mirrors the resilience of
+    ``_fetch_market_metadata`` so callers can decide whether to
+    tolerate a transient failure.
+
+    Account credentials are looked up via the calling context — the
+    caller is responsible for ensuring they are present before
+    invoking this helper.
+    """
+    raise RuntimeError(
+        "_fetch_ondoperps_trading_pairs must be called with an account; "
+        "use _fetch_ondoperps_trading_pairs_for(account) instead."
+    )
+
+
+def _fetch_ondoperps_trading_pairs_for(account: str) -> List[Dict[str, Any]]:
+    """Same as ``_fetch_ondoperps_trading_pairs`` but accepts the
+    account explicitly. The Ondo Perps ``/v1/markets`` endpoint
+    is unauthenticated, but the helper goes through the same
+    redaction context as the rest of the agent by reusing the
+    account's credentials dict for the HTTP call.
+    """
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return []
+    payload = _signed_get(credentials, _PATH_MARKETS)
+    pairs: List[Dict[str, Any]] = []
+    if isinstance(payload, dict):
+        perps = payload.get("perps")
+        if isinstance(perps, dict):
+            trading_pairs = perps.get("tradingPairs")
+            if isinstance(trading_pairs, list):
+                pairs = [it for it in trading_pairs if isinstance(it, dict)]
+        if not pairs and isinstance(perps, dict):
+            for value in perps.values():
+                if isinstance(value, list):
+                    pairs.extend(it for it in value if isinstance(it, dict))
+                elif isinstance(value, dict):
+                    pairs.append(value)
+    return pairs
+
+
+def _normalize_ondoperps_market(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Ondo ``/v1/markets`` ``tradingPairs`` entry
+    to the Fibo common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. Ondo payload items
+    carry ``market`` (the canonical venue id, e.g. ``ETH-USD.P``),
+    ``baseCurrency``, ``quoteCurrency``, and ``tags`` (a list).
+    """
+    if not isinstance(entry, dict):
+        return {"instrument": ""}
+    instrument = str(entry.get("market") or "").strip()
+    if not instrument:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    base = str(entry.get("baseCurrency") or "").strip()
+    if base:
+        out["base"] = base
+    quote = str(entry.get("quoteCurrency") or "").strip()
+    if quote:
+        out["quote"] = quote
+    if entry.get("marketType") in ("perp", "perpetual"):
+        out["market_type"] = "perp"
+    elif entry.get("marketType") in ("spot",):
+        out["market_type"] = "spot"
+    desc = str(entry.get("description") or "").strip()
+    if desc:
+        out["description"] = desc
+    elif entry.get("displayName"):
+        out["description"] = str(entry.get("displayName")).strip()
+    return out
+
+
+def _execute_list_instruments(
+    account: str, request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Ondo Perps.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id.
+    """
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message=(
+                "Unknown or invalid Ondo Perps account configuration"
+            ),
+        )
+    try:
+        pairs = _fetch_ondoperps_trading_pairs_for(account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    instruments: List[Dict[str, Any]] = []
+    for entry in pairs:
+        norm = _normalize_ondoperps_market(entry)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
     )
 
 

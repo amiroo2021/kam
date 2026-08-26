@@ -960,12 +960,14 @@ class SourceExchangeIdentitySplitTests(_Base):
         )
         # Feed a valid starting volume.
         screen = flow.handle_text("chat-1", "user-1", "0.001")
-        # The confirmation screen's text contains BOTH (Phase 2.2
-        # spec §6 — the canonical venue contract is the prominent
-        # 'Symbol:' line; the MT4 source appears as 'MT4 source:').
-        self.assertIn("Symbol:", screen.text)
+        # The confirmation screen's text contains BOTH (Phase 2.3
+        # spec §12 polish — the canonical venue contract is shown as
+        # 'Exchange instrument:' and the MT4 source appears as
+        # 'Source symbol:'; the legacy 'Symbol:' / 'MT4 source:'
+        # wording is gone).
+        self.assertIn("Exchange instrument:", screen.text)
         self.assertIn("ETH-USD.P", screen.text)
-        self.assertIn("MT4 source:", screen.text)
+        self.assertIn("Source symbol:", screen.text)
         self.assertIn("ETHUSD", screen.text)
 
 

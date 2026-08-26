@@ -233,7 +233,9 @@ def list_accounts() -> List[str]:
 
 def capabilities() -> List[str]:
     """Return the operations this agent supports."""
-    return ["balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder"]
+    return ["balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
+ # Phase 2.4: read-only catalog enumeration via documented POST /info.
+ "list_instruments"]
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
@@ -290,6 +292,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_close_position(account, request)
     if operation == "resolve_instrument":
         return _execute_resolve_instrument(account, request)
+    if operation == "list_instruments":
+        return _execute_list_instruments(account, request)
     if operation == "new_order":
         return _execute_new_order(account, request)
     if operation == "cancel_order_group":
@@ -585,6 +589,93 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                 }
             )
     return candidates
+
+
+def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Hyperliquid perp-market candidate to the
+    Fibo common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. The HL
+    ``_fetch_perp_market_candidates`` helper returns records with
+    both ``route_symbol`` (the full wire id, e.g. ``xyz:SP500``) and
+    ``public_symbol`` (the dex-stripped display alias). We use the
+    ``route_symbol`` because that is what the wizard's resolve /
+    write paths must use to disambiguate dex routing.
+    """
+    if not isinstance(candidate, dict):
+        return {"instrument": ""}
+    instrument = str(
+        candidate.get("route_symbol")
+        or candidate.get("internal_name")
+        or candidate.get("public_symbol")
+        or ""
+    ).strip()
+    if not instrument:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    public = str(candidate.get("public_symbol") or "").strip()
+    if public and public != instrument:
+        out["display_name"] = public
+    dex = str(candidate.get("dex") or "").strip()
+    if dex:
+        out["base"] = dex  # the dex id — e.g. ``xyz``
+        out["market_type"] = "perp"
+    # HL exposes size_increment, but not a base/quote split per
+    # perp in the meta payload — leaving those None is fine for the
+    # picker UI.
+    return out
+
+
+def _execute_list_instruments(
+    account: str, request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Hyperliquid.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id (the route_symbol used by the
+    existing write paths). No price is attached — Hyperliquid
+    does not currently expose a market_price operation.
+
+    The catalog is fetched via the existing ``/info`` POST with
+    payload type ``metaAndAssetCtxs`` (a documented read
+    endpoint). This is a protocol-level POST used for reads; no
+    exchange-action / order / position-mutation operation is
+    invoked.
+    """
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        candidates = _fetch_perp_market_candidates()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    instruments: List[Dict[str, Any]] = []
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        norm = _normalize_hyperliquid_market(entry)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
 
 
 def _resolve_instrument_candidate(requested_symbol: str, candidates: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], str]:

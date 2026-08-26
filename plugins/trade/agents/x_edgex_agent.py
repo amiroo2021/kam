@@ -118,6 +118,8 @@ def capabilities() -> List[str]:
         "cancel_orders", "cancel_order_group",
         "set_tp", "set_sl", "close_position",
         "resolve_instrument",
+        # Phase 2.4: read-only catalog enumeration.
+        "list_instruments",
     ]
 
 
@@ -820,6 +822,101 @@ def _ladder(request: Dict[str, Any]) -> CanonicalResponse:
         )
 
 
+def _normalize_edgex_market(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single EdgeX contractList entry to the Fibo
+    common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. EdgeX payload items
+    carry ``contractId`` (e.g. ``10000001``) and ``contractName``
+    (e.g. ``ETHUSD``). The venue contract id used by the wizard's
+    resolve_instrument path is the contractName (the human-facing
+    symbol). We expose both in the normalized record so the
+    downstream ranking can use either form.
+    """
+    if not isinstance(contract, dict):
+        return {"instrument": ""}
+    instrument = str(
+        contract.get("contractName") or ""
+    ).strip().upper()
+    if not instrument:
+        # Fall back to contractId-as-string when contractName is
+        # missing — keeps the catalog usable even if the upstream
+        # payload drifts.
+        cid = str(contract.get("contractId") or "").strip()
+        if cid:
+            return {"instrument": cid}
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    cid = str(contract.get("contractId") or "").strip()
+    if cid:
+        out["display_name"] = cid
+    # EdgeX doesn't expose base/quote separately; the contractName
+    # carries both (e.g. ``ETHUSD``).
+    return out
+
+
+def _execute_list_instruments(
+    account: str, request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for EdgeX.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id. No price is attached —
+    EdgeX does not currently expose a market_price operation.
+    """
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        payload = _metadata_full()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if not isinstance(payload, dict):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="EdgeX getMetaData returned an unexpected payload shape.",
+        )
+    rows = payload.get("contractList")
+    if not isinstance(rows, list):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="EdgeX getMetaData missing 'contractList' list.",
+        )
+    instruments: List[Dict[str, Any]] = []
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        norm = _normalize_edgex_market(entry)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
+
+
 def _resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     requested = str(request.get("symbol") or "").strip()
     if not requested:
@@ -885,6 +982,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _position_action(request)
     if operation == "resolve_instrument":
         return _resolve_instrument(account, request)
+    if operation == "list_instruments":
+        return _execute_list_instruments(account, request)
     return make_failure(
         operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED",
         message=f"EdgeX does not implement '{operation}' yet.",

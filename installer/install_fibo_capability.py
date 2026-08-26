@@ -53,6 +53,21 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "session.py",
     Path("plugins") / "trade" / "fibo" / "flow.py",
     Path("plugins") / "trade" / "fibo" / "mt4_reader.py",
+    # Phase 2.x additions: identity split (Phase 2.1), alias
+    # memory + instrument translation (Phase 2.2), ranked candidate
+    # discovery + price evidence (Phase 2.3).
+    Path("plugins") / "trade" / "fibo" / "alias_memory.py",
+    Path("plugins") / "trade" / "fibo" / "candidates.py",
+    Path("plugins") / "trade" / "fibo" / "discovery.py",
+    Path("plugins") / "trade" / "fibo" / "dryrun.py",
+    Path("plugins") / "trade" / "fibo" / "reconciler.py",
+    # Phase 2.3 agent-side regression tests live under
+    # plugins/trade/agents/tests. They are pure unit tests and are
+    # copied alongside the agent so the verifier can import them
+    # from the deployed tree.
+    Path("plugins") / "trade" / "agents" / "tests" / "__init__.py",
+    Path("plugins") / "trade" / "agents" / "tests"
+    / "test_x_ondoperps_market_price.py",
 ]
 
 

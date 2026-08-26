@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import inspect
 import sys
 import tempfile
 import unittest
@@ -39,7 +40,7 @@ from plugins.trade.fibo.candidates import (
     _search_hints,
 )
 from plugins.trade.fibo.flow import (
-    CB_AGREE, CB_BACK, CB_BROWSE, CB_CANCEL, CB_CAND, CB_CREATE,
+    CB_ACCT, CB_AGREE, CB_BACK, CB_BROWSE, CB_CANCEL, CB_CAND, CB_CREATE,
     CB_INST, CB_INSTSEL, CB_OTHER, CB_SIDE, CB_SYM, SIDE_TOKEN_BUY,
     SIDE_TOKEN_SELL, StartFiboFlow,
 )
@@ -223,23 +224,52 @@ def _flow(
         resolve_instrument_fn=resolver,
         alias_memory=alias_memory,
     )
-    # Phase 2.3 catalog + price readers — monkey-patch the discovery
-    # module's per-exchange listers via the flow's imports.
-    import plugins.trade.fibo.candidates as _cand_mod
-    # Save originals so other tests aren't affected.
-    orig_list = discovery.list_market_catalog
-    orig_price = discovery.get_market_price
-    def _list_catalog(ex, ac):
-        return list(cat)
-    def _price(ex, ac, market):
-        if not pm:
-            return None
-        return pm.get(market)
-    discovery.list_market_catalog = _list_catalog
-    discovery.get_market_price = _price
-    flow._test_restore_discovery = lambda: (
-        setattr(discovery, "list_market_catalog", orig_list),
-        setattr(discovery, "get_market_price", orig_price),
+    # Phase 2.4: route discovery's TradeDesk through a
+    # ``FakeTradeDesk`` so the test stays fully offline.
+    import plugins.trade.tests.fake_tradedesk as _fake_mod
+    desk = _fake_mod.FakeTradeDesk()
+    desk.resolver = resolver
+    # Tests in this module click ``fibo:s:ex:0`` (apex) by
+    # default. Provide catalogs for both apex and ondoperps so
+    # candidate discovery works regardless of which exchange the
+    # navigation step lands on.
+    normalized_catalog = [
+        {
+            "instrument": inst["market"],
+            "display_name": inst.get("displayName") or inst["market"],
+            "description": (
+                inst.get("longName") or inst.get("displayName")
+                or inst["market"]
+            ),
+            "market_type": (
+                "crypto" if "Crypto" in (inst.get("tags") or [])
+                else ("etf" if "ETF" in (inst.get("description") or "")
+                      else "index" if "Index" in (inst.get("description") or "")
+                      else "")
+            ),
+            "base": (
+                (inst.get("pair") or {}).get("base")
+                or ""
+            ) if isinstance(inst.get("pair"), dict) else "",
+            "quote": (
+                (inst.get("pair") or {}).get("quote")
+                or ""
+            ) if isinstance(inst.get("pair"), dict) else "",
+            "price": (
+                pm.get(inst["market"]) if pm else None
+            ),
+        }
+        for inst in cat
+    ]
+    catalog_records = list(normalized_catalog)
+    desk.catalog_fn = lambda ex, ac: list(catalog_records)
+    desk.price_fn = lambda ex, ac, market: (
+        pm.get(market) if pm else None
+    )
+    prior_get_desk = discovery._get_desk
+    discovery._get_desk = lambda: desk
+    flow._test_restore_discovery = lambda: setattr(
+        discovery, "_get_desk", prior_get_desk,
     )
     return flow
 
@@ -374,8 +404,9 @@ class EthusdCandidateTests(unittest.TestCase):
         )
 
     def test_confirmation_shows_canonical_symbol_and_mt4_source(self) -> None:
-        """Spec §12: confirmation shows Symbol: <canonical>,
-        MT4 source: <source_symbol> — NOT Symbol: ETHUSD."""
+        """Spec §12: confirmation shows the venue contract under
+        'Exchange instrument:' and the MT4 source under 'Source
+        symbol:'. The two identities MUST be distinct."""
         resolver = _FakeResolver({"ETH-USD.P": "ETH-USD.P"},
                                 fail_on={"ETHUSD"})
         fibo = _good_fibo(symbol="ETHUSD")
@@ -390,12 +421,14 @@ class EthusdCandidateTests(unittest.TestCase):
         flow.handle_callback("chat-1", "user-1", f"{CB_CAND}{idx}")
         flow.handle_callback("chat-1", "user-1", CB_AGREE)
         screen = flow.handle_text("chat-1", "user-1", "0.001")
-        # Symbol: is the venue contract. MT4 source: is the source.
-        self.assertIn("Symbol:", screen.text)
+        # New wording: "Exchange instrument:" is the venue; "Source
+        # symbol:" is the MT4 source.
+        self.assertIn("Exchange instrument:", screen.text)
         self.assertIn("ETH-USD.P", screen.text)
-        self.assertIn("MT4 source:", screen.text)
+        self.assertIn("Source symbol:", screen.text)
         self.assertIn("ETHUSD", screen.text)
-        # "Symbol: ETHUSD" must NOT appear — Symbol means the venue.
+        # The legacy "Symbol: ETHUSD" wording MUST NOT appear — the
+        # two identities must remain unambiguous.
         self.assertNotIn("Symbol:       ETHUSD", screen.text)
 
 
@@ -888,28 +921,16 @@ class CallbackBudgetTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class PriceReadHardeningTests(unittest.TestCase):
-    """Hardening regression: the Phase 2.3 price read must succeed
-    for canonical Ondo instruments such as ``ETH-USD.P``,
-    ``US500-USD.P``, ``SPY-USD.P`` — without going through the
-    agent's ``market_price`` operation (whose metadata cache is
-    keyed by the SYMBOL-ONLY form).
-    """
+    """Phase 2.4 hardening: the public TradeDesk.execute price read
+    works for canonical Ondo instruments such as ``ETH-USD.P``,
+    ``US500-USD.P``, ``SPY-USD.P`` — fully offline via
+    ``FakeTradeDesk``.
 
-    def setUp(self) -> None:
-        self.fx = _Fixture()
-        self.addCleanup(self.fx.cleanup)
-
-    """
-
-    These tests run against the LIVE ``get_ondoperps_price`` helper
-    and assert it returns a finite Decimal price. If the live Ondo
-    credentials are unavailable, the helper returns ``None`` and the
-    tests skip — but we never let the fix silently regress to "no
-    price, no error".
-
-    The tests also assert the helper does NOT raise, does NOT use
-    any write operation, and continues to handle missing / unknown
-    markets gracefully.
+    These tests prove that ``plugins.trade.fibo.discovery``
+    reads prices through the same public TradeDesk boundary that
+    production uses. ``get_market_price`` must return a finite
+    Decimal when supported and ``None`` when not (or when no
+    price is available for a market).
     """
 
     CANONICAL_INSTRUMENTS = (
@@ -920,31 +941,48 @@ class PriceReadHardeningTests(unittest.TestCase):
         "XAU-USD.P",
     )
 
-    @staticmethod
-    def _live_priced(market: str):
+    def setUp(self) -> None:
+        # Base fixture — keeps an fx handle for any test that
+        # chooses to navigate through a full flow.
+        self.fx = _Fixture()
+        self.addCleanup(self.fx.cleanup)
+        # Phase 2.4: every test in this class installs a
+        # FakeTradeDesk with deterministic prices so the suite
+        # is fully offline.
         from plugins.trade.fibo import discovery
-        return discovery.get_ondoperps_price("BITGET", market)
+        from plugins.trade.tests.fake_tradedesk import FakeTradeDesk
+        self._desk = FakeTradeDesk()
+        for m in self.CANONICAL_INSTRUMENTS:
+            self._desk.price_map[("ondoperps", "BITGET", m)] = Decimal("100")
+            self._desk.price_map[("ondoperps", "ALT", m)] = Decimal("100")
+        self._prior_get_desk = discovery._get_desk
+        discovery._get_desk = lambda: self._desk
+
+    def tearDown(self) -> None:
+        from plugins.trade.fibo import discovery
+        discovery._get_desk = self._prior_get_desk
+
+    def _live_priced(self, market: str):
+        from plugins.trade.fibo import discovery
+        return discovery.get_market_price("ondoperps", "BITGET", market)
 
     def test_canonical_eth_usd_p_price_returns_finite_decimal(self) -> None:
         price = self._live_priced("ETH-USD.P")
-        if price is None:
-            self.skipTest("live Ondo credentials unavailable")
+        self.assertIsNotNone(price)
         self.assertIsInstance(price, Decimal)
         self.assertTrue(price.is_finite())
         self.assertGreater(price, Decimal("0"))
 
     def test_canonical_us500_usd_p_price_returns_finite_decimal(self) -> None:
         price = self._live_priced("US500-USD.P")
-        if price is None:
-            self.skipTest("live Ondo credentials unavailable")
+        self.assertIsNotNone(price)
         self.assertIsInstance(price, Decimal)
         self.assertTrue(price.is_finite())
         self.assertGreater(price, Decimal("0"))
 
     def test_canonical_spy_usd_p_price_returns_finite_decimal(self) -> None:
         price = self._live_priced("SPY-USD.P")
-        if price is None:
-            self.skipTest("live Ondo credentials unavailable")
+        self.assertIsNotNone(price)
         self.assertIsInstance(price, Decimal)
         self.assertTrue(price.is_finite())
         self.assertGreater(price, Decimal("0"))
@@ -952,35 +990,23 @@ class PriceReadHardeningTests(unittest.TestCase):
     def test_all_canonical_instruments_have_a_price(self) -> None:
         """Loop through every documented canonical instrument and
         ensure the helper returns a finite Decimal for each."""
-        priced = 0
         for m in self.CANONICAL_INSTRUMENTS:
             price = self._live_priced(m)
-            if price is None:
-                # Live credentials may be missing — skip silently.
-                continue
+            self.assertIsNotNone(price, m)
             self.assertIsInstance(price, Decimal)
             self.assertTrue(price.is_finite())
-            self.assertGreater(price, Decimal("0"))
-            priced += 1
-        if priced == 0:
-            self.skipTest(
-                "live Ondo credentials unavailable — no instrument "
-                "returned a price"
-            )
 
     def test_unknown_market_returns_none_without_raising(self) -> None:
         """The helper must not raise on unknown markets — just
-        return None. This proves the read path is safe to call
-        from the picker without try/except."""
+        return None."""
         from plugins.trade.fibo import discovery
-        result = discovery.get_ondoperps_price("BITGET", "DOES-NOT-EXIST")
-        # Returns None (not raise). Either path is fine.
+        result = discovery.get_market_price("ondoperps", "BITGET", "DOES-NOT-EXIST")
         self.assertIsNone(result)
 
     def test_empty_market_returns_none(self) -> None:
         from plugins.trade.fibo import discovery
-        self.assertIsNone(discovery.get_ondoperps_price("BITGET", ""))
-        self.assertIsNone(discovery.get_ondoperps_price("BITGET", "   "))
+        self.assertIsNone(discovery.get_market_price("ondoperps", "BITGET", ""))
+        self.assertIsNone(discovery.get_market_price("ondoperps", "BITGET", "   "))
 
     def test_price_read_uses_no_write_tokens(self) -> None:
         """Static guard: the price-read source contains no write
@@ -1030,6 +1056,331 @@ class PriceReadHardeningTests(unittest.TestCase):
         flow2.handle_callback("chat-2", "user-2", CB_OTHER)
         screen2 = flow2.handle_text("chat-2", "user-2", "US500")
         self.assertIn("US500-USD.P", screen2.text)
+
+
+class UiPolishTests(unittest.TestCase):
+    """Phase 2.3 UI polish regression tests.
+
+    Covers:
+      - Automatic proposal has no confusing empty "Your alias:" line.
+      - Manual Other path shows "Your input:".
+      - Cached mapping shows "Learned alias:".
+      - Candidate type is displayed only once.
+      - ETHUSD picker contains ETH-USD.P + price.
+      - #SP500 picker contains SPY-USD.P + US500-USD.P + prices.
+      - Final confirmation uses "Source symbol:" / "Exchange
+        instrument:" wording.
+      - Selecting a candidate does NOT write alias memory.
+      - Typing in Other does NOT write alias memory.
+      - Agree is the only path that may write alias memory.
+      - Source has no write operation tokens.
+    """
+
+    def setUp(self) -> None:
+        self.fx = _Fixture()
+        self.addCleanup(self.fx.cleanup)
+
+    def _navigate_to_picker(
+        self, *, fibo, resolver, alias_memory=None, price_map=None,
+    ):
+        self.fx.snap_path.write_text(
+            json.dumps(_snapshot([fibo]).to_dict())
+        )
+        flow = _flow(
+            self.fx, resolver=resolver, alias_memory=alias_memory,
+            price_map=price_map,
+        )
+        flow.open("chat-1", "user-1")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
+        flow.handle_callback(
+            "chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}",
+        )
+        flow.handle_callback("chat-1", "user-1", "fibo:s:ex:2")
+        flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        return flow, flow.session_store.get("chat-1", "user-1")
+
+    def _good_buy_fibo(self, symbol: str):
+        return _good_fibo(
+            symbol=symbol,
+            buy_cycle_id=46626815,
+            cumulative_buy_weight="2",
+            sell_cycle_id=0,
+            cumulative_sell_weight="0",
+        )
+
+    def test_automatic_proposal_omits_alias_line(self) -> None:
+        """Direct resolve success → no alias label at all."""
+        resolver = _FakeResolver({
+            "ETHUSD": "ETH-USD.P",
+            "ETH-USD.P": "ETH-USD.P",
+        })
+        fibo = self._good_buy_fibo("ETHUSD")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver,
+        )
+        self.assertEqual(
+            sess.state, SessionState.AWAITING_INSTRUMENT_CONFIRM,
+        )
+        screen = flow._render_instrument_proposal(
+            sess, flow._snapshot_store.load(),
+        )
+        for label in ("Your alias:", "Your input:", "Learned alias:"):
+            self.assertNotIn(label, screen.text)
+        self.assertIn("OndoPerps:", screen.text)
+        self.assertIn("ETH-USD.P", screen.text)
+
+    def test_other_path_shows_your_input(self) -> None:
+        """User typed via Other → "Your input: <typed>\" label."""
+        resolver = _FakeResolver(
+            {"US500": "US500-USD.P"}, fail_on={"#SP500"},
+        )
+        fibo = self._good_buy_fibo("#SP500")
+        flow, _ = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver,
+        )
+        flow.handle_callback("chat-1", "user-1", CB_OTHER)
+        flow.handle_text("chat-1", "user-1", "US500")
+        sess = flow.session_store.get("chat-1", "user-1")
+        self.assertEqual(sess.proposal_origin, "alias")
+        screen = flow._render_instrument_proposal(
+            sess, flow._snapshot_store.load(),
+        )
+        self.assertIn("Your input:", screen.text)
+        self.assertIn("US500", screen.text)
+        self.assertNotIn("Learned alias:", screen.text)
+
+    def test_cached_with_user_alias_shows_learned_alias(self) -> None:
+        """Cached mapping whose resolution_input differs from source
+        shows 'Learned alias:'."""
+        am = AliasMemory(self.fx.alias_path)
+        key = alias_key("ondoperps", "ALT", "ETHUSD")
+        am.record_approval(
+            key, source_symbol="ETHUSD",
+            resolution_input="ETH",  # user typed ETH originally
+            exchange_instrument="ETH-USD.P",
+        )
+        resolver = _FakeResolver({"ETH-USD.P": "ETH-USD.P"})
+        fibo = self._good_buy_fibo("ETHUSD")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver, alias_memory=am,
+        )
+        self.assertEqual(sess.proposal_origin, "cached")
+        screen = flow._render_instrument_proposal(
+            sess, flow._snapshot_store.load(),
+        )
+        self.assertIn("Learned alias:", screen.text)
+        self.assertIn("ETH", screen.text)
+        self.assertNotIn("Your input:", screen.text)
+
+    def test_cached_when_resolution_input_equals_source_omits_label(
+        self,
+    ) -> None:
+        """Cached mapping with no separate user alias (resolution_input
+        == source) — no alias line."""
+        am = AliasMemory(self.fx.alias_path)
+        key = alias_key("ondoperps", "ALT", "ETHUSD")
+        am.record_approval(
+            key, source_symbol="ETHUSD",
+            resolution_input="ETHUSD",  # first approval: same as source
+            exchange_instrument="ETH-USD.P",
+        )
+        resolver = _FakeResolver({"ETH-USD.P": "ETH-USD.P"})
+        fibo = self._good_buy_fibo("ETHUSD")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver, alias_memory=am,
+        )
+        self.assertEqual(sess.proposal_origin, "cached")
+        screen = flow._render_instrument_proposal(
+            sess, flow._snapshot_store.load(),
+        )
+        for label in ("Your alias:", "Your input:", "Learned alias:"):
+            self.assertNotIn(label, screen.text)
+
+    def test_candidate_type_displayed_only_once(self) -> None:
+        """The candidate's market type tag appears at most once in
+        its compact block."""
+        cand = InstrumentCandidate(
+            instrument="ETH-USD.P",
+            display_name="ETHUSD",
+            description="Ethereum [crypto]",
+            market_type="crypto",
+            price=Decimal("2462"),
+            score=130,
+            reasons=("exact",),
+        )
+        block = cand.to_compact_block(0)
+        # Description includes [crypto]; market_type line is NOT
+        # repeated.
+        self.assertIn("[crypto]", block)
+        self.assertEqual(block.count("[crypto]"), 1)
+
+    def test_ethusd_picker_has_eth_usd_p_and_price(self) -> None:
+        """ETHUSD picker shows ETH-USD.P and its price."""
+        resolver = _FakeResolver(
+            {"ETH-USD.P": "ETH-USD.P"}, fail_on={"ETHUSD"},
+        )
+        fibo = self._good_buy_fibo("ETHUSD")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver,
+            price_map={"ETH-USD.P": Decimal("2462.4")},
+        )
+        picker = flow._render_candidates_screen(
+            sess, flow._snapshot_store.load(),
+        )
+        self.assertIn("ETH-USD.P", picker.text)
+        self.assertIn("2462.4", picker.text)
+
+    def test_sp500_picker_has_spy_and_us500(self) -> None:
+        """#SP500 picker includes SPY-USD.P and US500-USD.P with
+        prices."""
+        resolver = _FakeResolver(
+            {"US500-USD.P": "US500-USD.P"}, fail_on={"#SP500"},
+        )
+        fibo = self._good_buy_fibo("#SP500")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver,
+            price_map={
+                "SPY-USD.P": Decimal("764.89"),
+                "US500-USD.P": Decimal("7671.24"),
+            },
+        )
+        picker = flow._render_candidates_screen(
+            sess, flow._snapshot_store.load(),
+        )
+        self.assertIn("SPY-USD.P", picker.text)
+        self.assertIn("US500-USD.P", picker.text)
+        self.assertIn("764.89", picker.text)
+        self.assertIn("7671.24", picker.text)
+
+    def test_final_confirmation_new_wording(self) -> None:
+        """Final confirmation uses 'Source symbol:' and
+        'Exchange instrument:' labels — not the old 'Symbol:' /
+        'MT4 source:' wording."""
+        from plugins.trade.fibo.flow import StartFiboFlow
+        flow = StartFiboFlow(
+            snapshot_store=Mt4SnapshotStore(self.fx.snap_path),
+            registration_store=FiboRegistrationStore(self.fx.reg_path),
+            list_exchanges_fn=lambda: [],
+            list_accounts_fn=lambda ex: [],
+            list_instruments_fn=lambda ex, ac: [],
+            resolve_instrument_fn=lambda *a, **kw: None,
+        )
+        text = flow._format_confirmation(
+            source_symbol="ETHUSD",
+            variant="NORMALFib",
+            side="BUY",
+            exchange="ondoperps",
+            account="bitget",
+            exchange_instrument="ETH-USD.P",
+            starting_volume=Decimal("0.001"),
+            source="mt4-Fresh542468-1",
+            source_seq=29992,
+            cycle_id=46626815,
+            cumulative_weight=Decimal("2"),
+            percentage=Decimal("0.01"),
+            desired_exchange_size=Decimal("0.002"),
+            snapshot_age="3.1s",
+        )
+        self.assertIn("Source symbol:       ETHUSD", text)
+        self.assertIn("Exchange instrument: ETH-USD.P", text)
+        self.assertNotIn("Symbol:", text)
+        self.assertNotIn("MT4 source:", text)
+
+    def test_selecting_candidate_does_not_write_alias(self) -> None:
+        """Picking a candidate writes nothing to alias memory."""
+        am = AliasMemory(self.fx.alias_path)
+        resolver = _FakeResolver(
+            {"US500-USD.P": "US500-USD.P"}, fail_on={"#SP500"},
+        )
+        fibo = self._good_buy_fibo("#SP500")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver, alias_memory=am,
+        )
+        idx = next(
+            i for i, c in enumerate(sess.candidates)
+            if c.instrument == "US500-USD.P"
+        )
+        flow.handle_callback(
+            "chat-1", "user-1", f"{CB_CAND}{idx}",
+        )
+        if self.fx.alias_path.exists():
+            data = json.loads(self.fx.alias_path.read_text())
+            self.assertEqual(data["mappings"], {})
+
+    def test_typing_in_other_does_not_write_alias(self) -> None:
+        """Typing an alias via Other writes nothing to alias memory."""
+        am = AliasMemory(self.fx.alias_path)
+        resolver = _FakeResolver(
+            {"US500": "US500-USD.P"}, fail_on={"#SP500"},
+        )
+        fibo = self._good_buy_fibo("#SP500")
+        flow, _ = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver, alias_memory=am,
+        )
+        flow.handle_callback("chat-1", "user-1", CB_OTHER)
+        flow.handle_text("chat-1", "user-1", "US500")
+        if self.fx.alias_path.exists():
+            data = json.loads(self.fx.alias_path.read_text())
+            self.assertEqual(data["mappings"], {})
+
+    def test_only_agree_writes_alias(self) -> None:
+        """Agree is the only path that writes alias memory."""
+        am = AliasMemory(self.fx.alias_path)
+        resolver = _FakeResolver(
+            {"US500-USD.P": "US500-USD.P"}, fail_on={"#SP500"},
+        )
+        fibo = self._good_buy_fibo("#SP500")
+        flow, sess = self._navigate_to_picker(
+            fibo=fibo, resolver=resolver, alias_memory=am,
+        )
+        idx = next(
+            i for i, c in enumerate(sess.candidates)
+            if c.instrument == "US500-USD.P"
+        )
+        flow.handle_callback(
+            "chat-1", "user-1", f"{CB_CAND}{idx}",
+        )
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
+        # After Agree: alias file exists with the new mapping.
+        self.assertTrue(self.fx.alias_path.exists())
+        data = json.loads(self.fx.alias_path.read_text())
+        self.assertEqual(len(data["mappings"]), 1)
+
+    def test_polished_source_has_no_write_tokens(self) -> None:
+        """Static guard: polished modules contain no write
+        operations or non-GET HTTP methods. We strip docstrings
+        and string literals before scanning."""
+        import re
+        for name in ("flow", "candidates", "discovery"):
+            mod = __import__(
+                f"plugins.trade.fibo.{name}", fromlist=["*"]
+            )
+            src = inspect.getsource(mod)
+            cleaned = re.sub(r'"""[\s\S]*?"""', "", src)
+            cleaned = re.sub(r"'''[\s\S]*?'''", "", cleaned)
+            cleaned = "\n".join(
+                ln for ln in cleaned.splitlines()
+                if not ln.lstrip().startswith("#")
+            )
+            cleaned = "\n".join(
+                re.sub(r'"[^"\\\n]*(?:\\.[^"\\\n]*)*"', "", ln)
+                for ln in cleaned.splitlines()
+            )
+            cleaned = "\n".join(
+                re.sub(r"'[^'\\\n]*(?:\\.[^'\\\n]*)*'", "", ln)
+                for ln in cleaned.splitlines()
+            )
+            for tok in (
+                "new_order", "market_order", "limit_order",
+                "cancel_order", "cancel_order_group",
+                "close_position", "stop_order",
+                "method=\"POST\"", "method=\"PUT\"",
+                "method=\"DELETE\"", "method=\"PATCH\"",
+            ):
+                self.assertNotIn(
+                    tok, cleaned,
+                    f"{name}.py references {tok!r}",
+                )
 
 
 class SafetyTests(unittest.TestCase):

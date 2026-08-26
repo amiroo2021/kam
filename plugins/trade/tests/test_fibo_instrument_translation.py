@@ -45,7 +45,9 @@ from plugins.trade.fibo.session import (
 from plugins.trade.fibo.snapshot import (
     Mt4Fibo, Mt4Snapshot, Mt4SnapshotStore,
 )
+from plugins.trade.fibo import discovery as fibo_discovery
 from plugins.trade.fibo.store import FiboRegistrationStore
+from plugins.trade.tests.fake_tradedesk import FakeTradeDesk
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +102,29 @@ def _snapshot(
         telegram_message_id=0,
         reader_chat_id=-100,
     )
+
+
+def _install_fake_desk(desk: "FakeTradeDesk") -> None:
+    """Install ``desk`` as the discovery module's TradeDesk binding.
+
+    The previous binding is restored by :func:`_restore_desk`
+    when the test class tears down. Tests that build many
+    StartFiboFlow instances share a single install for the
+    entire test class to keep onboarding cheap.
+    """
+    global _PRIOR_GET_DESK
+    _PRIOR_GET_DESK = fibo_discovery._get_desk
+    fibo_discovery._get_desk = lambda: desk
+    # Also install FakeTradeDesk-backed CommonContract - not needed
+    # for these specific tests but ensures no TradeDesk singleton
+    # from another test ever intercepts.
+
+
+def _restore_desk() -> None:
+    global _PRIOR_GET_DESK
+    if _PRIOR_GET_DESK is not None:
+        fibo_discovery._get_desk = _PRIOR_GET_DESK
+        _PRIOR_GET_DESK = None
 
 
 class _FakeResolver:
@@ -192,6 +217,25 @@ def _flow(
     alias_memory: Optional[AliasMemory] = None,
     instruments: Optional[List[str]] = None,
 ) -> StartFiboFlow:
+    """Build a StartFiboFlow rooted at ``fx``.
+
+    Phase 2.4: the Fibo wizard no longer accepts a
+    ``resolve_instrument_fn`` constructor argument — it goes
+    through the public ``TradeDesk.execute`` boundary via
+    ``plugins.trade.fibo.discovery``. To keep these old tests
+    fully offline we install a ``FakeTradeDesk`` with the
+    caller-supplied resolver/catalog/price responses.
+    """
+    desk = FakeTradeDesk()
+    if resolver is not None:
+        desk.resolver = resolver
+    desk.catalog_map[("ondoperps", "BITGET")] = [
+        {"instrument": inst, "description": inst}
+        for inst in (instruments or ["ETH-USD.P", "BTC-USD.P"])
+    ]
+    desk.price_map[("ondoperps", "BITGET", "ETH-USD.P")] = Decimal("100")
+    desk.price_map[("ondoperps", "BITGET", "BTC-USD.P")] = Decimal("100")
+    _install_fake_desk(desk)
     snap_store = Mt4SnapshotStore(fx.snap_path)
     reg_store = FiboRegistrationStore(fx.reg_path)
     return StartFiboFlow(
@@ -202,7 +246,7 @@ def _flow(
         list_instruments_fn=lambda ex, ac: list(instruments or [
             "ETH-USD.P", "BTC-USD.P",
         ]),
-        resolve_instrument_fn=resolver,
+        resolve_instrument_fn=None,
         alias_memory=alias_memory,
     )
 
@@ -648,12 +692,13 @@ class ConfirmationFieldsTests(unittest.TestCase):
         flow, _ = _navigate_to_proposal(self.fx, resolver=resolver)
         flow.handle_callback("chat-1", "user-1", CB_AGREE)
         screen = flow.handle_text("chat-1", "user-1", "0.001")
-        # The confirmation screen shows BOTH:
-        #   Symbol: ETH-USD.P (canonical venue)
-        #   MT4 source: ETHUSD
-        self.assertIn("Symbol:", screen.text)
+        # Phase 2.3 UI polish: the canonical venue is shown as
+        # 'Exchange instrument:' and the MT4 source appears as
+        # 'Source symbol:'. The legacy 'Symbol:' / 'MT4 source:'
+        # wording is gone.
+        self.assertIn("Exchange instrument:", screen.text)
         self.assertIn("ETH-USD.P", screen.text)
-        self.assertIn("MT4 source:", screen.text)
+        self.assertIn("Source symbol:", screen.text)
         self.assertIn("ETHUSD", screen.text)
 
 

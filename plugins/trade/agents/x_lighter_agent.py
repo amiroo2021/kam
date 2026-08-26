@@ -791,7 +791,12 @@ def list_accounts() -> List[Dict[str, str]]:
 
 
 def capabilities() -> List[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "ladder", "cancel_orders"]
+    return [
+        "balance", "positions_orders", "positions_management",
+        "new_order", "ladder", "cancel_orders",
+        # Phase 2.4: read-only catalog enumeration + price reader.
+        "list_instruments", "market_price",
+    ]
 
 
 def _build_signer_client(credentials: Dict[str, Any]) -> Any:
@@ -4611,6 +4616,10 @@ def _classify_order_status(order: Dict[str, Any]) -> str:
 # credential-less price reads).
 _LIGHTER_URL_ARBITRUM = "https://mainnet.zklighter.elliot.ai"
 _LIGHTER_URL_ROBINHOOD = "https://robinhood.zklighter.elliot.ai"
+# Phase 2.4: public mainnet URL used as the default for the
+# unauthenticated catalog endpoint when no configured account is
+# available to derive ``base_url`` from.
+_LIGHTER_DEFAULT_BASE_URL = _LIGHTER_URL_ARBITRUM
 
 
 def _execute_resolve_instrument(request: Dict[str, Any]) -> CanonicalResponse:
@@ -4798,6 +4807,180 @@ def _fetch_lighter_public_market_price(
         "ask": _decimal_text(ask) if ask is not None else None,
         "ts": int(first.get("timestamp") or 0),
     }
+
+
+def _normalize_lighter_market(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a single Lighter order_book_details entry to the
+    Fibo common schema.
+
+    Only ``instrument`` is required; the rest may be ``None`` if
+    the upstream payload doesn't supply them. The Lighter catalog
+    payload typically carries ``symbol`` (e.g. ``ETH``, ``BTC``)
+    and ``market_id``. We preserve those plus any descriptive
+    fields that are useful for the wizard's UI.
+    """
+    if not isinstance(entry, dict):
+        return {"instrument": ""}
+    instrument = (
+        entry.get("symbol")
+        or entry.get("market_symbol")
+        or entry.get("market")
+    )
+    if not isinstance(instrument, str) or not instrument:
+        return {"instrument": ""}
+    out: Dict[str, Any] = {"instrument": instrument}
+    # Optional descriptive fields the Lighter API may carry.
+    desc = (
+        entry.get("description")
+        or entry.get("name")
+        or entry.get("long_name")
+    )
+    if isinstance(desc, str) and desc:
+        out["description"] = desc
+    # Quote / base guess from symbol suffix (Lighter symbols like
+    # ``ETH`` are pure base; perps use ``-PERP`` etc.).
+    sym = instrument.upper()
+    for suffix in ("-PERP", "-USD", "-USDT", "-USDC"):
+        if sym.endswith(suffix):
+            out["base"] = sym[: -len(suffix)] or None
+            out["quote"] = suffix.lstrip("-")
+            break
+    if "base" not in out:
+        out["base"] = sym
+    # Market type — the caller tags each record with
+    # ``market_type`` before passing it here.
+    market_type = entry.get("market_type")
+    if isinstance(market_type, str) and market_type:
+        out["market_type"] = market_type
+    display_name = entry.get("display_name") or entry.get("name")
+    if isinstance(display_name, str) and display_name:
+        out["display_name"] = display_name
+    # Optional price (if a previous catalog pass bundled it).
+    raw_price = entry.get("last_trade_price") or entry.get("mark_price")
+    if raw_price is not None:
+        try:
+            from decimal import Decimal as _D
+            d = _D(str(raw_price))
+            if d.is_finite():
+                out["price"] = format(d.normalize(), "f")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _execute_list_instruments(
+    request: Dict[str, Any]
+) -> CanonicalResponse:
+    """Phase 2.4: read-only catalog enumeration for Lighter.
+
+    Returns the normalized Fibo schema (see
+    ``plugins/trade/fibo/discovery.py``) inside
+    ``data["instruments"]``. Each record carries at minimum the
+    venue-native ``instrument`` id.
+    """
+    account = str(request.get("account") or "").strip()
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    # Lighter's public catalog endpoint is unauthenticated — we
+    # only need a base_url. Use the configured account's URL when
+    # available, otherwise fall back to the public mainnet.
+    credentials = _lookup_credentials(account)
+    if credentials is not None:
+        base_url = credentials["base_url"]
+    else:
+        base_url = _LIGHTER_DEFAULT_BASE_URL
+    try:
+        catalog = _fetch_market_catalog(base_url)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if not isinstance(catalog, list):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="Lighter catalog returned an unexpected payload shape.",
+        )
+    # Re-fetch deterministically to know perp vs spot per symbol.
+    perp_symbols = set()
+    spot_symbols = set()
+    try:
+        perp_items = _fetch_lighter_market_catalog_raw(
+            base_url, "order_book_details",
+        )
+        for it in perp_items:
+            sym = it.get("symbol") if isinstance(it, dict) else None
+            if isinstance(sym, str):
+                perp_symbols.add(sym)
+        spot_items = _fetch_lighter_market_catalog_raw(
+            base_url, "spot_order_book_details",
+        )
+        for it in spot_items:
+            sym = it.get("symbol") if isinstance(it, dict) else None
+            if isinstance(sym, str):
+                spot_symbols.add(sym)
+    except Exception:  # noqa: BLE001
+        pass
+    instruments: List[Dict[str, Any]] = []
+    for entry in catalog:
+        if not isinstance(entry, dict):
+            continue
+        sym = entry.get("symbol")
+        if not isinstance(sym, str):
+            continue
+        tagged = dict(entry)
+        if sym in spot_symbols and sym not in perp_symbols:
+            tagged["market_type"] = "spot"
+        elif sym in perp_symbols and sym not in spot_symbols:
+            tagged["market_type"] = "perp"
+        else:
+            tagged.setdefault("market_type", "perp")
+        norm = _normalize_lighter_market(tagged)
+        if norm.get("instrument"):
+            instruments.append(norm)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
+
+
+def _fetch_lighter_market_catalog_raw(
+    base_url: str, key: str
+) -> List[Dict[str, Any]]:
+    """Fetch only one of ``order_book_details`` /
+    ``spot_order_book_details`` from Lighter. Used internally by
+    ``_execute_list_instruments`` to tag each entry with perp vs
+    spot. Returns ``[]`` on any error."""
+    try:
+        limiter = _get_lighter_limiter(
+            {"chain": _URL_TO_CHAIN.get(base_url, ""), "account_index": 0}
+        )
+        limiter.acquire()
+        response = requests.get(
+            f"{base_url}/api/v1/orderBookDetails",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception:  # noqa: BLE001
+        return []
+    payload = response.json() or {}
+    items = payload.get(key) or []
+    return [it for it in items if isinstance(it, dict)]
 
 
 def _execute_market_price(request: Dict[str, Any]) -> CanonicalResponse:
@@ -5551,7 +5734,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "list_instruments", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
         return make_failure(
             operation=operation,
             exchange=name,
@@ -5586,6 +5769,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_cancel_order_group(request)
         if operation == "resolve_instrument":
             return _execute_resolve_instrument(request)
+        if operation == "list_instruments":
+            return _execute_list_instruments(request)
         if operation == "market_price":
             return _execute_market_price(request)
         if operation == "position_state":

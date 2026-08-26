@@ -41,6 +41,15 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "session.py",
     Path("plugins") / "trade" / "fibo" / "flow.py",
     Path("plugins") / "trade" / "fibo" / "mt4_reader.py",
+    # Phase 2.x additions (must mirror install_fibo_capability).
+    Path("plugins") / "trade" / "fibo" / "alias_memory.py",
+    Path("plugins") / "trade" / "fibo" / "candidates.py",
+    Path("plugins") / "trade" / "fibo" / "discovery.py",
+    Path("plugins") / "trade" / "fibo" / "dryrun.py",
+    Path("plugins") / "trade" / "fibo" / "reconciler.py",
+    Path("plugins") / "trade" / "agents" / "tests" / "__init__.py",
+    Path("plugins") / "trade" / "agents" / "tests"
+    / "test_x_ondoperps_market_price.py",
 ]
 
 

@@ -45,6 +45,12 @@ FIBO_SUBPACKAGE_FILES = (
     "session.py",
     "flow.py",
     "mt4_reader.py",
+    # Phase 2.x additions.
+    "alias_memory.py",
+    "candidates.py",
+    "discovery.py",
+    "dryrun.py",
+    "reconciler.py",
 )
 
 
