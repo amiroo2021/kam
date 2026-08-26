@@ -69,6 +69,7 @@ from .store import (
     FiboRegistration,
     FiboRegistrationStore,
 )
+from .alias_memory import AliasMemory, alias_key
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,17 @@ CB_SYM = "fibo:s:sym:"          # symbol+variant pick
 CB_SIDE = "fibo:s:side:"        # side pick
 CB_EX = "fibo:s:ex:"            # exchange pick
 CB_ACCT = "fibo:s:acct:"        # account pick
+CB_INST = "fibo:s:inst:"        # venue-instrument pick (Phase 2.1)
+# Phase 2.2 — instrument-translation callbacks (spec §2-5).
+# All prefixes are kept short so the indexed tokens stay under
+# Telegram's 64-byte callback_data limit.
+CB_AGREE = "fibo:s:agree"        # user accepts the proposed instrument
+CB_OTHER = "fibo:s:other"        # user wants to enter an alias
+CB_BROWSE = "fibo:s:browse"      # user wants to page through markets
+CB_BROWSEPG = "fibo:s:browsepg:" # browse-pagination (negative=prev, 1..N=page)
+CB_INSTSEL = "fibo:s:instsel:"   # market pick from Browse list
+CB_CAND = "fibo:s:cand:"       # candidate pick (Phase 2.3)
+CB_INSTFAIL_RETRY = "fibo:s:instrtry"  # "Try another" alias failure
 CB_CREATE = "fibo:s:create"
 CB_BACK = "fibo:s:back"
 CB_CANCEL = "fibo:s:cancel"
@@ -141,19 +153,30 @@ class StartFiboFlow:
         registration_store: FiboRegistrationStore,
         list_exchanges_fn,
         list_accounts_fn,
+        list_instruments_fn=None,
+        resolve_instrument_fn=None,
+        alias_memory=None,
         session_store: Optional[FiboSessionStore] = None,
         stale_threshold_seconds: float = STALE_THRESHOLD_SECONDS,
         now_fn=None,
     ) -> None:
         # ``list_exchanges_fn`` is a callable returning ``List[str]``.
         # ``list_accounts_fn(exchange: str) -> List[Any]``.
-        # Injected so the flow can be unit-tested without a real
-        # TradeDesk; in production these are bound to the live
-        # TradeDesk helpers.
+        # ``list_instruments_fn(exchange, account) -> List[str]``
+        # (Phase 2.1, kept for the Browse fallback).
+        # ``resolve_instrument_fn(exchange, account, symbol) -> str | None``
+        # is the agent-validated translation path (Phase 2.2). It
+        # must be the existing TradeDesk ``resolve_instrument``
+        # operation (read-only by construction — see fibo_wizard).
+        # ``alias_memory`` is an ``AliasMemory`` instance (Phase 2.2).
+        # Both are optional so unit tests can run without them.
         self._snapshot_store = snapshot_store
         self._registration_store = registration_store
         self._list_exchanges = list_exchanges_fn
         self._list_accounts = list_accounts_fn
+        self._list_instruments = list_instruments_fn
+        self._resolve_instrument = resolve_instrument_fn
+        self._alias_memory = alias_memory
         self._sessions = session_store or FiboSessionStore()
         self._stale_threshold = float(stale_threshold_seconds)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
@@ -232,6 +255,29 @@ class StartFiboFlow:
             return self._handle_exchange_pick(sess, snap, data)
         if data.startswith(CB_ACCT):
             return self._handle_account_pick(sess, snap, data)
+        # Phase 2.2 dispatch (must come AFTER legacy CB_INST in case a
+        # stale Phase 2.1 button is still around — the prefixes are
+        # distinct so the order is cosmetic).
+        if data == CB_AGREE:
+            return self._handle_instrument_agree(sess, snap)
+        if data == CB_OTHER:
+            return self._handle_instrument_other(sess, snap)
+        if data == CB_BROWSE:
+            return self._handle_instrument_browse(sess, snap)
+        if data.startswith(CB_BROWSEPG):
+            return self._handle_browse_paginate(sess, snap, data)
+        if data.startswith(CB_INSTSEL):
+            return self._handle_browse_market_pick(sess, snap, data)
+        if data.startswith(CB_CAND):
+            return self._handle_candidate_pick(sess, snap, data)
+        if data == CB_INSTFAIL_RETRY:
+            return self._handle_instrument_other(sess, snap)
+        if data.startswith(CB_INST):
+            # Legacy Phase 2.1 direct-pick path. We keep it as a
+            # fallback so old messages don't break — it routes
+            # through the proposal screen (spec §5: "clicking a
+            # market shows the translation approval screen").
+            return self._handle_legacy_inst_pick(sess, snap, data)
 
         return self._render_invalid_callback(key)
 
@@ -241,42 +287,99 @@ class StartFiboFlow:
         user_id: Any,
         text: str,
     ) -> Optional[Screen]:
-        """Consume free-text volume input ONLY when the user's session
-        is in AWAITING_VOLUME. Returns None when the wizard should not
-        intercept (the underlying adapter can route the message to its
-        normal handler).
+        """Consume free-text input only when the user's session is
+        in a whitelist state (spec §6, §12).
 
-        Per spec §6: text interception belongs only to the Start Fibo
-        session manager.
+        Whitelisted states:
+          * ``AWAITING_VOLUME`` — the user types their starting volume.
+          * ``AWAITING_EXCHANGE_ALIAS`` — the user types an alias
+            (e.g. ``US500``) for the agent to validate.
+
+        All other states return ``None`` so the underlying adapter
+        can route the message to its normal handler.
+
+        Per-user isolation is enforced via the session store
+        (``FiboSessionStore``), which is keyed by
+        ``(chat_id, user_id)``. A user in ``AWAITING_VOLUME``
+        cannot affect a different user's session, and vice versa.
         """
         try:
             key = self._validate_key(chat_id, user_id)
         except ValueError:
             return None
         sess = self._sessions.get(*key)
-        if sess is None or not sess.is_awaiting_volume():
+        if sess is None:
             return None
         raw = (text or "").strip()
-        # Validation ---------------------------------------------
-        try:
-            d = Decimal(raw)
-        except (InvalidOperation, ValueError):
-            return self._render_volume_invalid(sess, reason="not_a_number")
-        if not d.is_finite():
-            return self._render_volume_invalid(sess, reason="not_finite")
-        if d <= 0:
-            return self._render_volume_invalid(sess, reason="not_positive")
-        sess.starting_volume = d
-        sess.touch()
-        # Re-load the snapshot to capture its current state at
-        # confirmation time. A stale or missing snapshot blocks Create
-        # at the confirmation screen.
+        # Phase 2.2: alias-entry interception (spec §3).
+        if sess.state == SessionState.AWAITING_EXCHANGE_ALIAS:
+            return self._handle_alias_text(sess, raw)
+        # Volume entry (spec §6).
+        if sess.is_awaiting_volume():
+            # Validation ---------------------------------------------
+            try:
+                d = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                return self._render_volume_invalid(sess, reason="not_a_number")
+            if not d.is_finite():
+                return self._render_volume_invalid(sess, reason="not_finite")
+            if d <= 0:
+                return self._render_volume_invalid(sess, reason="not_positive")
+            sess.starting_volume = d
+            sess.touch()
+            # Re-load the snapshot to capture its current state at
+            # confirmation time. A stale or missing snapshot blocks Create
+            # at the confirmation screen.
+            snap = self._snapshot_store.load()
+            if snap is None:
+                return self._render_no_data(sess)
+            sess.state = SessionState.AWAITING_CONFIRM
+            self._capture_snapshot_metadata(sess, snap)
+            return self._render_confirmation(sess, snap)
+        # Any other state: do not intercept.
+        return None
+
+    def _handle_alias_text(
+        self,
+        sess: FiboSession,
+        raw: str,
+    ) -> Screen:
+        """Phase 2.2 §3: the user typed an alias. Pass it through
+        the SAME agent resolver as the source symbol. The agent
+        MUST be the only authority for what becomes the canonical
+        ``exchange_instrument``; we NEVER trust the raw user text
+        as a venue contract id.
+
+        Per-user isolation: this method is only reachable through
+        ``handle_text`` which already gated on the session for the
+        calling ``(chat_id, user_id)``.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            # Empty text: re-prompt.
+            snap = self._snapshot_store.load()
+            if snap is None:
+                return self._render_no_data(sess)
+            return self._render_alias_prompt(sess, snap)
+        # Hard cap to keep callback_data sane (the typed text is
+        # not stored as a callback; it just has to fit a single
+        # line in the alias-prompt UI). The agent is the only
+        # validator; we don't truncate here on purpose.
         snap = self._snapshot_store.load()
         if snap is None:
             return self._render_no_data(sess)
-        sess.state = SessionState.AWAITING_CONFIRM
-        self._capture_snapshot_metadata(sess, snap)
-        return self._render_confirmation(sess, snap)
+        sess.resolution_input = raw
+        canonical = self._safe_resolve(
+            sess.exchange or "", sess.account or "", raw,
+        )
+        if canonical is None:
+            # Failure: stay in alias-entry flow (spec §3.B).
+            sess.awaiting = "alias-failure"
+            return self._render_alias_failure(sess, snap, raw)
+        # Success: stage the proposal; user must still Agree.
+        sess.awaiting = "proposal:" + canonical
+        sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+        return self._render_instrument_proposal(sess, snap)
 
     def reset(self, chat_id: Any, user_id: Any) -> None:
         """Drop the session (used by Exit, Cancel, Create, sweep)."""
@@ -364,14 +467,513 @@ class StartFiboFlow:
         snap: Optional[Mt4Snapshot],
         data: str,
     ) -> Screen:
+        """Phase 2.2: after account pick, kick off the
+        agent-validated instrument translation flow.
+
+        Order of operations (spec §7):
+
+        1. Look up the alias-memory key for this (exchange,
+           account, source_symbol). If present, call the agent to
+           revalidate the stored ``exchange_instrument`` live.
+        2. If revalidation succeeds, propose the cached mapping
+           immediately (the user still must Agree).
+        3. If alias memory misses OR revalidation fails OR the
+           agent's response is empty, call
+           ``resolve_instrument(source_symbol)`` fresh.
+        4. If fresh resolution succeeds → render the proposal
+           screen.
+        5. If fresh resolution fails → render the "could not
+           resolve" screen with Enter alias / Browse / Back / Cancel.
+
+        The wizard MUST NOT auto-store ``exchange_instrument``
+        here. The user must tap Agree.
+        """
         if snap is None:
             return self._render_no_data(sess)
         idx = self._parse_index(data, len(CB_ACCT))
         if idx is None or idx >= len(sess.choices_accounts):
             return self._render_invalid_callback(sess.session_key)
         sess.account = sess.choices_accounts[idx]
+        # Reset any prior instrument-translation state (this is
+        # the gate between account pick and the proposal screen).
+        sess.exchange_instrument = None
+        sess.resolution_input = sess.symbol  # default input
+        sess.choices_instruments = []
+        sess.instrument_page = 0
+        sess.awaiting = None
+        return self._propose_exchange_instrument(sess, snap)
+
+    # ------------------------------------------------------------------
+    # Phase 2.2: instrument-translation proposal + handlers
+    # ------------------------------------------------------------------
+
+    def _safe_resolve(
+        self,
+        exchange: str,
+        account: str,
+        symbol: str,
+    ) -> Optional[str]:
+        """Resolve ``symbol`` through the live exchange agent.
+
+        Returns the canonical venue contract id (e.g.
+        ``"ETH-USD.P"``) on success, ``None`` on failure or when
+        no resolver is wired. NEVER raises — all exceptions are
+        swallowed so a broken resolver never crashes the wizard.
+        """
+        if self._resolve_instrument is None:
+            return None
+        try:
+            result = self._resolve_instrument(
+                str(exchange), str(account), str(symbol)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "fibo_flow: resolve_instrument(%r,%r,%r) raised: %s",
+                exchange, account, symbol, exc,
+            )
+            return None
+        if not result:
+            return None
+        return str(result).strip() or None
+
+    def _propose_exchange_instrument(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Render the agent-resolved instrument proposal.
+
+        Spec §2 / §3 / §10: the canonical venue contract the agent
+        returned is shown to the user with Agree / Other / Browse /
+        Back / Cancel buttons. Only Agree commits the mapping.
+
+        Phase 2.3: when neither the alias cache nor a direct
+        ``resolve_instrument`` call produces a canonical, the flow
+        ranks plausible candidates from the exchange catalog and
+        shows the candidate picker (spec §3). Price evidence is
+        attached to each candidate but is NEVER used to auto-select.
+        """
+        # Try cached alias memory first.
+        key = alias_key(sess.exchange or "", sess.account or "",
+                        sess.symbol or "")
+        if self._alias_memory is not None and sess.symbol:
+            try:
+                cached = self._alias_memory.revalidate(
+                    key, resolve_fn=self._safe_resolve,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fibo_flow: alias_memory.revalidate failed: %s", exc
+                )
+                cached = None
+            if cached is not None:
+                # Cache hit + still valid → propose the cached
+                # mapping directly. resolution_input is whatever
+                # the user typed last time (or the original
+                # source_symbol on first approval). Stage the
+                # proposal canonical in sess.awaiting so Agree
+                # can find it.
+                sess.resolution_input = cached.resolution_input or sess.symbol
+                sess.awaiting = "proposal:" + cached.exchange_instrument
+                sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+                return self._render_instrument_proposal(sess, snap)
+        # Cache miss / stale / revalidation failed → fresh
+        # resolution of the source symbol.
+        canonical = self._safe_resolve(
+            sess.exchange or "", sess.account or "",
+            sess.symbol or "",
+        )
+        if canonical is None:
+            # Phase 2.3: try ranked candidate discovery before
+            # falling back to the "could not resolve" screen.
+            return self._propose_via_candidates(sess, snap)
+        # Resolution succeeded → render proposal.
+        sess.resolution_input = sess.symbol
+        sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+        # We stage the proposal here. session.exchange_instrument
+        # is still None — only the user's Agree commits it.
+        # The render reads from a transient field on the session.
+        sess.awaiting = "proposal:" + canonical
+        return self._render_instrument_proposal(sess, snap)
+
+    def _propose_via_candidates(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Phase 2.3: rank plausible venue candidates and show the
+        candidate picker.
+
+        This is the AMBIGUOUS SYMBOL path (spec §3). Steps:
+
+        1. Fetch the full exchange catalog (read-only ``GET /v1/markets``).
+        2. Rank with ``candidates.rank_candidates`` (price evidence
+           is supporting only — semantic / name similarity ranks higher).
+        3. Attach live prices via ``market_price`` (read-only ``GET
+           /v1/perps/mark_prices``) when available. Missing prices
+           do NOT block display.
+        4. Store the ranked candidates on ``sess.candidates`` and
+           render the picker.
+
+        The flow MUST NEVER pick a candidate automatically. The
+        user always taps a button (and that pick is still
+        revalidated through the exchange agent before the proposal
+        screen is shown).
+        """
+        from .candidates import (
+            InstrumentCandidate,
+            rank_candidates,
+            attach_price,
+        )
+        from . import discovery
+
+        sess.candidates = []
+        sess.selected_candidate_canonical = None
+
+        try:
+            catalog = discovery.list_market_catalog(
+                sess.exchange or "", sess.account or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "fibo_flow: catalog fetch failed: %s", exc
+            )
+            catalog = []
+
+        if not catalog:
+            # Discovery failed entirely — fall back to the original
+            # Phase 2.2 unresolved screen (Other / Browse / Back /
+            # Cancel).
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_instrument_unresolved(sess, snap)
+
+        # Build the ranker + price lookup bound to the chosen venue.
+        def _price_lookup(market: str):
+            try:
+                return discovery.get_market_price(
+                    sess.exchange or "",
+                    sess.account or "",
+                    market,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+
+        enriched = attach_price(catalog, _price_lookup)
+        ranked = rank_candidates(enriched, sess.symbol or "")
+        # Top-N: keep up to 10 candidates on screen.
+        top = ranked[:10]
+        sess.candidates = top
+        if not top:
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_instrument_unresolved(sess, snap)
+        # Show the picker. The user picks one, which we revalidate
+        # through the agent before staging the proposal.
+        sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+        return self._render_candidates_screen(sess, snap)
+
+    def _handle_instrument_agree(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+    ) -> Screen:
+        """User tapped Agree. Commit the canonical contract id to
+        ``exchange_instrument``, persist to alias memory (ONLY
+        here), and advance to volume."""
+        if snap is None:
+            return self._render_no_data(sess)
+        if sess.state != SessionState.AWAITING_INSTRUMENT_CONFIRM:
+            return self._render_invalid_callback(sess.session_key)
+        canonical = self._extract_proposal_canonical(sess)
+        if not canonical:
+            # Defensive: nothing to agree to.
+            return self._render_invalid_callback(sess.session_key)
+        sess.exchange_instrument = canonical
+        sess.awaiting = None
+        sess.choices_instruments = []
+        sess.instrument_page = 0
+        # Record to alias memory. Failure here must NOT block the
+        # wizard — alias memory is a hint, not a source of truth.
+        if self._alias_memory is not None and sess.symbol:
+            try:
+                key = alias_key(
+                    sess.exchange or "", sess.account or "",
+                    sess.symbol or "",
+                )
+                self._alias_memory.record_approval(
+                    key,
+                    source_symbol=sess.symbol or "",
+                    resolution_input=sess.resolution_input or sess.symbol or "",
+                    exchange_instrument=canonical,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fibo_flow: alias_memory.record_approval failed: %s", exc
+                )
         sess.state = SessionState.AWAITING_VOLUME
         return self._render_volume_screen(sess, snap)
+
+    def _handle_instrument_other(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+    ) -> Screen:
+        """User tapped Other. Switch to the alias-entry state.
+        Text input from this point is intercepted ONLY for this
+        exact session.
+
+        We deliberately preserve the staged proposal in
+        ``sess.awaiting`` (if present) so Back returns to the
+        original proposal screen instead of dropping the user
+        to "could not resolve".
+        """
+        if snap is None:
+            return self._render_no_data(sess)
+        # NOTE: we DO NOT clear sess.awaiting here. The proposal
+        # canonical stays staged so Back can restore it.
+        sess.state = SessionState.AWAITING_EXCHANGE_ALIAS
+        return self._render_alias_prompt(sess, snap)
+
+    def _handle_instrument_browse(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+    ) -> Screen:
+        """User tapped Browse. Page through the read-only market
+        list. Clicking a market sends the user to the same
+        translation approval screen (spec §5)."""
+        if snap is None:
+            return self._render_no_data(sess)
+        sess.instrument_page = 0
+        # Refresh market list (the Phase 2.1 lister is reused).
+        if self._list_instruments is not None and sess.exchange and sess.account:
+            try:
+                instruments = self._list_instruments(
+                    str(sess.exchange), str(sess.account)
+                )
+            except Exception:
+                instruments = []
+            sess.choices_instruments = list(instruments or [])
+        sess.state = SessionState.AWAITING_MARKET_BROWSE
+        return self._render_market_browse(sess, snap)
+
+    def _handle_browse_paginate(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+        data: str,
+    ) -> Screen:
+        if snap is None:
+            return self._render_no_data(sess)
+        # CB_BROWSEPG: -1 for prev, 1..N for direct page jump.
+        try:
+            delta = int(data[len(CB_BROWSEPG):])
+        except ValueError:
+            return self._render_invalid_callback(sess.session_key)
+        if delta == -1:
+            sess.instrument_page = max(0, sess.instrument_page - 1)
+        elif delta > 0:
+            sess.instrument_page = max(0, delta - 1)
+        return self._render_market_browse(sess, snap)
+
+    def _handle_browse_market_pick(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+        data: str,
+    ) -> Screen:
+        """User picked a market from the Browse list.
+
+        We do NOT immediately store it as ``exchange_instrument``.
+        Instead we set up a fresh proposal with this market as
+        the candidate resolution_input (spec §5)."""
+        if snap is None:
+            return self._render_no_data(sess)
+        idx = self._parse_index(data, len(CB_INSTSEL))
+        if idx is None or idx >= len(sess.choices_instruments):
+            return self._render_invalid_callback(sess.session_key)
+        candidate = sess.choices_instruments[idx]
+        # Run the candidate through the SAME agent path so the
+        # user sees the canonical id (browse can return the
+        # canonical id directly, but we re-resolve for safety).
+        canonical = self._safe_resolve(
+            sess.exchange or "", sess.account or "",
+            candidate,
+        )
+        if canonical is None:
+            # Browse returned a market that the agent no longer
+            # resolves. Treat as a failed proposal.
+            sess.resolution_input = candidate
+            sess.awaiting = "alias-failure"
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_alias_failure(sess, snap, candidate)
+        sess.resolution_input = candidate
+        sess.awaiting = "proposal:" + canonical
+        sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+        return self._render_instrument_proposal(sess, snap)
+
+    def _handle_legacy_inst_pick(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+        data: str,
+    ) -> Screen:
+        """Backwards-compat shim for stale Phase 2.1 messages.
+
+        Treats the picked market as a resolution_input and routes
+        through the proposal screen (spec §5)."""
+        if snap is None:
+            return self._render_no_data(sess)
+        idx = self._parse_index(data, len(CB_INST))
+        if idx is None or idx >= len(sess.choices_instruments):
+            return self._render_invalid_callback(sess.session_key)
+        candidate = sess.choices_instruments[idx]
+        return self._handle_browse_market_pick(
+            sess, snap, f"{CB_INSTSEL}{idx}"
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 2.3 — ranked candidate picker
+    # ------------------------------------------------------------------
+
+    def _handle_candidate_pick(
+        self,
+        sess: FiboSession,
+        snap: Optional[Mt4Snapshot],
+        data: str,
+    ) -> Screen:
+        """User picked a candidate from the ranked picker.
+
+        The button callback carries ONLY an INDEX — never the raw
+        venue contract string. We look up
+        ``sess.candidates[idx].instrument``, then revalidate it
+        through the same exchange agent path. The agent is the
+        ONLY authority allowed to produce the canonical
+        ``exchange_instrument``.
+
+        Only after the agent confirms the contract id do we stage
+        the proposal. (If the agent no longer resolves the
+        candidate — e.g. the catalog raced — we drop back to the
+        "could not resolve" screen.)
+        """
+        if snap is None:
+            return self._render_no_data(sess)
+        if sess.state != SessionState.AWAITING_INSTRUMENT_CONFIRM:
+            return self._render_invalid_callback(sess.session_key)
+        idx = self._parse_index(data, len(CB_CAND))
+        if idx is None or idx >= len(sess.candidates):
+            return self._render_invalid_callback(sess.session_key)
+        candidate = sess.candidates[idx]
+        # Validate through the live agent path. NEVER trust the
+        # button payload as the canonical identity.
+        canonical = self._safe_resolve(
+            sess.exchange or "",
+            sess.account or "",
+            candidate.instrument,
+        )
+        if canonical is None:
+            # Agent rejected the candidate — fall back to the
+            # unresolved screen.
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            sess.awaiting = "alias-failure"
+            return self._render_alias_failure(sess, snap, candidate.instrument)
+        # Stage the proposal. session.exchange_instrument stays
+        # None — only Agree commits.
+        sess.resolution_input = candidate.instrument
+        sess.selected_candidate_canonical = canonical
+        sess.awaiting = "proposal:" + canonical
+        return self._render_instrument_proposal(sess, snap)
+
+    def _render_candidates_screen(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Spec §3: render the ranked candidate picker.
+
+        One button per candidate (``fibo:s:cand:<idx>``), plus the
+        secondary actions (Other / Browse / Back / Cancel). Prices
+        are displayed as evidence only — they never auto-select.
+
+        Callback lengths are kept tight: ``fibo:s:cand:9`` is
+        15 bytes — well under the 64-byte Telegram limit. The
+        raw venue contract string NEVER appears in callback_data.
+        """
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        src = sess.symbol or "?"
+        # Build per-candidate rows.
+        rows: List[List[Dict[str, str]]] = []
+        for i, cand in enumerate(sess.candidates):
+            label = cand.instrument
+            if len(label) > 24:
+                label = label[:21] + "..."
+            # Append the price as part of the button text (purely
+            # decorative; not used for selection logic).
+            if cand.price is not None:
+                # Trim trailing zeros for compact display.
+                ps = format(cand.price.normalize(), "f")
+                rows.append([
+                    {"text": f"{label} · {ps}",
+                     "callback_data": f"{CB_CAND}{i}"},
+                ])
+            else:
+                rows.append([
+                    {"text": label,
+                     "callback_data": f"{CB_CAND}{i}"},
+                ])
+        rows.append([
+            {"text": "✏️ Other", "callback_data": CB_OTHER},
+            {"text": "📋 Browse markets", "callback_data": CB_BROWSE},
+        ])
+        rows.append([
+            {"text": "◀️ Back", "callback_data": CB_BACK},
+            {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+        ])
+        # Build the body listing per-candidate metadata. We render
+        # only the top entries to keep the message short.
+        body_lines: List[str] = []
+        for i, cand in enumerate(sess.candidates[:8]):
+            block = cand.to_compact_block(i)
+            body_lines.append(block)
+        body = "\n\n".join(body_lines)
+        # Re-confirm: this is a hint, NOT an auto-selection.
+        text = (
+            f"{header}"
+            f"🔎 Resolve MT4 instrument\n\n"
+            f"Source: {src}\n"
+            f"Exchange: {sess.exchange}\n"
+            f"Account: {sess.account}\n\n"
+            f"Possible matches:\n\n"
+            f"{body}\n\n"
+            f"Choose the exchange instrument that matches {src}.\n\n"
+            f"Ranked by name similarity; price is supporting evidence only."
+        )
+        return Screen(text=text, buttons=rows)
+
+    def _extract_proposal_canonical(self, sess: FiboSession) -> str:
+        """Decode the canonical id for the current proposal.
+
+        Sources (in order):
+          1. ``sess.awaiting`` (set when entering the proposal
+             screen — the staged-but-not-yet-Agreed canonical).
+          2. ``sess.exchange_instrument`` (set after Agree; useful
+             for back-navigation that returns to the proposal).
+
+        Returns ``""`` when neither has a value.
+        """
+        tag = sess.awaiting or ""
+        if tag.startswith("proposal:"):
+            canonical = tag[len("proposal:"):].strip()
+            if canonical:
+                return canonical
+        # Fall back to the agreed (or pre-agreed) value.
+        if sess.exchange_instrument:
+            return sess.exchange_instrument.strip()
+        return ""
+
+    # ------------------------------------------------------------------
+    # Back navigation
+    # ------------------------------------------------------------------
 
     def _handle_back(
         self,
@@ -380,10 +982,36 @@ class StartFiboFlow:
     ) -> Screen:
         # Back navigates one step up; cannot go past symbol+variant.
         prev = sess.state
-        if prev == SessionState.AWAITING_VOLUME:
-            sess.starting_volume = None
+        # Phase 2.2: proposal / alias / browse states all go back
+        # to the account screen (the user can re-pick an account
+        # to retry resolution, or simply choose Other / Browse
+        # again).
+        if prev == SessionState.AWAITING_INSTRUMENT_CONFIRM:
+            sess.awaiting = None
+            sess.exchange_instrument = None
+            sess.choices_instruments = []
+            sess.instrument_page = 0
             sess.state = SessionState.AWAITING_ACCOUNT
             return self._render_account_screen(sess, snap) if snap else self._render_no_data(sess)
+        if prev == SessionState.AWAITING_EXCHANGE_ALIAS:
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            # NOTE: do NOT clear sess.awaiting here — the staged
+            # proposal canonical is preserved so the user can Agree.
+            return self._render_instrument_proposal(sess, snap) if snap else self._render_no_data(sess)
+        if prev == SessionState.AWAITING_MARKET_BROWSE:
+            sess.instrument_page = 0
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_instrument_proposal(sess, snap) if snap else self._render_no_data(sess)
+        if prev == SessionState.AWAITING_INSTRUMENT:
+            sess.exchange_instrument = None
+            sess.choices_instruments = []
+            sess.state = SessionState.AWAITING_ACCOUNT
+            return self._render_account_screen(sess, snap) if snap else self._render_no_data(sess)
+        if prev == SessionState.AWAITING_VOLUME:
+            sess.starting_volume = None
+            # Always go back to the proposal / confirm screen.
+            sess.state = SessionState.AWAITING_INSTRUMENT_CONFIRM
+            return self._render_instrument_proposal(sess, snap) if snap else self._render_no_data(sess)
         if prev == SessionState.AWAITING_ACCOUNT:
             sess.account = None
             sess.choices_accounts = []
@@ -454,7 +1082,9 @@ class StartFiboFlow:
             registration = FiboRegistration.build(
                 exchange=sess.exchange,
                 account=sess.account,
-                symbol=sess.symbol,
+                symbol=sess.symbol,                # JSONL compat (kept = source_symbol)
+                source_symbol=sess.symbol,         # MT4 source symbol
+                exchange_instrument=sess.exchange_instrument,  # venue contract id
                 variant=sess.variant,
                 side=side,
                 starting_volume=starting_volume,
@@ -665,6 +1295,229 @@ class StartFiboFlow:
         )
         return Screen(text=text, buttons=rows)
 
+    def _render_instrument_screen(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Phase 2.1: the venue-instrument picker.
+
+        Shows the list of actual exchange instruments discovered for
+        the chosen exchange + account. The user MUST pick one — we
+        do not assume any source/exchange equivalence.
+
+        Callbacks stay under the 64-byte Telegram limit: a typical
+        button is ``fibo:s:inst:7`` (15 bytes).
+        """
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        rows: List[List[Dict[str, str]]] = []
+        for i, inst in enumerate(sess.choices_instruments):
+            # Truncate the label so even a long instrument name fits
+            # in a single button.
+            label = inst if len(inst) <= 28 else (inst[:25] + "...")
+            rows.append([
+                {"text": label, "callback_data": f"{CB_INST}{i}"},
+            ])
+        rows.append([
+            {"text": "◀️ Back", "callback_data": CB_BACK},
+            {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+        ])
+        text = (
+            f"{header}"
+            f"🏷️ Pick the exchange market for "
+            f"{sess.symbol} {sess.variant} {sess.side} "
+            f"on {sess.exchange}/{sess.account}:\n\n"
+            f"MT4 source: {sess.symbol}  ·  {len(sess.choices_instruments)} markets available.\n\n"
+            f"Choose the actual venue contract to target."
+        )
+        return Screen(text=text, buttons=rows)
+
+    # ------------------------------------------------------------------
+    # Phase 2.2 — instrument-translation renders
+    # ------------------------------------------------------------------
+
+    def _render_instrument_proposal(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Show the agent-resolved canonical venue contract to the
+        user (spec §2.A). Buttons: Agree / Other / Browse / Back /
+        Cancel. Only Agree commits the mapping.
+        """
+        canonical = self._extract_proposal_canonical(sess)
+        # If there's no canonical staged (e.g. user navigated here
+        # without an agent proposal), re-render the unresolved screen.
+        if not canonical:
+            return self._render_instrument_unresolved(sess, snap)
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        src = sess.symbol or "?"
+        exchange_label = sess.exchange or "?"
+        rows = [
+            [
+                {"text": "✅ Agree", "callback_data": CB_AGREE},
+                {"text": "✏️ Other", "callback_data": CB_OTHER},
+                {"text": "📋 Browse markets", "callback_data": CB_BROWSE},
+            ],
+            [
+                {"text": "◀️ Back", "callback_data": CB_BACK},
+                {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+            ],
+        ]
+        # Show resolution_input distinctly only when it differs
+        # from the source symbol.
+        alias_line = ""
+        ri = sess.resolution_input or src
+        if ri.strip() and ri.strip() != src:
+            alias_line = f"Your alias:   {ri}\n"
+        text = (
+            f"{header}"
+            f"🔎 Instrument translation\n\n"
+            f"MT4 source:  {src}\n"
+            f"{alias_line}"
+            f"OndoPerps:   {canonical}\n\n"
+            f"Does this look correct?"
+        )
+        return Screen(text=text, buttons=rows)
+
+    def _render_instrument_unresolved(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Show the "could not resolve" screen (spec §2.B).
+        Buttons: Enter alias / Browse / Back / Cancel. No Agree —
+        we have nothing to agree to."""
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        src = sess.symbol or "?"
+        exchange_label = sess.exchange or "?"
+        rows = [
+            [
+                {"text": "✏️ Enter alias", "callback_data": CB_OTHER},
+                {"text": "📋 Browse markets", "callback_data": CB_BROWSE},
+            ],
+            [
+                {"text": "◀️ Back", "callback_data": CB_BACK},
+                {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+            ],
+        ]
+        text = (
+            f"{header}"
+            f"⚠️ Could not uniquely resolve MT4 symbol:\n\n"
+            f"MT4 source:  {src}\n"
+            f"Exchange:    {exchange_label}\n\n"
+            f"Enter another symbol/alias you believe the exchange uses,\n"
+            f"or browse available markets."
+        )
+        return Screen(text=text, buttons=rows)
+
+    def _render_alias_prompt(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Spec §3: the user is typing a free-form alias (e.g.
+        ``US500``) which will be passed through the SAME agent
+        resolver.
+        """
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        src = sess.symbol or "?"
+        rows = [
+            [
+                {"text": "◀️ Back", "callback_data": CB_BACK},
+                {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+            ],
+        ]
+        text = (
+            f"{header}"
+            f"✏️ Enter exchange alias for {src}\n\n"
+            f"Type a symbol/alias the exchange might use\n"
+            f"(e.g. ``US500`` for #SP500).\n\n"
+            f"It will be validated through the {sess.exchange} agent."
+        )
+        return Screen(text=text, buttons=rows)
+
+    def _render_alias_failure(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+        attempted: str,
+    ) -> Screen:
+        """Spec §3: the typed alias failed agent validation."""
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        exchange_label = sess.exchange or "?"
+        rows = [
+            [
+                {"text": "✏️ Try another", "callback_data": CB_INSTFAIL_RETRY},
+                {"text": "📋 Browse markets", "callback_data": CB_BROWSE},
+            ],
+            [
+                {"text": "◀️ Back", "callback_data": CB_BACK},
+                {"text": "❌ Cancel", "callback_data": CB_CANCEL},
+            ],
+        ]
+        text = (
+            f"{header}"
+            f"❌ {exchange_label} could not resolve \"{attempted}\".\n\n"
+            f"Try another alias or browse markets."
+        )
+        return Screen(text=text, buttons=rows)
+
+    def _render_market_browse(
+        self,
+        sess: FiboSession,
+        snap: Mt4Snapshot,
+    ) -> Screen:
+        """Spec §5: compact paginated market list.
+
+        Each row is one instrument; the button's callback_data is
+        an INDEX (not the raw market string), so we stay under the
+        64-byte Telegram limit regardless of instrument name."""
+        from .session import SESSION_TTL_SECONDS  # noqa: F401  (sanity)
+        age = snap.age_seconds(self._now_fn())
+        header = self._age_header(age)
+        page_size = 8
+        total = len(sess.choices_instruments)
+        page = max(0, min(sess.instrument_page, max(0, (total - 1) // page_size)))
+        start = page * page_size
+        end = min(start + page_size, total)
+        rows: List[List[Dict[str, str]]] = []
+        for i in range(start, end):
+            inst = sess.choices_instruments[i]
+            label = inst if len(inst) <= 28 else (inst[:25] + "...")
+            rows.append([
+                {"text": label, "callback_data": f"{CB_INSTSEL}{i}"},
+            ])
+        nav_row: List[Dict[str, str]] = []
+        if page > 0:
+            nav_row.append(
+                {"text": "◀ Prev", "callback_data": f"{CB_BROWSEPG}-1"}
+            )
+        if end < total:
+            nav_row.append(
+                {"text": "Next ▶", "callback_data": f"{CB_BROWSEPG}1"}
+            )
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([
+            {"text": "◀️ Back", "callback_data": CB_BACK},
+            {"text": "� Cancel", "callback_data": CB_CANCEL},
+        ])
+        text = (
+            f"{header}"
+            f"📋 Markets on {sess.exchange}/{sess.account}\n\n"
+            f"Page {page + 1} of {max(1, (total + page_size - 1) // page_size)}"
+            f"  ·  {total} markets\n\n"
+            f"Pick a market to propose it as the canonical contract.\n"
+            f"You'll still need to Agree on the next screen."
+        )
+        return Screen(text=text, buttons=rows)
+
     def _render_volume_screen(
         self,
         sess: FiboSession,
@@ -724,11 +1577,12 @@ class StartFiboFlow:
         age_str = f"{age:.1f}s" if age is not None else "?"
 
         text = self._format_confirmation(
-            symbol=sess.symbol or "?",
+            source_symbol=sess.symbol or "?",
             variant=sess.variant or "?",
             side=side,
             exchange=sess.exchange or "?",
             account=sess.account or "?",
+            exchange_instrument=sess.exchange_instrument or "",
             starting_volume=sess.starting_volume,
             source=snap.source,
             source_seq=snap.seq,
@@ -906,11 +1760,12 @@ class StartFiboFlow:
     @staticmethod
     def _format_confirmation(
         *,
-        symbol: str,
+        source_symbol: str,
         variant: str,
         side: str,
         exchange: str,
         account: str,
+        exchange_instrument: str,
         starting_volume: Optional[Decimal],
         source: str,
         source_seq: int,
@@ -920,21 +1775,44 @@ class StartFiboFlow:
         desired_exchange_size: Decimal,
         snapshot_age: str,
     ) -> str:
+        """Spec §6: the canonical venue contract is the prominent
+        Symbol line; MT4 source appears as its own line.
+
+        The layout matches the spec example exactly:
+            Symbol:       <canonical venue>
+            MT4 source:   <source_symbol>
+            Variant:      <variant>
+            Side:         <side>
+            Exchange:     <exchange>
+            Account:      <account>
+            Volume:       <vol>
+            MT4 feed:     <source> (seq <seq>)
+            MT4 cycle:    <cycle_id>
+            MT4 weight:   <weight>
+            MT4 %:        <percentage>
+            Calc target:  <desired_size>
+            Snapshot age: <age>
+        """
         vol = "?" if starting_volume is None else _fmt_decimal(starting_volume)
+        symbol_line = (
+            f"Symbol:       {exchange_instrument}\n"
+            if exchange_instrument
+            else "Symbol:       ⚠ not selected (NEEDS_INSTRUMENT_SELECTION)\n"
+        )
         return (
             f"📋 Confirm registration:\n\n"
-            f"Symbol:      {symbol}\n"
-            f"Variant:     {variant}\n"
-            f"Side:        {side}\n"
-            f"Exchange:    {exchange}\n"
-            f"Account:     {account}\n"
-            f"Volume:      {vol}\n"
-            f"MT4 source:  {source} (seq {source_seq})\n"
-            f"MT4 cycle:   {cycle_id}\n"
-            f"MT4 weight:  {_fmt_decimal(cumulative_weight)}\n"
-            f"MT4 %:       {_fmt_decimal(percentage)}\n"
-            f"Calc target: {_fmt_decimal(desired_exchange_size)} "
-            f"(preview — exchange position not yet inspected)\n"
+            f"{symbol_line}"
+            f"MT4 source:   {source_symbol}\n"
+            f"Variant:      {variant}\n"
+            f"Side:         {side}\n"
+            f"Exchange:     {exchange}\n"
+            f"Account:      {account}\n"
+            f"Volume:       {vol}\n\n"
+            f"MT4 feed:     {source} (seq {source_seq})\n"
+            f"MT4 cycle:    {cycle_id}\n"
+            f"MT4 weight:   {_fmt_decimal(cumulative_weight)}\n"
+            f"MT4 %:        {_fmt_decimal(percentage)}\n\n"
+            f"Calc target:  {_fmt_decimal(desired_exchange_size)}\n"
             f"Snapshot age: {snapshot_age}"
         )
 
@@ -1036,6 +1914,14 @@ __all__ = [
     "CB_SIDE",
     "CB_EX",
     "CB_ACCT",
+    "CB_INST",
+    "CB_AGREE",
+    "CB_OTHER",
+    "CB_BROWSE",
+    "CB_BROWSEPG",
+    "CB_INSTSEL",
+    "CB_CAND",
+    "CB_INSTFAIL_RETRY",
     "CB_CREATE",
     "CB_BACK",
     "CB_CANCEL",

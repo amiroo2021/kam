@@ -1615,13 +1615,20 @@ def _fetch_market_metadata(credentials: Dict[str, Any], refresh: bool = False) -
             market = str(entry.get("market") or "").strip()
             if not market:
                 continue
-            mapping[_symbol_from_market(market)] = {
+            record = {
                 "market": market,
                 "base_currency": str(entry.get("baseCurrency") or "").strip(),
                 "quote_currency": str(entry.get("quoteCurrency") or "").strip(),
                 "base_increment": _decimal_or_none(entry.get("baseIncrement")),
                 "quote_increment": _decimal_or_none(entry.get("quoteIncrement")),
             }
+            # Index by BOTH the canonical venue market id
+            # (e.g. ``ETH-USD.P``) AND the stripped symbol
+            # (e.g. ``ETH``). This lets callers pass either form
+            # to ``market_price`` / ``resolve_instrument`` without
+            # the agent having to guess which one the caller used.
+            mapping[market.upper()] = record
+            mapping[_symbol_from_market(market)] = record
     _market_cache = mapping
     return mapping
 

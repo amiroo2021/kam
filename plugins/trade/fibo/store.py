@@ -54,11 +54,32 @@ class FiboRegistration:
     Identity is computed by ``registration_key``. Components are
     normalized at construction time (spec §10) so two registrations
     built from identical raw inputs always have identical keys.
+
+    Phase 2.1 identity split (source vs exchange):
+
+    * ``source_symbol`` — the symbol used to look up the MT4 entry
+      in the latest ``mt4_snapshot.json``. Same spelling as the
+      Observer publishes (e.g. ``"ETHUSD"``).
+    * ``exchange_instrument`` — the venue's contract identifier
+      (e.g. ``"ETH-USD.P"`` on Ondo). Used for exchange reads. Empty
+      for legacy records created before Phase 2.1 — those need
+      ``NEEDS_INSTRUMENT_SELECTION``.
+    * ``symbol`` is preserved as an alias for ``source_symbol`` in
+      the on-disk JSONL record so Phase 1 readers keep working.
+
+    The ``registration_key`` is:
+        ``exchange/account/exchange_instrument/variant/side`` if
+        ``exchange_instrument`` is set,
+        else ``exchange/account/source_symbol/variant/side``
+        (legacy compat — preserves the on-disk identity of
+        pre-Phase-2.1 records).
     """
 
     exchange: str
     account: str
-    symbol: str
+    symbol: str  # kept for JSONL backward compat (= source_symbol)
+    source_symbol: str
+    exchange_instrument: str  # empty for legacy records
     variant: str
     side: str  # canonical "BUY" or "SELL"
     starting_volume: Decimal
@@ -77,11 +98,26 @@ class FiboRegistration:
 
     @property
     def registration_key(self) -> str:
-        """Identity string per spec §10."""
+        """Identity string. When ``exchange_instrument`` is set, it
+        replaces ``source_symbol`` in the key. For legacy records
+        (empty ``exchange_instrument``) the key falls back to the
+        pre-Phase-2.1 form so the on-disk identity is preserved.
+        """
+        venue_token = self.exchange_instrument or self.source_symbol
         return (
             f"{self.exchange}/{self.account}/"
-            f"{self.symbol}/{self.variant}/{self.side}"
+            f"{venue_token}/{self.variant}/{self.side}"
         )
+
+    @property
+    def is_legacy(self) -> bool:
+        """True when the record was created before Phase 2.1 and
+        therefore has no ``exchange_instrument`` set.
+
+        The reconciler must classify such records as
+        ``NEEDS_INSTRUMENT_SELECTION`` and never call the venue.
+        """
+        return not self.exchange_instrument
 
     # Normalization + construction -----------------------------------
 
@@ -95,7 +131,27 @@ class FiboRegistration:
 
     @staticmethod
     def normalize_symbol(value: Any) -> str:
+        """Normalize a SYMBOL identifier (source or legacy ``symbol``).
+
+        Source symbols are MT4-side identifiers (e.g. ``"ETHUSD"``).
+        They are case-insensitive in matching, so we uppercase them
+        for stable identity.
+
+        For EXCHANGE contract identifiers (e.g. ``"ETH-USD.P"``),
+        use ``normalize_exchange_instrument`` — these are case-
+        sensitive in some venues and must be passed through verbatim.
+        """
         return str(value or "").strip().upper()
+
+    @staticmethod
+    def normalize_exchange_instrument(value: Any) -> str:
+        """Normalize an EXCHANGE INSTRUMENT (venue contract id).
+
+        Passes through case and punctuation. Venue contracts like
+        ``"ETH-USD.P"`` must match exactly what the venue returns.
+        We only trim whitespace.
+        """
+        return str(value or "").strip()
 
     @staticmethod
     def normalize_variant(value: Any) -> str:
@@ -125,6 +181,8 @@ class FiboRegistration:
         source_percentage: Any,
         source_snapshot_received_at: str,
         desired_exchange_size: Any,
+        source_symbol: Optional[Any] = None,
+        exchange_instrument: Optional[Any] = None,
         status: str = "registered",
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -134,6 +192,10 @@ class FiboRegistration:
         Decimal fields are parsed via ``Decimal(str(value))`` (no float
         coercion). NaN / Infinity are rejected so they cannot be
         smuggled in via ``Decimal('Infinity')``.
+
+        ``source_symbol`` defaults to ``symbol`` for backward compat.
+        ``exchange_instrument`` is optional; an empty string means
+        "legacy record, must be classified NEEDS_INSTRUMENT_SELECTION".
         """
         def _dec(name: str, value: Any) -> Decimal:
             try:
@@ -160,11 +222,34 @@ class FiboRegistration:
         if not target.is_finite():
             raise ValueError(f"desired_exchange_size must be finite; got {target}")
 
+        norm_symbol = cls.normalize_symbol(symbol)
+        norm_source_symbol = (
+            cls.normalize_symbol(source_symbol)
+            if source_symbol is not None
+            else norm_symbol
+        )
+        # exchange_instrument: pass through verbatim. We do NOT
+        # upper-case it (venue contract identifiers are
+        # case-sensitive in some exchanges).
+        if exchange_instrument is None:
+            norm_instrument = ""
+        else:
+            norm_instrument = cls.normalize_exchange_instrument(
+                exchange_instrument
+            )
+        if norm_instrument == "" and norm_source_symbol == "":
+            raise ValueError(
+                "registration must have at least one of source_symbol or "
+                "exchange_instrument"
+            )
+
         now = created_at or _utc_iso_now()
         return cls(
             exchange=cls.normalize_exchange(exchange),
             account=cls.normalize_account(account),
-            symbol=cls.normalize_symbol(symbol),
+            symbol=norm_symbol,
+            source_symbol=norm_source_symbol,
+            exchange_instrument=norm_instrument,
             variant=cls.normalize_variant(variant),
             side=norm_side,
             starting_volume=vol,
@@ -190,6 +275,8 @@ class FiboRegistration:
             "exchange": self.exchange,
             "account": self.account,
             "symbol": self.symbol,
+            "source_symbol": self.source_symbol,
+            "exchange_instrument": self.exchange_instrument,
             "variant": self.variant,
             "side": self.side,
             "starting_volume": str(self.starting_volume),
@@ -212,6 +299,11 @@ class FiboRegistration:
     def from_dict(cls, raw: Dict[str, Any]) -> "FiboRegistration":
         if not isinstance(raw, dict):
             raise ValueError("registration row is not an object")
+        # source_symbol is the new key. If a legacy record has only
+        # ``symbol``, copy that into source_symbol so the schema is
+        # uniform post-load.
+        source_symbol = raw.get("source_symbol", "") or raw.get("symbol", "")
+        exchange_instrument = raw.get("exchange_instrument", "")
         # Delegate normalization to ``build`` so missing fields error out
         # with the same messages everywhere.
         return cls.build(
@@ -230,6 +322,8 @@ class FiboRegistration:
                 "source_snapshot_received_at", ""
             ),
             desired_exchange_size=raw.get("desired_exchange_size", "0"),
+            source_symbol=source_symbol,
+            exchange_instrument=exchange_instrument,
             status=raw.get("status", "registered"),
             created_at=raw.get("created_at") or _utc_iso_now(),
             updated_at=raw.get("updated_at") or _utc_iso_now(),

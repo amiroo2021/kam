@@ -36,9 +36,9 @@ from typing import Any, Dict, List, Optional
 from unittest import mock
 
 from plugins.trade.fibo.flow import (
-    CB_ACCT, CB_BACK, CB_CANCEL, CB_CREATE, CB_EX, CB_PREFIX, CB_REFRESH,
-    CB_SIDE, CB_SYM, SIDE_TOKEN_BUY, SIDE_TOKEN_SELL, STALE_THRESHOLD_SECONDS,
-    Screen, StartFiboFlow,
+    CB_ACCT, CB_AGREE, CB_BACK, CB_CANCEL, CB_CREATE, CB_EX, CB_PREFIX,
+    CB_REFRESH, CB_SIDE, CB_SYM, SIDE_TOKEN_BUY, SIDE_TOKEN_SELL,
+    STALE_THRESHOLD_SECONDS, Screen, StartFiboFlow,
 )
 from plugins.trade.fibo.session import (
     SESSION_TTL_SECONDS, FiboSessionStore, SessionState,
@@ -126,7 +126,21 @@ class FakeFlowFactory:
         envelope = snap.to_dict()
         self.snap_path.write_text(json.dumps(envelope))
 
-    def flow(self) -> StartFiboFlow:
+    def flow(
+        self,
+        *,
+        resolve_instrument_fn=None,
+        list_instruments_fn=None,
+    ) -> StartFiboFlow:
+        """Build a StartFiboFlow with the standard fake wiring.
+
+        Phase 2.2 additions: callers may inject a custom
+        resolve_instrument_fn (used by the agent-resolved
+        proposal screen) and a list_instruments_fn (used by
+        Browse markets fallback). Both default to None — the
+        flow handles that by going through the "unresolved"
+        screen.
+        """
         snap_store = Mt4SnapshotStore(self.snap_path)
         reg_store = FiboRegistrationStore(self.reg_path)
 
@@ -145,6 +159,8 @@ class FakeFlowFactory:
             registration_store=reg_store,
             list_exchanges_fn=list_exchanges,
             list_accounts_fn=list_accounts,
+            resolve_instrument_fn=resolve_instrument_fn,
+            list_instruments_fn=list_instruments_fn,
             now_fn=now_fn,
         )
 
@@ -389,14 +405,38 @@ class DiscoveryReadOnlyTests(_FlowTestBase):
 
 
 class VolumeInputTests(_FlowTestBase):
-    def _navigate_to_volume(self, *, fibos: List[Mt4Fibo]) -> StartFiboFlow:
+    def _navigate_to_volume(
+        self,
+        *,
+        fibos: List[Mt4Fibo],
+        resolve_instrument_fn=None,
+    ) -> StartFiboFlow:
+        """Drive a session from /fibo up to AWAITING_VOLUME.
+
+        Phase 2.2: account pick now triggers the agent-resolved
+        proposal screen. We inject a default
+        ``resolve_instrument_fn`` that maps ``<src>-USD.P`` so
+        existing tests can keep walking the volume path. Tests
+        that want to exercise the unresolved path pass
+        ``resolve_instrument_fn=None`` explicitly.
+        """
+        if resolve_instrument_fn is None:
+            def _default_resolver(exchange, account, symbol):
+                # Default convention used by the existing test suite:
+                # source symbol X → venue contract "X-USD.P".
+                # Production wires the real agent via the wizard
+                # shim; tests can override per-test.
+                return f"{symbol}-USD.P"
+            resolve_instrument_fn = _default_resolver
         self.fx.set_snapshot(_snapshot(fibos))
-        flow = self.fx.flow()
+        flow = self.fx.flow(resolve_instrument_fn=resolve_instrument_fn)
         flow.open("chat-1", "user-1")
         flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
         flow.handle_callback("chat-1", "user-1", f"{CB_EX}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        # Phase 2.2: tap Agree on the proposal screen.
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
         return flow
 
     def test_decimal_starting_volume(self) -> None:
@@ -448,12 +488,16 @@ class VolumeInputTests(_FlowTestBase):
     def test_text_interception_isolated_per_user(self) -> None:
         fibos = [_good_fibo()]
         self.fx.set_snapshot(_snapshot(fibos))
-        flow = self.fx.flow()
+        # Phase 2.2: inject resolver.
+        def _default_resolver(exchange, account, symbol):
+            return f"{symbol}-USD.P"
+        flow = self.fx.flow(resolve_instrument_fn=_default_resolver)
         flow.open("chat-1", "user-1")
         flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
         flow.handle_callback("chat-1", "user-1", f"{CB_EX}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
         # user-1 is awaiting volume; user-2 has no session at all.
         # A text from user-2 must NOT be consumed.
         self.assertIsNone(flow.handle_text("chat-1", "user-2", "0.10"))
@@ -469,12 +513,17 @@ class VolumeInputTests(_FlowTestBase):
 class ConfirmationCreateTests(_FlowTestBase):
     def _happy_path(self, *, fibos: List[Mt4Fibo]) -> StartFiboFlow:
         self.fx.set_snapshot(_snapshot(fibos))
-        flow = self.fx.flow()
+        # Phase 2.2: inject the default resolver so the proposal
+        # screen appears.
+        def _default_resolver(exchange, account, symbol):
+            return f"{symbol}-USD.P"
+        flow = self.fx.flow(resolve_instrument_fn=_default_resolver)
         flow.open("chat-1", "user-1")
         flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
         flow.handle_callback("chat-1", "user-1", f"{CB_EX}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
         flow.handle_text("chat-1", "user-1", "0.10")
         return flow
 
@@ -505,10 +554,16 @@ class ConfirmationCreateTests(_FlowTestBase):
         self.assertEqual(len(all_), 1)
         # The wizard picked index 0; sorted(["MAIN","ALT"]) -> ["ALT","MAIN"],
         # so the first account is "ALT" (uppercase normalization).
+        # Phase 2.2: the registration_key uses the stored
+        # exchange_instrument (the canonical venue contract the
+        # user Agreed to), NOT the MT4 source symbol.
         self.assertEqual(
             all_[0].registration_key,
-            "apex/ALT/BTCUSD/FASTFIB/BUY",
+            "apex/ALT/BTCUSD-USD.P/FASTFIB/BUY",
         )
+        # And both source_symbol and exchange_instrument are stored.
+        self.assertEqual(all_[0].source_symbol, "BTCUSD")
+        self.assertEqual(all_[0].exchange_instrument, "BTCUSD-USD.P")
         # And the desired_exchange_size = 0.10 * 2.5 = 0.25.
         self.assertEqual(
             all_[0].desired_exchange_size, Decimal("0.25"),
@@ -524,6 +579,7 @@ class ConfirmationCreateTests(_FlowTestBase):
         flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
         flow.handle_callback("chat-1", "user-1", f"{CB_EX}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
         flow.handle_text("chat-1", "user-1", "0.10")
         screen = flow.handle_callback(
             "chat-1", "user-1", CB_CREATE
@@ -548,12 +604,16 @@ class ConfirmationCreateTests(_FlowTestBase):
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         fibos = [_good_fibo(buy_cycle_id=42, cumulative_buy_weight="2.5")]
         self.fx.set_snapshot(_snapshot(fibos, received_at=old_received))
-        flow = self.fx.flow()
+        # Phase 2.2: inject resolver.
+        def _default_resolver(exchange, account, symbol):
+            return f"{symbol}-USD.P"
+        flow = self.fx.flow(resolve_instrument_fn=_default_resolver)
         flow.open("chat-1", "user-1")
         flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
         flow.handle_callback("chat-1", "user-1", f"{CB_EX}0")
         flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
         confirm = flow.handle_text("chat-1", "user-1", "0.10")
         # No Create button — Refresh instead.
         flat_cb = [
@@ -636,7 +696,11 @@ class CallbackBudgetTests(_FlowTestBase):
             _good_fibo(symbol="ETHUSD", variant="NORMALFib"),
         ]
         self.fx.set_snapshot(_snapshot(fibos))
-        flow = self.fx.flow()
+        # Phase 2.2: inject a resolver so the proposal screen
+        # appears (otherwise the flow lands on "unresolved").
+        def _default_resolver(exchange, account, symbol):
+            return f"{symbol}-USD.P"
+        flow = self.fx.flow(resolve_instrument_fn=_default_resolver)
         screens = [
             flow.open("chat-1", "user-1"),
         ]
@@ -650,8 +714,13 @@ class CallbackBudgetTests(_FlowTestBase):
         screens.append(flow.handle_callback(
             "chat-1", "user-1", f"{CB_ACCT}0"
         ))
+        screens.append(flow.handle_callback(
+            "chat-1", "user-1", CB_AGREE
+        ))
         screens.append(flow.handle_text("chat-1", "user-1", "0.10"))
         for screen in screens:
+            if screen is None:
+                continue
             for row in screen.buttons:
                 for btn in row:
                     self.assertLessEqual(

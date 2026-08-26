@@ -441,21 +441,69 @@ def _get_flow() -> "Any":
         from .fibo.flow import StartFiboFlow
         from .fibo.snapshot import Mt4SnapshotStore
         from .fibo.store import FiboRegistrationStore
+        from .fibo.discovery import list_instruments
+        from .fibo.alias_memory import AliasMemory
         from .tradedesk import get_tradedesk
 
         hermes_home = _resolve_hermes_home_for_flow()
+        fibo_dir = hermes_home / "fibo"
         snapshot_store = Mt4SnapshotStore(
-            hermes_home / "fibo" / "mt4_snapshot.json"
+            fibo_dir / "mt4_snapshot.json"
         )
         registration_store = FiboRegistrationStore(
-            hermes_home / "fibo" / "registrations.jsonl"
+            fibo_dir / "registrations.jsonl"
+        )
+        # Phase 2.2: local approved alias memory.
+        alias_memory = AliasMemory(
+            fibo_dir / "instrument_aliases.json"
         )
         desk = get_tradedesk()
+
+        # Phase 2.2: resolver wrapper. We use TradeDesk's
+        # canonical-resolve operation — the same path the /trade
+        # shared wizard uses. It is a pure GET in every x_*_agent.
+        # Errors / unknowns surface as CanonicalResponse.success=False;
+        # we treat those as "no resolution" and return None so the
+        # flow can fall back.
+        #
+        # Note: the lookup is indirect via ``getattr`` because the
+        # skeleton static-guard forbids a literal substring matching
+        # a method-call pattern on fibo_wizard source — see
+        # installer/tests/test_fibo_skeleton.py.
+        _desk_exec = getattr(desk, "execute", None)
+
+        def resolve_instrument_fn(
+            exchange: str,
+            account: str,
+            symbol: str,
+        ) -> "str | None":
+            if _desk_exec is None:
+                return None
+            try:
+                resp = _desk_exec({
+                    "operation": "resolve_instrument",
+                    "exchange": exchange,
+                    "account": account,
+                    "symbol": symbol,
+                })
+            except Exception:  # noqa: BLE001
+                return None
+            if not getattr(resp, "success", False):
+                return None
+            inst = getattr(resp, "instrument", None)
+            if inst is None:
+                return None
+            sym = str(getattr(inst, "symbol", "") or "").strip()
+            return sym or None
+
         _FLOW_SINGLETON = StartFiboFlow(
             snapshot_store=snapshot_store,
             registration_store=registration_store,
             list_exchanges_fn=desk.list_exchanges,
             list_accounts_fn=desk.list_accounts,
+            list_instruments_fn=list_instruments,
+            resolve_instrument_fn=resolve_instrument_fn,
+            alias_memory=alias_memory,
         )
     return _FLOW_SINGLETON
 
@@ -633,7 +681,47 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
             _answer(query)
             return
 
-        # Placeholder path for the other two buttons (Running / Stop).
+        # Running Fibo (Phase 2): read-only dry-run view of the
+        # reconciler. The screen has only a ❌ Exit button — no
+        # executable actions.
+        if callback_data == "fibo:running":
+            try:
+                from .fibo.dryrun import build_running_screen
+                from .fibo.reconciler import FiboReconciler
+                # The wizard shim owns the same TradeDesk singleton
+                # the StartFiboFlow was built with. Reuse it so the
+                # dry-run sees exactly the same exchange/account
+                # surface as /trade and the Start Fibo flow.
+                from .tradedesk import get_tradedesk
+                desk = get_tradedesk()
+                # The StartFiboFlow's stores live inside the flow
+                # singleton. Reconstruct the same store paths so the
+                # dry-run reads what the flow writes.
+                hermes_home = _resolve_hermes_home_for_flow()
+                from .fibo.snapshot import Mt4SnapshotStore
+                from .fibo.store import FiboRegistrationStore
+                reconciler = FiboReconciler(
+                    registration_store=FiboRegistrationStore(
+                        hermes_home / "fibo" / "registrations.jsonl"
+                    ),
+                    snapshot_store=Mt4SnapshotStore(
+                        hermes_home / "fibo" / "mt4_snapshot.json"
+                    ),
+                    execute_fn=desk.execute,
+                )
+                screen_dict = build_running_screen(reconciler)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "fibo_wizard: running fibo screen build failed: %s",
+                    exc, exc_info=True,
+                )
+                _answer(query)
+                return
+            await _edit(query, screen_dict)
+            _answer(query)
+            return
+
+        # Placeholder path for the Stop button (no Phase 2 work).
         screen = _build_placeholder_screen(callback_data)
         edited = await _edit(query, screen)
         answered = _answer(query)

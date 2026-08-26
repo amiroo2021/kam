@@ -36,6 +36,15 @@ Public surface (consumed by ``plugins.trade.fibo_wizard``):
         FiboSessionStore,
     )
     from plugins.trade.fibo.flow import StartFiboFlow
+    from plugins.trade.fibo.reconciler import (
+        DeltaAction,
+        FiboReconciler,
+        ReconciliationResult,
+        Side,
+    )
+    from plugins.trade.fibo.discovery import list_instruments
+    from plugins.trade.fibo.dryrun import build_running_screen
+    from plugins.trade.fibo.alias_memory import AliasMemory, AliasRecord, alias_key
 """
 
 from __future__ import annotations
@@ -46,4 +55,8 @@ __all__ = [
     "session",
     "flow",
     "mt4_reader",
+    "reconciler",
+    "dryrun",
+    "discovery",
+    "alias_memory",
 ]

@@ -278,11 +278,10 @@ class FiboCallbackRoutingTests(unittest.TestCase):
                 "answered": q.answered,
             }
 
-        # Strategy callbacks still route to placeholder screens; Exit
-        # is excluded here because it has its own dedicated close path.
-        # fibo:start is also excluded because it now opens the Start
-        # Fibo sub-flow (covered by test_fibo_start_flow.py).
-        for cb in ("fibo:running", "fibo:stop"):
+        # Phase 2: fibo:running is the read-only dry-run view, NOT a
+        # placeholder. fibo:stop is still a placeholder.
+        # fibo:start opens the Start Fibo sub-flow.
+        for cb in ("fibo:stop",):
             with self.subTest(callback=cb):
                 import asyncio
                 result = asyncio.run(run_one(cb))
@@ -330,12 +329,17 @@ class FiboCallbackRoutingTests(unittest.TestCase):
 
 class PlaceholderActionTests(unittest.TestCase):
     def test_callbacks_return_placeholder_only(self) -> None:
-        """Placeholder text exists for strategy buttons. Exit is
+        """Placeholder text exists for the strategy button. Exit is
         deliberately absent from SCREEN_TEXT — it does not render a
-        placeholder screen (it closes the wizard UI instead)."""
+        placeholder screen (it closes the wizard UI instead).
+
+        Phase 2: fibo:start opens the Start Fibo sub-flow and
+        fibo:running opens the read-only dry-run view. Neither is a
+        placeholder.
+        """
         from plugins.trade import fibo_wizard
 
-        for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+        for cb in ("fibo:stop",):
             with self.subTest(callback=cb):
                 text = fibo_wizard.SCREEN_TEXT.get(cb)
                 self.assertIsInstance(text, str)
@@ -356,6 +360,13 @@ class PlaceholderActionTests(unittest.TestCase):
     def test_no_execute_invocation_on_callback(self) -> None:
         """Placeholder must not call any agent .execute() (no exchange writes).
         Exit must also perform ZERO exchange calls — it's a UI dismiss only.
+
+        Phase 2: fibo:start opens the Start Fibo sub-flow (no exchange
+        writes by construction). fibo:running opens the read-only
+        dry-run view; it does call the existing TradeDesk for
+        resolve_instrument and positions_orders which are pure GETs
+        (the same path /trade uses for read-only views). Neither
+        call mutates any exchange state.
         """
         from plugins.trade import fibo_wizard
 
@@ -373,7 +384,11 @@ class PlaceholderActionTests(unittest.TestCase):
         adapter.send_message = mock.AsyncMock()
 
         async def run_all() -> None:
-            # Cover ALL four callbacks, including Exit.
+            # Phase 2: fibo:start and fibo:running open sub-flows /
+            # dry-run views. Both are read-only end-to-end and never
+            # invoke the .execute() method on a fake agent. The
+            # /trade shared TradeDesk.execute is the only "execute"
+            # path reachable, and it is never wired to a fake here.
             for cb in ("fibo:start", "fibo:running", "fibo:stop", "fibo:exit"):
                 q = mock.MagicMock()
                 q.delete_message = mock.MagicMock()  # Exit-path available
@@ -680,11 +695,14 @@ class FiboExitCallbackTests(unittest.TestCase):
             )
 
     def test_strategy_callbacks_unchanged(self) -> None:
-        """Regression: Running / Stop must still route to their
-        placeholder screens. Exit is added to the entry menu but does
-        NOT alter the strategy-callback behaviour. ``fibo:start`` is
-        no longer a placeholder — it opens the Start Fibo sub-flow,
-        covered by ``test_fibo_start_flow.py``.
+        """Regression: Stop must still route to its placeholder screen.
+        Exit is added to the entry menu but does NOT alter the
+        strategy-callback behaviour.
+
+        Phase 2: ``fibo:running`` is no longer a placeholder — it
+        opens the read-only dry-run view (covered by
+        ``test_fibo_reconciler.py``). ``fibo:start`` opens the Start
+        Fibo sub-flow (covered by ``test_fibo_start_flow.py``).
         """
         import asyncio
         from plugins.trade import fibo_wizard
@@ -706,7 +724,7 @@ class FiboExitCallbackTests(unittest.TestCase):
             def answer(self):
                 self.answered = True
 
-        for cb in ("fibo:running", "fibo:stop"):
+        for cb in ("fibo:stop",):
             with self.subTest(callback=cb):
                 q = StubQuery()
                 asyncio.run(
@@ -1003,9 +1021,15 @@ class FiboSendPathRegressionTests(unittest.TestCase):
         self.assertIn("cannot render /fibo screen", joined)
 
     def test_callback_rendering_uses_send_inline_keyboard_contract(self) -> None:
-        """The /fibo callback edit path must succeed against an adapter that
-        exposes only the real PTB inline-keyboard helper (matches what
-        Hermes's TelegramAdapter actually exposes at adapter.py:8784)."""
+        """The /fibo callback edit path must succeed against an adapter
+        that exposes only the real PTB inline-keyboard helper.
+
+        Phase 2: ``fibo:running`` opens the read-only dry-run view.
+        With no persisted registrations the screen still renders
+        cleanly (a "no registrations" body + a single ❌ Exit
+        button). The render path goes through ``edit_message_text``
+        as before — the contract is unchanged.
+        """
         import asyncio
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1032,7 +1056,9 @@ class FiboSendPathRegressionTests(unittest.TestCase):
         query.answer = lambda: setattr(query, "answered", True) or None
 
         asyncio.run(fibo_wizard.handle_fibo_callback(adapter, query, "fibo:running"))
-        self.assertEqual(query.edited_text, fibo_wizard.SCREEN_TEXT["fibo:running"])
+        # The screen renders successfully (non-None text + answered).
+        self.assertIsNotNone(query.edited_text)
+        self.assertTrue(query.edited_text.strip())
 
     def test_callback_rendering_uses_real_ptb_edit_message_text(self) -> None:
         """The /fibo callback edit path must use query.edit_message_text (the

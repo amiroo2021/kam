@@ -45,20 +45,40 @@ class SessionState(str, Enum):
 
     Stored on the session itself so a callback/text handler can route
     without consulting a global state machine.
+
+    Phase 2.2 instrument-translation states (spec §12):
+
+    * ``AWAITING_INSTRUMENT_CONFIRM`` — the agent-resolved venue
+      contract has been proposed to the user; the user must
+      Agree (or Other / Browse) before continuing.
+    * ``AWAITING_EXCHANGE_ALIAS`` — the user tapped "Other" and
+      is typing a free-form alias (e.g. ``US500``) for the
+      exchange agent to resolve.
+    * ``AWAITING_MARKET_BROWSE`` — the user tapped "Browse markets"
+      and is paging through the read-only market list.
     """
 
     AWAITING_SYMBOL = "awaiting_symbol"
     AWAITING_SIDE = "awaiting_side"
     AWAITING_EXCHANGE = "awaiting_exchange"
     AWAITING_ACCOUNT = "awaiting_account"
+    AWAITING_INSTRUMENT = "awaiting_instrument"
+    AWAITING_INSTRUMENT_CONFIRM = "awaiting_instrument_confirm"
+    AWAITING_EXCHANGE_ALIAS = "awaiting_exchange_alias"
+    AWAITING_MARKET_BROWSE = "awaiting_market_browse"
     AWAITING_VOLUME = "awaiting_volume"
     AWAITING_CONFIRM = "awaiting_confirm"
 
 
-# Whitelist of states where free-text volume input is consumed.
-# Matches spec §6: "Text volume input must only be intercepted when
-# that user's Start Fibo session is specifically awaiting volume."
-TEXT_INTERCEPT_STATES = frozenset({SessionState.AWAITING_VOLUME})
+# Whitelist of states where free-text input is consumed.
+# Matches spec §6 / §12:
+#   * AWAITING_VOLUME — the user types their starting volume.
+#   * AWAITING_EXCHANGE_ALIAS — the user types an exchange-side
+#     alias they believe corresponds to the MT4 source symbol.
+TEXT_INTERCEPT_STATES = frozenset({
+    SessionState.AWAITING_VOLUME,
+    SessionState.AWAITING_EXCHANGE_ALIAS,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +127,33 @@ class FiboSession:
     # choices for the account screen
     choices_accounts: list = field(default_factory=list)       # [account_alias, ...]
     account: Optional[str] = None
+    # choices for the venue-instrument screen (Phase 2.1)
+    choices_instruments: list = field(default_factory=list)     # [instrument, ...]
+    # Phase 2.2: instrument-translation state (spec §12)
+    resolution_input: Optional[str] = None   # the string the agent
+                                             # was last asked to
+                                             # resolve (source_symbol
+                                             # or a user-supplied
+                                             # alias)
+    # Canonical venue contract id. Set ONLY after user Agree.
+    # Alias memory MUST NOT bypass this gate.
+    exchange_instrument: Optional[str] = None
+    # Market-browse pagination (spec §5).
+    instrument_page: int = 0
+    # Set to a transient string ("alias", "browse") inside specific
+    # states for downstream handler dispatch. Most state lives in
+    # ``state``; this is a sub-mode tag.
+    awaiting: Optional[str] = None
+    # Phase 2.3: ranked candidate list for the candidate-picker
+    # screen (spec §3). Each entry is an ``InstrumentCandidate``
+    # dataclass (see candidates.py). Callback tokens reference
+    # ``sess.candidates[i].instrument`` so the flow never embeds
+    # the raw venue contract string in callback_data.
+    candidates: list = field(default_factory=list)             # [InstrumentCandidate, ...]
+    # The user-selected candidate's canonical venue contract id.
+    # Set ONLY after the candidate is revalidated through the
+    # exchange agent; never trusted from raw button payload.
+    selected_candidate_canonical: Optional[str] = None
     starting_volume: Optional[Decimal] = None
     # Snapshot metadata captured at confirmation time so Create can
     # re-validate against the latest snapshot atomically.
