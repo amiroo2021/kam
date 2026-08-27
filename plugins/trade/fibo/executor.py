@@ -272,6 +272,38 @@ def _resolve_mt4_target(
 # ---------------------------------------------------------------------------
 
 
+def _row_identity(row: Any) -> Optional[str]:
+    """Return the canonical identity string for a position row.
+
+    Preference order:
+      1. ``exchange_instrument`` (full canonical, e.g. ``ETH-USD.P``).
+      2. ``symbol`` (display-friendly, e.g. ``ETH``).
+
+    Returns ``None`` if the row is not a dict/dict-like with neither
+    field. The Fibo matcher uses this helper to correlate venue
+    positions against a registration's ``exchange_instrument`` and
+    ``source_symbol`` without any agent-specific knowledge.
+    """
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        exi = row.get("exchange_instrument")
+        if exi:
+            return str(exi).strip().upper()
+        sym = row.get("symbol")
+        if sym:
+            return str(sym).strip().upper()
+        return None
+    # CanonicalPosition / dataclass-like
+    exi = getattr(row, "exchange_instrument", None)
+    if exi:
+        return str(exi).strip().upper()
+    sym = getattr(row, "symbol", None)
+    if sym:
+        return str(sym).strip().upper()
+    return None
+
+
 def _actual_position_for_symbol(
     positions: Any, symbol: str,
 ) -> ExchangePosition:
@@ -279,21 +311,26 @@ def _actual_position_for_symbol(
 
     Returns a flat ``ExchangePosition`` if no row matches.
     """
+    target = str(symbol or "").strip().upper()
     rows = list(positions or [])
     for row in rows:
-        if not isinstance(row, dict):
+        ident = _row_identity(row)
+        if ident is None or ident != target:
             continue
-        row_symbol = str(row.get("symbol") or "").strip().upper()
-        if row_symbol != symbol.upper():
-            continue
-        side = _normalize_actual_side(row.get("side"))
-        size = _decimal_or_zero(row.get("size"))
+        side = _normalize_actual_side(
+            row.get("side") if isinstance(row, dict)
+            else getattr(row, "side", None)
+        )
+        size = _decimal_or_zero(
+            row.get("size") if isinstance(row, dict)
+            else getattr(row, "size", None)
+        )
         return ExchangePosition(
-            symbol=row_symbol,
+            symbol=target,
             side=side,
             size=size,
         )
-    return ExchangePosition(symbol=symbol.upper(), side="", size=Decimal("0"))
+    return ExchangePosition(symbol=target, side="", size=Decimal("0"))
 
 
 def _read_actual_position_from_response(
@@ -309,6 +346,14 @@ def _read_actual_position_from_response(
     (returning a flat position on read failure) was unsafe
     because it could cause the executor to send a new order
     against an unknown venue state.
+
+    Matching preference (exchange-agnostic):
+      1. ``row.exchange_instrument == reg.exchange_instrument``
+      2. ``row.symbol == reg.exchange_instrument``
+      3. ``row.symbol == reg.source_symbol`` (legacy fallback)
+
+    The first pass that hits a non-flat row wins. If all three
+    miss, a flat ExchangePosition is returned.
     """
     if not getattr(response, "success", False):
         logger.warning(
@@ -324,23 +369,56 @@ def _read_actual_position_from_response(
 
     positions = list(getattr(response, "positions", None) or [])
     if reg.exchange_instrument:
-        # Try the canonical (registered) symbol first.
+        target_exi = str(reg.exchange_instrument).strip().upper()
+        # 1) Canonical identity via exchange_instrument.
+        for row in positions:
+            ident = _row_identity(row)
+            if ident is None:
+                continue
+            if ident == target_exi:
+                side = _normalize_actual_side(
+                    row.get("side") if isinstance(row, dict)
+                    else getattr(row, "side", None)
+                )
+                size = _decimal_or_zero(
+                    row.get("size") if isinstance(row, dict)
+                    else getattr(row, "size", None)
+                )
+                return ExchangePosition(
+                    symbol=target_exi, side=side, size=size,
+                )
+        # 2) Direct symbol match on exchange_instrument (display name).
         direct = _actual_position_for_symbol(
             positions, reg.exchange_instrument,
         )
         if not direct.is_flat:
             return direct
-        # Fallback: agents like Ondo normalise the venue symbol
-        # to the underlying base. Match against the source_symbol.
+        # 3) Legacy fallback to source_symbol.
         src = str(reg.source_symbol or "").strip().upper()
-        for row in positions:
-            if not isinstance(row, dict):
-                continue
-            row_symbol = str(row.get("symbol") or "").strip().upper()
-            if src and row_symbol == src:
-                side = _normalize_actual_side(row.get("side"))
-                size = _decimal_or_zero(row.get("size"))
-                return ExchangePosition(symbol=src, side=side, size=size)
+        if src:
+            for row in positions:
+                if isinstance(row, dict):
+                    row_symbol = str(
+                        row.get("exchange_instrument")
+                        or row.get("symbol") or ""
+                    ).strip().upper()
+                else:
+                    row_symbol = str(
+                        getattr(row, "exchange_instrument", None)
+                        or getattr(row, "symbol", None) or ""
+                    ).strip().upper()
+                if src and row_symbol == src:
+                    side = _normalize_actual_side(
+                        row.get("side") if isinstance(row, dict)
+                        else getattr(row, "side", None)
+                    )
+                    size = _decimal_or_zero(
+                        row.get("size") if isinstance(row, dict)
+                        else getattr(row, "size", None)
+                    )
+                    return ExchangePosition(
+                        symbol=src, side=side, size=size,
+                    )
     return ExchangePosition(
         symbol=str(reg.exchange_instrument or "").upper(),
         side="", size=Decimal("0"),

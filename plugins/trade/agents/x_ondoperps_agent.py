@@ -1159,6 +1159,14 @@ def _normalize_positions(
                 sl=sl_text,
                 tp_count=1 if tp_text else None,
                 sl_count=1 if sl_text else None,
+                # Phase 2.10.2 — expose the FULL canonical
+                # exchange instrument (e.g. ``ETH-USD.P``) so that
+                # downstream consumers (Fibo executor, shadow) can
+                # correlate this position against the registration's
+                # ``exchange_instrument`` without any suffix handling.
+                # ``symbol`` remains the display-friendly short name
+                # (``ETH``) for legacy wizard consumers.
+                exchange_instrument=market.upper() or None,
             )
         )
     positions.sort(key=lambda item: (item.symbol, item.side))

@@ -88,7 +88,16 @@ class CanonicalPortfolioSummary:
 
 @dataclass(frozen=True)
 class CanonicalPosition:
-    """Canonical read-only position row."""
+    """Canonical read-only position row.
+
+    ``symbol`` is the display-friendly short name (e.g. ``BTC``, ``ETH``).
+    ``exchange_instrument`` is the FULL canonical exchange instrument
+    identity (e.g. ``ETH-USD.P``) that consumers can match against a
+    registration's ``exchange_instrument``. ``exchange_instrument`` is
+    ``None`` for agents that do not expose it (Hyperliquid, Lighter,
+    Raydium, Apex, Hibachi); for OndoPerps it is the raw ``market``
+    string from the API (``ETH-USD.P``).
+    """
 
     symbol: str
     side: str
@@ -99,6 +108,7 @@ class CanonicalPosition:
     sl: Optional[str] = None
     tp_count: Optional[int] = None
     sl_count: Optional[int] = None
+    exchange_instrument: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -111,6 +121,7 @@ class CanonicalPosition:
             "sl": self.sl,
             "tp_count": self.tp_count,
             "sl_count": self.sl_count,
+            "exchange_instrument": self.exchange_instrument,
         }
 
 
