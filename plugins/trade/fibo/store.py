@@ -267,7 +267,19 @@ class FiboRegistration:
                 "exchange_instrument"
             )
 
-        now = created_at or _utc_iso_now()
+        # Phase 2.7.1 — timestamp semantics fix:
+        # Capture the current timestamp ONCE per build so both
+        # ``created_at`` and ``updated_at`` defaults derive from
+        # the same instant. Initial registrations (both fields
+        # ``None``) get ``created_at == updated_at == current_time``.
+        # Status transitions (``mark_stopped``, ``reactivate``) pass
+        # the original ``created_at`` to preserve historical
+        # identity, and the transition-time ``updated_at`` defaults
+        # to ``current_time`` so it refreshes.
+        # Explicit ``updated_at`` overrides both defaults.
+        current_time = _utc_iso_now()
+        effective_created_at = created_at or current_time
+        effective_updated_at = updated_at or current_time
         return cls(
             exchange=cls.normalize_exchange(exchange),
             account=cls.normalize_account(account),
@@ -287,8 +299,8 @@ class FiboRegistration:
             source_snapshot_received_at=str(source_snapshot_received_at or "").strip(),
             desired_exchange_size=target,
             status=str(status or "registered").strip() or "registered",
-            created_at=now,
-            updated_at=updated_at or now,
+            created_at=effective_created_at,
+            updated_at=effective_updated_at,
         )
 
     # Serialization --------------------------------------------------
