@@ -21,6 +21,7 @@ a Back button (no Update action).
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -410,17 +411,18 @@ class FiboRegistrationStore:
     ) -> Optional[str]:
         """Return the effective status of the latest row for the key.
 
-        Phase 2.6: a stopped registration is **terminal** — Resume
-        is not implemented in this phase. Therefore we only return
-        ``"registered"`` or ``None`` for the purposes of duplicate
-        detection:
+        Phase 2.6/2.7 transition rules: both directions of
+        ``registered <-> stopped`` are allowed. Same-status
+        duplicate appends raise ``DuplicateRegistrationError``.
 
         * latest row is ``status="registered"`` → return
           ``"registered"`` (a transition to ``"stopped"`` is
           allowed; any further ``"registered"`` append is a true
           duplicate).
         * latest row is ``status="stopped"`` → return ``"stopped"``
-          (no transition is permitted; the key is locked).
+          (a transition to ``"registered"`` is allowed via
+          ``reactivate``; any further ``"stopped"`` append is a true
+          duplicate).
         * no row exists → return ``None``.
 
         Used by ``append`` to detect status transitions.
@@ -443,40 +445,119 @@ class FiboRegistrationStore:
     def append(self, registration: FiboRegistration) -> None:
         """Append a registration as one JSON line.
 
-        A row with the same ``registration_key`` is rejected only
-        when the EXISTING latest row has the same ``status`` as
-        the new row. A different ``status`` is treated as a valid
-        status transition (Phase 2.6 ``mark_stopped``).
+        Allowed transitions:
+
+        * ``registered -> stopped`` (Phase 2.6 ``mark_stopped``).
+        * Same-status appends (e.g. ``registered -> registered``
+          or ``stopped -> stopped``) raise
+          ``DuplicateRegistrationError``.
+        * ``stopped -> registered`` is NOT allowed via plain
+          ``append`` — the canonical reactivation path is
+          ``reactivate(...)`` which performs identity validation
+          and a controlled status transition. Calling ``append``
+          directly to reactivate would skip that identity check.
 
         Raises:
             DuplicateRegistrationError: a record with the same
                 ``registration_key`` AND the same ``status`` already
-                exists in the store (latest-per-key).
+                exists in the store (latest-per-key), OR the new
+                row's status is ``"registered"`` while the existing
+                latest row is ``"stopped"`` (use ``reactivate``
+                instead).
             StoreBusy: another writer holds the file lock for longer
                 than ``_LOCK_WAIT_SECONDS``.
             AtomicWriteError: the atomic rename failed (e.g. permission).
             OSError: I/O errors.
         """
-        # Duplicate check happens UNDER the lock below, but a fast
-        # pre-check avoids a needless write cycle for the common case.
-        # The pre-check mirrors the lock-held rule: blocked unless
-        # the existing row is ``status="registered"`` and the new
-        # row is ``status="stopped"`` (status transition).
-        latest_status = self._latest_status_for(
-            registration.registration_key
-        )
-        if latest_status is not None and not (
-            (latest_status or "").strip().lower() == "registered"
-            and (registration.status or "").strip().lower() == "stopped"
-        ):
-            raise DuplicateRegistrationError(registration.registration_key)
+        # Duplicate check happens UNDER the same exclusive lock
+        # acquisition as the write. This closes the TOCTOU
+        # window where two concurrent writers could both observe
+        # the same latest-status and both proceed to write.
+        with self._open_and_lock() as f:
+            latest_status = self._raw_latest_status_under_lock(
+                f, registration.registration_key
+            )
+            last = (
+                (latest_status or "").strip().lower()
+                if latest_status is not None else None
+            )
+            new = (registration.status or "").strip().lower()
+            if latest_status is not None:
+                if last == new:
+                    # Same-status duplicate: blocked.
+                    raise DuplicateRegistrationError(
+                        registration.registration_key
+                    )
+                if last == "stopped" and new == "registered":
+                    # Plain append is forbidden from reactivating;
+                    # the caller must use the canonical ``reactivate``
+                    # path.
+                    raise DuplicateRegistrationError(
+                        registration.registration_key
+                    )
+            # Re-check immediately before write (still under lock)
+            # to defeat any racing writer that slipped in between
+            # the pre-check and the write on the OLD non-locking
+            # implementation. This is the authoritative guard.
+            recheck_status = self._raw_latest_status_under_lock(
+                f, registration.registration_key
+            )
+            recheck_last = (
+                (recheck_status or "").strip().lower()
+                if recheck_status is not None else None
+            )
+            if recheck_status is not None:
+                if recheck_last == new:
+                    raise DuplicateRegistrationError(
+                        registration.registration_key
+                    )
+                if recheck_last == "stopped" and new == "registered":
+                    raise DuplicateRegistrationError(
+                        registration.registration_key
+                    )
+            self._write_under_lock(f, registration)
 
-        ensure_dir_0700(self._path.parent)
+    def _write_under_lock(self, f, registration: FiboRegistration) -> None:
+        """Atomic-write a registration row to the JSONL file.
+
+        The caller MUST already hold the exclusive file lock
+        (acquired via ``_open_and_lock`` or ``_acquire_lock``).
+        This primitive only does the write + fsync; it does NOT
+        acquire the lock and does NOT validate. It exists so
+        ``append`` / ``mark_stopped`` / ``reactivate`` can compose
+        read+validate+write under a single lock acquisition.
+
+        Raises:
+            OSError: I/O errors.
+        """
         line = registration.to_jsonl()
         if not line.endswith("\n"):
             line += "\n"
         payload = line.encode("utf-8")
 
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+    @contextlib.contextmanager
+    def _open_and_lock(self):
+        """Open the JSONL file in append+read mode and acquire the
+        exclusive file lock for the duration of the ``yield``.
+
+        The caller MUST use ``_write_under_lock``, ``_read_*``, and
+        ``_seek_and_read_*`` primitives that ASSUME the lock is
+        held. The lock is released deterministically when the
+        ``with`` block exits.
+
+        Yields:
+            open file handle in append+read binary mode.
+
+        Raises:
+            StoreBusy: another writer holds the file lock too long.
+            AtomicWriteError: file-create / chmod failed.
+            OSError: I/O errors.
+        """
+        ensure_dir_0700(self._path.parent)
         # Ensure file exists with 0600 mode (touch + chmod once).
         if not self._path.exists():
             try:
@@ -495,25 +576,100 @@ class FiboRegistrationStore:
             except OSError:
                 pass
 
-        with open(self._path, "ab", buffering=0) as f:
+        with open(self._path, "ab+", buffering=0) as f:
             self._acquire_lock(f)
             try:
-                # Re-check under the lock to close the TOCTOU window.
-                self._raise_if_duplicate_under_lock(
-                    registration.registration_key,
-                    new_status=registration.status,
-                )
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
+                yield f
             finally:
-                # flock is released when the file is closed; we close
-                # explicitly to make the release deterministic across
-                # Python versions.
                 try:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
+
+    def _read_latest_under_lock(
+        self, f, registration_key: str,
+    ) -> Optional[FiboRegistration]:
+        """Return the latest parsed ``FiboRegistration`` for
+        ``registration_key`` while holding the exclusive lock.
+
+        Reads the file from offset 0 (the writer's current EOF is
+        not necessarily the reader's EOF for append+read). The
+        file size at lock time determines how much we scan; lines
+        are JSON-decoded in memory.
+
+        Returns ``None`` if no row exists with that key, or if the
+        file does not yet exist (caller should treat as
+        initial-create case).
+        """
+        try:
+            f.seek(0, os.SEEK_SET)
+            data = f.read()
+        except OSError as exc:
+            logger.warning(
+                "fibo_registrations: lock-held read failed: %s", exc
+            )
+            return None
+        latest_status: Optional[str] = None
+        latest_reg: Optional[FiboRegistration] = None
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("registration_key") != registration_key:
+                continue
+            latest_status = str(raw.get("status", "") or "")
+            # Re-parse the full registration row from the JSON.
+            try:
+                latest_reg = FiboRegistration.from_dict(raw)
+            except Exception:  # noqa: BLE001 - bad row is skipped
+                continue
+        # latest_reg is the parsed row whose status is the latest
+        # status. We may have hit a malformed row and skipped it,
+        # but latest_status tracks the raw status (raw is what
+        # the duplicate-check rule compares against).
+        # We keep latest_reg if present; otherwise the caller may
+        # fall back to identity validation via _raw_latest_payload.
+        del latest_status
+        return latest_reg
+
+    def _raw_latest_status_under_lock(
+        self, f, registration_key: str,
+    ) -> Optional[str]:
+        """Return the latest ``status`` string for
+        ``registration_key`` while holding the exclusive lock.
+
+        Used by ``append`` for the fast duplicate-check rule.
+        Always returns the raw status (a malformed row's
+        ``status`` is still returned as the latest). The caller
+        treats ``None`` as "no row exists".
+        """
+        try:
+            f.seek(0, os.SEEK_SET)
+            data = f.read()
+        except OSError as exc:
+            logger.warning(
+                "fibo_registrations: lock-held read failed: %s", exc
+            )
+            return None
+        latest_status: Optional[str] = None
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("registration_key") != registration_key:
+                continue
+            latest_status = str(raw.get("status", "") or "")
+        return latest_status
 
     def _acquire_lock(self, f) -> None:
         """Acquire ``LOCK_EX`` with bounded wait."""
@@ -531,77 +687,6 @@ class FiboRegistrationStore:
                         f"{_LOCK_WAIT_SECONDS}s"
                     ) from exc
                 time.sleep(_LOCK_POLL_INTERVAL)
-
-    def _raise_if_duplicate_under_lock(
-        self, key: str, *, new_status: str = "",
-    ) -> None:
-        """Re-scan the file under the lock and raise if a duplicate
-        exists.
-
-        Phase 2.6 transition rules:
-
-        * No existing row → allowed (initial create).
-        * Existing latest row is ``status="registered"`` and new
-          row is ``status="stopped"`` → ALLOWED (status
-          transition). ``mark_stopped`` uses this path.
-        * Existing latest row is ``status="stopped"`` → BLOCKED,
-          regardless of new row's status (the key is terminal
-          until Resume is implemented).
-        * Existing latest row has any other status, and new row's
-          status matches → BLOCKED (true duplicate).
-        * Any other combination → BLOCKED with
-          ``DuplicateRegistrationError``.
-
-        O(N) scan is acceptable: the file is human-tiny and Phase 1
-        volumes are bounded.
-        """
-        if not self._path.is_file():
-            return
-        try:
-            with open(self._path, "rb") as f:
-                try:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except OSError:
-                    # Another writer holds the exclusive lock. The
-                    # append() caller already has it, so this branch
-                    # should be unreachable. Be defensive: do nothing.
-                    return
-                try:
-                    data = f.read()
-                finally:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-        except OSError as exc:
-            logger.warning(
-                "fibo_registrations: lock-collision read failed: %s", exc
-            )
-            return
-        last_status_for_key: Optional[str] = None
-        for line in data.splitlines():
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(raw, dict):
-                continue
-            if raw.get("registration_key") == key:
-                last_status_for_key = str(
-                    raw.get("status", "") or ""
-                )
-        if last_status_for_key is None:
-            # No existing row — allowed (initial create).
-            return
-        # Existing row present. Only one transition is allowed:
-        # registered -> stopped. Anything else is blocked.
-        last = (last_status_for_key or "").strip().lower()
-        new = (new_status or "").strip().lower()
-        if last == "registered" and new == "stopped":
-            return  # status transition allowed
-        raise DuplicateRegistrationError(key)
 
 
     # -- status transitions ------------------------------------------
@@ -636,51 +721,198 @@ class FiboRegistrationStore:
             DuplicateRegistrationError / StoreBusy / AtomicWriteError:
                 same as ``append``.
         """
-        latest = self.get(registration_key)
-        if latest is None:
-            raise KeyError(
-                f"no registration with key {registration_key!r}"
+        # Atomic under ONE exclusive file lock:
+        #   1. read latest row (status + identity)
+        #   2. validate latest.is_stopped is False
+        #   3. build stopped row
+        #   4. write under the same lock
+        # Concurrent mark_stopped callers are serialized; only the
+        # first one observes latest.is_active and writes; the loser
+        # observes latest.is_stopped=True and raises ValueError.
+        with self._open_and_lock() as f:
+            latest = self._read_latest_under_lock(
+                f, registration_key
             )
-        if latest.is_stopped:
-            raise ValueError(
-                f"registration {registration_key!r} is already stopped"
+            if latest is None:
+                raise KeyError(
+                    f"no registration with key {registration_key!r}"
+                )
+            # Atomic re-check under the same lock — closes the
+            # TOCTOU window between read and write.
+            if latest.is_stopped:
+                raise ValueError(
+                    f"registration {registration_key!r} is "
+                    f"already stopped"
+                )
+            stopped = FiboRegistration.build(
+                exchange=latest.exchange,
+                account=latest.account,
+                symbol=latest.symbol,
+                variant=latest.variant,
+                side=latest.side,
+                starting_volume=latest.starting_volume,
+                source=latest.source,
+                source_seq=latest.source_seq,
+                source_cycle_id=latest.source_cycle_id,
+                source_cumulative_weight=latest.source_cumulative_weight,
+                source_percentage=latest.source_percentage,
+                source_snapshot_received_at=(
+                    latest.source_snapshot_received_at
+                ),
+                desired_exchange_size=latest.desired_exchange_size,
+                source_symbol=latest.source_symbol,
+                exchange_instrument=latest.exchange_instrument,
+                status="stopped",
+                created_at=latest.created_at,
+                updated_at=updated_at,
             )
-        # Build a new registration row preserving every field, but
-        # with status="stopped" and a fresh updated_at.
-        stopped = FiboRegistration.build(
-            exchange=latest.exchange,
-            account=latest.account,
-            symbol=latest.symbol,
-            variant=latest.variant,
-            side=latest.side,
-            starting_volume=latest.starting_volume,
-            source=latest.source,
-            source_seq=latest.source_seq,
-            source_cycle_id=latest.source_cycle_id,
-            source_cumulative_weight=latest.source_cumulative_weight,
-            source_percentage=latest.source_percentage,
-            source_snapshot_received_at=(
-                latest.source_snapshot_received_at
-            ),
-            desired_exchange_size=latest.desired_exchange_size,
-            source_symbol=latest.source_symbol,
-            exchange_instrument=latest.exchange_instrument,
-            status="stopped",
-            created_at=latest.created_at,
-            updated_at=updated_at,
-        )
-        # ``append`` raises DuplicateRegistrationError if a key
-        # collision appears under the lock — but since we just
-        # re-read the file and confirmed only the original row
-        # exists, the only way that can happen is a concurrent
-        # writer. Surface that as ValueError for clarity.
-        try:
-            self.append(stopped)
-        except DuplicateRegistrationError as exc:
-            raise ValueError(
-                f"concurrent stop of {registration_key!r}: {exc}"
-            ) from exc
-        return stopped
+            # Final atomic re-check immediately before write — if
+            # some other writer slipped in between the read and
+            # here (which shouldn't happen because we hold the
+            # exclusive lock, but defense in depth), we'd see a
+            # status mismatch and refuse.
+            recheck = self._read_latest_under_lock(f, registration_key)
+            if recheck is None or recheck.is_stopped:
+                raise ValueError(
+                    f"registration {registration_key!r} is "
+                    f"already stopped"
+                )
+            self._write_under_lock(f, stopped)
+            return stopped
+
+    def reactivate(
+        self,
+        registration_key: str,
+        *,
+        # Identity fields — must match the stopped row exactly.
+        source_symbol: str,
+        exchange_instrument: str,
+        # Mutable / source-snapshot fields — taken from the new
+        # Start wizard session so the reactivated row reflects the
+        # CURRENT MT4 state.
+        starting_volume: Decimal,
+        desired_exchange_size: Decimal,
+        source: str,
+        source_seq: int,
+        source_cycle_id: int,
+        source_cumulative_weight: Decimal,
+        source_percentage: Decimal,
+        source_snapshot_received_at: str,
+        updated_at: Optional[str] = None,
+    ) -> FiboRegistration:
+        """Append a "registered" transition row for a stopped
+        registration (Phase 2.7 Restart).
+
+        The store is append-only JSONL with "latest per key wins"
+        semantics. Appending a new row that preserves the original
+        ``created_at`` and refreshes ``updated_at``, while setting
+        ``status="registered"``, is the canonical way to record the
+        restart without rewriting historical JSONL rows.
+
+        Identity contract — the caller MUST pass:
+
+        * ``source_symbol`` — must equal the stopped row's
+          ``source_symbol``. Mismatch raises ``ValueError`` so we
+          never silently restart under a different identity.
+        * ``exchange_instrument`` — must equal the stopped row's
+          ``exchange_instrument``. Legacy rows with empty
+          ``exchange_instrument`` are accepted (the identity is
+          still uniquely captured by exchange/account/variant/side
+          + source_symbol).
+
+        Mutable / snapshot fields — these come from the new Start
+        wizard session:
+
+        * ``starting_volume`` / ``desired_exchange_size``
+        * ``source``, ``source_seq``, ``source_cycle_id``,
+          ``source_cumulative_weight``, ``source_percentage``,
+          ``source_snapshot_received_at``
+
+        ``created_at`` is preserved (NOT refreshed) so historical
+        identity is stable. ``updated_at`` defaults to the current
+        UTC ISO timestamp.
+
+        Raises:
+            KeyError: no registration with that key exists.
+            ValueError:
+                * the registration is already registered (no-op
+                  transition refused).
+                * the source_symbol or exchange_instrument doesn't
+                  match the stopped row.
+            DuplicateRegistrationError / StoreBusy /
+                AtomicWriteError: same as ``append``.
+        """
+        # Atomic under ONE exclusive file lock:
+        #   1. read latest row (status + identity)
+        #   2. validate latest.is_stopped is True
+        #   3. validate identity match
+        #   4. build reactivated row
+        #   5. write under the same lock
+        # Concurrent reactivate callers are serialized; only the
+        # first one observes latest.is_stopped and writes; the
+        # loser observes latest.status="registered" and raises
+        # ValueError (no-op transition refused).
+        with self._open_and_lock() as f:
+            latest = self._read_latest_under_lock(
+                f, registration_key
+            )
+            if latest is None:
+                raise KeyError(
+                    f"no registration with key {registration_key!r}"
+                )
+            if not latest.is_stopped:
+                raise ValueError(
+                    f"registration {registration_key!r} is not "
+                    f"stopped; current status: {latest.status!r}"
+                )
+            if (source_symbol or "") != (latest.source_symbol or ""):
+                raise ValueError(
+                    f"source_symbol mismatch on reactivate: "
+                    f"passed {source_symbol!r}, stored "
+                    f"{latest.source_symbol!r}"
+                )
+            if (exchange_instrument or "") != (
+                latest.exchange_instrument or ""
+            ):
+                raise ValueError(
+                    f"exchange_instrument mismatch on reactivate: "
+                    f"passed {exchange_instrument!r}, stored "
+                    f"{latest.exchange_instrument!r}"
+                )
+            reactivated = FiboRegistration.build(
+                exchange=latest.exchange,
+                account=latest.account,
+                symbol=latest.symbol,
+                variant=latest.variant,
+                side=latest.side,
+                starting_volume=starting_volume,
+                source=source,
+                source_seq=source_seq,
+                source_cycle_id=source_cycle_id,
+                source_cumulative_weight=source_cumulative_weight,
+                source_percentage=source_percentage,
+                source_snapshot_received_at=source_snapshot_received_at,
+                desired_exchange_size=desired_exchange_size,
+                source_symbol=latest.source_symbol,
+                exchange_instrument=latest.exchange_instrument,
+                status="registered",
+                created_at=latest.created_at,
+                updated_at=updated_at,
+            )
+            # Final atomic re-check immediately before write — if
+            # some other writer slipped in between the read and
+            # here (which shouldn't happen because we hold the
+            # exclusive lock, but defense in depth), we'd see the
+            # status flipped and refuse.
+            recheck = self._read_latest_under_lock(f, registration_key)
+            if recheck is None or not recheck.is_stopped:
+                raise ValueError(
+                    f"registration {registration_key!r} state "
+                    f"changed during reactivate; current status: "
+                    f"{(recheck.status if recheck else None)!r}"
+                )
+            self._write_under_lock(f, reactivated)
+            return reactivated
 
     # -- read ---------------------------------------------------------
 

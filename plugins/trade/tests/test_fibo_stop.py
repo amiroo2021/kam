@@ -863,11 +863,13 @@ class StopRegistrationStoreTransitionsTests(_WizardTestBase):
             store.mark_stopped(reg.registration_key)
 
     def test_append_after_stop_raises_duplicate(self) -> None:
-        """Once stopped, the registration_key remains occupied.
-        ``append`` for a NEW row with the same key must raise
-        DuplicateRegistrationError. Resume is not implemented;
-        any future Start attempt that targets this exact venue
-        identity MUST refuse until Resume is added.
+        """Once stopped, the registration_key remains occupied at
+        the LOW-LEVEL ``append`` API. A plain ``append`` of a new
+        ``status="registered"`` row over a stopped one raises
+        ``DuplicateRegistrationError``. The canonical reactivation
+        path is ``store.reactivate(...)`` (Phase 2.7), which
+        bypasses the plain duplicate guard and validates identity
+        + status itself.
         """
         store = FiboRegistrationStore(self.reg_path)
         reg = _append_registration(

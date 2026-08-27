@@ -1169,6 +1169,22 @@ class StartFiboFlow:
         try:
             self._registration_store.append(registration)
         except DuplicateRegistrationError as exc:
+            # Phase 2.7: if the existing latest row for this key
+            # is ``stopped``, reactivate it instead of refusing
+            # the Start flow. The user's Start wizard values for
+            # mutable/snapshot fields are honoured on reactivation;
+            # identity fields are verified against the stopped row.
+            restarted = self._reactivate_if_stopped(
+                registration_key=exc.registration_key,
+                sess=sess,
+                snap=snap,
+                cycle_id_now=cycle_id_now,
+                weight_now=weight_now,
+                target=target,
+            )
+            if restarted is not None:
+                self._sessions.reset(*sess.session_key)
+                return self._render_restarted(restarted)
             return self._render_duplicate(sess, snap, exc.registration_key)
         except Exception as exc:  # noqa: BLE001 - surface generically
             logger.error(
@@ -1178,6 +1194,68 @@ class StartFiboFlow:
 
         self._sessions.reset(*sess.session_key)
         return self._render_registered(registration)
+
+    # ------------------------------------------------------------------
+    # Phase 2.7 — Restart helper for stopped registrations
+    # ------------------------------------------------------------------
+
+    def _reactivate_if_stopped(
+        self,
+        *,
+        registration_key: str,
+        sess: "FiboSession",
+        snap: Mt4Snapshot,
+        cycle_id_now: int,
+        weight_now: Decimal,
+        target: Decimal,
+    ) -> Optional[FiboRegistration]:
+        """Phase 2.7 restart: if the latest persisted row for
+        ``registration_key`` is ``stopped``, reactivate it with
+        the CURRENT snapshot fields taken from the new Start
+        wizard session.
+
+        Returns the reactivated registration on success, or
+        ``None`` if the existing row is not stopped (in which
+        case the caller falls back to the duplicate screen).
+
+        Failure modes that raise ``ValueError`` (identity
+        mismatch, missing registration, etc.) propagate up and
+        are caught by ``_handle_create``.
+        """
+        latest = self._registration_store.get(registration_key)
+        if latest is None or not latest.is_stopped:
+            return None
+        starting_volume = sess.starting_volume
+        if starting_volume is None or starting_volume <= 0:
+            return None
+        percentage = self._current_percentage(snap, sess)
+        return self._registration_store.reactivate(
+            registration_key,
+            source_symbol=sess.symbol or "",
+            exchange_instrument=sess.exchange_instrument or "",
+            starting_volume=starting_volume,
+            desired_exchange_size=target,
+            source=snap.source,
+            source_seq=snap.seq,
+            source_cycle_id=cycle_id_now,
+            source_cumulative_weight=weight_now,
+            source_percentage=percentage,
+            source_snapshot_received_at=snap.received_at,
+        )
+
+    @staticmethod
+    def _current_percentage(snap: Mt4Snapshot, sess: "FiboSession") -> Decimal:
+        """Return the live MT4 percentage for the current
+        symbol/variant. Used by ``_reactivate_if_stopped`` to
+        populate ``source_percentage`` on the reactivated row.
+        """
+        try:
+            fibo = snap.find_fibo(sess.symbol or "", sess.variant or "")
+        except Exception:  # noqa: BLE001
+            return Decimal("0")
+        if fibo is None:
+            return Decimal("0")
+        return Decimal(str(fibo.percentage))
 
     # ------------------------------------------------------------------
     # Renderers
@@ -1853,6 +1931,25 @@ class StartFiboFlow:
             f"Cum weight:  {registration.source_cumulative_weight}\n"
             f"Percentage:  {registration.source_percentage}\n\n"
             f"Persisted to ~/.hermes/fibo/registrations.jsonl"
+        )
+        return Screen(text=text, buttons=[], no_keyboard=True)
+
+    def _render_restarted(self, registration: FiboRegistration) -> Screen:
+        """Phase 2.7 render for a successfully reactivated
+        registration. The screen confirms the reactivation and
+        shows the canonical identity + the new mutable /
+        snapshot fields.
+        """
+        text = (
+            "✅ Fibo restarted\n\n"
+            f"Source symbol:       {registration.source_symbol}\n"
+            f"Exchange instrument: {registration.exchange_instrument}\n"
+            f"Variant:             {registration.variant}\n"
+            f"Side:                {registration.side}\n"
+            f"Exchange:            {registration.exchange}\n"
+            f"Account:             {registration.account}\n"
+            f"Volume:              {registration.starting_volume}\n\n"
+            "Fibo reconciliation is active again."
         )
         return Screen(text=text, buttons=[], no_keyboard=True)
 
