@@ -602,6 +602,15 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
     ``public_symbol`` (the dex-stripped display alias). We use the
     ``route_symbol`` because that is what the wizard's resolve /
     write paths must use to disambiguate dex routing.
+
+    Phase 2.4.1: the Hyperliquid ``/info metaAndAssetCtxs`` payload
+    also returns spot markets via the ``cash`` dex. Those are
+    spot/cash instruments and MUST NOT be exposed to Fibo's
+    GoldenFibo (which targets perpetuals only). Entries with
+    ``route_symbol`` starting with ``cash:`` are filtered out by
+    the caller; this function additionally tags each remaining
+    record with a ``market_type`` of ``perp`` so the picker can
+    surface it consistently. Per-dex routing is preserved.
     """
     if not isinstance(candidate, dict):
         return {"instrument": ""}
@@ -613,14 +622,28 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
     ).strip()
     if not instrument:
         return {"instrument": ""}
+    # Phase 2.4.1 safety filter: spot markets live under the
+    # ``cash`` dex namespace. ``resolve_instrument`` for those
+    # would succeed but the Fibo write paths target perpetuals
+    # only. Drop them at the normalize step so the picker never
+    # offers them.
+    if instrument.startswith("cash:"):
+        return {"instrument": ""}
     out: Dict[str, Any] = {"instrument": instrument}
     public = str(candidate.get("public_symbol") or "").strip()
     if public and public != instrument:
         out["display_name"] = public
     dex = str(candidate.get("dex") or "").strip()
+    # All surviving entries are perpetuals.
+    out["market_type"] = "perp"
     if dex:
-        out["base"] = dex  # the dex id — e.g. ``xyz``
-        out["market_type"] = "perp"
+        # ``base`` here carries the dex id so the picker UI can
+        # show "BTC (xyz)" vs "BTC (main)" for distinguishing
+        # HIP-3 builder-deployed perps.
+        out["base"] = dex
+        out["description"] = (
+            f"{public or instrument.split(':', 1)[-1]} (perp, dex={dex})"
+        )
     # HL exposes size_increment, but not a base/quote split per
     # perp in the meta payload — leaving those None is fine for the
     # picker UI.

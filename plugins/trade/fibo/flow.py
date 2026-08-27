@@ -451,11 +451,21 @@ class StartFiboFlow:
             return self._render_invalid_callback(sess.session_key)
         sess.exchange = sess.choices_exchanges[idx]
         try:
-            sess.choices_accounts = sorted(
+            raw_accounts = list(
                 self._safe_list_accounts(str(sess.exchange))
             )
         except Exception:
-            sess.choices_accounts = []
+            raw_accounts = []
+        # Phase 2.4.1: an exchange's ``list_accounts()`` may return
+        # either strings OR dicts (e.g. Lighter returns a list of
+        # ``{'account': 'amiroo', 'chain': 'ARBITRUM', ...}``).
+        # Normalize each to its canonical id; drop entries that
+        # don't carry one. Sort for stable button indexing.
+        sess.choices_accounts = sorted(
+            aid for aid in (
+                _account_id_for(entry) for entry in raw_accounts
+            ) if aid is not None
+        )
         if not sess.choices_accounts:
             # No accounts configured for this exchange; can't continue.
             return self._render_no_accounts(sess, snap)
@@ -1972,6 +1982,36 @@ class StartFiboFlow:
         if not isinstance(result, list):
             return []
         return list(result)
+
+
+def _account_id_for(entry: Any) -> Optional[str]:
+    """Return the canonical account id for a ``list_accounts()``
+    entry, or ``None`` if the entry cannot be normalized.
+
+    Phase 2.4.1: an exchange agent's ``list_accounts()`` may return
+    either plain strings (e.g. ``["bitget"]``) or dicts with an
+    ``account`` sub-key plus optional ``chain`` / ``label``
+    (e.g. Lighter's ``[{'account': 'amiroo', 'chain': 'ARBITRUM',
+    'label': 'amiroo — Arbitrum'}, ...]``). The /trade shared
+    wizard uses the same normalization (see
+    ``plugins/trade/wizard.py::_account_option_parts``); Fibo
+    applies the identical rule here so the two wizards agree
+    on the canonical id passed to ``TradeDesk.execute`` calls.
+    """
+    if isinstance(entry, str):
+        v = entry.strip()
+        return v or None
+    if isinstance(entry, dict):
+        # Prefer the explicit ``account`` field; fall back to
+        # ``label`` / ``name`` / ``id`` as a defensive fallback.
+        for key in ("account", "name", "id"):
+            v = entry.get(key)
+            if v is None:
+                continue
+            v = str(v).strip()
+            if v:
+                return v
+    return None
 
 
 def _fmt_decimal(value: Decimal) -> str:

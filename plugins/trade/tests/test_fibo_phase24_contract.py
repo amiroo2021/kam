@@ -1175,6 +1175,231 @@ class DiscoveryZeroWriteSafetyTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Capability / dispatch consistency
 # ---------------------------------------------------------------------------
+# Phase 2.4.1 — three regression tests for the deployment issues
+# ---------------------------------------------------------------------------
+
+
+class HibachiCatalogResolverAgreementTests(unittest.TestCase):
+    """Phase 2.4.1 hardening A.
+
+    Hibachi's catalog normalizer MUST produce the same ``instrument``
+    id that ``resolve_instrument`` returns for the same venue
+    contract. Before 2.4.1 the catalog emitted the venue-native
+    ``BTC/USDT-P`` while the resolver stripped it to ``BTC`` —
+    picking a catalog candidate would revalidate against a
+    different id than the user saw.
+    """
+
+    AGENT_NAME = "x_hibachi_agent"
+    NORMALIZE_FN_NAME = "_normalize_hibachi_market"
+
+    def setUp(self) -> None:
+        import importlib
+        self.agent_mod = importlib.import_module(
+            f"plugins.trade.agents.{self.AGENT_NAME}"
+        )
+        self.norm = getattr(self.agent_mod, self.NORMALIZE_FN_NAME)
+
+    def test_catalog_matches_resolver_for_btc(self) -> None:
+        """``BTC/USDT-P`` in catalog and as resolver input → both yield
+        ``BTC``."""
+        catalog = self.norm({
+            "symbol": "BTC/USDT-P",
+            "displayName": "BTC/USDT Perps",
+            "underlyingSymbol": "BTC",
+            "settlementSymbol": "USDT",
+        })
+        # The catalog id must equal what resolve_instrument returns
+        # for the same venue contract. Use the agent's own
+        # canonicalizer to derive the resolver output.
+        resolver_canonical = self.agent_mod._canonical_symbol_from_request(
+            "BTC/USDT-P"
+        )
+        self.assertEqual(catalog["instrument"], resolver_canonical)
+        self.assertEqual(catalog["instrument"], "BTC")
+        self.assertEqual(catalog["market_type"], "perp")
+
+    def test_catalog_matches_resolver_for_eth(self) -> None:
+        catalog = self.norm({
+            "symbol": "ETH/USDT-P",
+            "underlyingSymbol": "ETH",
+            "settlementSymbol": "USDT",
+        })
+        resolver_canonical = self.agent_mod._canonical_symbol_from_request(
+            "ETH/USDT-P"
+        )
+        self.assertEqual(catalog["instrument"], resolver_canonical)
+        self.assertEqual(catalog["instrument"], "ETH")
+
+    def test_catalog_normalizes_concatenated_form(self) -> None:
+        """BTCUSDT-P (no slash) must still strip to BTC."""
+        catalog = self.norm({
+            "symbol": "BTCUSDT-P",
+            "underlyingSymbol": "BTC",
+            "settlementSymbol": "USDT",
+        })
+        resolver_canonical = self.agent_mod._canonical_symbol_from_request(
+            "BTCUSDT-P"
+        )
+        self.assertEqual(catalog["instrument"], resolver_canonical)
+
+    def test_catalog_market_type_is_perp(self) -> None:
+        """Every Hibachi catalog entry MUST be tagged as a perp."""
+        for raw_symbol in ("BTC/USDT-P", "ETH/USDT-P", "SOL/USDT-P"):
+            catalog = self.norm({
+                "symbol": raw_symbol,
+                "underlyingSymbol": raw_symbol.split("/")[0],
+                "settlementSymbol": "USDT",
+            })
+            self.assertEqual(
+                catalog.get("market_type"), "perp",
+                f"{raw_symbol}: market_type should be 'perp', "
+                f"got {catalog!r}",
+            )
+
+
+class HyperliquidCatalogSpotExclusionTests(unittest.TestCase):
+    """Phase 2.4.1 hardening B.
+
+    Hyperliquid's ``/info metaAndAssetCtxs`` payload returns spot
+    markets via the ``cash`` dex namespace. Those MUST NOT appear
+    in the Fibo catalog (which targets perpetuals only).
+    """
+
+    AGENT_NAME = "x_hyperliquid_agent"
+    NORMALIZE_FN_NAME = "_normalize_hyperliquid_market"
+
+    def setUp(self) -> None:
+        import importlib
+        self.agent_mod = importlib.import_module(
+            f"plugins.trade.agents.{self.AGENT_NAME}"
+        )
+        self.norm = getattr(self.agent_mod, self.NORMALIZE_FN_NAME)
+
+    def test_cash_prefix_filtered_to_empty_instrument(self) -> None:
+        """``cash:BTC`` is a spot market. The normalizer returns
+        an empty ``instrument`` so the catalog filter at the
+        dispatch level rejects it."""
+        out = self.norm({
+            "route_symbol": "cash:BTC",
+            "public_symbol": "BTC",
+            "dex": "cash",
+        })
+        self.assertEqual(out, {"instrument": ""})
+
+    def test_cash_prefix_filtered_for_any_symbol(self) -> None:
+        for sym in ("BTC", "ETH", "SOL", "HYPE", "XAU"):
+            out = self.norm({
+                "route_symbol": f"cash:{sym}",
+                "public_symbol": sym,
+                "dex": "cash",
+            })
+            self.assertEqual(
+                out.get("instrument"), "",
+                f"cash:{sym} should be filtered out: {out!r}",
+            )
+
+    def test_main_perp_preserved(self) -> None:
+        """Main-HL perps (no dex prefix) are preserved."""
+        out = self.norm({
+            "route_symbol": "BTC",
+            "public_symbol": "BTC",
+            "dex": "",
+        })
+        self.assertEqual(out["instrument"], "BTC")
+        self.assertEqual(out["market_type"], "perp")
+
+    def test_hip3_perp_preserved(self) -> None:
+        """HIP-3 / builder-deployed perp DEXes (xyz, flx, etc.) are
+        preserved with their full route_symbol."""
+        for dex in ("xyz", "flx", "vntl", "hyna", "km"):
+            out = self.norm({
+                "route_symbol": f"{dex}:BTC",
+                "public_symbol": "BTC",
+                "dex": dex,
+            })
+            self.assertEqual(out["instrument"], f"{dex}:BTC")
+            self.assertEqual(out["market_type"], "perp")
+            self.assertEqual(out["base"], dex)
+
+    def test_hip3_perp_description_tags_dex(self) -> None:
+        """Perp metadata includes ``(perp, dex=...)`` so the picker
+        UI can distinguish HIP-3 from main perps."""
+        out = self.norm({
+            "route_symbol": "xyz:SP500",
+            "public_symbol": "SP500",
+            "dex": "xyz",
+        })
+        self.assertIn("perp, dex=xyz", out.get("description", ""))
+
+
+class FiboAccountNormalizationTests(unittest.TestCase):
+    """Phase 2.4.1 hardening C.
+
+    An exchange agent's ``list_accounts()`` may return plain strings
+    OR dicts (e.g. Lighter returns a list of
+    ``{'account': 'amiroo', 'chain': 'ARBITRUM', 'label': '...'}``).
+    Fibo must extract the canonical account id the SAME way the
+    /trade shared wizard does (see
+    ``plugins/trade/wizard.py::_account_option_parts``).
+    """
+
+    def test_plain_string_account(self) -> None:
+        from plugins.trade.fibo.flow import _account_id_for
+        self.assertEqual(_account_id_for("bitget"), "bitget")
+        self.assertEqual(_account_id_for("BITGET"), "BITGET")
+
+    def test_dict_account_extracts_account_key(self) -> None:
+        from plugins.trade.fibo.flow import _account_id_for
+        out = _account_id_for({
+            "account": "amiroo",
+            "chain": "ARBITRUM",
+            "label": "amiroo — Arbitrum",
+        })
+        self.assertEqual(out, "amiroo")
+
+    def test_dict_account_with_only_label_returns_none(self) -> None:
+        """A dict that lacks ``account`` / ``name`` / ``id`` must
+        not be coerced to its label. /trade also returns ``None``
+        in this case; Fibo must match."""
+        from plugins.trade.fibo.flow import _account_id_for
+        self.assertIsNone(_account_id_for({"label": "some label"}))
+        self.assertIsNone(_account_id_for({"chain": "ARBITRUM"}))
+
+    def test_dict_account_fallback_to_name_field(self) -> None:
+        from plugins.trade.fibo.flow import _account_id_for
+        self.assertEqual(_account_id_for({"name": "wallet-1"}), "wallet-1")
+        self.assertEqual(_account_id_for({"id": "acc-42"}), "acc-42")
+
+    def test_empty_string_returns_none(self) -> None:
+        from plugins.trade.fibo.flow import _account_id_for
+        self.assertIsNone(_account_id_for(""))
+        self.assertIsNone(_account_id_for({}))
+        self.assertIsNone(_account_id_for(None))
+
+    def test_choices_accounts_strips_dicts(self) -> None:
+        """End-to-end: the flow's choices_accounts is now plain
+        string ids, sorted, even when the agent returns dicts.
+        This is the exact transformation ``/trade`` performs too.
+        """
+        from plugins.trade.fibo.flow import _account_id_for
+        raw = [
+            {"account": "amiroo", "chain": "ARBITRUM"},
+            {"account": "robin", "chain": "ROBINHOOD"},
+            "plain-btc",
+        ]
+        normalized = sorted(
+            aid for aid in
+            (_account_id_for(entry) for entry in raw)
+            if aid is not None
+        )
+        self.assertEqual(normalized, ["amiroo", "plain-btc", "robin"])
+        # Every entry is a plain string id (NOT a dict).
+        for entry in normalized:
+            self.assertIsInstance(entry, str)
+
+
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

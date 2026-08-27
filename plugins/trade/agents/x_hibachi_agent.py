@@ -830,15 +830,27 @@ def _normalize_hibachi_market(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     Only ``instrument`` is required; the rest may be ``None`` if
     the upstream payload doesn't supply them. Hibachi carries
-    ``symbol`` (the venue-native id, e.g. ``ETHUSD-PERP``),
+    ``symbol`` (the venue-native id, e.g. ``ETH/USDT-P``),
     ``displayName``, ``underlyingSymbol`` (base), and
     ``settlementSymbol`` (quote).
+
+    Phase 2.4.1: the normalized ``instrument`` field is the
+    **stripped** canonical (``BTC``) — the same form
+    ``_resolve_instrument`` returns via
+    ``_canonical_symbol_from_request``. Catalog + resolver
+    MUST agree on the same canonical id, otherwise picking a
+    catalog entry revalidates against a different id than
+    what the catalog displayed.
     """
     if not isinstance(contract, dict):
         return {"instrument": ""}
-    instrument = str(contract.get("symbol") or "").strip()
-    if not instrument:
+    raw_symbol = str(contract.get("symbol") or "").strip()
+    if not raw_symbol:
         return {"instrument": ""}
+    # Strip the venue-side quote + perp markers so the catalog
+    # ``instrument`` matches what ``resolve_instrument`` returns
+    # (e.g. ``BTC/USDT-P`` → ``BTC``).
+    instrument = _canonical_symbol_from_request(raw_symbol) or raw_symbol
     out: Dict[str, Any] = {"instrument": instrument}
     base = str(contract.get("underlyingSymbol") or "").strip()
     if base:
@@ -850,7 +862,11 @@ def _normalize_hibachi_market(contract: Dict[str, Any]) -> Dict[str, Any]:
     if desc:
         out["description"] = desc
     # Hibachi exposes perps in this catalog.
-    if contract.get("contractType") or "PERP" in instrument.upper():
+    if (
+        contract.get("contractType")
+        or "PERP" in raw_symbol.upper()
+        or raw_symbol.endswith("-P")
+    ):
         out["market_type"] = "perp"
     # No bundled price in exchange-info — Fibo will call
     # ``market_price`` separately when supported (Hibachi does
