@@ -119,6 +119,29 @@ class FiboRegistration:
         """
         return not self.exchange_instrument
 
+    @property
+    def is_stopped(self) -> bool:
+        """True when ``status == 'stopped'``.
+
+        Stopped registrations are persisted for audit but the
+        reconciler / Running screen / Stop picker exclude them.
+        Phase 2.6: only "registered" and "stopped" are recognized;
+        any other value is treated as active (legacy back-compat).
+        """
+        return (self.status or "").strip().lower() == "stopped"
+
+    @property
+    def is_active(self) -> bool:
+        """True when this registration should still be considered
+        running for reconciliation / Stop choices.
+
+        A registration is active when ``status`` is NOT
+        ``"stopped"``. The default ``status="registered"`` counts
+        as active. Unknown values are treated as active (legacy
+        back-compat).
+        """
+        return not self.is_stopped
+
     # Normalization + construction -----------------------------------
 
     @staticmethod
@@ -382,6 +405,32 @@ class FiboRegistrationStore:
                 return True
         return False
 
+    def _latest_status_for(
+        self, registration_key: str,
+    ) -> Optional[str]:
+        """Return the effective status of the latest row for the key.
+
+        Phase 2.6: a stopped registration is **terminal** — Resume
+        is not implemented in this phase. Therefore we only return
+        ``"registered"`` or ``None`` for the purposes of duplicate
+        detection:
+
+        * latest row is ``status="registered"`` → return
+          ``"registered"`` (a transition to ``"stopped"`` is
+          allowed; any further ``"registered"`` append is a true
+          duplicate).
+        * latest row is ``status="stopped"`` → return ``"stopped"``
+          (no transition is permitted; the key is locked).
+        * no row exists → return ``None``.
+
+        Used by ``append`` to detect status transitions.
+        """
+        latest_status: Optional[str] = None
+        for reg in self.load_all():
+            if reg.registration_key == registration_key:
+                latest_status = reg.status
+        return latest_status
+
     def get(self, registration_key: str) -> Optional[FiboRegistration]:
         latest: Optional[FiboRegistration] = None
         for reg in self.load_all():
@@ -394,9 +443,15 @@ class FiboRegistrationStore:
     def append(self, registration: FiboRegistration) -> None:
         """Append a registration as one JSON line.
 
+        A row with the same ``registration_key`` is rejected only
+        when the EXISTING latest row has the same ``status`` as
+        the new row. A different ``status`` is treated as a valid
+        status transition (Phase 2.6 ``mark_stopped``).
+
         Raises:
             DuplicateRegistrationError: a record with the same
-                ``registration_key`` already exists in the store.
+                ``registration_key`` AND the same ``status`` already
+                exists in the store (latest-per-key).
             StoreBusy: another writer holds the file lock for longer
                 than ``_LOCK_WAIT_SECONDS``.
             AtomicWriteError: the atomic rename failed (e.g. permission).
@@ -404,7 +459,16 @@ class FiboRegistrationStore:
         """
         # Duplicate check happens UNDER the lock below, but a fast
         # pre-check avoids a needless write cycle for the common case.
-        if self.exists(registration.registration_key):
+        # The pre-check mirrors the lock-held rule: blocked unless
+        # the existing row is ``status="registered"`` and the new
+        # row is ``status="stopped"`` (status transition).
+        latest_status = self._latest_status_for(
+            registration.registration_key
+        )
+        if latest_status is not None and not (
+            (latest_status or "").strip().lower() == "registered"
+            and (registration.status or "").strip().lower() == "stopped"
+        ):
             raise DuplicateRegistrationError(registration.registration_key)
 
         ensure_dir_0700(self._path.parent)
@@ -436,7 +500,8 @@ class FiboRegistrationStore:
             try:
                 # Re-check under the lock to close the TOCTOU window.
                 self._raise_if_duplicate_under_lock(
-                    registration.registration_key
+                    registration.registration_key,
+                    new_status=registration.status,
                 )
                 f.write(payload)
                 f.flush()
@@ -467,8 +532,25 @@ class FiboRegistrationStore:
                     ) from exc
                 time.sleep(_LOCK_POLL_INTERVAL)
 
-    def _raise_if_duplicate_under_lock(self, key: str) -> None:
-        """Re-scan the file under the lock and raise if key exists.
+    def _raise_if_duplicate_under_lock(
+        self, key: str, *, new_status: str = "",
+    ) -> None:
+        """Re-scan the file under the lock and raise if a duplicate
+        exists.
+
+        Phase 2.6 transition rules:
+
+        * No existing row → allowed (initial create).
+        * Existing latest row is ``status="registered"`` and new
+          row is ``status="stopped"`` → ALLOWED (status
+          transition). ``mark_stopped`` uses this path.
+        * Existing latest row is ``status="stopped"`` → BLOCKED,
+          regardless of new row's status (the key is terminal
+          until Resume is implemented).
+        * Existing latest row has any other status, and new row's
+          status matches → BLOCKED (true duplicate).
+        * Any other combination → BLOCKED with
+          ``DuplicateRegistrationError``.
 
         O(N) scan is acceptable: the file is human-tiny and Phase 1
         volumes are bounded.
@@ -496,6 +578,7 @@ class FiboRegistrationStore:
                 "fibo_registrations: lock-collision read failed: %s", exc
             )
             return
+        last_status_for_key: Optional[str] = None
         for line in data.splitlines():
             if not line.strip():
                 continue
@@ -506,7 +589,98 @@ class FiboRegistrationStore:
             if not isinstance(raw, dict):
                 continue
             if raw.get("registration_key") == key:
-                raise DuplicateRegistrationError(key)
+                last_status_for_key = str(
+                    raw.get("status", "") or ""
+                )
+        if last_status_for_key is None:
+            # No existing row — allowed (initial create).
+            return
+        # Existing row present. Only one transition is allowed:
+        # registered -> stopped. Anything else is blocked.
+        last = (last_status_for_key or "").strip().lower()
+        new = (new_status or "").strip().lower()
+        if last == "registered" and new == "stopped":
+            return  # status transition allowed
+        raise DuplicateRegistrationError(key)
+
+
+    # -- status transitions ------------------------------------------
+
+    def mark_stopped(
+        self,
+        registration_key: str,
+        *,
+        updated_at: Optional[str] = None,
+    ) -> FiboRegistration:
+        """Append a "stopped" status transition row for ``registration_key``.
+
+        The store is append-only JSONL with "latest per key wins"
+        semantics (``load_all``). Appending a new row that preserves
+        every other field but sets ``status="stopped"`` is the
+        canonical way to record the transition without rewriting
+        historical JSONL rows.
+
+        The original row remains in the file (audit history). The
+        latest row with this key — now with ``status="stopped"`` —
+        becomes the effective state visible to ``get``,
+        ``load_all``, and the reconciler.
+
+        Phase 2.6 scope: only Stop is implemented. Resume is
+        deferred to a later phase.
+
+        Raises:
+            KeyError: no registration with that key exists.
+            ValueError: the registration is already stopped (no-op
+                transition refused so callers cannot accidentally
+                double-stop).
+            DuplicateRegistrationError / StoreBusy / AtomicWriteError:
+                same as ``append``.
+        """
+        latest = self.get(registration_key)
+        if latest is None:
+            raise KeyError(
+                f"no registration with key {registration_key!r}"
+            )
+        if latest.is_stopped:
+            raise ValueError(
+                f"registration {registration_key!r} is already stopped"
+            )
+        # Build a new registration row preserving every field, but
+        # with status="stopped" and a fresh updated_at.
+        stopped = FiboRegistration.build(
+            exchange=latest.exchange,
+            account=latest.account,
+            symbol=latest.symbol,
+            variant=latest.variant,
+            side=latest.side,
+            starting_volume=latest.starting_volume,
+            source=latest.source,
+            source_seq=latest.source_seq,
+            source_cycle_id=latest.source_cycle_id,
+            source_cumulative_weight=latest.source_cumulative_weight,
+            source_percentage=latest.source_percentage,
+            source_snapshot_received_at=(
+                latest.source_snapshot_received_at
+            ),
+            desired_exchange_size=latest.desired_exchange_size,
+            source_symbol=latest.source_symbol,
+            exchange_instrument=latest.exchange_instrument,
+            status="stopped",
+            created_at=latest.created_at,
+            updated_at=updated_at,
+        )
+        # ``append`` raises DuplicateRegistrationError if a key
+        # collision appears under the lock — but since we just
+        # re-read the file and confirmed only the original row
+        # exists, the only way that can happen is a concurrent
+        # writer. Surface that as ValueError for clarity.
+        try:
+            self.append(stopped)
+        except DuplicateRegistrationError as exc:
+            raise ValueError(
+                f"concurrent stop of {registration_key!r}: {exc}"
+            ) from exc
+        return stopped
 
     # -- read ---------------------------------------------------------
 

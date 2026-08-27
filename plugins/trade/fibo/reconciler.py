@@ -279,7 +279,14 @@ class FiboReconciler:
     # ------------------------------------------------------------------
 
     def reconcile_all(self) -> List[ReconciliationResult]:
-        """Reconcile every persisted registration."""
+        """Reconcile every persisted ACTIVE registration.
+
+        Phase 2.6: stopped registrations are excluded. A stopped
+        registration must never reach exchange reconciliation /
+        positions inspection / action planning. ``load_all`` already
+        returns the latest row per ``registration_key``, so the
+        ``is_stopped`` check uses that effective state.
+        """
         try:
             regs = self._registrations.load_all()
         except Exception as exc:  # noqa: BLE001
@@ -287,7 +294,8 @@ class FiboReconciler:
                 "fibo_reconciler: failed to load registrations: %s", exc
             )
             return []
-        return [self.reconcile_one(r) for r in regs]
+        active = [r for r in regs if r.is_active]
+        return [self.reconcile_one(r) for r in active]
 
     def reconcile_one(self, reg: FiboRegistration) -> ReconciliationResult:
         """Reconcile a single registration by its identity.

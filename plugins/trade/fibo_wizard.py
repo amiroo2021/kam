@@ -721,17 +721,42 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
             _answer(query)
             return
 
-        # Placeholder path for the Stop button (no Phase 2 work).
-        screen = _build_placeholder_screen(callback_data)
-        edited = await _edit(query, screen)
-        answered = _answer(query)
-        if edited and answered:
-            logger.info("fibo_wizard: callback %s rendered placeholder", callback_data)
-        else:
-            logger.warning(
-                "fibo_wizard: callback %s partially rendered (edited=%s, answered=%s)",
-                callback_data, edited, answered,
-            )
+        # Phase 2.6 — Stop Fibo. LOCAL ONLY: marks a registration
+        # as status="stopped" in the JSONL store. Does NOT touch
+        # the exchange, alias memory, or MT4. Reads only.
+        if callback_data == "fibo:stop":
+            screen_dict = _build_stop_picker_screen()
+            await _edit(query, screen_dict)
+            _answer(query)
+            return
+        if callback_data.startswith("fibo:stop:p:"):
+            idx_str = callback_data[len("fibo:stop:p:"):]
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                _answer(query)
+                return
+            screen_dict = _build_stop_confirm_screen(idx)
+            await _edit(query, screen_dict)
+            _answer(query)
+            return
+        if callback_data.startswith("fibo:stop:y:"):
+            idx_str = callback_data[len("fibo:stop:y:"):]
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                _answer(query)
+                return
+            screen_dict = _execute_stop(idx)
+            await _edit(query, screen_dict)
+            _answer(query)
+            return
+        if callback_data == "fibo:stop:cancel":
+            # Returning to the Stop picker
+            screen_dict = _build_stop_picker_screen()
+            await _edit(query, screen_dict)
+            _answer(query)
+            return
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "fibo_wizard: callback dispatch failed: %s", exc, exc_info=True
@@ -751,6 +776,243 @@ def _screen_to_dict(screen) -> dict:
         # Already a dict.
         return {"text": screen["text"], "buttons": screen["buttons"]}
     return {"text": text, "buttons": buttons}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.6 — Stop Fibo helpers (LOCAL ONLY — no exchange, no alias writes)
+# ---------------------------------------------------------------------------
+#
+# Stop Fibo is a purely administrative local action:
+#   * Reads active registrations from the JSONL store.
+#   * Lets the user pick one and confirm.
+#   * Calls ``FiboRegistrationStore.mark_stopped(key)`` which appends
+#     a new row with status="stopped" preserving every other field.
+#   * Never invokes TradeDesk. Never writes alias memory. Never touches
+#     MT4. Never calls any exchange write operation.
+#
+# The reconciler / Running Fibo filter stopped registrations via the
+# ``is_active`` helper. A stopped registration disappears from the
+# Stop choices (because only ``is_active`` rows are listed) and from
+# Running Fibo (because the reconciler skips them).
+# ---------------------------------------------------------------------------
+
+_STOP_BACK_LABEL = "◀️ Back"
+_STOP_CANCEL_LABEL = "❌ Cancel"
+_STOP_CONFIRM_LABEL = "⛔️ Stop"
+
+
+def _stop_active_registrations():
+    """Return the active (``is_active``) registrations, sorted
+    deterministically by ``registration_key``.
+
+    Raises no exception on missing / unreadable file — empty list
+    instead, so the Stop UI degrades gracefully.
+    """
+    try:
+        from .fibo.store import FiboRegistrationStore
+        hermes_home = _resolve_hermes_home_for_flow()
+        store = FiboRegistrationStore(
+            hermes_home / "fibo" / "registrations.jsonl"
+        )
+        all_regs = store.load_all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fibo_wizard: stop — load_all failed: %s", exc
+        )
+        return []
+    active = [r for r in all_regs if r.is_active]
+    active.sort(key=lambda r: r.registration_key)
+    return active
+
+
+def _format_stop_block(reg) -> str:
+    """Render one registration block for the Stop picker."""
+    src = reg.source_symbol or reg.symbol or "?"
+    venue = reg.exchange_instrument or "(legacy)"
+    return (
+        f"{src} {reg.variant} {reg.side}\n"
+        f"   {reg.exchange} / {reg.account}\n"
+        f"   MT4: {src}\n"
+        f"   Venue: {venue}"
+    )
+
+
+def _build_stop_picker_screen() -> dict:
+    """Render the "select a registration to stop" screen."""
+    active = _stop_active_registrations()
+    if not active:
+        body = (
+            "⛔️ Stop Fibo\n\n"
+            "No active registrations to stop.\n\n"
+            "Use ▶️ Start Fibo to create one."
+        )
+        return {
+            "text": body,
+            "buttons": [
+                [
+                    {"text": "▶️ Start Fibo",
+                     "callback_data": "fibo:start"},
+                    {"text": "📋 Running Fibo",
+                     "callback_data": "fibo:running"},
+                ],
+                [
+                    {"text": "❌ Exit",
+                     "callback_data": "fibo:exit"},
+                ],
+            ],
+        }
+    blocks = []
+    rows = []
+    for idx, reg in enumerate(active):
+        blocks.append(
+            f"{idx + 1}. {_format_stop_block(reg)}"
+        )
+        rows.append([
+            {
+                "text": (
+                    f"{idx + 1}. {reg.source_symbol or reg.symbol or '?'} "
+                    f"{reg.variant} {reg.side}"
+                ),
+                "callback_data": f"fibo:stop:p:{idx}",
+            }
+        ])
+    body = (
+        "⛔️ Stop Fibo\n\n"
+        "Select a running registration to stop:\n\n"
+        + "\n\n".join(blocks)
+    )
+    rows.append([
+        {"text": _STOP_CANCEL_LABEL, "callback_data": "fibo:exit"},
+    ])
+    return {"text": body, "buttons": rows}
+
+
+def _build_stop_confirm_screen(idx: int) -> dict:
+    """Render the confirmation screen for registration at ``idx``."""
+    active = _stop_active_registrations()
+    if idx < 0 or idx >= len(active):
+        return _build_stop_picker_screen()
+    reg = active[idx]
+    src = reg.source_symbol or reg.symbol or "?"
+    venue = reg.exchange_instrument or "(none — legacy record)"
+    body = (
+        "⚠️ Stop Fibo registration?\n\n"
+        f"Source symbol:       {src}\n"
+        f"Exchange instrument: {venue}\n"
+        f"Variant:             {reg.variant}\n"
+        f"Side:                {reg.side}\n"
+        f"Exchange:            {reg.exchange}\n"
+        f"Account:             {reg.account}\n\n"
+        "Stopping this registration will stop Fibo reconciliation only.\n\n"
+        "It will NOT:\n"
+        "• close the exchange position\n"
+        "• cancel exchange orders\n"
+        "• change TP or SL"
+    )
+    return {
+        "text": body,
+        "buttons": [
+            [
+                {"text": _STOP_CONFIRM_LABEL,
+                 "callback_data": f"fibo:stop:y:{idx}"},
+            ],
+            [
+                {"text": _STOP_BACK_LABEL,
+                 "callback_data": "fibo:stop:cancel"},
+                {"text": _STOP_CANCEL_LABEL,
+                 "callback_data": "fibo:exit"},
+            ],
+        ],
+    }
+
+
+def _execute_stop(idx: int) -> dict:
+    """Mark the registration at ``idx`` as stopped and render the
+    post-stop screen.
+
+    Returns a wizard-shaped dict. If the index is stale (the user
+    double-clicked after a previous stop), falls back to the
+    picker screen with a small banner.
+    """
+    try:
+        active = _stop_active_registrations()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "fibo_wizard: stop — load_all failed at execute: %s", exc
+        )
+        return _build_stop_picker_screen()
+    if idx < 0 or idx >= len(active):
+        logger.warning(
+            "fibo_wizard: stop — stale index %d (active=%d)",
+            idx, len(active),
+        )
+        return _build_stop_picker_screen()
+    reg = active[idx]
+    try:
+        from .fibo.store import FiboRegistrationStore
+        hermes_home = _resolve_hermes_home_for_flow()
+        store = FiboRegistrationStore(
+            hermes_home / "fibo" / "registrations.jsonl"
+        )
+        store.mark_stopped(reg.registration_key)
+    except (KeyError, ValueError) as exc:
+        # Already stopped or no longer exists: refresh the picker.
+        logger.info(
+            "fibo_wizard: stop — %s refresh picker: %s",
+            reg.registration_key, exc,
+        )
+        return _build_stop_picker_screen()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "fibo_wizard: stop — mark_stopped failed: %s", exc,
+            exc_info=True,
+        )
+        # Local-only failure: report and return to picker.
+        return {
+            "text": (
+                f"⛔️ Stop Fibo failed\n\n"
+                f"Could not mark registration as stopped:\n{exc}\n\n"
+                "No exchange position or order was changed."
+            ),
+            "buttons": [
+                [
+                    {"text": "📋 Running Fibo",
+                     "callback_data": "fibo:running"},
+                    {"text": "▶️ Start Fibo",
+                     "callback_data": "fibo:start"},
+                ],
+                [
+                    {"text": "❌ Exit",
+                     "callback_data": "fibo:exit"},
+                ],
+            ],
+        }
+    src = reg.source_symbol or reg.symbol or "?"
+    venue = reg.exchange_instrument or src
+    body = (
+        "✅ Fibo stopped\n\n"
+        f"{src} {reg.variant} {reg.side}\n"
+        f"{reg.exchange} / {reg.account}\n"
+        f"{src} → {venue}\n\n"
+        "No exchange position or order was changed."
+    )
+    return {
+        "text": body,
+        "buttons": [
+            [
+                {"text": "\U0001f4cb Running Fibo",
+                 "callback_data": "fibo:running"},
+                {"text": "▶️ Start Fibo",
+                 "callback_data": "fibo:start"},
+            ],
+            [
+                {"text": _STOP_BACK_LABEL,
+                 "callback_data": "fibo:stop"},
+                {"text": "❌ Exit",
+                 "callback_data": "fibo:exit"},
+            ],
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

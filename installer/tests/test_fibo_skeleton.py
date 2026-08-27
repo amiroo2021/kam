@@ -279,46 +279,26 @@ class FiboCallbackRoutingTests(unittest.TestCase):
             }
 
         # Phase 2: fibo:running is the read-only dry-run view, NOT a
-        # placeholder. fibo:stop is still a placeholder.
+        # placeholder. fibo:stop is the Stop-Fibo picker (Phase 2.6).
         # fibo:start opens the Start Fibo sub-flow.
         for cb in ("fibo:stop",):
             with self.subTest(callback=cb):
                 import asyncio
                 result = asyncio.run(run_one(cb))
-                # Placeholder screen text matches SCREEN_TEXT[cb].
-                self.assertEqual(result["edited_text"], fibo_wizard.SCREEN_TEXT[cb])
+                # Phase 2.6: fibo:stop now renders the Stop picker
+                # (or an empty-list screen if no registrations exist).
+                # Either way, the screen is NOT the Phase-1
+                # "Stop Fibo" placeholder text.
+                self.assertNotEqual(
+                    result["edited_text"],
+                    fibo_wizard.SCREEN_TEXT.get(cb, ""),
+                    "fibo:stop must no longer route through the "
+                    "Phase-1 placeholder path.",
+                )
                 self.assertTrue(result["answered"])
-                # The buttons offered after the placeholder are the entry
-                # buttons (so the user can pick another action).
+                # The buttons offered are the per-registration picker
+                # buttons (or, if empty, the Start/Running/Exit trio).
                 self.assertIsNotNone(result["edited_buttons"])
-                # Normalise InlineKeyboardButton objects to dicts so we can
-                # assert on text / callback_data uniformly across adapters.
-                def _to_dict(btn):
-                    if isinstance(btn, dict):
-                        return btn
-                    # PTB InlineKeyboardButton has .text and .callback_data.
-                    return {
-                        "text": getattr(btn, "text", "") or "",
-                        "callback_data": getattr(btn, "callback_data", "") or "",
-                    }
-
-                flat = [
-                    _to_dict(btn)["text"]
-                    for row in result["edited_buttons"] or []
-                    for btn in (row or [])
-                ]
-                self.assertIn("▶️ Start Fibo", flat)
-                self.assertIn("📋 Running Fibo", flat)
-                self.assertIn("⛔️ Stop Fibo", flat)
-                self.assertIn("❌ Exit", flat)
-                # And the callback_data carries the fibo: namespace.
-                flat_cb = [
-                    _to_dict(btn)["callback_data"]
-                    for row in result["edited_buttons"] or []
-                    for btn in (row or [])
-                ]
-                self.assertIn("fibo:running", flat_cb)
-                self.assertIn("fibo:stop", flat_cb)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +675,10 @@ class FiboExitCallbackTests(unittest.TestCase):
             )
 
     def test_strategy_callbacks_unchanged(self) -> None:
-        """Regression: Stop must still route to its placeholder screen.
+        """Regression: Stop must NOT close the wizard (Exit path is
+        separate). Phase 2.6: ``fibo:stop`` opens the Stop picker
+        rather than the legacy Phase-1 placeholder screen.
+
         Exit is added to the entry menu but does NOT alter the
         strategy-callback behaviour.
 
@@ -731,12 +714,14 @@ class FiboExitCallbackTests(unittest.TestCase):
                     fibo_wizard.handle_fibo_callback(None, q, cb)
                 )
                 # The strategy callbacks still go through the
-                # placeholder-edit path, NOT the close path.
+                # edit path, NOT the close path.
                 self.assertFalse(q.deleted, f"{cb} must NOT close the wizard")
-                # Each placeholder's body text is still its SCREEN_TEXT entry.
-                self.assertEqual(
-                    q.edited_text, fibo_wizard.SCREEN_TEXT[cb],
-                    f"{cb} must render its SCREEN_TEXT entry unchanged",
+                # Phase 2.6: Stop now renders the Stop picker
+                # (not the Phase-1 placeholder text).
+                self.assertNotEqual(
+                    q.edited_text, fibo_wizard.SCREEN_TEXT.get(cb, ""),
+                    f"{cb} must no longer render the Phase-1 "
+                    f"SCREEN_TEXT entry",
                 )
                 self.assertTrue(q.answered)
 
