@@ -47,6 +47,12 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "discovery.py",
     Path("plugins") / "trade" / "fibo" / "dryrun.py",
     Path("plugins") / "trade" / "fibo" / "reconciler.py",
+    # Phase 2.8 — stateless target-convergence executor.
+    Path("plugins") / "trade" / "fibo" / "executor.py",
+    # Phase 2.9 — shadow-mode executor wiring (read-only).
+    Path("plugins") / "trade" / "fibo" / "shadow.py",
+    # Phase 2.10 — controlled live target convergence (allowlist-gated).
+    Path("plugins") / "trade" / "fibo" / "live.py",
     Path("plugins") / "trade" / "agents" / "tests" / "__init__.py",
     Path("plugins") / "trade" / "agents" / "tests"
     / "test_x_ondoperps_market_price.py",

@@ -61,6 +61,12 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "discovery.py",
     Path("plugins") / "trade" / "fibo" / "dryrun.py",
     Path("plugins") / "trade" / "fibo" / "reconciler.py",
+    # Phase 2.8 — stateless target-convergence executor.
+    Path("plugins") / "trade" / "fibo" / "executor.py",
+    # Phase 2.9 — shadow-mode executor wiring (read-only).
+    Path("plugins") / "trade" / "fibo" / "shadow.py",
+    # Phase 2.10 — controlled live target convergence (allowlist-gated).
+    Path("plugins") / "trade" / "fibo" / "live.py",
     # Phase 2.3 agent-side regression tests live under
     # plugins/trade/agents/tests. They are pure unit tests and are
     # copied alongside the agent so the verifier can import them

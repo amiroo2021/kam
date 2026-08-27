@@ -729,7 +729,13 @@ class ClientOrderIdUniquenessTests(unittest.TestCase):
         cid2 = self._capture_client_order_id(snap2)
         self.assertEqual(cid1, cid2)
 
-    def test_different_snapshot_seq_different_id(self):
+    def test_different_snapshot_seq_same_id(self):
+        """Phase 2.10: snap.seq MUST NOT change the id. Two MT4
+        snapshots observing the same underlying cycle + weight
+        must produce the same client_order_id for the same
+        intended adjustment. The venue's idempotency layer
+        relies on this stability across rapid observer ticks.
+        """
         import dataclasses
         snap1 = _snap(buy_cycle=42, buy_weight="2.0")
         snap2 = _snap(buy_cycle=42, buy_weight="2.0")
@@ -737,7 +743,8 @@ class ClientOrderIdUniquenessTests(unittest.TestCase):
         snap2 = dataclasses.replace(snap2, seq=snap1.seq + 1)
         cid1 = self._capture_client_order_id(snap1)
         cid2 = self._capture_client_order_id(snap2)
-        self.assertNotEqual(cid1, cid2)
+        self.assertEqual(cid1, cid2,
+                         "snap.seq must NOT change the id (Phase 2.10)")
 
     def test_different_mt4_cycle_different_id(self):
         snap1 = _snap(buy_cycle=42, buy_weight="2.0")

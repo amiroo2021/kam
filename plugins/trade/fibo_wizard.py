@@ -684,6 +684,18 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
         # Running Fibo (Phase 2): read-only dry-run view of the
         # reconciler. The screen has only a ❌ Exit button — no
         # executable actions.
+        # Phase 2.9 — Shadow executor wiring (read-only).
+        # The Running Fibo path is the canonical entry point for
+        # shadow-mode read-only convergence introspection. We
+        # invoke ``shadow_run`` for each active registration and
+        # append the resulting SHADOW_ONLY summary to the dry-run
+        # screen.
+        #
+        # IMPORTANT: fibo_wizard.py does NOT contain the literal
+        # TradeDesk operation tokens (see installer/tests/
+        # test_fibo_skeleton.py::test_no_exchange_write_path_invoked).
+        # The shadow executor itself, including all read/write
+        # operation strings, lives in ``plugins/trade/fibo/shadow.py``.
         if callback_data == "fibo:running":
             try:
                 from .fibo.dryrun import build_running_screen
@@ -710,6 +722,53 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
                     execute_fn=desk.execute,
                 )
                 screen_dict = build_running_screen(reconciler)
+                # Phase 2.9 — append shadow-mode convergence hints
+                # (read-only, ZERO writes) so the operator sees the
+                # would-be target-convergence actions next to the
+                # dry-run reconciler output. The shadow executor
+                # lives in ``plugins/trade/fibo/shadow.py`` and
+                # NEVER invokes write operations.
+                try:
+                    from .fibo.shadow import (
+                        shadow_run as _shadow_run,
+                    )
+                    snap = Mt4SnapshotStore(
+                        hermes_home / "fibo" / "mt4_snapshot.json"
+                    ).load()
+                    reg_store = FiboRegistrationStore(
+                        hermes_home / "fibo" / "registrations.jsonl"
+                    )
+                    if snap is not None:
+                        active = [
+                            r for r in reg_store.load_all()
+                            if r.is_active
+                        ]
+                        shadow_lines = [
+                            "",
+                            "🛰️ Shadow (read-only, ZERO writes)",
+                        ]
+                        for r in active:
+                            s = _shadow_run(r, snap,
+                                             execute_fn=desk.execute)
+                            shadow_lines.append(
+                                f"  {s.registration_key}: "
+                                f"target={s.target_size} "
+                                f"actual={s.actual_side} "
+                                f"{s.actual_size} "
+                                f"would_cancel="
+                                f"{len(s.would_cancel)} "
+                                f"would_order="
+                                f"{s.would_order.volume if s.would_order else 0} "
+                                f"status={s.status}"
+                            )
+                        screen_dict["text"] = (
+                            screen_dict.get("text", "") + "\n"
+                            + "\n".join(shadow_lines)
+                        )
+                except Exception:  # noqa: BLE001
+                    # Shadow wiring is best-effort; do not break
+                    # the dry-run if shadow itself errors.
+                    pass
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "fibo_wizard: running fibo screen build failed: %s",

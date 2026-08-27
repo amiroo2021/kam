@@ -583,7 +583,8 @@ def _compute_remaining_delta(
 def _fibo_client_order_id(
     reg: FiboRegistration,
     *,
-    snap: Mt4Snapshot,
+    source: str,
+    cycle_id: int,
     target: Mt4Target,
     delta: "_Delta",
 ) -> str:
@@ -593,41 +594,36 @@ def _fibo_client_order_id(
     Convention: ``fibo-<16-char hex>``. The hex is the SHA-256 of:
 
         registration_key
-        | MT4 snapshot seq
-        | MT4 snapshot source
-        | MT4 cycle id (resolved from snapshot for the
-          registration's side; 0 when inactive / missing)
+        | MT4 snapshot source (the observer feed identifier)
+        | resolved MT4 cycle id
         | target side
         | target size
         | delta side
         | delta size
 
-    Two adjustments that differ in ANY of those fields produce
-    different ids. Within a single convergence attempt the id
-    is stable (deterministic from inputs).
+    The hash does NOT include ``snap.seq`` (the observer message
+    sequence number). Two MT4 snapshots that observe the SAME
+    underlying cycle + weight therefore produce the SAME
+    client_order_id for the same intended adjustment. A new
+    cycle, a new weight, or a different delta all change the id.
+
+    Phase 2.10 corrected the hash to drop ``snap.seq`` so that
+    the venue's idempotency layer can deduplicate retries across
+    rapid MT4 observer ticks without rejecting legitimate new
+    adjustments at a new cycle or weight.
 
     Guarantees:
-        - Unique to the current adjustment intent (not reused
-          across the lifetime of the registration).
-        - Stable / deterministic for the same inputs.
+        - Same registration + same cycle + same target + same
+          remaining delta => SAME client_order_id.
+        - Changed MT4 cycle => different client_order_id.
+        - Changed target size => different client_order_id.
+        - Changed remaining delta => different client_order_id.
         - <= 64 chars (per Ondo's documented limit).
-
-    The executor does NOT use the id for cancel-by-id — cancels
-    happen at the (symbol, side) group level. The id exists so
-    post-hoc reconciliation can identify Fibo-owned orders by
-    client_order_id and so the venue's own idempotency layer
-    can dedupe accidental double-submits.
     """
-    cycle_id = 0
-    fibo = snap.find_fibo(reg.source_symbol, reg.variant)
-    if fibo is not None:
-        try:
-            cycle_id = int(fibo.side_cycle_id(reg.side) or 0)
-        except (ValueError, AttributeError):
-            cycle_id = 0
     payload = (
-        f"{reg.registration_key}|{snap.seq}|{snap.source}|"
-        f"{cycle_id}|{target.side}|{_format_decimal(target.size)}|"
+        f"{reg.registration_key}|{source}|"
+        f"{int(cycle_id)}|"
+        f"{target.side}|{_format_decimal(target.size)}|"
         f"{delta.side}|{_format_decimal(delta.size)}"
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -640,7 +636,8 @@ def _place_market_order(
     execute_fn: ExecuteFn,
     side: str,
     size: Decimal,
-    snap: Mt4Snapshot,
+    source: str,
+    cycle_id: int,
     target: Mt4Target,
     delta: "_Delta",
 ) -> Optional[Dict[str, Any]]:
@@ -670,7 +667,8 @@ def _place_market_order(
         "volume": _format_decimal(size),
         "reduce_only": False,
         "client_order_id": _fibo_client_order_id(
-            reg, snap=snap, target=target, delta=delta,
+            reg, source=source, cycle_id=cycle_id,
+            target=target, delta=delta,
         ),
     }
     try:
@@ -745,6 +743,18 @@ def converge(
     """
     target = _resolve_mt4_target(reg, snap)
     target_symbol = str(reg.exchange_instrument or "").strip().upper()
+
+    # Phase 2.10 — resolve the cycle id and source feed identifier
+    # so the client_order_id hash (see ``_fibo_client_order_id``)
+    # is invariant against ``snap.seq`` ticks but changes when
+    # the underlying cycle or weight changes.
+    cycle_id = 0
+    _fibo = snap.find_fibo(reg.source_symbol, reg.variant)
+    if _fibo is not None:
+        try:
+            cycle_id = int(_fibo.side_cycle_id(reg.side) or 0)
+        except (ValueError, AttributeError):
+            cycle_id = 0
 
     # ------------------------------------------------------------------
     # Step 1 — BEFORE read.
@@ -895,7 +905,8 @@ def converge(
         placed = _place_market_order(
             reg, execute_fn=execute_fn,
             side=delta.side, size=delta.size,
-            snap=snap, target=target, delta=delta,
+            source=snap.source, cycle_id=cycle_id,
+            target=target, delta=delta,
         )
         if placed is None:
             reason = "new_order failed"
