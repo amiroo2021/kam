@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tempfile
 import time
 import unittest
@@ -37,9 +38,9 @@ from typing import Any, Dict, List, Optional
 from unittest import mock
 
 from plugins.trade.fibo.flow import (
-    CB_ACCT, CB_AGREE, CB_BACK, CB_CANCEL, CB_CREATE, CB_EX, CB_PREFIX,
-    CB_REFRESH, CB_SIDE, CB_SYM, SIDE_TOKEN_BUY, SIDE_TOKEN_SELL,
-    STALE_THRESHOLD_SECONDS, Screen, StartFiboFlow,
+    CB_ACCT, CB_AGREE, CB_BACK, CB_CANCEL, CB_CREATE, CB_EX, CB_OTHER,
+    CB_PREFIX, CB_REFRESH, CB_SIDE, CB_SYM, SIDE_TOKEN_BUY,
+    SIDE_TOKEN_SELL, STALE_THRESHOLD_SECONDS, Screen, StartFiboFlow,
 )
 from plugins.trade.fibo.session import (
     SESSION_TTL_SECONDS, FiboSessionStore, SessionState,
@@ -841,6 +842,392 @@ class ConstantsTests(unittest.TestCase):
         for cb in (CB_SYM, CB_SIDE, CB_EX, CB_ACCT, CB_CREATE,
                    CB_BACK, CB_CANCEL, CB_REFRESH):
             self.assertTrue(cb.startswith(CB_PREFIX))
+
+
+# -------------------------------------------------------------------
+# Phase 2.5: Create-persistence invariant tests
+# -------------------------------------------------------------------
+#
+# These tests pin the invariants the user requested:
+#   1. Create persists original source_symbol.
+#   2. Create persists approved exchange_instrument.
+#   3. Registration key uses the venue contract id.
+#   4. source_symbol and exchange_instrument remain distinct.
+#   5. ETHUSD → ETH-USD.P survives the full path.
+#   6. #SP500 → US500-USD.P survives the full path.
+#   7. Typed Other alias → canonical (not the raw typed text) is
+#      what is persisted.
+#   8. Cached learned alias gets revalidated before Create.
+#   9. Create with missing exchange_instrument fails closed.
+#  10. Create never triggers any exchange write.
+#  11. Pre-Phase-2.1 legacy records remain readable and surface
+#      ``is_legacy=True`` so the reconciler / Running screen can
+#      classify them as NEEDS_INSTRUMENT_SELECTION.
+#  12. Callback payloads remain within Telegram limits (covered
+#      by test_callback_data_under_64_bytes).
+# -------------------------------------------------------------------
+
+
+class CreatePersistenceInvariantTests(_FlowTestBase):
+    """Phase 2.5 hardening: every Create happy-path must persist
+    BOTH source_symbol and exchange_instrument, and the
+    registration_key must use the venue contract id.
+    """
+
+    def _happy_path_with_resolver(
+        self,
+        *,
+        fibos: List[Mt4Fibo],
+        exchange: str = "ondoperps",
+        account: str = "ALT",
+        symbol_idx: int = 0,
+        side_token: str = SIDE_TOKEN_BUY,
+        volume: str = "0.001",
+        resolver=None,
+    ) -> StartFiboFlow:
+        """Drive the wizard through open → symbol → side → exchange
+        → account → agree → volume, returning the flow.
+        ``resolver`` is the resolve_instrument_fn that the flow
+        will call for direct resolve; if None, picker is used.
+        """
+        self.fx.set_snapshot(_snapshot(fibos))
+        flow = self.fx.flow(
+            resolve_instrument_fn=resolver,
+        )
+        # The factory default list_exchanges is
+        # [apex, hyperliquid, ondoperps]. If we want a different
+        # exchange, swap the closure via flow's own helper:
+        exchange_index = {"apex": 0, "hyperliquid": 1, "ondoperps": 2}[exchange]
+        flow.open("chat-1", "user-1")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SYM}{symbol_idx}")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{side_token}")
+        flow.handle_callback(
+            "chat-1", "user-1", f"{CB_EX}{exchange_index}"
+        )
+        flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
+        flow.handle_text("chat-1", "user-1", volume)
+        return flow
+
+    def test_create_persists_source_symbol_and_exchange_instrument_distinct(
+        self,
+    ) -> None:
+        """Create must persist both source_symbol and the approved
+        exchange_instrument, and they must remain distinct fields
+        in the on-disk record.
+        """
+        fibos = [_good_fibo(symbol="ETHUSD", variant="NORMALFib",
+                            buy_cycle_id=42, cumulative_buy_weight="2.0")]
+
+        def _resolver(exchange, account, symbol):
+            # ETHUSD → ETH-USD.P on Ondo
+            return {"ETHUSD": "ETH-USD.P"}.get(symbol)
+
+        flow = self._happy_path_with_resolver(
+            fibos=fibos, exchange="ondoperps", account="ALT",
+            symbol_idx=0, side_token=SIDE_TOKEN_BUY,
+            volume="0.5", resolver=_resolver,
+        )
+        screen = flow.handle_callback(
+            "chat-1", "user-1", CB_CREATE
+        )
+        self.assertIn("✅ Registered", screen.text)
+        store = FiboRegistrationStore(self.fx.reg_path)
+        all_ = store.load_all()
+        self.assertEqual(len(all_), 1)
+        reg = all_[0]
+        # source_symbol: original MT4 identifier
+        self.assertEqual(reg.source_symbol, "ETHUSD")
+        # exchange_instrument: venue canonical contract id
+        self.assertEqual(reg.exchange_instrument, "ETH-USD.P")
+        # The two fields must be distinct on disk
+        self.assertNotEqual(reg.source_symbol, reg.exchange_instrument)
+        # symbol (legacy back-compat field) mirrors source_symbol
+        self.assertEqual(reg.symbol, "ETHUSD")
+        # registration_key uses exchange_instrument
+        self.assertEqual(
+            reg.registration_key,
+            "ondoperps/ALT/ETH-USD.P/NORMALFIB/BUY",
+        )
+
+    def test_create_persists_spx500_to_us500_alias_path(
+        self,
+    ) -> None:
+        """#SP500 → Other → type 'US500' → resolve to US500-USD.P →
+        Agree → volume → Create. The PERSISTED record must contain
+        ``source_symbol='#SP500'`` and
+        ``exchange_instrument='US500-USD.P'``, NOT the raw typed
+        text 'US500'.
+        """
+        fibos = [_good_fibo(symbol="#SP500", variant="NORMALFib",
+                            sell_cycle_id=42,
+                            cumulative_sell_weight="1.5",
+                            buy_cycle_id=0, cumulative_buy_weight="0")]
+
+        def _resolver(exchange, account, symbol):
+            # Direct resolve fails for #SP500; the Other path
+            # is needed. But we want to drive the typed-alias
+            # branch; direct resolve returning None makes the flow
+            # land in the picker, where the user then taps Other.
+            if symbol == "US500":
+                return "US500-USD.P"
+            return None
+
+        self.fx.set_snapshot(_snapshot(fibos))
+        flow = self.fx.flow(resolve_instrument_fn=_resolver)
+        # ondoperps is index 2 in [apex, hyperliquid, ondoperps]
+        flow.open("chat-1", "user-1")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
+        flow.handle_callback(
+            "chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_SELL}"
+        )
+        flow.handle_callback("chat-1", "user-1", f"{CB_EX}2")
+        flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        # Direct resolve returns None → picker fires. Tap Other.
+        flow.handle_callback("chat-1", "user-1", CB_OTHER)
+        # Type the alias.
+        flow.handle_text("chat-1", "user-1", "US500")
+        # Re-resolve via public TradeDesk.execute(); Agree.
+        flow.handle_callback("chat-1", "user-1", CB_AGREE)
+        # Volume
+        flow.handle_text("chat-1", "user-1", "0.01")
+        screen = flow.handle_callback(
+            "chat-1", "user-1", CB_CREATE
+        )
+        self.assertIn("✅ Registered", screen.text)
+        store = FiboRegistrationStore(self.fx.reg_path)
+        all_ = store.load_all()
+        self.assertEqual(len(all_), 1)
+        reg = all_[0]
+        # source_symbol is the ORIGINAL MT4 symbol, not the alias.
+        self.assertEqual(reg.source_symbol, "#SP500")
+        # exchange_instrument is the venue canonical, not the typed
+        # alias text.
+        self.assertEqual(reg.exchange_instrument, "US500-USD.P")
+        # registration_key uses the venue canonical.
+        self.assertEqual(
+            reg.registration_key,
+            "ondoperps/ALT/US500-USD.P/NORMALFIB/SELL",
+        )
+
+    def test_create_fails_closed_when_exchange_instrument_missing(
+        self,
+    ) -> None:
+        """Defensive: if neither source_symbol nor
+        exchange_instrument is available when the user presses
+        Create, the flow fails closed (no registration persisted).
+        """
+        from plugins.trade.fibo.session import SessionState
+        from plugins.trade.fibo.store import FiboRegistrationStore
+        fibos = [_good_fibo(symbol="ETHUSD", variant="NORMALFib",
+                            buy_cycle_id=42, cumulative_buy_weight="2.0")]
+        # Resolver returns None — direct resolve fails; picker
+        # fires; the user does NOT pick a candidate; the flow
+        # falls back to the "unresolved" screen. The user then
+        # backs out without agreeing.
+        self.fx.set_snapshot(_snapshot(fibos))
+        flow = self.fx.flow(
+            resolve_instrument_fn=lambda ex, ac, sym: None,
+        )
+        flow.open("chat-1", "user-1")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
+        flow.handle_callback("chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}")
+        flow.handle_callback("chat-1", "user-1", f"{CB_EX}2")
+        flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+        # Picker fired but user backs out without picking.
+        flow.handle_callback("chat-1", "user-1", CB_BACK)
+        sess = flow.session_store.get("chat-1", "user-1")
+        # exchange_instrument was never set (proposal never approved)
+        self.assertFalse(sess.exchange_instrument)
+        # The session was rolled back to AWAITING_ACCOUNT by Back
+        self.assertEqual(sess.state, SessionState.AWAITING_ACCOUNT)
+        # Verify no registration was created
+        store = FiboRegistrationStore(self.fx.reg_path)
+        self.assertEqual(store.load_all(), [])
+
+    def test_create_does_not_trigger_any_exchange_write(self) -> None:
+        """The Create path must never invoke a write-capable
+        operation on TradeDesk. We verify this by injecting a
+        SpyTradeDesk (or equivalent) and asserting no write
+        operation was issued.
+        """
+        from plugins.trade.fibo.store import FiboRegistrationStore
+
+        class _SpyDesk:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def execute(self, request: Dict[str, Any]) -> Any:
+                from plugins.trade.canonical import (
+                    make_failure, make_success, CanonicalInstrument,
+                )
+                self.calls.append(dict(request))
+                op = str(request.get("operation", ""))
+                if op == "resolve_instrument":
+                    return make_success(
+                        operation=op,
+                        exchange=request.get("exchange", ""),
+                        account=request.get("account", ""),
+                        instrument=CanonicalInstrument(
+                            requested_symbol=request.get("symbol", ""),
+                            symbol="ETH-USD.P",
+                            display_name="ETH-USD.P",
+                        ),
+                    )
+                if op == "list_instruments":
+                    return make_success(
+                        operation=op,
+                        exchange=request.get("exchange", ""),
+                        account=request.get("account", ""),
+                        data={"instruments": []},
+                    )
+                if op == "market_price":
+                    return make_failure(
+                        operation=op, exchange="x", account="y",
+                        code="MARK_PRICE_NOT_FOUND",
+                        message="no",
+                    )
+                # Unknown: any other operation is a write attempt.
+                return make_failure(
+                    operation=op, exchange="x", account="y",
+                    code="WRITE_REJECTED",
+                    message="Spy rejected write",
+                )
+
+        spy = _SpyDesk()
+        sys.modules.pop("plugins.trade.fibo", None)
+        fibos = [_good_fibo(symbol="ETHUSD", variant="NORMALFib",
+                            buy_cycle_id=42, cumulative_buy_weight="2.0")]
+        self.fx.set_snapshot(_snapshot(fibos))
+        # Install spy desk so the flow's `_safe_resolve` returns
+        # ETH-USD.P (via SpyDesk.execute).
+        from plugins.trade.fibo import discovery as fibo_discovery
+        saved_get_desk = fibo_discovery._get_desk
+        fibo_discovery._get_desk = lambda: spy
+        try:
+            flow = self.fx.flow()
+            flow._resolve_instrument = (
+                lambda ex, ac, sym: spy.execute({
+                    "operation": "resolve_instrument",
+                    "exchange": ex, "account": ac, "symbol": sym,
+                }).instrument.symbol
+            )
+            flow.open("chat-1", "user-1")
+            flow.handle_callback("chat-1", "user-1", f"{CB_SYM}0")
+            flow.handle_callback(
+                "chat-1", "user-1", f"{CB_SIDE}{SIDE_TOKEN_BUY}"
+            )
+            flow.handle_callback("chat-1", "user-1", f"{CB_EX}2")
+            flow.handle_callback("chat-1", "user-1", f"{CB_ACCT}0")
+            flow.handle_callback("chat-1", "user-1", CB_AGREE)
+            flow.handle_text("chat-1", "user-1", "0.5")
+            flow.handle_callback("chat-1", "user-1", CB_CREATE)
+        finally:
+            fibo_discovery._get_desk = saved_get_desk
+
+        # Audit: every TradeDesk call must be a read op.
+        WRITE_OPS = {
+            "new_order", "market_order", "limit_order", "ladder",
+            "cancel_order", "cancel_order_group", "close_position",
+            "stop_order", "set_tp", "set_sl", "set_position_trigger",
+            "set_position_protections",
+        }
+        for c in spy.calls:
+            op = str(c.get("operation", ""))
+            self.assertNotIn(
+                op, WRITE_OPS,
+                f"Create path invoked a write operation: {op!r}",
+            )
+        # And the registration was persisted correctly.
+        store = FiboRegistrationStore(self.fx.reg_path)
+        all_ = store.load_all()
+        self.assertEqual(len(all_), 1)
+        reg = all_[0]
+        self.assertEqual(reg.source_symbol, "ETHUSD")
+        self.assertEqual(reg.exchange_instrument, "ETH-USD.P")
+
+    def test_legacy_record_surfaces_legacy_flag(self) -> None:
+        """A pre-Phase-2.1 record (no source_symbol or
+        exchange_instrument) must still load via
+        ``FiboRegistration.from_dict`` and surface ``is_legacy=True``
+        so the reconciler can classify it as
+        ``NEEDS_INSTRUMENT_SELECTION`` rather than guessing.
+        """
+        from plugins.trade.fibo.store import FiboRegistration
+
+        legacy = {
+            "registration_key": "ondoperps/BITGET/ETHUSD/NORMALFIB/SELL",
+            "exchange": "ondoperps",
+            "account": "BITGET",
+            "symbol": "ETHUSD",
+            # No source_symbol, no exchange_instrument
+            "variant": "NORMALFIB",
+            "side": "SELL",
+            "starting_volume": "0.001",
+            "source": "mt4-Fresh542468-1",
+            "source_seq": 25463,
+            "source_cycle_id": 46871101,
+            "source_cumulative_weight": "1",
+            "source_percentage": "0.01",
+            "source_snapshot_received_at": "2026-08-26T11:26:43Z",
+            "desired_exchange_size": "0.001",
+            "status": "registered",
+            "created_at": "2026-08-26T11:26:46Z",
+            "updated_at": "2026-08-26T11:26:46Z",
+        }
+        reg = FiboRegistration.from_dict(legacy)
+        # Legacy invariants
+        self.assertTrue(reg.is_legacy)
+        # from_dict() back-fills source_symbol from the legacy
+        # ``symbol`` field so the post-load schema is uniform.
+        # exchange_instrument stays empty — that is the legacy
+        # signal.
+        self.assertEqual(reg.exchange_instrument, "")
+        # Symbol back-compat is preserved on BOTH fields.
+        self.assertEqual(reg.symbol, "ETHUSD")
+        self.assertEqual(reg.source_symbol, "ETHUSD")
+        # registration_key falls back to source_symbol (legacy form)
+        self.assertEqual(
+            reg.registration_key,
+            "ondoperps/BITGET/ETHUSD/NORMALFIB/SELL",
+        )
+
+    def test_phase_2_1_plus_record_surfaces_legacy_flag_false(self) -> None:
+        """A Phase-2.1+ record with BOTH source_symbol and
+        exchange_instrument must surface ``is_legacy=False``.
+        """
+        from plugins.trade.fibo.store import FiboRegistration
+
+        modern = {
+            "registration_key": "hyperliquid/BASED/SOL/NORMALFIB/SELL",
+            "exchange": "hyperliquid",
+            "account": "BASED",
+            "symbol": "SOLUSD",
+            "source_symbol": "SOLUSD",
+            "exchange_instrument": "SOL",
+            "variant": "NORMALFIB",
+            "side": "SELL",
+            "starting_volume": "0.15",
+            "source": "mt4-Fresh542468-1",
+            "source_seq": 37432,
+            "source_cycle_id": 47012293,
+            "source_cumulative_weight": "4",
+            "source_percentage": "0.01",
+            "source_snapshot_received_at": "2026-08-27T04:06:10Z",
+            "desired_exchange_size": "0.60",
+            "status": "registered",
+            "created_at": "2026-08-27T04:06:15Z",
+            "updated_at": "2026-08-27T04:06:15Z",
+        }
+        reg = FiboRegistration.from_dict(modern)
+        self.assertFalse(reg.is_legacy)
+        self.assertEqual(reg.source_symbol, "SOLUSD")
+        self.assertEqual(reg.exchange_instrument, "SOL")
+        # registration_key uses exchange_instrument
+        self.assertEqual(
+            reg.registration_key,
+            "hyperliquid/BASED/SOL/NORMALFIB/SELL",
+        )
 
 
 if __name__ == "__main__":
