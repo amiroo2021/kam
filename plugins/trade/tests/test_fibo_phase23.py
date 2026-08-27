@@ -1126,7 +1126,20 @@ class UiPolishTests(unittest.TestCase):
         )
         for label in ("Your alias:", "Your input:", "Learned alias:"):
             self.assertNotIn(label, screen.text)
-        self.assertIn("OndoPerps:", screen.text)
+        # Phase 2.4.2: the exchange label is dynamic (no longer
+        # hard-coded to "OndoPerps:"). The generic helper derives
+        # the label from the actual selected session exchange id.
+        from plugins.trade.fibo.flow import _exchange_display_label
+        sess_exchange = sess.exchange or "ondoperps"
+        self.assertIn(
+            _exchange_display_label(sess_exchange), screen.text,
+            f"proposal screen must show the dynamic label for "
+            f"{sess_exchange!r}",
+        )
+        self.assertNotIn(
+            "OndoPerps:", screen.text,
+            "proposal screen must NOT contain the hard-coded label",
+        )
         self.assertIn("ETH-USD.P", screen.text)
 
     def test_other_path_shows_your_input(self) -> None:

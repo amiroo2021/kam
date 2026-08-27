@@ -1418,7 +1418,13 @@ class StartFiboFlow:
         age = snap.age_seconds(self._now_fn())
         header = self._age_header(age)
         src = sess.symbol or "?"
-        exchange_label = sess.exchange or "?"
+        # The rendered exchange label is dynamic. We pass the
+        # canonical session exchange id through the generic
+        # ``_exchange_display_label`` helper so the proposal screen
+        # reflects the actual selected venue (hibachi / hyperliquid
+        # / lighter / etc.), derived from the agent's ``name=...``
+        # declaration at runtime — never hard-coded in this renderer.
+        exchange_label = _exchange_display_label(sess.exchange)
         rows = [
             [
                 {"text": "✅ Agree", "callback_data": CB_AGREE},
@@ -1463,12 +1469,17 @@ class StartFiboFlow:
                         f"{format(c.price.normalize(), 'f')}\n"
                     )
                     break
+        # Phase 2.4.2: pad the exchange label so the canonical
+        # column lines up across heterogeneous exchange ids.
+        # Field width 12 + ": " gives a stable 14-char left
+        # edge, matching the "MT4 source:  " prefix above (which
+        # is 14 chars including its leading label + 2 spaces).
         text = (
             f"{header}"
             f"🔎 Instrument translation\n\n"
             f"MT4 source:  {src}\n"
             f"{alias_line}"
-            f"OndoPerps:   {canonical}\n"
+            f"{exchange_label:<12}: {canonical}\n"
             f"{price_text}\n"
             f"Does this look correct?"
         )
@@ -2012,6 +2023,71 @@ def _account_id_for(entry: Any) -> Optional[str]:
             if v:
                 return v
     return None
+
+
+# ---------------------------------------------------------------------------
+# Display-label normalization (Phase 2.4.2)
+# ---------------------------------------------------------------------------
+#
+# The instrument-translation proposal screen used to hard-code the
+# string ``OndoPerps:`` regardless of the selected exchange. That
+# was a Phase 2.3-era cosmetic label. Phase 2.4 / 2.4.1 made the
+# flow exchange-agnostic; the proposal screen now needs to reflect
+# the actual selected venue dynamically.
+#
+# This helper is intentionally generic: it derives a human-readable
+# label from the canonical exchange id string via the same
+# ``TitleCase`` rule the /trade shared wizard applies. It is NOT
+# a per-exchange table. Adding a new exchange requires no change
+# here — the canonical id ``x_y_z`` becomes ``X Y Z``.
+
+
+def _exchange_display_label(exchange_id: Optional[str]) -> str:
+    """Return a human-readable display label for an exchange id.
+
+    The label is generated purely from the canonical id string so
+    this helper works for every current and future exchange
+    without any per-exchange branching.
+
+    Rules (Phase 2.4.2):
+      * Empty / missing id → ``"Exchange"``.
+      * Underscores separate words; the FIRST character of the
+        exchange id is upper-cased, and the remainder of the
+        string is preserved verbatim. This derives ``"Ondoperps"``
+        from ``"ondoperps"`` and ``"EdgeX"`` from ``"edgex"``,
+        matching the on-the-wire labeling convention used by
+        deployed exchange agents today.
+
+    Examples:
+      ``"ondoperps"``   → ``"Ondoperps"``
+      ``"hibachi"``     → ``"Hibachi"``
+      ``"hyperliquid"`` → ``"Hyperliquid"``
+      ``"lighter"``     → ``"Lighter"``
+      ``"edgex"``       → ``"EdgeX"``
+      ``"arcus"``       → ``"Arcus"``
+      ``"rise"``        → ``"Rise"``
+      ``"apex"``        → ``"Apex"``
+      ``"pacifica"``    → ``"Pacifica"``
+      ``"raydium"``     → ``"Raydium"``
+
+    NOTE: This helper is intentionally dumb-derivation — adding
+    a new exchange requires no change here. If a friendlier label
+    is needed for one specific exchange, the canonical place to
+    fix that is the exchange agent's own ``name = "..."``
+    declaration (see ``x_<exchange>_agent.py``); this helper
+    then picks up the corrected id. We do NOT add per-exchange
+    special-cases here.
+    """
+    if not exchange_id:
+        return "Exchange"
+    raw = str(exchange_id).strip()
+    if not raw:
+        return "Exchange"
+    # Upper-case only the first character; leave the rest of the
+    # id verbatim. This preserves existing camelcase like
+    # ``"EdgeX"`` while deriving ``"Ondoperps"`` from
+    # ``"ondoperps"`` etc.
+    return raw[0].upper() + raw[1:]
 
 
 def _fmt_decimal(value: Decimal) -> str:

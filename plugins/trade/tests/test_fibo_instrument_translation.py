@@ -321,9 +321,23 @@ class ProposalScreenTests(unittest.TestCase):
     def test_proposal_shows_source_and_canonical(self) -> None:
         resolver = _FakeResolver({"ETHUSD": "ETH-USD.P"})
         flow, screen = _navigate_to_proposal(self.fx, resolver=resolver)
-        # Both labels present (spec §2.A).
+        # Both labels present (spec §2.A). The exchange label is
+        # derived dynamically from the selected session's
+        # ``name=...`` (Phase 2.4.2); the test below asserts the
+        # actual rendered label matches the agent's declaration.
         self.assertIn("MT4 source:", screen.text)
-        self.assertIn("OndoPerps:", screen.text)  # may be other exchange name
+        from plugins.trade.fibo.flow import _exchange_display_label
+        sess = flow.session_store.get(
+            *flow.session_store_key_for_test,
+        ) if False else None
+        # The proposal screen below belongs to the apex session
+        # (per _navigate_to_proposal's default test setUp). The
+        # exchange label displayed must match the generic helper
+        # output for the apex exchange id, never an old hard-coded
+        # OndoPerps label.
+        expected_label = _exchange_display_label("apex")
+        self.assertIn(f"{expected_label}", screen.text)
+        self.assertNotIn("OndoPerps:", screen.text)
         # Buttons present and in the right slots.
         flat = [
             b for row in screen.buttons for b in row

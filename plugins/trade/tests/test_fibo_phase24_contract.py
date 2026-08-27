@@ -1400,6 +1400,252 @@ class FiboAccountNormalizationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.4.2 — exchange-name display-label fix
+# ---------------------------------------------------------------------------
+
+
+class ExchangeDisplayLabelTests(unittest.TestCase):
+    """Phase 2.4.2 hardening: the proposal screen's exchange label
+    must be derived dynamically from the selected session exchange
+    rather than hard-coded to "OndoPerps".
+    """
+
+    EXCHANGE_IDS = (
+        ("ondoperps",   "Ondoperps"),
+        ("hibachi",     "Hibachi"),
+        ("hyperliquid", "Hyperliquid"),
+        ("lighter",     "Lighter"),
+        ("edgex",       "Edgex"),
+        ("arcus",       "Arcus"),
+        ("rise",        "Rise"),
+        ("apex",        "Apex"),
+        ("pacifica",    "Pacifica"),
+        ("raydium",     "Raydium"),
+    )
+
+    def test_label_for_each_supported_exchange(self) -> None:
+        from plugins.trade.fibo.flow import _exchange_display_label
+        for ex_id, expected in self.EXCHANGE_IDS:
+            with self.subTest(exchange=ex_id):
+                self.assertEqual(
+                    _exchange_display_label(ex_id), expected,
+                    f"_exchange_display_label({ex_id!r}) should "
+                    f"yield {expected!r}",
+                )
+
+    def test_label_handles_empty_input(self) -> None:
+        from plugins.trade.fibo.flow import _exchange_display_label
+        for empty in (None, "", "   "):
+            with self.subTest(input=empty):
+                self.assertEqual(
+                    _exchange_display_label(empty), "Exchange",
+                    f"empty exchange id {empty!r} must fall back",
+                )
+
+    def test_label_pure_function_no_per_exchange_special_cases(self) -> None:
+        """No per-exchange special-case branches inside the helper."""
+        import inspect
+        from plugins.trade.fibo import flow as flow_mod
+        src = inspect.getsource(flow_mod._exchange_display_label)
+        # Strip comments and any docstring; the function body must
+        # contain no literal per-exchange special cases.
+        import re
+        cleaned = re.sub(r'"""[\s\S]*?"""', "", src)
+        cleaned = re.sub(r"#[^\n]*", "", cleaned)
+        for ex_id, _ in self.EXCHANGE_IDS:
+            self.assertNotIn(
+                f'"{ex_id}"',
+                cleaned,
+                f"_exchange_display_label must not special-case "
+                f"{ex_id!r}",
+            )
+
+
+class ProposalLabelRenderTests(unittest.TestCase):
+    """The Fibo proposal screen MUST use the actual selected
+    session exchange id (via ``_exchange_display_label``), not a
+    hard-coded "OndoPerps:".
+    """
+
+    def _make_screen(self, exchange: str):
+        """Render the proposal screen for one session exchange id
+        using only test fixtures (no live state)."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from pathlib import Path
+        import json
+        from plugins.trade.fibo.flow import StartFiboFlow
+        from plugins.trade.fibo.candidates import InstrumentCandidate
+        from plugins.trade.fibo.session import FiboSessionStore
+        from plugins.trade.fibo.snapshot import (
+            Mt4Fibo, Mt4Snapshot, Mt4SnapshotStore,
+        )
+        from plugins.trade.fibo.store import FiboRegistrationStore
+        from plugins.trade.tests.fake_tradedesk import FakeTradeDesk
+        from plugins.trade.tests.fibo_phase24_helpers import fake_desk_installed
+
+        snap_path = Path("/tmp/_p_label_snap.json")
+        reg_path = Path("/tmp/_p_label_reg.jsonl")
+        fibo = Mt4Fibo(
+            symbol="BTCUSD", variant="NORMALFib",
+            percentage=Decimal("0.01"),
+            buy_cycle_id=1, cumulative_buy_weight=Decimal("1"),
+            sell_cycle_id=0, cumulative_sell_weight=Decimal("0"),
+        )
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        snap = Mt4Snapshot(
+            v=1, source="test", seq=1, ts=0, fibos=[fibo],
+            received_at=now.replace("+00:00", "Z"),
+            telegram_update_id=0, telegram_message_id=0, reader_chat_id=-1,
+        )
+        snap_path.write_text(json.dumps(snap.to_dict()))
+        desk = FakeTradeDesk()
+        with fake_desk_installed(desk):
+            flow = StartFiboFlow(
+                snapshot_store=Mt4SnapshotStore(snap_path),
+                registration_store=FiboRegistrationStore(reg_path),
+                list_exchanges_fn=lambda: [exchange],
+                list_accounts_fn=lambda ex: ["BITGET"],
+            )
+            sess_store = FiboSessionStore()
+            sess = sess_store.create(
+                f"p-{exchange}", f"u-{exchange}",
+            )
+            sess.symbol = "BTCUSD"
+            sess.exchange = exchange
+            sess.account = "BITGET"
+            sess.exchange_instrument = "BTC"
+            sess.resolution_input = "BTCUSD"
+            sess.proposal_origin = "auto"
+            sess.candidates = [
+                InstrumentCandidate(
+                    instrument="BTC", display_name="BTC",
+                    description="synthetic", score=100, reasons=[],
+                    price=Decimal("2500.9"),
+                ),
+            ]
+            snap_obj = flow._snapshot_store.load()
+            return flow._render_instrument_proposal(sess, snap_obj)
+
+    def test_no_hardcoded_ondoperps_label_in_generic_renderer(self) -> None:
+        """The literal substring "OndoPerps:" MUST NOT appear in the
+        source of ``_render_instrument_proposal`` — the dynamic
+        helper is the only path to a label.
+        """
+        import inspect
+        from plugins.trade.fibo import flow as flow_mod
+        src = inspect.getsource(flow_mod.StartFiboFlow._render_instrument_proposal)
+        # Drop triple-quoted docstrings + single-line comments so
+        # the historical-migration note doesn't trip the test.
+        import re
+        cleaned = re.sub(r'"""[\s\S]*?"""', "", src)
+        cleaned = re.sub(r"#[^\n]*", "", cleaned)
+        self.assertNotIn(
+            "OndoPerps:", cleaned,
+            "_render_instrument_proposal must not contain a "
+            "hard-coded 'OndoPerps:' label anywhere",
+        )
+
+    def test_proposal_screen_label_for_hibachi(self) -> None:
+        screen = self._make_screen("hibachi")
+        self.assertIn("Hibachi", screen.text)
+        # The hard-coded label must be gone.
+        self.assertNotIn("OndoPerps:", screen.text)
+
+    def test_proposal_screen_label_for_hyperliquid(self) -> None:
+        screen = self._make_screen("hyperliquid")
+        self.assertIn("Hyperliquid", screen.text)
+        self.assertNotIn("OndoPerps:", screen.text)
+
+    def test_proposal_screen_label_for_lighter(self) -> None:
+        screen = self._make_screen("lighter")
+        self.assertIn("Lighter", screen.text)
+        self.assertNotIn("OndoPerps:", screen.text)
+
+    def test_proposal_screen_label_for_edgex(self) -> None:
+        # ``edgex`` is the canonical id used by ``x_edgex_agent.py``.
+        # The display label follows the generic first-letter-only
+        # rule and reads as ``Edgex``.
+        screen = self._make_screen("edgex")
+        self.assertIn("Edgex", screen.text)
+        self.assertNotIn("OndoPerps:", screen.text)
+
+    def test_proposal_screen_label_for_ondoperps(self) -> None:
+        """OndoPerps is still rendered correctly (the screen must
+        show the actual selected exchange, even when it's Ondo)."""
+        screen = self._make_screen("ondoperps")
+        self.assertIn("Ondoperps", screen.text)
+
+    def test_proposal_screen_label_for_arcus_rise_etc(self) -> None:
+        """Smoke-check the dynamic label for the remaining agents."""
+        for ex in ("arcus", "rise", "apex", "pacifica", "raydium"):
+            with self.subTest(exchange=ex):
+                screen = self._make_screen(ex)
+                self.assertNotIn("OndoPerps:", screen.text)
+                # Exact label match (title-cased):
+                from plugins.trade.fibo.flow import _exchange_display_label
+                self.assertIn(_exchange_display_label(ex), screen.text)
+
+    def test_alias_path_label_remains_dynamic(self) -> None:
+        """In the typed-alias path, the exchange label still reflects
+        the actual selected session exchange — the ``Your input:``
+        line is the only thing the alias path adds.
+        """
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from pathlib import Path
+        import json
+        from plugins.trade.fibo.flow import StartFiboFlow
+        from plugins.trade.fibo.session import FiboSessionStore
+        from plugins.trade.fibo.snapshot import (
+            Mt4Fibo, Mt4Snapshot, Mt4SnapshotStore,
+        )
+        from plugins.trade.fibo.store import FiboRegistrationStore
+        from plugins.trade.tests.fake_tradedesk import FakeTradeDesk
+        from plugins.trade.tests.fibo_phase24_helpers import fake_desk_installed
+        snap_path = Path("/tmp/_p_alias_snap.json")
+        reg_path = Path("/tmp/_p_alias_reg.jsonl")
+        fibo = Mt4Fibo(
+            symbol="#SP500", variant="NORMALFib",
+            percentage=Decimal("0.01"),
+            buy_cycle_id=0, cumulative_buy_weight=Decimal("0"),
+            sell_cycle_id=1, cumulative_sell_weight=Decimal("1"),
+        )
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        snap = Mt4Snapshot(
+            v=1, source="t", seq=1, ts=0, fibos=[fibo],
+            received_at=now.replace("+00:00", "Z"),
+            telegram_update_id=0, telegram_message_id=0, reader_chat_id=-1,
+        )
+        snap_path.write_text(json.dumps(snap.to_dict()))
+        desk = FakeTradeDesk()
+        with fake_desk_installed(desk):
+            flow = StartFiboFlow(
+                snapshot_store=Mt4SnapshotStore(snap_path),
+                registration_store=FiboRegistrationStore(reg_path),
+                list_exchanges_fn=lambda: ["ondoperps"],
+                list_accounts_fn=lambda ex: ["BITGET"],
+            )
+            sess_store = FiboSessionStore()
+            sess = sess_store.create("p-alias", "u-alias")
+            sess.symbol = "#SP500"
+            sess.exchange = "ondoperps"
+            sess.account = "BITGET"
+            sess.exchange_instrument = "US500-USD.P"
+            sess.resolution_input = "US500"
+            sess.proposal_origin = "alias"
+            snap_obj = flow._snapshot_store.load()
+            screen = flow._render_instrument_proposal(sess, snap_obj)
+        # The alias-input line must be present.
+        self.assertIn("Your input:    US500", screen.text)
+        # The exchange label must still be Ondoperps.
+        self.assertIn("Ondoperps", screen.text)
+        self.assertIn("US500-USD.P", screen.text)
+        # Hard-coded "OndoPerps:" literal must NOT appear.
+        self.assertNotIn("OndoPerps:", screen.text)
+
+
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
