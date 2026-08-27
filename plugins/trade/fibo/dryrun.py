@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 def _compact_block(r: ReconciliationResult) -> str:
     # Phase 2.1: show source vs exchange distinctly. For legacy
     # records (exchange_instrument empty), we flag it.
-    venue_token = r.exchange_instrument or "� not selected"
+    venue_token = r.exchange_instrument or ": not selected"
     sym_variant = (
         f"{r.source_symbol} {r.variant} {r.side}"
     )

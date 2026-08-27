@@ -1114,5 +1114,201 @@ class FiboSendPathRegressionTests(unittest.TestCase):
             self.assertNotIn(forbidden, src, f"fibo_wizard source contains {forbidden!r}")
 
 
+# ---------------------------------------------------------------------------
+# /fibo top-level button callback regression (BUGFIX 2026-08-27)
+# ---------------------------------------------------------------------------
+#
+# Phase 2.4 rewrote ``plugins.trade.fibo.discovery`` to expose
+# ``list_market_catalog`` instead of ``list_instruments``. That
+# rename was correctly threaded through the live wizard code in
+# most places — except for the lazy-import block inside
+# ``_get_flow()``. Until those two lines were fixed, clicking
+# ``Start Fibo`` (and ``Stop Fibo``, which routes through the
+# same singleton) raised an ``ImportError`` and the user saw
+# "no response at all".
+#
+# These tests drive the deployed callback routing the same way
+# Telegram would, asserting each top-level button returns a
+# non-empty response — not just "didn't crash" or "didn't call
+# .execute()". The previous tests were passing the silent-drop
+# bug because they only asserted the absence of side effects.
+class FiboTopLevelButtonRegressionTests(unittest.TestCase):
+    """Drive every top-level menu button via the SAME callback
+    routing that Telegram uses (``handle_fibo_callback``) and
+    assert each one returns a usable, non-empty screen.
+
+    The tests do NOT press Agree / Create / any flow-internal
+    button. They are read-only at the wizard shim boundary.
+    """
+
+    def _make_query(self):
+        from unittest.mock import MagicMock
+        adapter = MagicMock()
+        adapter.name = "RegressionAdapter"
+        query = MagicMock()
+        query.message = MagicMock()
+        query.message.chat_id = 64620303
+        query.message.chat.id = 64620303
+        query.from_user = MagicMock()
+        query.from_user.id = 64620303
+        query.edited_text = None
+        query.edited_markup = None
+
+        async def _edit(text="", reply_markup=None):
+            query.edited_text = text
+            query.edited_markup = reply_markup
+        query.edit_message_text = _edit
+        query.answered = False
+        query.answer = lambda: setattr(query, "answered", True) or None
+        query.deleted = False
+        async def _delete():
+            query.deleted = True
+        query.delete_message = _delete
+        return adapter, query
+
+    def test_start_fibo_returns_start_screen(self) -> None:
+        """Clicking ``fibo:start`` MUST render the first Start
+        Fibo screen — not a silent ImportError."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+        adapter, query = self._make_query()
+        asyncio.run(
+            fibo_wizard.handle_fibo_callback(adapter, query, "fibo:start")
+        )
+        # Telegram's loading spinner must always be cleared.
+        self.assertTrue(query.answered, "callback answer() never called")
+        # The Start Fibo screen must be edited into the chat.
+        self.assertIsNotNone(
+            query.edited_text,
+            "Start Fibo button produced no edit_message_text call",
+        )
+        self.assertTrue(query.edited_text.strip())
+        # First Start screen header is "Pick a symbol + variant".
+        self.assertIn("Pick a symbol", query.edited_text)
+        # The keyboard must be rebuilt with the symbol/variant
+        # pick callbacks — not the placeholder four-entry menu.
+        markup = query.edited_markup
+        self.assertIsNotNone(
+            markup,
+            "Start Fibo button produced no reply_markup",
+        )
+        # Every button must carry a fibo:s:* sub-flow callback.
+        flat_buttons = []
+        for row in markup.inline_keyboard:
+            for b in row:
+                flat_buttons.append((b.text, b.callback_data))
+        for _, cb in flat_buttons:
+            self.assertTrue(
+                cb.startswith("fibo:s:"),
+                f"Start Fibo produced a non-subflow callback: "
+                f"{cb!r}",
+            )
+
+    def test_running_fibo_returns_running_screen(self) -> None:
+        """Clicking ``fibo:running`` MUST return a non-empty
+        dry-run screen (control test — this is the previously
+        WORKING button)."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+        adapter, query = self._make_query()
+        asyncio.run(
+            fibo_wizard.handle_fibo_callback(adapter, query, "fibo:running")
+        )
+        self.assertTrue(query.answered)
+        self.assertIsNotNone(query.edited_text)
+        self.assertTrue(query.edited_text.strip())
+        self.assertIn("Running Fibo", query.edited_text)
+
+    def test_stop_fibo_returns_screen(self) -> None:
+        """Clicking ``fibo:stop`` MUST return a non-empty screen.
+        Pre-bugfix: this was the placeholder branch (which is
+        also non-empty today), but the regression we are guarding
+        against is the silent ImportError cascade from
+        ``_get_flow()`` if it ever resurfaces."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+        adapter, query = self._make_query()
+        # Avoid actually calling the real Stop handler — the
+        # placeholder path runs the same dispatch as the broken
+        # path did. We just want to prove the dispatcher does
+        # not silently no-op.
+        asyncio.run(
+            fibo_wizard.handle_fibo_callback(adapter, query, "fibo:stop")
+        )
+        self.assertTrue(query.answered)
+        self.assertIsNotNone(query.edited_text)
+        self.assertTrue(query.edited_text.strip())
+
+    def test_exit_returns_with_no_message_left(self) -> None:
+        """Clicking ``fibo:exit`` MUST close the wizard (delete
+        the message)."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+        adapter, query = self._make_query()
+        asyncio.run(
+            fibo_wizard.handle_fibo_callback(adapter, query, "fibo:exit")
+        )
+        self.assertTrue(query.answered)
+        # Either delete_message or edit-strip-keyboard happens;
+        # both are acceptable per the wizard contract.
+        if not query.deleted:
+            self.assertIsNotNone(
+                query.edited_text,
+                "Exit did not delete or edit; UI may not "
+                "have closed.",
+            )
+
+    def test_top_level_callbacks_all_route(self) -> None:
+        """Every top-level menu callback_data MUST reach a
+        handler that returns a non-empty screen — never a
+        silent no-op."""
+        import asyncio
+        from plugins.trade import fibo_wizard
+        for cb in ("fibo:start", "fibo:running", "fibo:stop"):
+            adapter, query = self._make_query()
+            asyncio.run(
+                fibo_wizard.handle_fibo_callback(adapter, query, cb)
+            )
+            self.assertTrue(
+                query.answered,
+                f"{cb}: callback answer() was never called",
+            )
+            self.assertIsNotNone(
+                query.edited_text,
+                f"{cb}: callback did not render any screen",
+            )
+            self.assertTrue(
+                query.edited_text.strip(),
+                f"{cb}: callback rendered an empty screen",
+            )
+
+    def test_dryrun_falls_back_marker_is_pure_ascii(self) -> None:
+        """The dryrun render's 'venue ... not selected' fallback
+        must NOT contain a U+FFFD replacement character or any
+        UTF-8-invalid literal."""
+        import inspect
+        from plugins.trade.fibo import dryrun
+        # Locate the literal in source.
+        src = inspect.getsource(dryrun)
+        # Find any double-quoted string containing "not selected".
+        m = []
+        import re
+        for match in re.finditer(r'"([^"]*not[^"]*selected[^"]*)"', src):
+            literal = match.group(1)
+            # The literal must be pure-ASCII and the colon must
+            # precede "not selected" (Phase 2 spec).
+            self.assertTrue(
+                all(ord(c) < 128 for c in literal),
+                f"dryrun fallback contains non-ASCII bytes: "
+                f"{literal!r}",
+            )
+            self.assertIn(": not selected", literal)
+            m.append(literal)
+        self.assertTrue(
+            m,
+            "dryrun.py must contain at least one " "not selected" " fallback",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

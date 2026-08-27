@@ -441,7 +441,7 @@ def _get_flow() -> "Any":
         from .fibo.flow import StartFiboFlow
         from .fibo.snapshot import Mt4SnapshotStore
         from .fibo.store import FiboRegistrationStore
-        from .fibo.discovery import list_instruments
+        from .fibo.discovery import list_market_catalog
         from .fibo.alias_memory import AliasMemory
         from .tradedesk import get_tradedesk
 
@@ -501,7 +501,7 @@ def _get_flow() -> "Any":
             registration_store=registration_store,
             list_exchanges_fn=desk.list_exchanges,
             list_accounts_fn=desk.list_accounts,
-            list_instruments_fn=list_instruments,
+            list_instruments_fn=list_market_catalog,
             resolve_instrument_fn=resolve_instrument_fn,
             alias_memory=alias_memory,
         )
