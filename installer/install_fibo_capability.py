@@ -67,6 +67,9 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "shadow.py",
     # Phase 2.10 — controlled live target convergence (allowlist-gated).
     Path("plugins") / "trade" / "fibo" / "live.py",
+    # Phase 2.11 — autonomous convergence script (invoked by the
+    # gateway's cron ticker, NOT by the Telegram wizard).
+    Path("plugins") / "trade" / "fibo" / "converge_once.py",
     # Phase 2.3 agent-side regression tests live under
     # plugins/trade/agents/tests. They are pure unit tests and are
     # copied alongside the agent so the verifier can import them

@@ -81,7 +81,13 @@ def is_allowlisted(reg: FiboRegistration) -> bool:
     """Return True iff ``reg`` matches the Phase 2.10 allowlist
     EXACTLY on every identity field. Phase 2.10 is a single-
     registration live path; any other registration remains in
-    shadow mode."""
+    shadow mode.
+
+    Note: this is a strict IDENTITY check. Phase 2.11 also
+    requires the registration to be ``is_active`` (not stopped)
+    before live_converge runs. Use ``is_live_eligible`` for the
+    combined check.
+    """
     return (
         str(reg.exchange or "").strip().lower()
         == ALLOWED_EXCHANGE.lower()
@@ -93,6 +99,23 @@ def is_allowlisted(reg: FiboRegistration) -> bool:
         == ALLOWED_VARIANT.upper()
         and str(reg.side or "").strip().upper() == ALLOWED_SIDE_BUY
     )
+
+
+def is_live_eligible(reg: FiboRegistration) -> bool:
+    """Phase 2.11 — combined gate for the live path.
+
+    A registration is live-eligible iff it matches the allowlist
+    AND is currently active (not stopped). Stopped registrations
+    are excluded from the live path even if their identity fields
+    match the controlled registration.
+    """
+    if not is_allowlisted(reg):
+        return False
+    try:
+        is_active = bool(getattr(reg, "is_active", False))
+    except Exception:  # noqa: BLE001
+        return False
+    return is_active
 
 
 # Operations the executor is allowed to invoke. Any other
@@ -157,7 +180,7 @@ def live_converge(
     target_symbol = str(reg.exchange_instrument or "").strip().upper()
 
     # ------------------------------------------------------------------
-    # Allowlist gate.
+    # Allowlist + active gate (Phase 2.11).
     # ------------------------------------------------------------------
     if not is_allowlisted(reg):
         return LiveConvergeResult(
@@ -174,6 +197,20 @@ def live_converge(
                 f"variant={ALLOWED_VARIANT!r}, side={ALLOWED_SIDE_BUY!r})"
             ),
             reason="not on allowlist — shadow only",
+        )
+    if not bool(getattr(reg, "is_active", False)):
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            blocked_reason=(
+                f"registration identity matches the allowlist but "
+                f"status={reg.status!r} (not active); excluded from "
+                f"the live path"
+            ),
+            reason="registration not active — shadow only",
         )
 
     # ------------------------------------------------------------------

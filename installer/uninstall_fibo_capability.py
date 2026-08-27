@@ -53,6 +53,8 @@ FIBO_REL_PATHS = [
     Path("plugins") / "trade" / "fibo" / "shadow.py",
     # Phase 2.10 — controlled live target convergence (allowlist-gated).
     Path("plugins") / "trade" / "fibo" / "live.py",
+    # Phase 2.11 — autonomous convergence script.
+    Path("plugins") / "trade" / "fibo" / "converge_once.py",
     Path("plugins") / "trade" / "agents" / "tests" / "__init__.py",
     Path("plugins") / "trade" / "agents" / "tests"
     / "test_x_ondoperps_market_price.py",
