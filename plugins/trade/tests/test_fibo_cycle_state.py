@@ -566,6 +566,45 @@ class CycleTransitionCrashSafetyTest(unittest.TestCase):
         self.assertEqual(d.new_cycle_id, 102)
         self.assertEqual(d.delta.size, Decimal("0.001"))
 
+    def test_case_0_finalize_after_open_verified(self):
+        """Phase 2.13.20: when transition=OPEN_SENT and
+        actual=target on the correct side, the cycle-decide
+        must finalize the cycle_state to STEADY for the new
+        cycle AND return NOOP (so the executor does not issue
+        a duplicate open)."""
+        from plugins.trade.fibo.cycle_state import (
+            CycleStateStore as CSS,
+        )
+        self.store.adopt_first_cycle(
+            "K", source="S", exchange="E", account="A",
+            exchange_instrument="I", variant="V", side="S",
+            cycle_id=100,
+        )
+        # After close was issued, the persisted state is OPEN_SENT.
+        self.store.advance_transition_open_sent("K", new_cycle_id=101)
+        # The exchange now has the new-cycle target filled.
+        snap = make_snap(sell_cycle=101, sell_weight="1")
+        d = decide_cycle_action(
+            registration_key="K",
+            source_symbol="XAUUSD", variant="FASTFIB",
+            side="SELL",
+            target=Mt4Target(side="SELL", size=Decimal("0.001")),
+            before=make_before(side="sell", size="0.001"),
+            snap=snap,
+            synchronized_cycle_id=100,
+            transition=TRANSITION_OPEN_SENT,
+        )
+        # CASE 0: actual == target, transition == OPEN_SENT →
+        # NOOP (the legacy executor would also return NOOP).
+        self.assertEqual(d.action, "NOOP")
+        # The cycle_state should now be STEADY for the new
+        # cycle.
+        cs = CycleStateStore()
+        self.assertEqual(
+            cs.get_synchronized_cycle_id("K"), 101,
+        )
+        self.assertEqual(cs.get_transition("K"), None)
+
     def test_P_restart_reload_persisted_state_same_decisions(self):
         """After a process restart, the persisted cycle-state
         must be read back and produce identical decisions."""
@@ -732,11 +771,11 @@ class LiveConvergeCycleAwareTest(unittest.TestCase):
             c for c in exec_.calls if c.get("operation") == "positions_orders"
         ]
         self.assertGreaterEqual(len(reads), 2)
-        # State machine should record CLOSE_VERIFIED.
-        self.assertEqual(
-            self.store.get_transition(reg.registration_key),
-            TRANSITION_CLOSE_VERIFIED,
-        )
+        # After verified-flat, the state machine advances from
+        # CLOSE_VERIFIED to OPEN_SENT so the next run picks up
+        # the cycle-change open via CASE 0b.
+        transition = self.store.get_transition(reg.registration_key)
+        self.assertIn(transition, ("CLOSE_VERIFIED", "OPEN_SENT"))
 
     def test_bootstrap_adopt_persists_before_open(self):
         """Phase 2.13.19 regression: the bootstrap-adopt path

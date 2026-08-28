@@ -103,6 +103,24 @@ def decide_cycle_action(
         and before.side.lower() == venue_side_for_compare
         and before.size == target.size
     ):
+        # The new-cycle open has filled and the exchange
+        # matches the target. The legacy executor's NOOP
+        # path will return "already at target". We must
+        # advance the persisted cycle_state to STEADY for
+        # the new cycle BEFORE returning, so the next run
+        # doesn't re-classify this as a cycle-change and
+        # re-issue the close.
+        try:
+            from plugins.trade.fibo.cycle_state import CycleStateStore
+            CycleStateStore().finalize_transition(
+                registration_key,
+                new_cycle_id=int(cycle_id),
+            )
+        except OSError:
+            # Persist failure is non-fatal for this NOOP
+            # decision. The next run will retry the finalize
+            # via this same code path.
+            pass
         return CycleDecision(
             action="NOOP",
             reason=(
@@ -110,6 +128,32 @@ def decide_cycle_action(
                 "finalize STEADY without duplicate order"
             ),
             block=False,
+        )
+
+    # CASE 0b: OPEN_SENT + actual=flat → resume the new-cycle
+    # open after a restart. We previously closed the old-cycle
+    # position and the executor persisted OPEN_SENT but did
+    # not get to issue the open (e.g. crash, or this is the
+    # first run after the close). Re-issue the open for the
+    # current cycle.
+    if (
+        transition == "OPEN_SENT"
+        and cycle_id > 0
+        and synchronized_cycle_id is not None
+        and synchronized_cycle_id != cycle_id
+        and before.is_flat
+    ):
+        return CycleDecision(
+            action="OPEN_REQUIRED",
+            reason=(
+                f"OPEN_SENT + actual flat for new cycle={cycle_id}; "
+                "resume new-cycle open after restart"
+            ),
+            block=False,
+            delta=_Delta(
+                action="OPEN", side=side, size=target.size,
+            ),
+            new_cycle_id=cycle_id,
         )
 
     # CASE A: current MT4 side is INACTIVE (target == 0).

@@ -873,25 +873,20 @@ def _execute_close_transition(
             reason="close did not flatten",
         )
 
-    # Persist verified-flat and mark inactive (synchronized=0)
-    # since the new cycle may not have a target yet. If the
-    # current cycle_id is non-zero, the next convergence run
-    # will trigger OPEN_REQUIRED through the legacy flow.
+    # Persist verified-flat and mark that the new-cycle open
+    # is now required. We transition from CLOSE_VERIFIED to
+    # OPEN_SENT so the next natural run can resume via the
+    # cycle-decide's CASE 0b (OPEN_SENT + actual flat → open).
     try:
         if new_cycle_id == 0:
             store.finalize_inactive(reg.registration_key)
         else:
-            # Leave synchronized at the old cycle_id so the
-            # next run recognizes the cycle-change and triggers
-            # the legacy executor's same-cycle delta logic on
-            # the now-flat position.
-            store.advance_transition_close_verified(
+            # Advance transition state from CLOSE_VERIFIED to
+            # OPEN_SENT (do NOT yet update synchronized_cycle_id;
+            # that happens only when the new-cycle open verifies).
+            store.advance_transition_open_sent(
                 reg.registration_key,
-                old_cycle_id=(
-                    store.get_synchronized_cycle_id(
-                        reg.registration_key,
-                    ) or 0
-                ),
+                new_cycle_id=new_cycle_id,
             )
     except OSError as exc:
         return LiveConvergeResult(
@@ -931,3 +926,50 @@ def _execute_close_transition(
             f"run for new-cycle OPEN"
         ),
     )
+
+
+def _is_cycle_change_open_state(
+    registration_key: str,
+    snap,
+    target,
+) -> bool:
+    """True iff the persisted cycle-state has an in-progress
+    transition (CLOSE_VERIFIED or OPEN_SENT) AND the current
+    MT4 cycle differs from the persisted synchronized_cycle.
+    This indicates we are mid-cycle-change and a successful
+    legacy open should be advanced to STEADY for the new cycle.
+    """
+    try:
+        from plugins.trade.fibo.cycle_state import CycleStateStore
+        store_obj = CycleStateStore()
+    except OSError:
+        return False
+    synced = store_obj.get_synchronized_cycle_id(registration_key)
+    transition = store_obj.get_transition(registration_key)
+    if synced is None or synced == 0:
+        return False
+    if transition not in ("CLOSE_VERIFIED", "OPEN_SENT"):
+        return False
+    fibo = snap.find_fibo(target.symbol_for_lookup, target.variant_for_lookup)
+    side_upper = str(target.side).upper()
+    if fibo is None:
+        return False
+    current_cycle_id = int(fibo.side_cycle_id(side_upper) or 0)
+    return current_cycle_id > 0 and current_cycle_id != int(synced)
+
+
+def _current_mt4_cycle_id(reg, snap, target) -> int:
+    """Look up the current MT4 cycle_id for this registration's
+    side. Returns 0 if no fibo is found or cycle is inactive.
+    """
+    from plugins.trade.fibo.snapshot import Mt4Snapshot
+    # We don't need to look up by reg.source_symbol / reg.variant
+    # — target already encodes the side, and the cycle-decide
+    # uses these. The caller has the snapshot, so we re-derive.
+    fibo = snap.find_fibo(reg.source_symbol, reg.variant)
+    if fibo is None:
+        return 0
+    side_upper = str(reg.side).upper()
+    if not fibo.is_side_active(side_upper):
+        return 0
+    return int(fibo.side_cycle_id(side_upper) or 0)
