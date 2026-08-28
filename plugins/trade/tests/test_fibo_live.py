@@ -33,6 +33,14 @@ from __future__ import annotations
 
 import re
 import unittest
+
+# Phase 2.13.18: redirect the cycle-state file to a per-process
+# temp dir so the tests do not pollute the live HERMES_HOME. The
+# CycleStateStore reads HERMES_HOME lazily at instantiation time.
+import os
+import tempfile as _tempfile_for_state
+_TEST_HERMES_HOME = _tempfile_for_state.mkdtemp(prefix="fibo_test_state_")
+os.environ["HERMES_HOME"] = _TEST_HERMES_HOME
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -171,6 +179,43 @@ _TEST_SUPPORTED_EXCHANGES = frozenset({
 TEST_PERMISSIVE_VALIDATE_ACCOUNTS = lambda exchange: [
     "BITGET", "BASED", "PHANTOM", "FIBO", "FLEX", "METAMASK", "amiroo"
 ]
+
+
+def _clear_cycle_state() -> None:
+    """Phase 2.13.18: clear the cycle-state file for a clean
+    per-test isolation. Removes any pre-existing file from
+    the current HERMES_HOME first."""
+    import os, pathlib
+    from plugins.trade.fibo.cycle_state import (
+        CycleStateStore, _default_path,
+    )
+    p = _default_path()
+    if p.exists():
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    store = CycleStateStore()
+    store._atomic_write({"version": 1, "registrations": {}})
+
+
+def _seed_cycle_state(reg, cycle_id: int) -> None:
+    """Phase 2.13.18: pre-populate the cycle-state file so the
+    live executor recognizes the test registration as having
+    an existing cycle. The state file is in the per-test
+    HERMES_HOME set at module-import time."""
+    from plugins.trade.fibo.cycle_state import CycleStateStore
+    store = CycleStateStore()
+    store.adopt_first_cycle(
+        reg.registration_key,
+        source=reg.source,
+        exchange=reg.exchange,
+        account=reg.account,
+        exchange_instrument=reg.exchange_instrument,
+        variant=reg.variant,
+        side=str(reg.side).upper(),
+        cycle_id=int(cycle_id),
+    )
 
 
 def _allowlisted_reg() -> FiboRegistration:
@@ -371,6 +416,8 @@ class LiveConvergeLongBelowTargetTests(unittest.TestCase):
                 [],
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.0015")
@@ -407,6 +454,8 @@ class LiveConvergeLongAboveTargetTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.003"}, []
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
@@ -426,18 +475,32 @@ class LiveConvergeShortActualTests(unittest.TestCase):
                 [],
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
-        self.assertIn("opposite", result.blocked_reason)
+        # Phase 2.13.18: same-cycle opposite-side is
+        # BLOCKED_OPPOSITE_POSITION (no auto-flip).
+        self.assertIn("BLOCKED_OPPOSITE_POSITION", result.blocked_reason)
 
 
 class LiveConvergeTargetZeroTests(unittest.TestCase):
     """target zero -> no order, no close."""
 
+    def setUp(self):
+        """Phase 2.13.18: clear cycle-state for test isolation."""
+        _clear_cycle_state()
+
     def test_target_zero_no_flatten(self):
+        # Phase 2.13.18: with cycle-awareness, an active
+        # registration with non-zero exchange exposure and no
+        # synchronized_cycle_id is treated as
+        # BLOCKED_CYCLE_OWNERSHIP_UNKNOWN. The legacy
+        # "no auto-flatten" message is replaced with the more
+        # specific cycle-ownership block reason.
         reg = _allowlisted_reg()
         snap = _snap(buy_cycle=0, buy_weight="0")  # cycle inactive
         execute, log = _stub_executor(
@@ -450,6 +513,10 @@ class LiveConvergeTargetZeroTests(unittest.TestCase):
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
+        # Phase 2.13.18: now BLOCKED_CYCLE_OWNERSHIP_UNKNOWN.
+        self.assertIn("BLOCKED_CYCLE_OWNERSHIP_UNKNOWN", result.blocked_reason)
+        # And the legacy "target zero" message is still in the
+        # blocked_reason for backward-compatibility wording.
         self.assertIn("target zero", result.blocked_reason.lower())
         cancels = [c for c in log.calls
                    if c["operation"] == "cancel_order_group"]
@@ -529,6 +596,8 @@ class LiveConvergeCancelFailureTests(unittest.TestCase):
                 error={"code": "UNKNOWN", "message": "noop"},
             ),
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.cancel_failed)
         self.assertFalse(result.placed_live_order)
@@ -557,6 +626,8 @@ class LiveConvergeTargetAchievedTests(unittest.TestCase):
                  []),
             ],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
@@ -575,6 +646,8 @@ class LiveConvergeAtMostOneOrderTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0"}, []
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, snap.buy_cycle_id if hasattr(snap, 'buy_cycle_id') else 42)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
@@ -606,11 +679,15 @@ class LiveStaticGuardTests(unittest.TestCase):
 
     def test_no_close_position_token(self):
         """Static guard: ``live.py`` must NOT contain tokens for
-        close_position, set_tp/sl, set_position_protections, ladder,
+        set_tp/sl, set_position_protections, ladder,
         stop_order, or single cancel_order (cancel_order_group is
         allowed). The docstring may LEGITIMATELY mention these
         tokens as part of the Deliberately NOT implemented list.
-        The guard scans only module-level executable code."""
+        The guard scans only module-level executable code.
+
+        Phase 2.13.18: ``close_position`` is now an ALLOWED
+        operation, used for cycle transitions, so it is
+        removed from the disallowed-token list."""
         import inspect
         import re
         from plugins.trade import fibo
@@ -626,7 +703,6 @@ class LiveStaticGuardTests(unittest.TestCase):
             full = f.read()
         text_no_doc = re.sub(r'^""".*?"""', "", full, count=1, flags=re.DOTALL)
         for forbidden in (
-            "close_position",
             "set_tp",
             "set_sl",
             "set_position_trigger",
@@ -643,13 +719,18 @@ class LiveStaticGuardTests(unittest.TestCase):
             )
 
     def test_allowed_operations_set_is_exact(self):
-        # The static guard MUST be exactly the three allowed ops.
+        # The static guard MUST include the four allowed ops.
         # If a future refactor adds an op to this set, the test
         # below forces the developer to acknowledge it explicitly.
         self.assertEqual(
             ALLOWED_OPERATIONS,
             frozenset(
-                {"positions_orders", "cancel_order_group", "new_order"}
+                {
+                    "positions_orders",
+                    "cancel_order_group",
+                    "new_order",
+                    "close_position",  # Phase 2.13.18 cycle-transition
+                }
             ),
         )
 

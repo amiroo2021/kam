@@ -23,6 +23,11 @@ import os
 import sys
 import tempfile
 import unittest
+
+# Phase 2.13.18: redirect HERMES_HOME to a temp dir BEFORE any
+# Fibo imports so the cycle-state file is per-test-run.
+_TEST_HERMES_HOME = tempfile.mkdtemp(prefix="fibo_elig_test_")
+os.environ["HERMES_HOME"] = _TEST_HERMES_HOME
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -873,6 +878,7 @@ class TestWriteSurfaceRestriction(unittest.TestCase):
                 "positions_orders",
                 "cancel_order_group",
                 "new_order",
+                "close_position",  # Phase 2.13.18 cycle-transition
             }),
         )
 
@@ -1262,6 +1268,11 @@ class TestTargetZeroDiagnostic(unittest.TestCase):
     ownership ledger). But the diagnostic message must be
     distinct so the operator can see what is happening."""
 
+    def setUp(self):
+        """Phase 2.13.18: clear cycle-state for test isolation."""
+        from plugins.trade.fibo.cycle_state import CycleStateStore
+        CycleStateStore()._atomic_write({"version": 1, "registrations": {}})
+
     def _make_reg_for_diagnostic(self):
         # ETH BUY ETH-USD.P (the legacy allowlisted reg).
         from plugins.trade.fibo.store import FiboRegistration
@@ -1325,8 +1336,26 @@ class TestTargetZeroDiagnostic(unittest.TestCase):
             validate_accounts_fn=_mock_validate_accounts,
         )
         self.assertFalse(result.placed_live_order)
-        self.assertIn("non-zero exchange exposure", result.blocked_reason.lower())
-        self.assertIn("ownership not proven", result.reason.lower())
+        # Phase 2.13.18: with cycle-awareness, the failure path
+        # is the more specific BLOCKED_CYCLE_OWNERSHIP_UNKNOWN
+        # because no synchronized_cycle_id exists for the reg.
+        self.assertIn("BLOCKED_CYCLE_OWNERSHIP_UNKNOWN", result.blocked_reason)
+        # The original semantics ("non-zero exchange exposure" +
+        # "ownership not proven") must still be present in the
+        # reason text for operator clarity.
+        self.assertTrue(
+            "non-zero exchange exposure" in result.blocked_reason.lower()
+            or "exchange non-flat" in result.blocked_reason.lower(),
+            f"expected 'non-zero exchange exposure' or 'exchange "
+            f"non-flat' in: {result.blocked_reason!r}",
+        )
+        self.assertTrue(
+            "ownership not proven" in result.reason.lower()
+            or "refusing to auto-flatten" in result.reason.lower()
+            or "unowned exposure" in result.reason.lower(),
+            f"expected 'ownership not proven' or 'unowned exposure' "
+            f"in: {result.reason!r}",
+        )
         # No new_order placed.
         self.assertEqual(fake.new_order_calls(), [])
         # No cancel_order_group placed.

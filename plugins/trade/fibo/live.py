@@ -85,6 +85,7 @@ ALLOWED_OPERATIONS = frozenset(
         "positions_orders",  # read (BEFORE + AFTER)
         "cancel_order_group",  # cancel matching Fibo pending groups
         "new_order",  # place exactly ONE market adjustment
+        "close_position",  # close an entire instrument position (cycle transition)
     }
 )
 
@@ -278,6 +279,46 @@ def live_converge(
             blocked_reason="positions_orders BEFORE exception",
             reason="read exception — no writes",
         )
+
+    # ------------------------------------------------------------------
+    # Step 1.5 — Phase 2.13.18 cycle-aware decision.
+    #
+    # Inspect the persisted cycle-state and decide whether the
+    # existing exchange position belongs to the same MT4 cycle
+    # the current snapshot reports, or to a previous cycle. If
+    # different, the executor must close the old-cycle position
+    # before opening the new-cycle target.
+    # ------------------------------------------------------------------
+    cycle_decision = _evaluate_cycle_decision(
+        reg=reg,
+        target=target,
+        before=before,
+        snap=snap,
+    )
+    if cycle_decision is not None:
+        if cycle_decision["action"] == "FAIL_CLOSED":
+            return LiveConvergeResult(
+                registration_key=reg.registration_key,
+                allowlisted=True,
+                placed_live_order=False,
+                placed_request=None,
+                cancelled_groups=(),
+                read_failed=False,
+                blocked_reason=cycle_decision["reason"],
+                reason=cycle_decision["reason"],
+            )
+        if cycle_decision["action"] == "CLOSE_REQUIRED":
+            # Execute the close. Use the canonical close_position
+            # operation exposed by the exchange agent. After the
+            # close, we must verify the instrument is flat before
+            # opening the new cycle's target.
+            return _execute_close_transition(
+                reg=reg,
+                target=target,
+                before=before,
+                execute_fn=execute_fn,
+                cycle_decision=cycle_decision,
+            )
 
     # ------------------------------------------------------------------
     # Step 4-6 — Inspect only the resolved exchange_instrument.
@@ -534,5 +575,324 @@ def live_converge(
         reason=(
             f"placed OPEN {SIDE_BUY} {_format_decimal(remaining)} "
             f"for {reg.registration_key}"
+        ),
+    )
+
+
+
+
+# -------------------------------------------------------------------
+# Phase 2.13.18 cycle-aware helpers
+# -------------------------------------------------------------------
+
+
+def _evaluate_cycle_decision(
+    *,
+    reg,
+    target,
+    before,
+    snap,
+):
+    """Run the cycle-decision module against the persisted state.
+
+    Returns:
+        None — the same-cycle path is not interesting for the
+        caller; the legacy executor logic still applies.
+        A dict describing the action to take:
+            {"action": "FAIL_CLOSED", "reason": ...}
+            {"action": "CLOSE_REQUIRED", "reason": ...,
+             "close_size": <Decimal>, "new_cycle_id": <int>}
+
+    Same-cycle returns None so the existing executor
+    flow (NOOP / delta-open / same-side reduction) is
+    preserved.
+    """
+    # Import lazily to avoid import cycles.
+    from plugins.trade.fibo.cycle_decide import (
+        decide_cycle_action,
+    )
+    from plugins.trade.fibo.cycle_state import (
+        CycleStateStore,
+    )
+
+    try:
+        store = CycleStateStore()
+    except OSError as exc:
+        return {
+            "action": "FAIL_CLOSED",
+            "reason": (
+                f"BLOCKED_CYCLE_STATE_UNREADABLE: cannot access "
+                f"cycle state: {exc}"
+            ),
+        }
+
+    synchronized = store.get_synchronized_cycle_id(
+        reg.registration_key,
+    )
+
+    # Determine the side the registration is targeting. The
+    # registration's side is canonical.
+    side = str(reg.side or "").upper()
+    if side not in ("BUY", "SELL"):
+        return {
+            "action": "FAIL_CLOSED",
+            "reason": (
+                f"BLOCKED_INVALID_SIDE: registration side "
+                f"{reg.side!r} is not BUY/SELL"
+            ),
+        }
+
+    decision = decide_cycle_action(
+        registration_key=reg.registration_key,
+        source_symbol=reg.source_symbol,
+        variant=reg.variant,
+        side=side,
+        target=target,
+        before=before,
+        snap=snap,
+        synchronized_cycle_id=synchronized,
+        transition=store.get_transition(reg.registration_key),
+    )
+
+    if decision.action == "NOOP":
+        # Same-cycle case: legacy executor logic handles it.
+        # Do not interfere.
+        return None
+    if decision.action == "OPEN_REQUIRED":
+        # Same-cycle delta-open: legacy executor logic still
+        # handles it via the existing target->remaining flow.
+        # We do not pass the delta through here; the legacy
+        # path computes remaining = target - actual.
+        return None
+    # FAIL_CLOSED or CLOSE_REQUIRED
+    if decision.action == "CLOSE_REQUIRED":
+        return {
+            "action": "CLOSE_REQUIRED",
+            "reason": decision.reason,
+            "close_size": decision.close_size,
+            "new_cycle_id": decision.new_cycle_id,
+        }
+    # FAIL_CLOSED
+    return {
+        "action": "FAIL_CLOSED",
+        "reason": decision.reason,
+    }
+
+
+def _execute_close_transition(
+    *,
+    reg,
+    target,
+    before,
+    execute_fn,
+    cycle_decision,
+):
+    """Execute the close for a cycle transition.
+
+    Phase 2.13.18: this is a CRASH-SAFE two-step. The close
+    is sent, then a positions_orders read verifies the
+    instrument is flat. If the verification fails, the
+    executor returns FAIL_CLOSED rather than blindly opening
+    a new position.
+
+    Persisted cycle state machine updates:
+      begin_transition_close_sent
+      advance_transition_close_verified (only after verified flat)
+
+    The current call returns a result that the caller (the
+    convergence loop) will see. The new-cycle OPEN is NOT
+    issued in this call — convergence runs every minute and
+    the next natural fire will see the now-flat position and
+    trigger the OPEN_REQUIRED path (or, if the close itself
+    is mid-flight, the recovery logic will pick up the
+    transition state).
+    """
+    from plugins.trade.fibo.cycle_state import (
+        CycleStateStore,
+    )
+
+    close_size = cycle_decision["close_size"]
+    new_cycle_id = cycle_decision["new_cycle_id"]
+
+    # Persist: a close is about to be sent.
+    try:
+        store = CycleStateStore()
+        store.begin_transition_close_sent(
+            reg.registration_key,
+            old_cycle_id=(
+                store.get_synchronized_cycle_id(
+                    reg.registration_key
+                )
+                or 0
+            ),
+        )
+    except OSError as exc:
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"BLOCKED_CYCLE_STATE_UNWRITEABLE: cannot "
+                f"persist close transition: {exc}"
+            ),
+            reason="cycle transition aborted",
+        )
+
+    # Issue the close.
+    close_request = {
+        "operation": "close_position",
+        "exchange": reg.exchange,
+        "account": reg.account,
+        "symbol": reg.exchange_instrument,
+    }
+    try:
+        close_response = execute_fn(close_request)
+    except Exception as exc:
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"close_position raised: {exc}"
+            ),
+            reason="close exception",
+        )
+
+    if not getattr(close_response, "success", False):
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"close_position returned failure: "
+                f"{getattr(getattr(close_response, 'error', None), 'message', '<no error>')}"
+            ),
+            reason="close failed",
+        )
+
+    # Re-read positions to verify flat.
+    verify_request = {
+        "operation": "positions_orders",
+        "exchange": reg.exchange,
+        "account": reg.account,
+    }
+    try:
+        verify_response = execute_fn(verify_request)
+    except Exception as exc:
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"positions_orders verify raised: {exc}"
+            ),
+            reason="verify exception — close completed but unverified",
+        )
+    if not getattr(verify_response, "success", False):
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"verify positions_orders returned failure: "
+                f"{getattr(getattr(verify_response, 'error', None), 'message', '<no error>')}"
+            ),
+            reason="verify failed",
+        )
+
+    # Parse the verify response to check if instrument is flat.
+    from plugins.trade.fibo.executor import (
+        _read_actual_position_from_response,
+    )
+    after_close = _read_actual_position_from_response(reg, verify_response)
+    if not after_close.is_flat:
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"CLOSE_NOT_FLAT: after close_position the "
+                f"instrument still shows "
+                f"{_format_decimal(after_close.size)} "
+                f"{after_close.side.upper()} — refusing to open "
+                f"new-cycle target"
+            ),
+            reason="close did not flatten",
+        )
+
+    # Persist verified-flat and mark inactive (synchronized=0)
+    # since the new cycle may not have a target yet. If the
+    # current cycle_id is non-zero, the next convergence run
+    # will trigger OPEN_REQUIRED through the legacy flow.
+    try:
+        if new_cycle_id == 0:
+            store.finalize_inactive(reg.registration_key)
+        else:
+            # Leave synchronized at the old cycle_id so the
+            # next run recognizes the cycle-change and triggers
+            # the legacy executor's same-cycle delta logic on
+            # the now-flat position.
+            store.advance_transition_close_verified(
+                reg.registration_key,
+                old_cycle_id=(
+                    store.get_synchronized_cycle_id(
+                        reg.registration_key,
+                    ) or 0
+                ),
+            )
+    except OSError as exc:
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=True,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"BLOCKED_CYCLE_STATE_UNWRITEABLE: cannot "
+                f"persist close verification: {exc}"
+            ),
+            reason="close verified but unwriteable",
+        )
+
+    # Success. Close completed and verified flat. The next
+    # natural convergence run will:
+    #   - if new_cycle_id is non-zero, see that the cycle
+    #     changed AND exchange is flat, and the legacy
+    #     executor will open the new-cycle target via the
+    #     normal Step 8 flow.
+    #   - if new_cycle_id == 0, see target=0 + actual flat,
+    #     and the legacy target=0/flat branch returns NOOP.
+    return LiveConvergeResult(
+        registration_key=reg.registration_key,
+        allowlisted=True,
+        placed_live_order=False,
+        placed_request=None,
+        cancelled_groups=(),
+        read_failed=False,
+        blocked_reason=None,
+        reason=(
+            f"cycle transition close complete: synchronized "
+            f"old cycle was {cycle_decision['new_cycle_id']}; "
+            f"instrument is now flat; awaiting next convergence "
+            f"run for new-cycle OPEN"
         ),
     )

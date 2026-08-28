@@ -13,6 +13,9 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
+import tempfile as _tempfile_for_state
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -63,6 +66,43 @@ class FakeCanonicalResponse:
             "order": self.order,
             "error": self.error,
         }
+
+
+def _clear_cycle_state() -> None:
+    """Phase 2.13.18: clear the cycle-state file for a clean
+    per-test isolation. Removes any pre-existing file from
+    the current HERMES_HOME first."""
+    import os, pathlib
+    from plugins.trade.fibo.cycle_state import (
+        CycleStateStore, _default_path,
+    )
+    p = _default_path()
+    if p.exists():
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    store = CycleStateStore()
+    store._atomic_write({"version": 1, "registrations": {}})
+
+
+def _seed_cycle_state(reg, cycle_id: int) -> None:
+    """Phase 2.13.18: pre-populate the cycle-state file."""
+    import os
+    import tempfile
+    os.environ.setdefault(
+        "HERMES_HOME",
+        tempfile.mkdtemp(prefix="fibo_phase2102_test_"),
+    )
+    from plugins.trade.fibo.cycle_state import CycleStateStore
+    store = CycleStateStore()
+    store.adopt_first_cycle(
+        reg.registration_key,
+        source=reg.source, exchange=reg.exchange,
+        account=reg.account, exchange_instrument=reg.exchange_instrument,
+        variant=reg.variant, side=str(reg.side).upper(),
+        cycle_id=int(cycle_id),
+    )
 
 
 def _make_reg(
@@ -417,6 +457,8 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
+        _clear_cycle_state()
+        _seed_cycle_state(reg, 47022998)
         result = live_converge(
             reg, snap, execute_fn=_fn,
             supported_exchanges=frozenset({"ondoperps"}),

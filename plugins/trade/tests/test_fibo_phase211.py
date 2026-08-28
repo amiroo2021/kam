@@ -25,6 +25,7 @@ import io
 import json
 import os
 import sys
+import tempfile as _tempfile_for_state
 import unittest
 from contextlib import redirect_stdout
 from decimal import Decimal
@@ -122,6 +123,42 @@ def _non_allowlisted_reg() -> FiboRegistration:
         desired_exchange_size=Decimal("1.20"),
         source_symbol="SOLUSD",
         exchange_instrument="SOL",
+    )
+
+
+def _clear_cycle_state() -> None:
+    """Phase 2.13.18: clear the cycle-state file for a clean
+    per-test isolation. Removes any pre-existing file from
+    the current HERMES_HOME first."""
+    import os, pathlib
+    from plugins.trade.fibo.cycle_state import (
+        CycleStateStore, _default_path,
+    )
+    p = _default_path()
+    if p.exists():
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    store = CycleStateStore()
+    store._atomic_write({"version": 1, "registrations": {}})
+
+
+def _seed_cycle_state(reg, cycle_id: int) -> None:
+    """Phase 2.13.18: pre-populate the cycle-state file so the
+    live executor recognizes the test registration as having
+    an existing cycle."""
+    import os
+    import tempfile
+    os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp(prefix="fibo_test_"))
+    from plugins.trade.fibo.cycle_state import CycleStateStore
+    store = CycleStateStore()
+    store.adopt_first_cycle(
+        reg.registration_key,
+        source=reg.source, exchange=reg.exchange,
+        account=reg.account, exchange_instrument=reg.exchange_instrument,
+        variant=reg.variant, side=str(reg.side).upper(),
+        cycle_id=int(cycle_id),
     )
 
 
@@ -228,6 +265,8 @@ class AutonomyPathIncreaseTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, 47022998)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.002")
@@ -295,6 +334,8 @@ class AutonomyPathPartialTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.003"}, []
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, 47022998)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.001")
@@ -415,9 +456,19 @@ class AutonomyPathTargetDecreaseTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
+        _clear_cycle_state()
+        _seed_cycle_state(reg, 47022998)
         result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
-        self.assertIn("no reduction", result.blocked_reason.lower())
+        # Phase 2.13.18: same-cycle actual > target is
+        # BLOCKED_ACTUAL_EXCEEDS_TARGET (no auto-reduction).
+        self.assertTrue(
+            "no reduction" in result.blocked_reason.lower()
+            or "BLOCKED_ACTUAL_EXCEEDS_TARGET" in result.blocked_reason
+            or "refusing to silently reduce" in result.blocked_reason.lower(),
+            f"expected 'no reduction' or BLOCKED_ACTUAL_EXCEEDS_TARGET "
+            f"in: {result.blocked_reason!r}",
+        )
 
 
 class AutonomyPathWrongSideTests(unittest.TestCase):
