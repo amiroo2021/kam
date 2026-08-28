@@ -275,5 +275,136 @@ class ConvergenceSafetyTest(unittest.TestCase):
         self.assertEqual(summary.get("results", []), [])
 
 
+class AccountValidatorWiringTest(unittest.TestCase):
+    """Phase 2.13.15 — regression test for the
+    BLOCKED_INVALID_ACCOUNT: validate_accounts_fn was not
+    provided bug.
+
+    The bug: ``converge_once._iter_once()`` passed
+    ``validate_accounts_fn=_validate_accounts`` to the
+    preliminary ``_evaluate_eligibility(...)`` call but FORGOT
+    to forward the SAME validator into the subsequent
+    ``live_converge(...)`` call. The result: even when the
+    configured account is valid, the executor's re-run of the
+    gate (with ``validate_accounts_fn=None``) fails closed.
+
+    These tests prove:
+      1. The fixed source file forwards the validator.
+      2. Calling live_converge() directly with NO validator
+         still fails closed (existing behavior preserved).
+    """
+
+    SOURCE_PATH = "/root/kam/plugins/trade/fibo/converge_once.py"
+
+    def _read_source(self):
+        with open(self.SOURCE_PATH) as f:
+            return f.read()
+
+    def test_converge_once_passes_validate_accounts_fn_to_live_converge(self):
+        """Static guard: the live_converge(...) call inside
+        converge_once._iter_once() MUST forward
+        ``validate_accounts_fn=_validate_accounts``.
+
+        This test catches the regression: if someone deletes that
+        kwarg from the live_converge call, this test fails.
+        """
+        src = self._read_source()
+        # Locate the live_converge call site inside _iter_once.
+        # We look for the function definition first to scope
+        # our search.
+        idx_iter = src.find("def _iter_once(")
+        self.assertNotEqual(idx_iter, -1,
+                             "_iter_once not found in converge_once.py")
+        # Find the next live_converge call after _iter_once.
+        idx_lc = src.find("lc = live_converge(", idx_iter)
+        self.assertNotEqual(idx_lc, -1,
+                             "live_converge call not found in _iter_once")
+        # Find the end of that call (matching close paren).
+        end = src.find(")", idx_lc)
+        snippet = src[idx_lc:end + 1]
+        # The snippet MUST include validate_accounts_fn=_validate_accounts.
+        self.assertIn(
+            "validate_accounts_fn=_validate_accounts",
+            snippet,
+            f"live_converge call in converge_once._iter_once() must "
+            f"forward validate_accounts_fn=_validate_accounts; got:\n"
+            f"{snippet}",
+        )
+
+    def test_live_converge_direct_call_fails_closed_when_validator_missing(self):
+        """Direct live_converge() call with NO validator must
+        fail closed with BLOCKED_INVALID_ACCOUNT: validate_accounts_fn
+        was not provided. This preserves the fail-closed contract.
+        """
+        from decimal import Decimal
+        from datetime import datetime, timezone
+        from plugins.trade.fibo.store import FiboRegistration
+        from plugins.trade.fibo.snapshot import Mt4Snapshot, Mt4Fibo
+        from plugins.trade.fibo.live import live_converge
+        from plugins.trade.fibo.live_eligibility import evaluate
+
+        reg = FiboRegistration.build(
+            exchange="ondoperps", account="BITGET",
+            symbol="XAUUSD", variant="FASTFIB", side="SELL",
+            starting_volume="0.001",
+            source="mt4-Fresh-1", source_seq=1,
+            source_cycle_id=47000001,
+            source_cumulative_weight="1", source_percentage="0.001",
+            source_snapshot_received_at="2026-08-27T00:00:00Z",
+            desired_exchange_size=Decimal("0.001"),
+            exchange_instrument="XAU-USD.P",
+        )
+        fibo = Mt4Fibo(
+            symbol="XAUUSD", variant="FASTFIB",
+            percentage=Decimal("0.001"),
+            buy_cycle_id=1, cumulative_buy_weight=Decimal("1"),
+            sell_cycle_id=47000001, cumulative_sell_weight=Decimal("1"),
+        )
+        snap = Mt4Snapshot(
+            v=1, source="mt4-Fresh-1", seq=1, ts=1, fibos=[fibo],
+            received_at=datetime.now(timezone.utc).isoformat(),
+            telegram_update_id=1, telegram_message_id=1, reader_chat_id=1,
+        )
+
+        # 1) Direct call WITHOUT validator must fail closed.
+        calls = []
+        def _noop_executor(req):
+            calls.append(req)
+            class _R:
+                success = True
+                error = None
+                positions = []
+                order_groups = []
+                open_order_count = 0
+                def to_dict(self):
+                    return {
+                        "success": True, "positions": [],
+                        "order_groups": [], "open_order_count": 0,
+                    }
+            return _R()
+        result = live_converge(
+            reg, snap, execute_fn=_noop_executor,
+            supported_exchanges=frozenset({"ondoperps"}),
+            # NO validate_accounts_fn — this is the bug scenario.
+        )
+        self.assertFalse(result.placed_live_order)
+        self.assertIn("validate_accounts_fn was not provided", result.blocked_reason)
+        # No exchange write attempted.
+        write_ops = [c for c in calls if c.get("operation") == "new_order"]
+        self.assertEqual(write_ops, [])
+
+        # 2) Direct call WITH validator must pass the account gate.
+        # Use a local permissive validator.
+        result_ok = live_converge(
+            reg, snap, execute_fn=_noop_executor,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["BITGET"],
+        )
+        # The account gate passed; we are now at the executor
+        # algorithm layer. The result will depend on positions
+        # data — but the BLOCKED_INVALID_ACCOUNT must NOT appear.
+        self.assertNotIn("BLOCKED_INVALID_ACCOUNT", result_ok.blocked_reason or "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

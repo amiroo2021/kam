@@ -230,6 +230,7 @@ def _iter_once() -> Dict[str, Any]:
                 reg, snap,
                 execute_fn=desk.execute,
                 supported_exchanges=supported_exchanges,
+                validate_accounts_fn=_validate_accounts,
             )
         except Exception as exc:  # noqa: BLE001
             # live_converge is designed to never raise (every failure
