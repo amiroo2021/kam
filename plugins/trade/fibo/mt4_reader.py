@@ -44,6 +44,7 @@ from __future__ import annotations
 import datetime as _dt
 import errno
 import fcntl
+import http.client
 import json
 import logging
 import os
@@ -450,6 +451,13 @@ def _http_get_json(
     Raises ``TelegramApiError`` for HTTP non-2xx so callers can log
     WITHOUT leaking the bot token (we never put the token in the
     exception message; the URL has the token but we redact below).
+
+    Phase 2.13.20 hardening: explicitly catch ``urllib.error.URLError``
+    AND ``http.client.RemoteDisconnected`` AND bare ``OSError`` so that
+    transient connection-reset / broken-pipe / DNS failures do NOT
+    escape this function. They are translated into ``OSError`` so
+    callers can recognize them as transient transport failures and
+    back off / reconnect.
     """
     req = urllib.request.Request(url, method="GET")
     try:
@@ -468,6 +476,31 @@ def _http_get_json(
             {},
             raw,
         )
+    except urllib.error.URLError as exc:
+        # Transport-level failure: DNS, connect refused, connection
+        # reset by peer, broken pipe, TLS handshake, etc. The underlying
+        # reason may be ``OSError`` (errno 104 ECONNRESET, 110 ETIMEDOUT,
+        # -2 ENOENT, ...) or ``ssl.SSLError`` or ``http.client.*``.
+        # Re-raise as a plain ``OSError`` so callers can recognize the
+        # transient failure uniformly and back off.
+        reason = exc.reason
+        try:
+            raise OSError(
+                getattr(reason, "errno", None),
+                f"URLError: {reason!r}",
+            ) from exc
+        except OSError as exc2:
+            raise exc2
+    except ConnectionResetError as exc:
+        # ECONNRESET — caught explicitly because some stdlib paths
+        # surface it directly rather than wrapping it in URLError.
+        raise OSError(getattr(exc, "errno", 104), str(exc)) from exc
+    except ConnectionAbortedError as exc:
+        raise OSError(getattr(exc, "errno", 110), str(exc)) from exc
+    except BrokenPipeError as exc:
+        raise OSError(getattr(exc, "errno", 32), str(exc)) from exc
+    except TimeoutError as exc:
+        raise OSError(getattr(exc, "errno", 110), str(exc)) from exc
     try:
         data = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
@@ -640,6 +673,7 @@ class Mt4ReaderProcess:
         snapshot_path: Path,
         reader_state_path: Path,
         reader_lock_path: Path,
+        health_path: Optional[Path] = None,
         api: Optional[TelegramLongPoll] = None,
         state: Optional[ReaderState] = None,
         lock: Optional[ReaderLock] = None,
@@ -653,11 +687,51 @@ class Mt4ReaderProcess:
         self._snapshot_path = Path(snapshot_path)
         self._reader_state_path = Path(reader_state_path)
         self._reader_lock_path = Path(reader_lock_path)
+        # Health observability: write a JSON file at
+        # ``~/.hermes/fibo/mt4_reader_health.json`` so the wizard
+        # and operators can detect "process alive but no progress"
+        # without scraping the log.
+        self._health_path = (
+            Path(health_path) if health_path is not None else
+            Path(str(reader_state_path).replace(
+                "mt4_reader_state.json", "mt4_reader_health.json",
+            ))
+        )
         self._api = api or TelegramLongPoll(bot_token)
         self._state = state or ReaderState.load(self._reader_state_path)
         self._lock = lock or ReaderLock(self._reader_lock_path)
         self._sleep = sleep_fn
         self._stop_requested = False
+        # Health observability: write a JSON file at
+        # ``~/.hermes/fibo/mt4_reader_health.json`` so the wizard
+        # and operators can detect "process alive but no progress"
+        # without scraping the log.
+        self._health_path = Path(
+            str(reader_state_path).replace(
+                "mt4_reader_state.json", "mt4_reader_health.json",
+            ),
+        )
+        # Watchdog thresholds. If the reader fails to receive an
+        # accepted Observer message for longer than this, it
+        # forces a reconnect cycle. We pick a conservative value
+        # because the normal cadence is ~5s and Telegram long
+        # polls block for up to 25s, so 5 minutes is well past
+        # any healthy long-poll.
+        self._stale_threshold_seconds = 300.0
+        # Backoff parameters for the persistent retry loop.
+        self._backoff_seconds = 0.0
+        self._backoff_initial = 1.0
+        self._backoff_ceiling = 30.0
+        # Last-success timestamps / counters — updated on every
+        # accepted message and every successful getUpdates call.
+        self._last_poll_attempt_at = _utc_iso_now()
+        self._last_accepted_message_at: Optional[str] = None
+        self._last_seq_accepted: Optional[int] = None
+        self._accepted_message_count = 0
+        self._transport_failure_count = 0
+        self._consecutive_empty_polls = 0
+        self._next_poll_offset: Optional[int] = self._state.last_update_id + 1 \
+            if self._state.last_update_id else None
 
     # -- properties ---------------------------------------------------
 
@@ -667,6 +741,71 @@ class Mt4ReaderProcess:
 
     # -- one cycle ---------------------------------------------------
 
+    def _write_health(self) -> None:
+        """Persist a JSON health snapshot so operators can detect
+        "process alive but no progress". Atomic via temp+rename.
+
+        The file is best-effort: a failed write must not break the
+        reader's main loop.
+        """
+        try:
+            payload = {
+                "v": 1,
+                "pid": os.getpid(),
+                "last_poll_attempt_at": self._last_poll_attempt_at,
+                "last_accepted_message_at": self._last_accepted_message_at,
+                "last_seq_accepted": self._last_seq_accepted,
+                "accepted_message_count": self._accepted_message_count,
+                "transport_failure_count": self._transport_failure_count,
+                "consecutive_empty_polls": self._consecutive_empty_polls,
+                "current_offset": self._next_poll_offset,
+                "state_source": self._state.current_source or None,
+                "state_last_seq": self._state.last_seq or None,
+                "state_last_update_id": self._state.last_update_id or None,
+                "stop_requested": bool(self._stop_requested),
+                "written_at": _utc_iso_now(),
+            }
+            # Atomic write via temp + rename.
+            tmp = str(self._health_path.with_suffix(".json.tmp"))
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self._health_path)
+            try:
+                os.chmod(self._health_path, 0o600)
+            except OSError:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            # Best-effort: do not let a health-file failure crash the
+            # reader loop.
+            logger.debug(
+                "mt4_reader: health write failed: %s", exc,
+            )
+
+    def _is_stale(self) -> bool:
+        """True iff the reader has not accepted a message for longer
+        than ``_stale_threshold_seconds``. The long-poll itself can
+        block for up to 25 seconds per cycle, so the threshold must
+        be much larger than that."""
+        if self._last_accepted_message_at is None:
+            # Never accepted a message yet. In normal operation this
+            # branch is only hit by a freshly-started reader; we
+            # return ``False`` (not stale) because the long-poll has
+            # been issued and we have just started accepting. A
+            # genuine stall would manifest as no ``_last_poll_attempt_at``
+            # updates, which the caller also tracks.
+            return False
+        last = _dt.datetime.fromisoformat(
+            self._last_accepted_message_at.replace("Z", "+00:00"),
+        )
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=_dt.timezone.utc)
+        age = (_dt.datetime.now(_dt.timezone.utc) - last).total_seconds()
+        return age > self._stale_threshold_seconds
+
     def run_once(self, *, long_poll_seconds: int = 1) -> List[UpdateOutcome]:
         """One getUpdates cycle.
 
@@ -674,7 +813,9 @@ class Mt4ReaderProcess:
         state is persisted to ``mt4_reader_state.json`` at the end
         of the cycle (after every update is processed).
         """
+        self._last_poll_attempt_at = _utc_iso_now()
         offset = self._state.last_update_id + 1 if self._state.last_update_id else None
+        self._next_poll_offset = offset
         try:
             updates = self._api.get_updates(
                 offset=offset, timeout_seconds=long_poll_seconds
@@ -685,25 +826,35 @@ class Mt4ReaderProcess:
             # transport failure (the server may have actually delivered
             # updates that we never saw). Just log and return; the
             # next cycle will ask for the same offset.
+            self._transport_failure_count += 1
             logger.warning("mt4_reader: getUpdates API error: %s", exc)
+            self._write_health()
             return []
         except OSError as exc:
             # DNS / connect / timeout / socket errors. Same invariant:
             # never advance the cursor. The next cycle retries the
             # same offset.
+            self._transport_failure_count += 1
+            self._consecutive_empty_polls += 1
             logger.warning(
                 "mt4_reader: getUpdates transport failure: %s", exc
             )
+            self._write_health()
             return []
         except Exception as exc:  # noqa: BLE001
             # Defensive: any unexpected error from the transport layer
             # must not advance the cursor. The Reader logs and skips
             # this cycle.
+            self._transport_failure_count += 1
             logger.error(
                 "mt4_reader: unexpected getUpdates error: %s",
                 exc, exc_info=True,
             )
+            self._write_health()
             return []
+        # Successful getUpdates HTTP round-trip (regardless of
+        # whether updates were returned).
+        self._last_poll_attempt_at = _utc_iso_now()
         outcomes: List[UpdateOutcome] = []
         for update in updates:
             try:
@@ -721,6 +872,24 @@ class Mt4ReaderProcess:
                 )
                 break
             outcomes.append(outcome)
+        # Update health snapshot for any accepted outcomes.
+        for outcome in outcomes:
+            if str(outcome).startswith("ACCEPTED"):
+                self._last_accepted_message_at = _utc_iso_now()
+                self._accepted_message_count += 1
+                try:
+                    seq = int(getattr(outcome, "seq", 0) or 0)
+                except (TypeError, ValueError):
+                    seq = 0
+                if seq > 0:
+                    self._last_seq_accepted = seq
+                break
+        if outcomes:
+            self._consecutive_empty_polls = 0
+            self._backoff_seconds = 0.0
+        else:
+            self._consecutive_empty_polls += 1
+        self._write_health()
         # Persist state once per cycle. State has either not advanced
         # (publish failure) or has every accepted update's cursor /
         # source / seq set. A failure here is logged but the loop
@@ -895,36 +1064,91 @@ class Mt4ReaderProcess:
             signal.signal(signal.SIGINT, _sigterm)
         except (ValueError, OSError):
             pass
+
+        # Persist initial health so a freshly-started reader shows up.
+        self._write_health()
+
         # Bounded backoff for transient transport failures: when a
         # cycle returns immediately (no updates fetched, transport
         # error), we sleep before the next attempt. The sleep grows
         # up to a ceiling, then resets after a successful cycle that
         # actually returned updates.
+        #
+        # Phase 2.13.20 hardening: also detect "process alive but
+        # no Observer message accepted for an abnormal period" and
+        # force a reconnect cycle by aborting any in-flight long-poll
+        # (the urllib socket closes naturally when the next HTTP
+        # round-trip is initiated). In practice this just forces the
+        # backoff loop to wake up early and try again.
         backoff_seconds = 0.0
-        backoff_ceiling = 30.0
-        backoff_initial = 1.0
+        backoff_ceiling = self._backoff_ceiling
+        backoff_initial = self._backoff_initial
+        consecutive_failures = 0
         while not self._stop_requested:
             outcomes = self.run_once(long_poll_seconds=25)
             if self._stop_requested:
                 break
+
             if outcomes:
                 # Successful cycle with at least one update; reset.
                 backoff_seconds = 0.0
+                consecutive_failures = 0
+                # Update health on every successful cycle.
+                self._write_health()
                 continue
-            # No outcomes this cycle (transport failure or empty
-            # batch). Sleep with bounded exponential backoff so we
-            # never busy-loop on a flaky network.
+
+            # No outcomes this cycle: either transport failure (the
+            # run_once path already wrote health) or an empty batch
+            # from Telegram (no new updates). Either way, we sleep
+            # before the next attempt with bounded exponential
+            # backoff so we never busy-loop on a flaky network.
+            consecutive_failures += 1
             if backoff_seconds == 0.0:
                 backoff_seconds = backoff_initial
             else:
-                backoff_seconds = min(backoff_seconds * 2, backoff_ceiling)
-            # Sleep in small chunks so SIGTERM is observed promptly.
+                backoff_seconds = min(
+                    backoff_seconds * 2,
+                    backoff_ceiling,
+                )
+
+            # Health observability: emit a one-line status when we
+            # start backing off, and periodically while stalled, so
+            # operators can distinguish "long-poll healthy, no
+            # updates" from "transport broken".
+            if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                logger.warning(
+                    "mt4_reader: %d consecutive empty cycles; "
+                    "backoff=%.1fs; last_poll_attempt=%s",
+                    consecutive_failures,
+                    backoff_seconds,
+                    self._last_poll_attempt_at,
+                )
+                self._write_health()
+
+            # Sleep in small chunks so SIGTERM is observed promptly
+            # AND so the watchdog check runs every second.
             slept = 0.0
             while slept < backoff_seconds and not self._stop_requested:
                 step = min(1.0, backoff_seconds - slept)
                 self._sleep(step)
                 slept += step
+                # Watchdog: if we are stale AND we have a healthy
+                # connection (no recent transport failure), force a
+                # reconnect cycle. In practice this resets the long
+                # poll socket by issuing a new HTTP round-trip on
+                # the next iteration.
+                if (
+                    consecutive_failures == 0
+                    and self._is_stale()
+                ):
+                    logger.warning(
+                        "mt4_reader: watchdog detected stale state; "
+                        "forcing reconnect cycle"
+                    )
+                    self._write_health()
+                    break
         logger.info("mt4_reader: stop requested; exiting")
+        self._write_health()
 
 
 # ---------------------------------------------------------------------------
