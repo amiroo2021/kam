@@ -1,41 +1,45 @@
-"""Phase 2.10 — Controlled live target convergence.
+"""Phase 2.13.12 — Dynamic live target convergence.
 
-Goal:
-    The smallest possible real execution path. ONLY the
-    pre-authorized registration may issue exchange writes in
-    Phase 2.10. Every other registration remains in shadow
-    / read-only mode.
+The live execution path is gated by the dynamic live-eligibility layer
+(``plugins.trade.fibo.live_eligibility``). The canonical persisted
+registration store (``registrations.jsonl``) is the authorization
+boundary — a raw MT4 snapshot entry is NEVER sufficient to trade.
 
-Allowed registration (identity must match EXACTLY):
+There is exactly ONE authorization model. The Phase 2.10 hard-coded
+identity allowlist has been retired; do not reintroduce it.
 
-    exchange            = ondoperps
-    account             = BITGET
-    exchange_instrument = ETH-USD.P
-    variant             = NORMALFIB
-    side                = BUY
+The supported exchanges surface remains whatever the live
+``TradeDesk.list_exchanges()`` returns at evaluation time; we do not
+hard-code the set.
 
 Algorithm (each fresh MT4 snapshot):
-    1. Compute target = starting_volume × cumulative BUY weight.
-    2. Read positions_orders.
-    3. On BEFORE-read failure -> STOP, no writes.
-    4. Inspect ETH-USD.P only.
-    5. Wrong side -> STOP, no flip.
-    6. Target zero -> STOP, no flatten, no cancel, no order.
-    7. actual LONG >= target -> NO-OP (Phase 2.10 must not
-       reduce exposure).
-    8. actual flat or LONG below target ->
+    1. The caller (converge_once) iterates over canonical persisted
+       registrations (latest per key) loaded from the JSONL store.
+    2. For each active registration, the live-eligibility gates
+       (see ``live_eligibility.evaluate``) are applied in order. Any
+       gate failure produces an explicit ``BlockReason`` and no
+       write is attempted.
+    3. If eligible, compute the target from the MT4 snapshot using
+       the registration's own side, variant, and exchange_instrument.
+    4. Read positions_orders for the resolved exchange+account.
+    5. On BEFORE-read failure -> STOP, no writes.
+    6. Inspect ONLY the resolved ``exchange_instrument``.
+    7. Wrong side (actual on opposite side of target) -> STOP, no flip.
+    8. Target zero -> STOP, no flatten, no cancel, no order.
+    9. actual size >= target size on the SAME side -> NO-OP.
+   10. actual flat or below target on the target side ->
          remaining_delta = target - actual_size.
-    9. Find matching pending groups (same account / symbol / side).
-    10. If matching groups exist, cancel_order_group them.
-        Any cancel failure -> STOP, no order.
-    11. Re-read positions_orders.
-    12. On AFTER-read failure -> STOP, no order.
-    13. Recompute remaining_delta.
-    14. target achieved -> NO-OP.
-    15. Still flat or below -> ONE new_order at MARKET for the
-        exact remaining_delta (no reduce_only).
-    16. At most one new_order per call.
-    17. The next MT4/exchange read is the only recovery mechanism.
+   11. Find matching pending groups (same account / symbol / side).
+   12. If matching groups exist, cancel_order_group them.
+         Any cancel failure -> STOP, no order.
+   13. Re-read positions_orders.
+   14. On AFTER-read failure -> STOP, no order.
+   15. Recompute remaining_delta.
+   16. target achieved -> NO-OP.
+   17. Still flat or below -> ONE new_order at MARKET for the
+         exact remaining_delta (no reduce_only).
+   18. At most one new_order per call.
+   19. The next MT4/exchange read is the only recovery mechanism.
 
 Deliberately NOT implemented:
     - partial-fill state machine
@@ -44,6 +48,7 @@ Deliberately NOT implemented:
     - reductions / auto-close / auto-flip
     - TP / SL / position_protections / ladder
     - new persistence files
+    - position-closing behavior on Stop Fibo
 """
 from __future__ import annotations
 
@@ -54,73 +59,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from plugins.trade.fibo.executor import (
     SIDE_BUY, SIDE_SELL, _compute_remaining_delta, _Delta,
-    _fibo_client_order_id, _format_decimal, _parse_open_groups,
-    _pending_groups_for_target, _read_actual_position,
-    _resolve_mt4_target, ConvergeResult, ExchangePosition, Mt4Target,
+    _fibo_client_order_id, _fibo_to_venue_side, _format_decimal,
+    _parse_open_groups, _pending_groups_for_target,
+    _read_actual_position, _reg_mt4_side, _resolve_mt4_target,
+    ConvergeResult, ExchangePosition, Mt4Target,
 )
+from plugins.trade.fibo.live_eligibility import LiveEligibility
 from plugins.trade.fibo.snapshot import Mt4Snapshot
 from plugins.trade.fibo.store import FiboRegistration
 
+
 logger = logging.getLogger(__name__)
+
 
 ExecuteFn = Callable[[Dict[str, Any]], Any]
 
 
-# ---------------------------------------------------------------------------
-# AUTHORIZED LIVE REGISTRATION — Phase 2.10 hard-coded identity allowlist.
-# ---------------------------------------------------------------------------
-
-ALLOWED_EXCHANGE = "ondoperps"
-ALLOWED_ACCOUNT = "BITGET"
-ALLOWED_EXCHANGE_INSTRUMENT = "ETH-USD.P"
-ALLOWED_VARIANT = "NORMALFIB"
-ALLOWED_SIDE_BUY = "BUY"  # FiboRegistration side string
-
-
-def is_allowlisted(reg: FiboRegistration) -> bool:
-    """Return True iff ``reg`` matches the Phase 2.10 allowlist
-    EXACTLY on every identity field. Phase 2.10 is a single-
-    registration live path; any other registration remains in
-    shadow mode.
-
-    Note: this is a strict IDENTITY check. Phase 2.11 also
-    requires the registration to be ``is_active`` (not stopped)
-    before live_converge runs. Use ``is_live_eligible`` for the
-    combined check.
-    """
-    return (
-        str(reg.exchange or "").strip().lower()
-        == ALLOWED_EXCHANGE.lower()
-        and str(reg.account or "").strip().upper()
-        == ALLOWED_ACCOUNT.upper()
-        and str(reg.exchange_instrument or "").strip().upper()
-        == ALLOWED_EXCHANGE_INSTRUMENT.upper()
-        and str(reg.variant or "").strip().upper()
-        == ALLOWED_VARIANT.upper()
-        and str(reg.side or "").strip().upper() == ALLOWED_SIDE_BUY
-    )
-
-
-def is_live_eligible(reg: FiboRegistration) -> bool:
-    """Phase 2.11 — combined gate for the live path.
-
-    A registration is live-eligible iff it matches the allowlist
-    AND is currently active (not stopped). Stopped registrations
-    are excluded from the live path even if their identity fields
-    match the controlled registration.
-    """
-    if not is_allowlisted(reg):
-        return False
-    try:
-        is_active = bool(getattr(reg, "is_active", False))
-    except Exception:  # noqa: BLE001
-        return False
-    return is_active
-
-
+# -------------------------------------------------------------------
 # Operations the executor is allowed to invoke. Any other
 # operation on the TradeDesk surface is unreachable from this
 # module — that is enforced by a static guard test.
+# -------------------------------------------------------------------
 ALLOWED_OPERATIONS = frozenset(
     {
         "positions_orders",  # read (BEFORE + AFTER)
@@ -166,23 +125,91 @@ def live_converge(
     snap: Mt4Snapshot,
     *,
     execute_fn: ExecuteFn,
+    store: Optional[Any] = None,
+    supported_exchanges: frozenset,
+    validate_accounts_fn: Optional[Any] = None,
 ) -> LiveConvergeResult:
     """Converge the live exchange position toward the MT4 target
-    on the allowlisted registration only.
+    on the dynamic-eligibility registration.
 
-    For non-allowlisted registrations, returns a result with
-    ``allowlisted=False``, ``placed_live_order=False``, and a
-    ``blocked_reason`` describing why the executor refuses to
-    act. No TradeDesk calls are issued for non-allowlisted
-    registrations.
+    For registrations that fail any live-eligibility gate, returns
+    a result with ``allowlisted=False``, ``placed_live_order=False``,
+    and a ``blocked_reason`` carrying the explicit ``BlockReason``
+    code. No TradeDesk calls are issued for ineligible registrations.
+
+    Parameters
+    ----------
+    reg : FiboRegistration
+        The candidate registration. Must be the canonical latest
+        state loaded from the persisted store.
+    snap : Mt4Snapshot
+        The current MT4 snapshot.
+    execute_fn : callable
+        The TradeDesk execute function (positions_orders,
+        new_order, cancel_order_group).
+    store : FiboRegistrationStore | None
+        Optional store reference. When provided, the eligibility
+        layer verifies the registration IS the canonical latest row
+        for its registration_key. Recommended.
+    supported_exchanges : frozenset[str]
+        REQUIRED. The set of exchanges the current Fibo/trade
+        adapter layer supports. The caller MUST pass this. If a
+        caller is unable to provide it, the production code must
+        resolve it once via ``TradeDesk.list_exchanges()`` and
+        forward it.
+
+    Notes
+    -----
+    There is NO legacy fallback to the Phase 2.10 hardcoded
+    ETH-only allowlist. The single authorization model is the
+    dynamic eligibility layer in ``live_eligibility.evaluate``.
+    There is exactly one authorization path: this function
+    delegates to ``evaluate`` and no other code path may
+    authorize a live write.
     """
+    from plugins.trade.fibo.live_eligibility import (
+        BlockReason, evaluate,
+    )
+
     target = _resolve_mt4_target(reg, snap)
     target_symbol = str(reg.exchange_instrument or "").strip().upper()
 
     # ------------------------------------------------------------------
-    # Allowlist + active gate (Phase 2.11).
+    # Dynamic live eligibility (Phase 2.13.12).
     # ------------------------------------------------------------------
-    if not is_allowlisted(reg):
+    # The single authorization model. supported_exchanges is REQUIRED;
+    # a missing value fails closed.
+    if not supported_exchanges:
+        # Empty frozenset is permitted (e.g. a deliberate empty
+        # supported set) but means every registration is blocked.
+        # We do NOT silently fall back to the Phase 2.10 hardcoded
+        # allowlist.
+        return LiveConvergeResult(
+            registration_key=reg.registration_key,
+            allowlisted=False,
+            placed_live_order=False,
+            placed_request=None,
+            cancelled_groups=(),
+            read_failed=False,
+            blocked_reason=(
+                f"{BlockReason.BLOCKED_UNSUPPORTED_EXCHANGE.value}: "
+                f"supported_exchanges is empty; refusing to "
+                f"authorize any live convergence"
+            ),
+            reason=(
+                f"{BlockReason.BLOCKED_UNSUPPORTED_EXCHANGE.value} — "
+                f"supported_exchanges not provided"
+            ),
+        )
+
+    eligibility = evaluate(
+        reg, snap,
+        supported_exchanges=supported_exchanges,
+        store=store,
+        validate_accounts_fn=validate_accounts_fn,
+    )
+
+    if not eligibility.eligible:
         return LiveConvergeResult(
             registration_key=reg.registration_key,
             allowlisted=False,
@@ -190,27 +217,9 @@ def live_converge(
             placed_request=None,
             cancelled_groups=(),
             blocked_reason=(
-                f"registration is not on the Phase 2.10 allowlist "
-                f"(required exchange={ALLOWED_EXCHANGE!r}, "
-                f"account={ALLOWED_ACCOUNT!r}, "
-                f"instrument={ALLOWED_EXCHANGE_INSTRUMENT!r}, "
-                f"variant={ALLOWED_VARIANT!r}, side={ALLOWED_SIDE_BUY!r})"
+                f"{eligibility.reason_code.value}: {eligibility.reason}"
             ),
-            reason="not on allowlist — shadow only",
-        )
-    if not bool(getattr(reg, "is_active", False)):
-        return LiveConvergeResult(
-            registration_key=reg.registration_key,
-            allowlisted=True,
-            placed_live_order=False,
-            placed_request=None,
-            cancelled_groups=(),
-            blocked_reason=(
-                f"registration identity matches the allowlist but "
-                f"status={reg.status!r} (not active); excluded from "
-                f"the live path"
-            ),
-            reason="registration not active — shadow only",
+            reason=f"{eligibility.reason_code.value} — shadow only",
         )
 
     # ------------------------------------------------------------------
@@ -231,6 +240,8 @@ def live_converge(
         )
         first_response = None
 
+    resolved_side = _reg_mt4_side(reg)  # fibo-side ('buy'/'sell')
+    venue_target_side = _fibo_to_venue_side(resolved_side)  # venue-side
     if first_response is not None and getattr(
         first_response, "success", False,
     ):
@@ -269,24 +280,57 @@ def live_converge(
         )
 
     # ------------------------------------------------------------------
-    # Step 4-6 — Inspect ETH-USD.P only.
-    # Step 5 — wrong side -> STOP. No flip.
-    # Step 6 — target zero -> STOP. No flatten, no cancel.
-    # Step 7 — actual LONG >= target -> NO-OP. No reduction.
+    # Step 4-6 — Inspect only the resolved exchange_instrument.
+    # Use the REGISTRATION'S side (not the hard-coded BUY).
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Target=0 diagnostic: distinct messages for flat vs. non-flat
+    # actual positions.
+    #
+    # MT4 reports cycle=0 / weight=0 → target=0 means "this side
+    # is currently inactive". The executor intentionally does NOT
+    # auto-flatten any existing exchange position at target=0,
+    # because there is no Fibo-owned-position attribution ledger
+    # in the persisted state. A legacy / manual / cross-cycle
+    # position must NOT be auto-closed by an MT4 cycle zero.
+    # Operator responsibility: manage exchange exposure outside
+    # of Fibo or via an explicit ownership-tracked close path.
     # ------------------------------------------------------------------
     if target.size <= Decimal("0"):
+        if before.is_flat:
+            return LiveConvergeResult(
+                registration_key=reg.registration_key,
+                allowlisted=True,
+                placed_live_order=False,
+                placed_request=None,
+                cancelled_groups=(),
+                blocked_reason=(
+                    "target flat — no auto-flatten (actual is flat)"
+                ),
+                reason=(
+                    "target zero, actual flat — nothing to do"
+                ),
+            )
         return LiveConvergeResult(
             registration_key=reg.registration_key,
             allowlisted=True,
             placed_live_order=False,
             placed_request=None,
             cancelled_groups=(),
-            blocked_reason="target flat — no auto-flatten",
-            reason="target zero — no flatten, no cancel, no order",
+            blocked_reason=(
+                f"target zero but non-zero exchange exposure exists "
+                f"({_format_decimal(before.size)} {before.side.upper()} "
+                f"{reg.exchange_instrument!r}); no auto-flatten because "
+                f"position ownership is not proven"
+            ),
+            reason=(
+                "target zero, actual non-flat — no auto-flatten "
+                "(ownership not proven); manual review required"
+            ),
         )
     if before.is_flat:
         before_side_for_compare = ""
-    elif before.side != SIDE_BUY:
+    elif before.side != venue_target_side:
         return LiveConvergeResult(
             registration_key=reg.registration_key,
             allowlisted=True,
@@ -295,12 +339,12 @@ def live_converge(
             cancelled_groups=(),
             blocked_reason=(
                 f"venue on opposite side ({before.side!r}) of target "
-                f"({SIDE_BUY!r}) — no auto-flip"
+                f"({venue_target_side!r}) — no auto-flip"
             ),
             reason="wrong side — no flip",
         )
     if (not before.is_flat
-            and before.side == SIDE_BUY
+            and before.side == venue_target_side
             and before.size >= target.size):
         return LiveConvergeResult(
             registration_key=reg.registration_key,
@@ -314,8 +358,11 @@ def live_converge(
 
     # ------------------------------------------------------------------
     # Step 8 — compute remaining delta from BEFORE.
+    # The executor's helper is side-agnostic; it takes the target
+    # side as an argument.
     # ------------------------------------------------------------------
-    remaining_before = target.size - (before.size if not before.is_flat else Decimal("0"))
+    before_size = before.size if not before.is_flat else Decimal("0")
+    remaining_before = target.size - before_size
     if remaining_before <= Decimal("0"):
         return LiveConvergeResult(
             registration_key=reg.registration_key,
@@ -329,12 +376,12 @@ def live_converge(
 
     # ------------------------------------------------------------------
     # Step 9-10 — cancel matching Fibo pending groups.
+    # Match by (account, symbol, side=venue_target_side).
     # ------------------------------------------------------------------
-    # Match by (account, symbol, side=BUY).
     target_groups = _pending_groups_for_target(
         initial_groups,
         target_symbol=target_symbol,
-        target_side=SIDE_BUY,
+        target_side=venue_target_side,
     )
     cancelled: Tuple[Tuple[str, str], ...] = ()
     cancel_failed = False
@@ -374,7 +421,7 @@ def live_converge(
     if after.is_flat:
         after_size_for_calc = Decimal("0")
         after_side_for_calc = ""
-    elif after.side != SIDE_BUY:
+    elif after.side != venue_target_side:
         return LiveConvergeResult(
             registration_key=reg.registration_key,
             allowlisted=True,
@@ -406,25 +453,24 @@ def live_converge(
     # Step 14-16 — place exactly ONE new_order at MARKET for
     # the remaining delta. reduce_only=False. deterministic
     # client_order_id (Phase 2.10 semantics).
+    #
+    # The client_order_id already includes the cycle_id; the executor
+    # is the single place that constructs it. We compute it from the
+    # registration's side.
     # ------------------------------------------------------------------
-    # Resolve cycle_id for the client_order_id hash.
     cycle_id = 0
     _fibo = snap.find_fibo(reg.source_symbol, reg.variant)
     if _fibo is not None:
         try:
-            cycle_id = int(_fibo.side_cycle_id(reg.side) or 0)
+            cycle_id = int(_fibo.side_cycle_id(resolved_side) or 0)
         except (ValueError, AttributeError):
             cycle_id = 0
 
-    # Build a synthetic _Delta for the client_order_id hash so
-    # the executor's helper signature is satisfied. The executor
-    # is the only place that constructs _Delta; here we mirror
-    # the same payload shape by hand to avoid leaking the type.
     cid_payload = (
         f"{reg.registration_key}|{snap.source}|"
         f"{int(cycle_id)}|"
         f"{target.side}|{_format_decimal(target.size)}|"
-        f"{SIDE_BUY}|{_format_decimal(remaining)}"
+        f"{venue_target_side}|{_format_decimal(remaining)}"
     )
     import hashlib
     digest = hashlib.sha256(cid_payload.encode("utf-8")).hexdigest()
@@ -435,7 +481,7 @@ def live_converge(
         "exchange": reg.exchange,
         "account": reg.account,
         "symbol": reg.exchange_instrument,
-        "side": SIDE_BUY,
+        "side": venue_target_side,
         "order_type": "market",
         "volume": _format_decimal(remaining),
         "reduce_only": False,

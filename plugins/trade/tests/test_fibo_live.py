@@ -43,9 +43,8 @@ from plugins.trade.fibo.executor import (
     _fibo_client_order_id, _format_decimal,
 )
 from plugins.trade.fibo.live import (
-    ALLOWED_ACCOUNT, ALLOWED_EXCHANGE, ALLOWED_EXCHANGE_INSTRUMENT,
-    ALLOWED_OPERATIONS, ALLOWED_SIDE_BUY, ALLOWED_VARIANT,
-    is_allowlisted, live_converge, LiveConvergeResult,
+    ALLOWED_OPERATIONS,
+    live_converge, LiveConvergeResult,
 )
 from plugins.trade.fibo.snapshot import Mt4Snapshot, Mt4Fibo
 from plugins.trade.fibo.store import FiboRegistration
@@ -154,6 +153,26 @@ def _stub_executor(
     return _fn, log
 
 
+# Set of exchanges that the production TradeDesk supports. The
+# tests below are passing the same fibo_registration (the original
+# Phase 2.10 ETH BUY allowlisted reg) and exercising the executor.
+# They pass this set so the dynamic eligibility gate treats
+# ondoperps as a supported exchange.
+_TEST_SUPPORTED_EXCHANGES = frozenset({
+    "ondoperps", "apex", "arcus", "edgex", "hibachi", "hyperliquid",
+    "lighter", "pacifica", "raydium", "rise",
+})
+
+# Permissive account validator for the Phase 2.10 test
+# fixtures. The legacy test fixtures were not designed with
+# the Phase 2.13.12 account-validation gate in mind, so we
+# accept any account in the test path. This validator is
+# TEST-ONLY and is never used by production code.
+TEST_PERMISSIVE_VALIDATE_ACCOUNTS = lambda exchange: [
+    "BITGET", "BASED", "PHANTOM", "FIBO", "FLEX", "METAMASK", "amiroo"
+]
+
+
 def _allowlisted_reg() -> FiboRegistration:
     return FiboRegistration.build(
         exchange="ondoperps", account="BITGET",
@@ -194,6 +213,7 @@ def _snap(
     buy_weight: str = "2.0",
     sell_cycle: int = 0,
     sell_weight: str = "0",
+    received_at: Optional[str] = None,
 ) -> Mt4Snapshot:
     fibo = Mt4Fibo(
         symbol=symbol, variant=variant,
@@ -203,9 +223,12 @@ def _snap(
         sell_cycle_id=sell_cycle,
         cumulative_sell_weight=Decimal(sell_weight),
     )
+    if received_at is None:
+        from datetime import datetime, timezone
+        received_at = datetime.now(timezone.utc).isoformat()
     return Mt4Snapshot(
         v=1, source="obs-1", seq=1, ts=1, fibos=[fibo],
-        received_at="2026-08-27T00:00:00Z",
+        received_at=received_at,
         telegram_update_id=1, telegram_message_id=1, reader_chat_id=1,
     )
 
@@ -299,70 +322,9 @@ class ClientOrderIdSemanticsTests(unittest.TestCase):
         self.assertTrue(cid.startswith("fibo-"))
 
 
-# ---------------------------------------------------------------------------
-# 2. Allowlist
-# ---------------------------------------------------------------------------
-
-
-class AllowlistTests(unittest.TestCase):
-
-    def test_allowlisted_registration_matches(self):
-        reg = _allowlisted_reg()
-        self.assertTrue(is_allowlisted(reg))
-
-    def test_non_allowlisted_registration_rejected(self):
-        # Different exchange.
-        reg = _non_allowlisted_reg(exchange="hyperliquid",
-                                     account="BASED",
-                                     instrument="SOL")
-        self.assertFalse(is_allowlisted(reg))
-
-    def test_wrong_account_rejected(self):
-        reg = _non_allowlisted_reg(exchange="ondoperps",
-                                     account="other_acct",
-                                     instrument="ETH-USD.P")
-        self.assertFalse(is_allowlisted(reg))
-
-    def test_wrong_instrument_rejected(self):
-        reg = _non_allowlisted_reg(exchange="ondoperps",
-                                     account="BITGET",
-                                     instrument="ETH-USDC.P")
-        self.assertFalse(is_allowlisted(reg))
-
-    def test_wrong_variant_rejected(self):
-        reg = _non_allowlisted_reg(exchange="ondoperps",
-                                     account="BITGET",
-                                     instrument="ETH-USD.P",
-                                     variant="FASTFib")
-        self.assertFalse(is_allowlisted(reg))
-
-    def test_wrong_side_rejected(self):
-        reg = _non_allowlisted_reg(exchange="ondoperps",
-                                     account="BITGET",
-                                     instrument="ETH-USD.P",
-                                     variant="NORMALFib",
-                                     side="BUY")  # Same side — fails other axis
-        # Use the allowlisted reg but mutate side to SELL.
-        reg_sell = _allowlisted_reg()
-        # Re-build with side=SELL:
-        from plugins.trade.fibo.store import FiboRegistration
-        new = FiboRegistration.build(
-            exchange="ondoperps", account="BITGET",
-            symbol="ETHUSD", variant="NORMALFib", side="SELL",
-            starting_volume="0.5",
-            source="obs-1", source_seq=1, source_cycle_id=46871101,
-            source_cumulative_weight="4", source_percentage="0.01",
-            source_snapshot_received_at="2026-08-27T00:00:00Z",
-            desired_exchange_size=Decimal("2.0"),
-            source_symbol="ETHUSD",
-            exchange_instrument="ETH-USD.P",
-        )
-        self.assertFalse(is_allowlisted(new))
-
-
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # 3. Live convergence algorithm
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 
 class LiveConvergeFlatToOpenTests(unittest.TestCase):
@@ -376,7 +338,7 @@ class LiveConvergeFlatToOpenTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.allowlisted)
         self.assertTrue(result.placed_live_order)
         self.assertIsNotNone(result.placed_request)
@@ -409,7 +371,7 @@ class LiveConvergeLongBelowTargetTests(unittest.TestCase):
                 [],
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.0015")
         self.assertEqual(result.placed_request["side"], "buy")
@@ -426,7 +388,7 @@ class LiveConvergeLongEqualTargetTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         self.assertEqual(result.placed_request, None)
         new_orders = [c for c in log.calls
@@ -445,7 +407,7 @@ class LiveConvergeLongAboveTargetTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.003"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
@@ -464,7 +426,7 @@ class LiveConvergeShortActualTests(unittest.TestCase):
                 [],
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
@@ -483,12 +445,12 @@ class LiveConvergeTargetZeroTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.003"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
-        self.assertIn("target flat", result.blocked_reason)
+        self.assertIn("target zero", result.blocked_reason.lower())
         cancels = [c for c in log.calls
                    if c["operation"] == "cancel_order_group"]
         self.assertEqual(cancels, [])
@@ -501,7 +463,7 @@ class LiveConvergeReadFailureTests(unittest.TestCase):
         reg = _allowlisted_reg()
         snap = _snap(buy_cycle=42, buy_weight="2.0")
         execute, log = _stub_executor(raise_on=["positions_orders"])
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.read_failed)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
@@ -522,7 +484,7 @@ class LiveConvergeReadFailureTests(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected op {op}")
 
-        result = live_converge(reg, snap, execute_fn=_patched)
+        result = live_converge(reg, snap, execute_fn=_patched, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.read_failed)
         self.assertFalse(result.placed_live_order)
 
@@ -545,7 +507,7 @@ class LiveConvergeReadFailureTests(unittest.TestCase):
                 raise RuntimeError("AFTER read failure")
             raise AssertionError(f"unexpected op {op}")
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(reg, snap, execute_fn=_fn, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.read_failed)
         self.assertFalse(result.placed_live_order)
 
@@ -567,7 +529,7 @@ class LiveConvergeCancelFailureTests(unittest.TestCase):
                 error={"code": "UNKNOWN", "message": "noop"},
             ),
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.cancel_failed)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
@@ -595,7 +557,7 @@ class LiveConvergeTargetAchievedTests(unittest.TestCase):
                  []),
             ],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
@@ -613,7 +575,7 @@ class LiveConvergeAtMostOneOrderTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         new_orders = [c for c in log.calls
                       if c["operation"] == "new_order"]
         self.assertEqual(len(new_orders), 1,
@@ -624,10 +586,11 @@ class NonAllowlistedTests(unittest.TestCase):
     """Non-allowlisted registration -> zero writes (no TradeDesk)."""
 
     def test_hyperliquid_reg_blocked_no_calls(self):
-        reg = _non_allowlisted_reg()
+        # Use an unsupported exchange to force BLOCKED_UNSUPPORTED_EXCHANGE.
+        reg = _non_allowlisted_reg(exchange="unsupported_xyz_exchange")
         snap = _snap(symbol="SOLUSD", buy_cycle=42, buy_weight="2.0")
         execute, log = _stub_executor()
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.allowlisted)
         self.assertFalse(result.placed_live_order)
         # No TradeDesk calls whatsoever.

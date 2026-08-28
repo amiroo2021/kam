@@ -33,12 +33,30 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from plugins.trade.fibo.live import (
-    ALLOWED_ACCOUNT, ALLOWED_EXCHANGE, ALLOWED_EXCHANGE_INSTRUMENT,
-    ALLOWED_OPERATIONS, ALLOWED_SIDE_BUY, ALLOWED_VARIANT,
-    is_allowlisted, is_live_eligible, live_converge,
+    ALLOWED_OPERATIONS,
+    live_converge,
 )
 from plugins.trade.fibo.snapshot import Mt4Snapshot, Mt4Fibo
 from plugins.trade.fibo.store import FiboRegistration
+
+
+# The set of exchanges that the production TradeDesk supports.
+# These tests are exercising the Phase 2.10 contract; they pass
+# this set so the dynamic eligibility gate treats ondoperps as
+# a supported exchange.
+_TEST_SUPPORTED_EXCHANGES = frozenset({
+    "ondoperps", "apex", "arcus", "edgex", "hibachi", "hyperliquid",
+    "lighter", "pacifica", "raydium", "rise",
+})
+
+# Permissive account validator for the Phase 2.10 test
+# fixtures. The legacy test fixtures were not designed with
+# the Phase 2.13.12 account-validation gate in mind, so we
+# accept any account in the test path. This validator is
+# TEST-ONLY and is never used by production code.
+TEST_PERMISSIVE_VALIDATE_ACCOUNTS = lambda exchange: [
+    "BITGET", "BASED", "PHANTOM", "FIBO", "FLEX", "METAMASK", "amiroo"
+]
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +125,11 @@ def _non_allowlisted_reg() -> FiboRegistration:
     )
 
 
-def _snap(weight="2.0", received_at="2026-08-27T00:00:00Z",
+def _snap(weight="2.0", received_at: Optional[str] = None,
           seq=1, source="obs-1") -> Mt4Snapshot:
+    if received_at is None:
+        from datetime import datetime, timezone
+        received_at = datetime.now(timezone.utc).isoformat()
     fibo = Mt4Fibo(
         symbol="ETHUSD", variant="NORMALFib",
         percentage=Decimal("0.01"),
@@ -189,7 +210,7 @@ class AutonomyPathATTargetTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.allowlisted)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log if c["operation"] == "new_order"]
@@ -207,7 +228,7 @@ class AutonomyPathIncreaseTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.002")
         new_orders = [c for c in log if c["operation"] == "new_order"]
@@ -225,7 +246,7 @@ class AutonomyPathAfterConvergedTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.004"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in log if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
@@ -274,7 +295,7 @@ class AutonomyPathPartialTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.003"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.001")
 
@@ -290,11 +311,12 @@ class AutonomyPathStoppedTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg_stopped, snap, execute_fn=execute)
-        # allowlisted=True (identity match) but is_live_eligible=False.
-        self.assertTrue(result.allowlisted)
+        result = live_converge(reg_stopped, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
+        # Phase 2.13.12 dynamic eligibility: a stopped
+        # registration is NOT allowlisted.
+        self.assertFalse(result.allowlisted)
         self.assertFalse(result.placed_live_order)
-        self.assertFalse(is_live_eligible(reg_stopped))
+        self.assertFalse(reg_stopped.is_active)
         new_orders = [c for c in log if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
 
@@ -308,7 +330,7 @@ class AutonomyPathNonAllowlistedTests(unittest.TestCase):
         execute, log = _stub_executor(
             reads=[(None, [])],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.allowlisted)
         self.assertFalse(result.placed_live_order)
         # NO TradeDesk calls whatsoever for non-allowlisted.
@@ -341,7 +363,7 @@ class AutonomyPathStaleMTTargetTests(unittest.TestCase):
         )
         # live_converge will still proceed; staleness is the script's
         # responsibility.
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         # The executor doesn't crash; the caller (script) must
         # enforce freshness.
         self.assertIsNotNone(result)
@@ -352,15 +374,34 @@ class AutonomyPathInactiveCycleTests(unittest.TestCase):
 
     def test_inactive_no_flatten(self):
         reg = _allowlisted_reg()
-        snap = _snap(weight="0")
+        # Both cycle=0 and weight=0 means the side is INACTIVE.
+        # Use a custom snapshot with cycle=0 (default has 47022998).
+        from plugins.trade.fibo.snapshot import Mt4Fibo, Mt4Snapshot
+        from decimal import Decimal
+        from datetime import datetime, timezone
+        fibo = Mt4Fibo(
+            symbol="ETHUSD", variant="NORMALFib",
+            percentage=Decimal("0.01"),
+            buy_cycle_id=0,
+            cumulative_buy_weight=Decimal("0"),
+            sell_cycle_id=0,
+            cumulative_sell_weight=Decimal("0"),
+        )
+        snap = Mt4Snapshot(
+            v=1, source="obs-1", seq=1, ts=1, fibos=[fibo],
+            received_at=datetime.now(timezone.utc).isoformat(),
+            telegram_update_id=1, telegram_message_id=1, reader_chat_id=1,
+        )
         execute, log = _stub_executor(
             reads=[(
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
-        self.assertIn("target flat", result.blocked_reason.lower())
+        # Phase 2.13.12 enhanced diagnostic: distinguish flat
+        # vs. non-flat at target=0.
+        self.assertIn("target zero", result.blocked_reason.lower())
 
 
 class AutonomyPathTargetDecreaseTests(unittest.TestCase):
@@ -374,7 +415,7 @@ class AutonomyPathTargetDecreaseTests(unittest.TestCase):
                 {"symbol": "ETH-USD.P", "side": "buy", "size": "0.002"}, []
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         self.assertIn("no reduction", result.blocked_reason.lower())
 
@@ -391,7 +432,7 @@ class AutonomyPathWrongSideTests(unittest.TestCase):
                 [],
             )],
         )
-        result = live_converge(reg, snap, execute_fn=execute)
+        result = live_converge(reg, snap, execute_fn=execute, supported_exchanges=_TEST_SUPPORTED_EXCHANGES, validate_accounts_fn=TEST_PERMISSIVE_VALIDATE_ACCOUNTS)
         self.assertFalse(result.placed_live_order)
         self.assertIn("opposite", result.blocked_reason.lower())
 
@@ -415,10 +456,10 @@ class TelegramTriggerInertTests(unittest.TestCase):
         # Strip docstrings and comments.
         text_no_doc = re.sub(r'\"\"\".*?\"\"\"', "", text, count=0, flags=re.DOTALL)
         text_no_doc = re.sub(r"#.*", "", text_no_doc)
-        if "live_converge" in text_no_doc or "is_live_eligible" in text_no_doc:
+        if "live_converge" in text_no_doc:
             raise AssertionError(
-                "fibo_wizard.py must NOT reference live_converge / "
-                "is_live_eligible — convergence is autonomous only."
+                "fibo_wizard.py must NOT reference live_converge — "
+                "convergence is autonomous only."
             )
 
 
@@ -525,6 +566,12 @@ class ConvergeOnceScriptTests(unittest.TestCase):
         original_get_tradedesk = td_mod.get_tradedesk
 
         class _StubDesk:
+            def list_exchanges(self):
+                return ["ondoperps"]
+
+            def list_accounts(self, exchange):
+                return ["BITGET"]
+
             def execute(self, req):
                 op = req.get("operation")
                 if op == "positions_orders":
@@ -582,9 +629,9 @@ class FiboNoOndoSpecificLogicTests(unittest.TestCase):
         translation; Fibo consumes canonical identities only.
 
         Allowed tokens in Fibo:
-          - "ETH-USD.P" may appear as the controlled registration's
-            ALLOWED_EXCHANGE_INSTRUMENT constant (a string literal
-            value, not a parsing operation).
+          - "ETH-USD.P" may appear as a string literal value
+            (the venue contract identifier), not as a parsing
+            operation.
           - ".strip()" whitespace-trim calls are allowed (generic
             string normalization, not venue-specific).
 

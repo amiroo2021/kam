@@ -13,11 +13,14 @@ Iteration contract:
   2. Load the current registration set from the JSONL store
      (``~/.hermes/fibo/registrations.jsonl``).
   3. For every ``is_active`` registration:
-       - if ``is_live_eligible(reg)`` (allowlist identity match +
-         registration is active): call
+       - if the dynamic eligibility layer in
+         ``live_eligibility.evaluate`` reports
+         ``LIVE_ELIGIBLE``: call
          ``live_converge(reg, snap, execute_fn=desk.execute)`` once.
-       - otherwise: skip silently (non-allowlisted / stopped
-         registrations stay shadow-only via the wizard).
+       - otherwise: emit a per-registration visibility record
+         with the explicit ``BlockReason`` and skip silently
+         (blocked / stopped registrations stay shadow-only via
+         the wizard).
   4. Emit a one-line JSON status record to stdout so the gateway's
      cron ticker can capture it in ``~/.hermes/cron/output/...``.
 
@@ -126,9 +129,9 @@ def _iter_once() -> Dict[str, Any]:
     }
 
     snap, err = _load_mt4_snapshot()
-    if err is not None:
+    if err is not None or snap is None:
         summary["status"] = "MT4_SKIPPED"
-        summary["reason"] = err
+        summary["reason"] = err or "MT4 snapshot unavailable"
         return summary
 
     regs = _load_registrations()
@@ -140,21 +143,94 @@ def _iter_once() -> Dict[str, Any]:
 
     # Live executor imports — done lazily so MT4 failures don't
     # prevent non-live evaluations from being logged.
-    from plugins.trade.fibo.live import (
-        live_converge,
-        is_live_eligible,
+    from plugins.trade.fibo.live import live_converge
+    from plugins.trade.fibo.live_eligibility import (
+        BlockReason as _BlockReason,
+        evaluate as _evaluate_eligibility,
     )
+
+    # ------------------------------------------------------------------
+    # Resolve the supported exchanges surface once per convergence.
+    # The live TradeDesk is the production source of truth.
+    # ------------------------------------------------------------------
+    from plugins.trade.tradedesk import get_tradedesk
+    supported_exchanges: frozenset = frozenset()
+    try:
+        desk_list = get_tradedesk().list_exchanges()
+        if isinstance(desk_list, (list, tuple, set, frozenset)) and desk_list:
+            supported_exchanges = frozenset(
+                str(n).strip().lower() for n in desk_list
+            )
+    except Exception:  # noqa: BLE001
+        # Fail-closed: empty set means BLOCKED_UNSUPPORTED_EXCHANGE
+        # for every registration.
+        supported_exchanges = frozenset()
+
+    # ------------------------------------------------------------------
+    # Resolve the canonical account-validator closure. The closure
+    # captures the TradeDesk singleton; it does not write to the
+    # exchange. ``list_accounts`` is a local read (per
+    # ``flow.py::_safe_list_accounts`` and ``TradeDesk.list_accounts``).
+    # We do NOT invent a second registry.
+    # ------------------------------------------------------------------
+    def _validate_accounts(exchange_name: str):
+        try:
+            return list(get_tradedesk().list_accounts(exchange_name))
+        except Exception:
+            return []
 
     for reg in regs:
         summary["evaluated"] += 1
         if not bool(getattr(reg, "is_active", False)):
-            continue  # stopped registrations are excluded by design
-        if not is_live_eligible(reg):
-            continue  # non-allowlisted stays shadow-only
+            # Stopped registrations are excluded from the live path
+            # by design. Emit a visibility record so the operator
+            # can see why they were skipped.
+            summary["results"].append({
+                "registration_key": reg.registration_key,
+                "allowlisted": False,
+                "placed_live_order": False,
+                "blocked_reason": (
+                    f"{_BlockReason.BLOCKED_NOT_ACTIVE.value}: "
+                    f"status={getattr(reg, 'status', None)!r}"
+                ),
+                "reason": "stopped — no future writes",
+                "status": _BlockReason.BLOCKED_NOT_ACTIVE.value,
+                "active": False,
+            })
+            continue
+
+        # Phase 2.13.12 — dynamic live eligibility. The canonical
+        # latest persisted registration IS the authorization
+        # boundary. Apply the eligibility gates.
+        eligibility = _evaluate_eligibility(
+            reg, snap,
+            supported_exchanges=supported_exchanges,
+            validate_accounts_fn=_validate_accounts,
+        )
+
+        if not eligibility.eligible:
+            # The registration is active but blocked. Emit a
+            # visibility record so the operator can see exactly why.
+            summary["results"].append({
+                "registration_key": reg.registration_key,
+                "allowlisted": False,
+                "placed_live_order": False,
+                "blocked_reason": (
+                    f"{eligibility.reason_code.value}: {eligibility.reason}"
+                ),
+                "reason": f"{eligibility.reason_code.value} — shadow only",
+                "status": eligibility.reason_code.value,
+                "active": True,
+            })
+            continue
 
         summary["live_eligible"] += 1
         try:
-            lc = live_converge(reg, snap, execute_fn=desk.execute)
+            lc = live_converge(
+                reg, snap,
+                execute_fn=desk.execute,
+                supported_exchanges=supported_exchanges,
+            )
         except Exception as exc:  # noqa: BLE001
             # live_converge is designed to never raise (every failure
             # path returns a LiveConvergeResult). This except is
@@ -165,6 +241,8 @@ def _iter_once() -> Dict[str, Any]:
                 "placed_live_order": False,
                 "reason": f"exception: {exc}",
                 "error": traceback.format_exc(limit=4),
+                "status": _BlockReason.LIVE_ELIGIBLE.value,
+                "active": True,
             })
             continue
 
@@ -176,6 +254,8 @@ def _iter_once() -> Dict[str, Any]:
             "cancel_failed": lc.cancel_failed,
             "blocked_reason": lc.blocked_reason or None,
             "reason": lc.reason or None,
+            "status": _BlockReason.LIVE_ELIGIBLE.value,
+            "active": True,
         }
         if lc.placed_live_order:
             summary["writes"] += 1

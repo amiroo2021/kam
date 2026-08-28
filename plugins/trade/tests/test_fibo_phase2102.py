@@ -16,6 +16,7 @@ import dataclasses
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Optional
 
 from plugins.trade.fibo.executor import (
     _read_actual_position_from_response,
@@ -88,7 +89,15 @@ def _make_reg(
     )
 
 
-def _make_snap(*, buy_cycle=47022998, buy_weight="2.0"):
+def _make_snap(*, buy_cycle=47022998, buy_weight="2.0",
+              received_at: Optional[str] = None):
+    """Build a fresh MT4 snapshot. By default ``received_at`` is
+    the current UTC timestamp (so staleness gates pass). Tests
+    that exercise stale-snapshot behavior can pass an explicit
+    older ``received_at``."""
+    if received_at is None:
+        from datetime import datetime, timezone
+        received_at = datetime.now(timezone.utc).isoformat()
     fibo = Mt4Fibo(
         symbol="ETHUSD", variant="NORMALFib",
         percentage=Decimal("0.01"),
@@ -99,7 +108,7 @@ def _make_snap(*, buy_cycle=47022998, buy_weight="2.0"):
     )
     return Mt4Snapshot(
         v=1, source="obs-1", seq=1, ts=1, fibos=[fibo],
-        received_at="2026-08-27T00:00:00Z",
+        received_at=received_at,
         telegram_update_id=1, telegram_message_id=1, reader_chat_id=1,
     )
 
@@ -386,7 +395,11 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(
+            reg, snap, execute_fn=_fn,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["bitget"],
+        )
         self.assertFalse(result.placed_live_order)
         self.assertIsNone(result.placed_request)
         new_orders = [c for c in calls if c["operation"] == "new_order"]
@@ -404,7 +417,11 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(
+            reg, snap, execute_fn=_fn,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["bitget"],
+        )
         self.assertTrue(result.placed_live_order)
         self.assertEqual(result.placed_request["volume"], "0.002")
 
@@ -420,7 +437,11 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(
+            reg, snap, execute_fn=_fn,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["bitget"],
+        )
         self.assertFalse(result.placed_live_order)
         new_orders = [c for c in calls if c["operation"] == "new_order"]
         self.assertEqual(new_orders, [])
@@ -437,7 +458,11 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(
+            reg, snap, execute_fn=_fn,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["bitget"],
+        )
         self.assertFalse(result.placed_live_order)
 
     def test_case_e_target_flat_no_flatten(self):
@@ -452,7 +477,11 @@ class LiveStubPhase2102Tests(unittest.TestCase):
             calls.append(dict(req))
             return resp
 
-        result = live_converge(reg, snap, execute_fn=_fn)
+        result = live_converge(
+            reg, snap, execute_fn=_fn,
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda exchange: ["bitget"],
+        )
         self.assertFalse(result.placed_live_order)
         cancels = [c for c in calls if c["operation"] == "cancel_order_group"]
         self.assertEqual(cancels, [])
