@@ -1,0 +1,28 @@
+[Unit]
+Description=Fibo autonomous convergence timer (per-minute, wall-clock fixed)
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# Fire at second 0 of every minute, on the wall clock. We use
+# OnCalendar (NOT OnUnitActiveSec) so the cadence is anchored
+# on the wall clock and does not drift based on how long the
+# previous run took. With OnUnitActiveSec=60s, a 90s run would
+# shift the next fire to 30s past the next minute boundary; with
+# OnCalendar=*:00, the next fire is always on the minute, and
+# systemd skips the activation if the previous run is still
+# active.
+OnCalendar=*-*-* *:*:00
+# Allow 1s of slack so we don't miss a boundary by a few
+# microseconds under load.
+AccuracySec=1s
+# Persistent=false: if the system was off at the scheduled time,
+# do NOT replay historical Fibo convergence cycles. The next
+# normal timer event simply converges against the newest MT4
+# snapshot. (This is the safe behavior for trading: replaying
+# historical cycles could double-spend or stale-decide.)
+Persistent=false
+# Unit to activate.
+Unit=fibo-converge.service
+
+[Install]
+WantedBy=timers.target

@@ -194,24 +194,52 @@ def main(argv: List[str]) -> int:
         level=os.environ.get("FIBO_CONVERGE_LOG_LEVEL", "WARNING"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    try:
-        summary = _iter_once()
-    except Exception as exc:  # noqa: BLE001
-        # Defensive: log and exit 1; the cron ticker will record the
-        # failure and the next tick will retry from a clean slate.
-        logging.exception("converge_once: iteration failed: %s", exc)
-        sys.stdout.write(json.dumps({
-            "status": "CRASHED",
-            "ts": _isoformat_utc(datetime.now(timezone.utc)),
-            "error": str(exc),
-            "traceback": traceback.format_exc(limit=8),
-        }) + "\n")
-        return 1
 
-    # Always emit a single JSON line on stdout so the cron ticker
-    # captures it. The gateway's cron subsystem routes the output
-    # to ~/.hermes/cron/output/<job_id>/<timestamp>.md when deliver
-    # is "local".
+    # Fibo-owned singleton lock. Acquires a Linux ``fcntl.flock``
+    # exclusive non-blocking lock on ${HERMES_HOME}/fibo/converge.lock
+    # BEFORE any TradeDesk or exchange activity. The lock is
+    # automatically released by the kernel when this process exits
+    # (normal exit, exception, or crash). If another process already
+    # holds the lock (systemd timer, manual run, accidental second
+    # launcher, old gateway cron), we exit cleanly with status
+    # ``SKIPPED_LOCKED`` and make ZERO TradeDesk calls.
+    from plugins.trade.fibo.singleton_lock import acquire_singleton_lock
+
+    with acquire_singleton_lock() as lock:
+        if not lock.acquired:
+            # Another local converge_once is in progress. Exit
+            # cleanly without invoking TradeDesk. No exchange call
+            # is made.
+            skipped_summary = {
+                "status": "SKIPPED_LOCKED",
+                "ts": _isoformat_utc(datetime.now(timezone.utc)),
+                "reason": lock.reason or "lock not acquired",
+                "lock_path": str(lock.path),
+            }
+            sys.stdout.write(json.dumps(skipped_summary) + "\n")
+            sys.stdout.flush()
+            return 0
+
+        # Lock is held by THIS process. Run the iteration.
+        try:
+            summary = _iter_once()
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: log and exit 1; the timer/cron will record
+            # the failure and the next minute's tick will retry
+            # from a clean slate.
+            logging.exception("converge_once: iteration failed: %s", exc)
+            sys.stdout.write(json.dumps({
+                "status": "CRASHED",
+                "ts": _isoformat_utc(datetime.now(timezone.utc)),
+                "error": str(exc),
+                "traceback": traceback.format_exc(limit=8),
+            }) + "\n")
+            return 1
+
+    # Always emit a single JSON line on stdout so the journal/cron
+    # captures it. The fibo-converge.service runs under systemd,
+    # so this is captured by journald; the previous gateway-cron
+    # path captured it under ~/.hermes/cron/output/<job_id>/.
     sys.stdout.write(json.dumps(summary) + "\n")
     sys.stdout.flush()
     return 0

@@ -68,8 +68,13 @@ FIBO_REL_PATHS = [
     # Phase 2.10 — controlled live target convergence (allowlist-gated).
     Path("plugins") / "trade" / "fibo" / "live.py",
     # Phase 2.11 — autonomous convergence script (invoked by the
-    # gateway's cron ticker, NOT by the Telegram wizard).
+    # gateway's cron ticker AND/OR by a Fibo-owned systemd timer).
     Path("plugins") / "trade" / "fibo" / "converge_once.py",
+    # Phase 2.13.11 — Fibo-owned fcntl.flock singleton lock. Ensures
+    # only ONE local converge_once enters TradeDesk at a time,
+    # regardless of launcher (systemd timer, manual run,
+    # accidental second shell, old gateway cron).
+    Path("plugins") / "trade" / "fibo" / "singleton_lock.py",
     # Phase 2.3 agent-side regression tests live under
     # plugins/trade/agents/tests. They are pure unit tests and are
     # copied alongside the agent so the verifier can import them
@@ -117,6 +122,91 @@ def run(
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
             record["copied_files"].append({"path": str(rel), "action": "copied"})
+
+    # Phase 2.13.11 — install the Fibo-owned systemd units
+    # (fibo-converge.service + fibo-converge.timer). These live in
+    # ``kam/installer/systemd/`` and are copied to the target
+    # systemd unit directory (``--systemd-dir``, default
+    # ``/etc/systemd/system``). The install does NOT enable or start
+    # the timer; that requires a separate operator action
+    # (``systemctl enable --now fibo-converge.timer``). The units
+    # are intentionally NOT installed if ``--systemd-dir`` is the
+    # empty string (caller signals "skip systemd").
+    #
+    # After unit-file installation, the installer invokes
+    # ``systemctl daemon-reload`` so systemd picks up the new
+    # units. If the unit files were already present and identical,
+    # the install is a no-op for the unit layer and the reload
+    # is still safe (it just re-reads the existing unit files).
+    # The install does NOT enable or start the timer; the operator
+    # is responsible for that. The Fibo flock provides the
+    # primary concurrency safety; the timer is a fixed-cadence
+    # trigger.
+    systemd_dir_str = ""
+    try:
+        # The dispatcher passes ``systemd_dir`` via ``shared`` (the
+        # resolved Path from ``installer.py::main``).
+        systemd_dir_str = str(shared.get("systemd_dir", "") or "")
+    except Exception:  # noqa: BLE001
+        systemd_dir_str = ""
+    if systemd_dir_str:
+        systemd_dir = Path(systemd_dir_str)
+        record["systemd_dir"] = str(systemd_dir)
+        record["systemd_units"] = []
+        units_written = False
+        for unit_name in (
+            "fibo-converge.service", "fibo-converge.timer",
+        ):
+            src_unit = REPO_ROOT / "installer" / "systemd" / unit_name
+            if not src_unit.is_file():
+                record["ok"] = False
+                record.setdefault("missing_units", []).append(unit_name)
+                continue
+            if dry_run:
+                record["systemd_units"].append({
+                    "unit": unit_name,
+                    "action": "would-install",
+                    "target": str(systemd_dir / unit_name),
+                })
+            else:
+                systemd_dir.mkdir(parents=True, exist_ok=True)
+                dst_unit = systemd_dir / unit_name
+                dst_unit.write_text(
+                    src_unit.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                dst_unit.chmod(0o644)
+                record["systemd_units"].append({
+                    "unit": unit_name,
+                    "action": "installed",
+                    "target": str(dst_unit),
+                })
+                units_written = True
+        if units_written and not dry_run:
+            # Run ``systemctl daemon-reload`` so systemd picks up
+            # the new unit files. If systemctl is not available
+            # (e.g., a chroot/builder environment), the operator
+            # must run daemon-reload manually. We log a warning
+            # but do not abort the install.
+            import shutil
+            import subprocess
+            if shutil.which("systemctl") is not None:
+                try:
+                    subprocess.run(
+                        ["systemctl", "daemon-reload"],
+                        check=False,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    record["daemon_reload"] = "ok"
+                except Exception as exc:  # noqa: BLE001
+                    record["daemon_reload"] = f"error: {exc}"
+            else:
+                record["daemon_reload"] = (
+                    "skipped: systemctl not on PATH; operator must "
+                    "run 'systemctl daemon-reload' manually"
+                )
+
     return record
 
 

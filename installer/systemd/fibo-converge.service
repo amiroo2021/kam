@@ -1,0 +1,106 @@
+[Unit]
+Description=Fibo autonomous convergence (per-minute, oneshot)
+Documentation=man:systemd.service(5)
+# Run after network is online so exchange REST calls can succeed.
+# Wants= is non-fatal: if network is missing the run will fail
+# closed (the next minute boundary will retry).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Fibo-owned runtime paths. HERMES_ROOT points at the deployed
+# Hermes Agent venv (not /root/kam). HERMES_HOME is the runtime
+# state directory. converge_once.py reads these from the
+# environment with sensible defaults; the explicit values here
+# are defense-in-depth.
+Environment=HERMES_ROOT=/usr/local/lib/hermes-agent
+Environment=HERMES_HOME=/root/.hermes
+Environment=PYTHONPATH=/usr/local/lib/hermes-agent
+Environment=FIBO_CONVERGE_LOG_LEVEL=WARNING
+
+# Direct invocation: converge_once.py is hermetic. It reads
+# HERMES_ROOT/HERMES_HOME from env (or defaults) and acquires the
+# Fibo singleton lock (fcntl.flock on
+# ${HERMES_HOME}/fibo/converge.lock) BEFORE any TradeDesk or
+# exchange activity. The exchange agents (x_ondoperps_agent etc.)
+# read ${HERMES_HOME}/.env themselves when they construct REST
+# clients — converge_once does NOT need to load .env. The
+# service therefore runs NO shell wrapper, which removes a layer
+# of failure (no missing-shebang, no bash set -e interactions).
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python /usr/local/lib/hermes-agent/plugins/trade/fibo/converge_once.py
+
+# Working directory: the Hermes venv's root. This is where
+# Python's site-packages are visible.
+WorkingDirectory=/usr/local/lib/hermes-agent
+
+# Same user/group as the existing Fibo runtime (root in this
+# deployment; required so the lock file is read/writable).
+User=root
+Group=root
+
+# --- Hardening (minimal) ---
+# NoNewPrivileges: deny privilege escalation (setuid, file_caps).
+NoNewPrivileges=true
+# ProtectSystem=full: makes /usr, /boot, /efi read-only. The
+# venv at /usr/local/lib/hermes-agent is also read-only, which
+# is fine for a one-shot service that only writes to /root.
+# ReadWritePaths= below re-enables /root/.hermes specifically.
+#
+# Note: ProtectHome=true was REMOVED in Phase 2.13.11B because
+# on systemd 255, ProtectHome=true makes /root completely
+# inaccessible (not just read-only), and ReadWritePaths= does
+# NOT re-enable /root under ProtectHome=true. /root/.hermes is
+# the Fibo runtime directory; we cannot hide /root entirely
+# and still reach /root/.hermes. The remaining ProtectSystem=full
+# + ReadWritePaths=/root/.hermes gives equivalent protection
+# against writes to /usr, /boot, /efi while allowing the
+# Fibo runtime to function.
+ProtectSystem=full
+# ReadWritePaths= must include the lock file location, the .env
+# file location, the registrations/aliases/snapshot directory,
+# and the per-run output (none in Fibo). /root/.hermes alone
+# covers all of these.
+ReadWritePaths=/root/.hermes
+
+# --- Resource limits (intentionally none) ---
+# No CPUQuota: imposing an arbitrary 50% limit on a network-bound
+# convergence loop adds no value and may cause subtle throttling
+# under load. Python + HTTP libraries are cooperative and
+# yield naturally.
+# No MemoryMax: the convergence is read-mostly; a hard 512M cap
+# risks OOM-killing a run if a future MT4 payload grows.
+# No TasksMax: Python may spawn multiple threads for HTTP
+# connection pools / async libraries; an arbitrary 8-task cap
+# may starve them.
+
+# --- Output / lifecycle ---
+# Success exit code is 0. The service does NOT auto-restart on
+# failure: the next minute's timer event re-runs converge_once,
+# which acquires the lock, observes the new MT4 snapshot, and
+# either converges (success) or fails closed.
+SuccessExitStatus=0
+# Standard output and error to journald. The Fibo summary JSON
+# line emitted by converge_once.py is captured here; operators
+# read it via ``journalctl -u fibo-converge``.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fibo-converge
+
+# --- Concurrency safety notes ---
+# The Fibo-owned fcntl.flock on ${HERMES_HOME}/fibo/converge.lock
+# is the PRIMARY cross-launcher concurrency guard. It protects
+# against: systemd timer, manual run, accidental second shell,
+# and any future second gateway ticker. See
+# plugins/trade/fibo/singleton_lock.py.
+# systemd's Type=oneshot + a fixed-cadence timer provides
+# ADDITIONAL safety: if a previous run is still active at the
+# next minute boundary, systemd skips the new activation.
+#
+# Intentionally NO [Install] section: this service is an
+# implementation unit invoked ONLY by fibo-converge.timer. Making
+# it independently enableable would allow a boot-time convergence
+# execution outside the timer's control, weakening the invariant
+# that autonomous scheduling is owned by the timer alone. The
+# timer (fibo-converge.timer) is the only enableable unit.

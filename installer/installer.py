@@ -245,6 +245,12 @@ def cmd_install(args: argparse.Namespace) -> int:
     # Per-capability install.
     results: List[dict] = []
     systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
+    # Phase 2.13.11 — make the resolved systemd_dir visible to the
+    # capability installer so it can stage unit files. The
+    # capability installer reads this from ``shared``; the empty
+    # string means "skip systemd unit installation" (used by
+    # tests that don't want a real /etc/systemd/system write).
+    shared_record["systemd_dir"] = str(systemd_dir)
     for cap in caps:
         if cap == "trade":
             res = run_trade(
