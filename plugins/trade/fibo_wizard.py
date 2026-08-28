@@ -859,6 +859,81 @@ _STOP_BACK_LABEL = "◀️ Back"
 _STOP_CANCEL_LABEL = "❌ Cancel"
 _STOP_CONFIRM_LABEL = "⛔️ Stop"
 
+# Emoji mapping for compact Stop Fibo button labels. The emoji
+# conveys variant + side; the label text shows only symbol (USD
+# stripped) and Exchange/Account. The underlying registration
+# identity (registration_key, source_symbol, exchange_instrument,
+# variant, side) is NOT changed by the label rendering — only the
+# display string is remapped. Callbacks still reference the
+# registration by index in the active list, which is keyed by
+# registration_key in the underlying store.
+_STOP_VARIANT_SIDE_EMOJI = {
+    ("NORMALFIB", "SELL"): "🔴",
+    ("FASTFIB",   "SELL"): "🔴🔴",
+    ("NORMALFIB", "BUY"):  "🔵",
+    ("FASTFIB",   "BUY"):  "🔵🔵",
+}
+
+# Display-only USD-stripping for ordinary MT4 source symbols. This
+# is purely a presentation transformation: the underlying
+# source_symbol and registration_key are NEVER modified by the
+# label renderer.
+_STOP_DISPLAY_STRIP_USD_SUFFIXES = ("USD",)
+
+
+# Display-only CamelCase normalization for exchange names that
+# are not single words. The display layer simply capitalizes the
+# first letter; specific known multi-word names are also mapped
+# so they render with their canonical CamelCase (e.g.
+# ``ondoperps`` → ``OndoPerps``).
+_STOP_DISPLAY_EXCHANGE_DISPLAY = {
+    "ondoperps":  "OndoPerps",
+    "hyperliquid": "Hyperliquid",
+    "raydium":   "Raydium",
+}
+
+
+def _stop_button_label(reg) -> str:
+    """Build the compact label for a Stop Fibo picker button.
+
+    Format: ``<emoji> <base-symbol> / <Exchange> / <Account>``
+
+    The emoji encodes (variant, side); see
+    ``_STOP_VARIANT_SIDE_EMOJI``. The base symbol is the MT4
+    source symbol with a trailing ``USD`` stripped for display
+    only — the underlying ``source_symbol`` and
+    ``registration_key`` are not modified. Exchange and Account
+    are presented with the canonical display capitalization (see
+    ``_STOP_DISPLAY_EXCHANGE_DISPLAY``); unknown exchanges fall
+    back to ``str.capitalize`` of the lowercased identifier.
+    """
+    raw_symbol = reg.source_symbol or reg.symbol or "?"
+    symbol = _strip_usd_for_display(raw_symbol)
+    variant = (reg.variant or "").strip().upper()
+    side = (reg.side or "").strip().upper()
+    emoji = _STOP_VARIANT_SIDE_EMOJI.get((variant, side), "⚪")
+    exchange_raw = (reg.exchange or "").strip().lower()
+    exchange = _STOP_DISPLAY_EXCHANGE_DISPLAY.get(
+        exchange_raw, exchange_raw.capitalize(),
+    )
+    account = (reg.account or "").strip().capitalize()
+    return f"{emoji} {symbol} / {exchange} / {account}"
+
+
+def _strip_usd_for_display(symbol: str) -> str:
+    """Return ``symbol`` with a trailing ``USD`` removed for display
+    only. If the symbol does not end with ``USD`` it is returned
+    unchanged. Case-insensitive match; preserves the original
+    capitalization for any prefix.
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return s
+    for suffix in _STOP_DISPLAY_STRIP_USD_SUFFIXES:
+        if s.upper().endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)]
+    return s
+
 
 def _stop_active_registrations():
     """Return the active (``is_active``) registrations, sorted
@@ -928,10 +1003,14 @@ def _build_stop_picker_screen() -> dict:
         )
         rows.append([
             {
-                "text": (
-                    f"{idx + 1}. {reg.source_symbol or reg.symbol or '?'} "
-                    f"{reg.variant} {reg.side}"
-                ),
+                # Phase 2.13.x — compact button label: emoji +
+                # stripped symbol + Exchange/Account. The full
+                # descriptive block above preserves all identity
+                # details. The callback still references the
+                # registration by its index in the active list
+                # (which is keyed by registration_key in the
+                # underlying store).
+                "text": _stop_button_label(reg),
                 "callback_data": f"fibo:stop:p:{idx}",
             }
         ])
