@@ -53,6 +53,17 @@ def _compact_block(r: ReconciliationResult) -> str:
     target = f"Target: {r.desired_side} {r.desired_size}"
     actual = f"Actual: {r.actual_side} {r.actual_size}"
     delta = f"Delta: {r.delta_action} {r.delta_size}"
+    # Phase 2.13.20: derive the displayed mode from the live
+    # runtime state. If fibo-converge.timer is active AND the
+    # registration has a persisted synchronized cycle, this is
+    # the LIVE convergence path — display "LIVE". Otherwise
+    # (dry-run only / no live timer) keep the legacy "DRY RUN"
+    # label so the operator can never confuse UI shadow with
+    # actual execution.
+    mode_label = _resolve_mode_label(
+        registration_key=r.registration_key,
+        source=r.source_symbol,
+    )
     return (
         f"📌 {sym_variant}\n"
         f"   {exchange_account}\n"
@@ -60,8 +71,61 @@ def _compact_block(r: ReconciliationResult) -> str:
         f"   {target}\n"
         f"   {actual}\n"
         f"   {delta}\n"
-        f"   Mode: DRY RUN"
+        f"   Mode: {mode_label}"
     )
+
+
+def _resolve_mode_label(
+    *,
+    registration_key: str,
+    source: str,
+) -> str:
+    """Return "LIVE" if the live timer is armed AND this
+    registration has a persisted cycle_state ownership
+    record. Returns "DRY RUN" otherwise.
+
+    The check is read-only (no exchange calls, no MT4
+    reads). If the timer is not active, or the cycle_state
+    file is absent / has no entry for this registration, the
+    operator sees the legacy "DRY RUN" label — never the
+    other way around. This means a missing cycle_state is
+    always rendered as DRY RUN, which is the safe
+    conservative default.
+    """
+    import json
+    import os
+    import pathlib
+    try:
+        timer_active = (
+            pathlib.Path(
+                "/etc/systemd/system/fibo-converge.timer"
+            ).exists()
+        )
+    except OSError:
+        timer_active = False
+    if not timer_active:
+        return "DRY RUN"
+    hermes_home = os.environ.get(
+        "HERMES_HOME", str(pathlib.Path.home() / ".hermes"),
+    )
+    cs_path = pathlib.Path(hermes_home) / "fibo" / "cycle_state.json"
+    if not cs_path.exists():
+        return "DRY RUN"
+    try:
+        data = json.loads(cs_path.read_text())
+    except (OSError, ValueError):
+        return "DRY RUN"
+    regs = data.get("registrations", {})
+    entry = regs.get(registration_key)
+    if not entry:
+        return "DRY RUN"
+    synced = entry.get("synchronized_cycle_id")
+    transition = entry.get("transition")
+    if synced is None or synced == 0:
+        return "DRY RUN"
+    if transition is not None:
+        return f"LIVE — {transition}"
+    return "LIVE"
 
 
 def build_running_screen(
