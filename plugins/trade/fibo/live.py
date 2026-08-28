@@ -659,6 +659,41 @@ def _evaluate_cycle_decision(
         # Do not interfere.
         return None
     if decision.action == "OPEN_REQUIRED":
+        # The cycle-decide returned OPEN_REQUIRED. Two distinct
+        # cases:
+        #   (a) same-cycle delta-open (synchronized_cycle_id
+        #       matches the current MT4 cycle): legacy executor
+        #       computes remaining = target - actual and
+        #       issues a single new_order. State remains
+        #       STEADY; no further persistence required.
+        #   (b) bootstrap-adopt (no prior state): we MUST
+        #       persist adopt_first_cycle BEFORE issuing the
+        #       new_order, so that if the executor crashes
+        #       between persisting and verifying, the next
+        #       run does not re-classify the position as
+        #       BLOCKED_CYCLE_OWNERSHIP_UNKNOWN.
+        if synchronized is None or synchronized == 0:
+            # Bootstrap-adopt path: persist the current cycle
+            # BEFORE falling through to the legacy executor.
+            try:
+                store.adopt_first_cycle(
+                    reg.registration_key,
+                    source=reg.source,
+                    exchange=reg.exchange,
+                    account=reg.account,
+                    exchange_instrument=reg.exchange_instrument,
+                    variant=reg.variant,
+                    side=side,
+                    cycle_id=int(decision.new_cycle_id or 0),
+                )
+            except OSError as exc:
+                return {
+                    "action": "FAIL_CLOSED",
+                    "reason": (
+                        f"BLOCKED_CYCLE_STATE_UNWRITEABLE: cannot "
+                        f"persist bootstrap-adopt: {exc}"
+                    ),
+                }
         # Same-cycle delta-open: legacy executor logic still
         # handles it via the existing target->remaining flow.
         # We do not pass the delta through here; the legacy

@@ -107,8 +107,15 @@ class LockedOutConvergeTest(unittest.TestCase):
         self.fx = _HermesHomeFixture()
         self.fx.write_registrations([])
         self.fx.write_snapshot(age_seconds=1.0)
+        # Phase 2.13.19: save and restore _lock_path to avoid
+        # leaking the monkey-patch to downstream tests.
+        from plugins.trade.fibo import singleton_lock as sl
+        self._original_lock_path = sl._lock_path
 
     def tearDown(self) -> None:
+        from plugins.trade.fibo import singleton_lock as sl
+        if hasattr(self, "_original_lock_path"):
+            sl._lock_path = self._original_lock_path
         self.fx.cleanup()
 
     def test_locked_out_skips_tradedesk(self) -> None:
@@ -203,9 +210,20 @@ class ConvergenceSafetyTest(unittest.TestCase):
         # the lock. To avoid that, we point the lock path to a
         # fresh location per test.
         from plugins.trade.fibo import singleton_lock as sl
+        # Save the original _lock_path so we can restore it on
+        # tearDown. Without this, downstream tests in the same
+        # Python process inherit the patched lambda and may try
+        # to flock a path inside an already-deleted temp dir,
+        # which surfaces as SKIPPED_LOCKED.
+        self._original_lock_path = sl._lock_path
         sl._lock_path = lambda: self.fx.fibo_dir / "converge.lock"  # type: ignore[assignment]
 
     def tearDown(self) -> None:
+        # Restore _lock_path so subsequent tests see the real
+        # default behavior (avoids test-ordering flakes).
+        from plugins.trade.fibo import singleton_lock as sl
+        if hasattr(self, "_original_lock_path"):
+            sl._lock_path = self._original_lock_path
         self.fx.cleanup()
 
     def test_stale_mt4_fails_closed(self) -> None:

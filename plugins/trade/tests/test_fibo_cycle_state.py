@@ -723,6 +723,83 @@ class LiveConvergeCycleAwareTest(unittest.TestCase):
             TRANSITION_CLOSE_VERIFIED,
         )
 
+    def test_bootstrap_adopt_persists_before_open(self):
+        """Phase 2.13.19 regression: the bootstrap-adopt path
+        must persist adopt_first_cycle BEFORE the executor
+        falls through to issue the new_order, so a subsequent
+        run does not see ``actual != 0 + synchronized = None``
+        and emit BLOCKED_CYCLE_OWNERSHIP_UNKNOWN."""
+        from plugins.trade.fibo.live import live_converge
+        from plugins.trade.fibo.store import FiboRegistration
+        from datetime import datetime, timezone
+        reg = FiboRegistration.build(
+            exchange="ondoperps", account="BITGET",
+            symbol="XAUUSD", variant="FASTFIB", side="SELL",
+            starting_volume="0.001",
+            source="mt4-Fresh-1", source_seq=1,
+            source_cycle_id=47033500,
+            source_cumulative_weight="1", source_percentage="0.001",
+            source_snapshot_received_at="2026-08-27T00:00:00Z",
+            desired_exchange_size=Decimal("0.001"),
+            exchange_instrument="XAU-USD.P",
+        )
+        # Empty state.
+        self.assertIsNone(
+            self.store.get_synchronized_cycle_id(reg.registration_key),
+        )
+        fibo = Mt4Fibo(
+            symbol="XAUUSD", variant="FASTFIB",
+            percentage=Decimal("0.001"),
+            buy_cycle_id=0, cumulative_buy_weight=Decimal("0"),
+            sell_cycle_id=47033659, cumulative_sell_weight=Decimal("1"),
+        )
+        snap = Mt4Snapshot(
+            v=1, source="mt4-Fresh-1", seq=1, ts=1, fibos=[fibo],
+            received_at=datetime.now(timezone.utc).isoformat(),
+            telegram_update_id=1, telegram_message_id=1,
+            reader_chat_id=1,
+        )
+        # Simulate a successful open: positions_orders BEFORE
+        # returns flat, positions_orders AFTER returns the
+        # new 0.001 short position.
+        calls = []
+        class _BootstrapExec(FakeExecutor):
+            def __init__(self):
+                super().__init__(positions={"ondoperps|BITGET": []})
+            def __call__(self, request):
+                calls.append(request)
+                op = request.get("operation")
+                if op == "new_order":
+                    return FakeResponse(
+                        success=True,
+                        order={
+                            "symbol": "XAU-USD.P",
+                            "side": "sell",
+                            "submitted_volume": "0.001",
+                        },
+                    )
+                return super().__call__(request)
+        result = live_converge(
+            reg, snap, execute_fn=_BootstrapExec(),
+            supported_exchanges=frozenset({"ondoperps"}),
+            validate_accounts_fn=lambda x: ["BITGET"],
+        )
+        # The new_order should have been placed.
+        new_orders = [
+            c for c in calls if c.get("operation") == "new_order"
+        ]
+        self.assertEqual(len(new_orders), 1)
+        # Critical: cycle_state must now have synchronized_cycle_id.
+        synced = self.store.get_synchronized_cycle_id(reg.registration_key)
+        self.assertIsNotNone(synced,
+                             "bootstrap-adopt MUST persist "
+                             "synchronized_cycle_id BEFORE the order")
+        self.assertEqual(int(synced), 47033659)
+        self.assertEqual(
+            self.store.get_transition(reg.registration_key),
+            None,  # STEADY
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

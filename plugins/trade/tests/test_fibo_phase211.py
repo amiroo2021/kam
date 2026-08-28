@@ -612,6 +612,15 @@ class ConvergeOnceScriptTests(unittest.TestCase):
         # Snapshot current logging state so we can restore it.
         _saved_disable = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
+        # The converge_once script reads HERMES_HOME to locate
+        # the MT4 snapshot and lock file. Other tests in the
+        # suite may have set HERMES_HOME to a temp dir; restore
+        # to the real production path so the script sees the
+        # real mt4_snapshot.json.
+        import os
+        _saved_hermes_home = os.environ.get("HERMES_HOME")
+        real_hermes = os.path.expanduser("~/.hermes")
+        os.environ["HERMES_HOME"] = real_hermes
         from plugins.trade.fibo import live as live_mod
         from plugins.trade import tradedesk as td_mod
         original_get_tradedesk = td_mod.get_tradedesk
@@ -661,6 +670,12 @@ class ConvergeOnceScriptTests(unittest.TestCase):
                                     "expected at least 1 live-eligible reg")
         finally:
             td_mod.get_tradedesk = original_get_tradedesk
+            # Restore HERMES_HOME so subsequent tests' test
+            # fixtures see the right value.
+            if _saved_hermes_home is not None:
+                os.environ["HERMES_HOME"] = _saved_hermes_home
+            else:
+                os.environ.pop("HERMES_HOME", None)
             # Restore logging state so subsequent tests' assertions
             # about log emissions still work.
             logging.disable(_saved_disable)
