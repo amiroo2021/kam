@@ -361,7 +361,22 @@ class CycleStateStoreTest(unittest.TestCase):
     """Persistent cycle-state store tests."""
 
     def setUp(self):
+        # Phase 2.13.19: redirect to per-test tempdir to avoid
+        # polluting the production cycle_state.json.
+        import os, tempfile, pathlib
+        self.tmp = tempfile.mkdtemp(prefix="fibo_cs_state_")
+        self._saved_hermes = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = self.tmp
+        from plugins.trade.fibo.cycle_state import CycleStateStore
         self.store = CycleStateStore()
+
+    def tearDown(self):
+        import os, shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._saved_hermes is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._saved_hermes
 
     def test_adopt_first_cycle(self):
         self.store.adopt_first_cycle(

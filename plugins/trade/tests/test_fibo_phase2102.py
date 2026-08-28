@@ -90,10 +90,7 @@ def _seed_cycle_state(reg, cycle_id: int) -> None:
     """Phase 2.13.18: pre-populate the cycle-state file."""
     import os
     import tempfile
-    os.environ.setdefault(
-        "HERMES_HOME",
-        tempfile.mkdtemp(prefix="fibo_phase2102_test_"),
-    )
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="fibo_phase2102_test_")
     from plugins.trade.fibo.cycle_state import CycleStateStore
     store = CycleStateStore()
     store.adopt_first_cycle(

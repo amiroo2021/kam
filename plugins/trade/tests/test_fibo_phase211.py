@@ -150,7 +150,7 @@ def _seed_cycle_state(reg, cycle_id: int) -> None:
     an existing cycle."""
     import os
     import tempfile
-    os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp(prefix="fibo_test_"))
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="fibo_test_")
     from plugins.trade.fibo.cycle_state import CycleStateStore
     store = CycleStateStore()
     store.adopt_first_cycle(
@@ -608,19 +608,35 @@ class ConvergeOnceScriptTests(unittest.TestCase):
     def test_converge_once_emits_json_and_no_writes_on_noop(self):
         # Run the script with a stubbed TradeDesk by intercepting
         # the get_tradedesk symbol in the live module.
+        # Phase 2.13.19: this test is fully hermetic — it
+        # creates a temp HERMES_HOME with no registrations and
+        # an MT4_SKIPPED-triggering snapshot path, so it can
+        # never pollute the production cycle_state.json.
         import logging
         # Snapshot current logging state so we can restore it.
         _saved_disable = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
-        # The converge_once script reads HERMES_HOME to locate
-        # the MT4 snapshot and lock file. Other tests in the
-        # suite may have set HERMES_HOME to a temp dir; restore
-        # to the real production path so the script sees the
-        # real mt4_snapshot.json.
         import os
+        import tempfile
+        import pathlib
+        import json as _json
         _saved_hermes_home = os.environ.get("HERMES_HOME")
-        real_hermes = os.path.expanduser("~/.hermes")
-        os.environ["HERMES_HOME"] = real_hermes
+        _saved_lock_path = None
+        from plugins.trade.fibo import singleton_lock as sl
+        _saved_lock_path = sl._lock_path
+        # Build an isolated HERMES_HOME.
+        self.tmp = tempfile.mkdtemp(prefix="fibo_e2e_converge_")
+        os.environ["HERMES_HOME"] = self.tmp
+        # Point the lock at a fresh path under HERMES_HOME so
+        # it doesn't see any stale state from the real lock
+        # file.
+        sl._lock_path = lambda: pathlib.Path(self.tmp) / "fibo" / "converge.lock"  # type: ignore[assignment]
+        # Create empty registrations.jsonl (zero registrations)
+        # and a missing mt4_snapshot.json so converge_once emits
+        # MT4_SKIPPED with 0 writes and 0 live_eligible.
+        fibo_dir = pathlib.Path(self.tmp) / "fibo"
+        fibo_dir.mkdir(parents=True, mode=0o700)
+        (fibo_dir / "registrations.jsonl").write_text("")
         from plugins.trade.fibo import live as live_mod
         from plugins.trade import tradedesk as td_mod
         original_get_tradedesk = td_mod.get_tradedesk
@@ -663,11 +679,13 @@ class ConvergeOnceScriptTests(unittest.TestCase):
             out = buf.getvalue()
             lines = [line for line in out.splitlines() if line.strip()]
             self.assertEqual(len(lines), 1)
-            summary = json.loads(lines[0])
-            self.assertEqual(summary["status"], "OK")
-            self.assertEqual(summary["writes"], 0)
-            self.assertGreaterEqual(summary["live_eligible"], 1,
-                                    "expected at least 1 live-eligible reg")
+            summary = _json.loads(lines[0])
+            # The script may emit MT4_SKIPPED (no snapshot)
+            # OR OK with evaluated:0 writes:0 (no registrations).
+            # Either is acceptable for a hermetic test that
+            # emits exactly ONE JSON line and has writes:0.
+            self.assertIn(summary["status"], ("OK", "MT4_SKIPPED"))
+            self.assertEqual(summary.get("writes", 0), 0)
         finally:
             td_mod.get_tradedesk = original_get_tradedesk
             # Restore HERMES_HOME so subsequent tests' test
@@ -676,9 +694,15 @@ class ConvergeOnceScriptTests(unittest.TestCase):
                 os.environ["HERMES_HOME"] = _saved_hermes_home
             else:
                 os.environ.pop("HERMES_HOME", None)
+            # Restore the lock path.
+            if _saved_lock_path is not None:
+                sl._lock_path = _saved_lock_path
             # Restore logging state so subsequent tests' assertions
             # about log emissions still work.
             logging.disable(_saved_disable)
+            # Clean up tempdir.
+            import shutil
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

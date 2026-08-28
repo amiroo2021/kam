@@ -314,6 +314,23 @@ class AccountValidatorWiringTest(unittest.TestCase):
 
     SOURCE_PATH = "/root/kam/plugins/trade/fibo/converge_once.py"
 
+    def setUp(self):
+        # Phase 2.13.19: redirect HERMES_HOME to a per-test
+        # tempdir so the live_converge() calls below do not
+        # pollute the production cycle_state.json.
+        import os, tempfile
+        self._saved_hermes = os.environ.get("HERMES_HOME")
+        self.tmp = tempfile.mkdtemp(prefix="fibo_acct_wiring_")
+        os.environ["HERMES_HOME"] = self.tmp
+
+    def tearDown(self):
+        import os, shutil
+        if self._saved_hermes is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._saved_hermes
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def _read_source(self):
         with open(self.SOURCE_PATH) as f:
             return f.read()
