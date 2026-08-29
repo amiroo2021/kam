@@ -133,6 +133,13 @@ def run(
     # are intentionally NOT installed if ``--systemd-dir`` is the
     # empty string (caller signals "skip systemd").
     #
+    # Phase 2.13.22 — also install ``fibo-mt4-reader.service``.
+    # The MT4 reader is a separate Fibo-owned daemon with its own
+    # lifecycle. It MUST NOT be coupled to hermes-gateway.service
+    # (the previous detached-launcher pattern was SIGKILLed during
+    # a gateway restart, causing a 21m46s snapshot outage; this
+    # dedicated unit eliminates that class of incident).
+    #
     # After unit-file installation, the installer invokes
     # ``systemctl daemon-reload`` so systemd picks up the new
     # units. If the unit files were already present and identical,
@@ -156,6 +163,7 @@ def run(
         units_written = False
         for unit_name in (
             "fibo-converge.service", "fibo-converge.timer",
+            "fibo-mt4-reader.service",
         ):
             src_unit = REPO_ROOT / "installer" / "systemd" / unit_name
             if not src_unit.is_file():

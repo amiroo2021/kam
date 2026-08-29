@@ -105,7 +105,11 @@ FIBO_REL_PATHS = [
 ]
 
 # Phase 2.13.11 — Fibo-owned systemd unit names.
-SYSTEMD_UNITS = ("fibo-converge.service", "fibo-converge.timer")
+# Phase 2.13.22 — added fibo-mt4-reader.service.
+SYSTEMD_UNITS = (
+    "fibo-converge.service", "fibo-converge.timer",
+    "fibo-mt4-reader.service",
+)
 
 
 def _systemctl_available() -> bool:

@@ -1,0 +1,166 @@
+[Unit]
+Description=Fibo MT4 reader (Phase 2.13.22 — transport-resilient, ts-ordered)
+Documentation=man:systemd.service(5)
+# Run after network is online so the Telegram long-poll can
+# reach api.telegram.org. Wants= is non-fatal: if network is
+# missing the reader will surface that as a transport failure
+# and the bounded backoff loop will keep retrying.
+After=network-online.target
+Wants=network-online.target
+
+# Intentionally NO Requires= or After= on hermes-gateway.service.
+# The reader is a fully independent Fibo-owned unit and MUST
+# survive gateway restarts, upgrades, and crashes. The previous
+# architecture (reader as a child of the gateway) caused a
+# 21m46s outage when a planned gateway restart SIGKILLed the
+# reader and no supervisor restarted it. This unit exists to
+# prevent that class of incident.
+
+[Service]
+Type=simple
+
+# --- Runtime environment ---
+# HERMES_ROOT: deployed Hermes Agent venv. The reader imports
+# plugins.trade.fibo.mt4_reader from this tree.
+Environment=HERMES_ROOT=/usr/local/lib/hermes-agent
+# HERMES_HOME: per-user runtime state (snapshots, state files,
+# health file, log directory). Same layout as fibo-converge.service.
+Environment=HERMES_HOME=/root/.hermes
+# PYTHONPATH: makes `import plugins.trade.fibo.mt4_reader` resolve
+# to the deployed module under HERMES_ROOT.
+Environment=PYTHONPATH=/usr/local/lib/hermes-agent
+# Unbuffered stdout/stderr so journald captures every log line
+# promptly (important for the watchdog/health observability path).
+Environment=PYTHONUNBUFFERED=1
+
+# Load MT4_READER_BOT_TOKEN, MT4_READER_CHAT_ID, and
+# MT4_OBSERVER_BOT_ID from the existing /root/.hermes/.env file.
+# This is the same env file the gateway loads via
+# hermes_cli.env_loader.load_hermes_dotenv. The reader's
+# ``_build_from_env`` reads these via os.environ, so
+# EnvironmentFile= is sufficient — no Python wrapper needed.
+#
+# If the env file is missing the unit will fail to start (the
+# main() check rejects empty values), which is the desired
+# fail-closed behavior. systemd's Restart=always will keep
+# retrying every 2s; the operator must populate the env file.
+EnvironmentFile=/root/.hermes/.env
+
+# --- Direct invocation: no shell wrapper ---
+# The reader module's main() acquires the singleton flock on
+# ${HERMES_HOME}/fibo/mt4_reader.lock BEFORE any Telegram I/O
+# and installs SIGTERM/SIGINT handlers in poll_forever. Invoking
+# the module directly removes a layer of failure (no missing
+# shebang, no bash set -e interactions).
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m plugins.trade.fibo.mt4_reader
+
+# Working directory: the Hermes venv's root. This is where
+# Python's site-packages are visible.
+WorkingDirectory=/usr/local/lib/hermes-agent
+
+# Same user/group as the existing Fibo runtime (root in this
+# deployment; required so the lock file and the /root/.hermes
+# tree are read/writable).
+User=root
+Group=root
+
+# --- Hardening (minimal) ---
+# NoNewPrivileges: deny privilege escalation (setuid, file_caps).
+NoNewPrivileges=true
+# ProtectSystem=full: makes /usr, /boot, /efi read-only. The
+# venv at /usr/local/lib/hermes-agent is also read-only, which
+# is fine for a network-bound long-poll. ReadWritePaths= below
+# re-enables /root/.hermes specifically.
+#
+# ProtectHome=true was REMOVED in Phase 2.13.11B because on
+# systemd 255, ProtectHome=true makes /root completely
+# inaccessible (not just read-only), and ReadWritePaths= does
+# NOT re-enable /root under ProtectHome=true. /root/.hermes is
+# the Fibo runtime directory; we cannot hide /root entirely
+# and still reach /root/.hermes. The remaining ProtectSystem=full
+# + ReadWritePaths=/root/.hermes gives equivalent protection
+# against writes to /usr, /boot, /efi while allowing the
+# Fibo runtime to function.
+ProtectSystem=full
+# ReadWritePaths= must include the lock file location, the .env
+# file location (loaded by hermes_cli.env_loader for Telegram
+# bot token), the registrations/aliases/snapshot directory,
+# and the per-run log output. /root/.hermes alone covers all of
+# these.
+ReadWritePaths=/root/.hermes
+# Read-only paths: the venv tree. The reader imports modules
+# from HERMES_ROOT but does not write there.
+ReadOnlyPaths=/usr/local/lib/hermes-agent
+
+# --- Resource limits (intentionally none for the reader) ---
+# No CPUQuota: a Telegram long-poll is network-bound and
+# cooperative; an artificial CPU cap provides no value.
+# No MemoryMax: a long-poll cycle allocates minimal memory; a
+# hard cap risks OOM-killing healthy restarts.
+# No TasksMax: Python may spawn threads for HTTP connection
+# pools / asyncio; an arbitrary task cap may starve them.
+# No LimitNOFILE: the reader holds the singleton lock file
+# descriptor plus the Telegram HTTP socket; both are well
+# below the systemd default of 1024.
+
+# --- Output / lifecycle ---
+# Type=simple + Restart=always: the reader must keep running.
+# Restart=always (rather than on-failure) is chosen because:
+#   - on-failure would skip restarts when the reader exits with
+#     a non-zero code AND when it's killed by a signal. SIGKILL
+#     by the kernel or by a tool like kill -9 leaves the process
+#     with exit code 137. SIGTERM (sent by systemd stop or by an
+#     operator) leaves the exit code 143. Both should trigger a
+#     restart under the supervised-lifecycle invariant.
+#   - If the reader exits cleanly (return 0 from main after
+#     request_stop), the operator's intent is "stop". Restart=always
+#     would re-spawn it in that case. We accept this because the
+#     intended way to stop the reader is ``systemctl stop``,
+#     which uses SIGTERM, the handler sets request_stop, and
+#     main() returns 0 — exactly the same exit path. If the
+#     operator wants a permanent stop they use
+#     ``systemctl disable --now fibo-mt4-reader.service``.
+Restart=always
+# RestartSec=2: short delay to avoid a tight restart loop when
+# the singleton lock is contested (the lock release happens
+# during process teardown; 2s gives the previous instance time
+# to fully release the flock).
+RestartSec=2
+# StartLimitBurst / StartLimitIntervalSec: limit the rate of
+# restart attempts in case the reader keeps failing on startup
+# (e.g., missing Telegram token). This is defense-in-depth; the
+# systemd default (StartLimitBurst=5 / StartLimitIntervalSec=10s)
+# is fine and is not overridden here.
+#
+# TimeoutStopSec: how long systemd waits for SIGTERM-driven
+# graceful shutdown before escalating to SIGKILL. The reader's
+# poll_forever loop checks _stop_requested between cycles and
+# between inner-sleep steps; a long-poll cycle can block up to
+# the long-poll timeout (25s default). 30s is comfortable.
+TimeoutStopSec=30
+# KillSignal: which signal to send on stop. Default SIGTERM
+# (matches the reader's installed handler). Not overridden.
+
+# Standard output and error to journald. The reader's INFO line
+# at startup and its bounded-backoff warnings are visible via
+# ``journalctl -u fibo-mt4-reader``. Operators can also see the
+# standalone log file at /root/.hermes/fibo/mt4_reader.log
+# because the module's _configure_logging also writes there for
+# back-compat with the previous detached-launcher pattern.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fibo-mt4-reader
+
+# --- Concurrency safety notes ---
+# The Fibo-owned fcntl.flock on
+# ${HERMES_HOME}/fibo/mt4_reader.lock is the PRIMARY concurrency
+# guard. It protects against: two reader services, a detached
+# launcher racing the unit, or any future second gateway ticker.
+# A second reader process exits 2 (ReaderLockError) within
+# milliseconds of startup. systemd will see the non-zero exit
+# and apply Restart=always, but the unit's RestartSec=2 and
+# singleton lock together prevent the two readers from
+# interleaving file writes.
+
+[Install]
+WantedBy=multi-user.target
