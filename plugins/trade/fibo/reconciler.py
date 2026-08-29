@@ -199,11 +199,20 @@ def _actual_position_for_symbol(
     symbol: str,
 ) -> Optional[Any]:
     """Return the CanonicalPosition matching ``symbol`` (case-insensitive),
-    or None if not present / empty."""
+    or None if not present / empty.
+
+    Phase 2.13.22: the canonical matcher is owned by
+    ``executor._row_identity`` (which checks ``exchange_instrument``
+    first, then ``symbol``). The Running Fibo display must use the
+    SAME matcher as production convergence so the read-only
+    Actual/Delta panel reflects what ``live_converge`` sees.
+    Importing here avoids a second independent position-matching
+    implementation.
+    """
+    from .executor import _row_identity
     target = (symbol or "").strip().upper()
     for p in positions or []:
-        sym = getattr(p, "symbol", None) or ""
-        if str(sym).strip().upper() == target:
+        if _row_identity(p) == target:
             return p
     return None
 
