@@ -92,9 +92,16 @@ def _make_observer_update(
     seq: int,
     fibos: List[Tuple[str, str, int, int]],
     received_at: str = "2026-08-28T22:00:00Z",
+    ts: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build a single Telegram update dict carrying a complete
-    snapshot payload from the MT4 Observer."""
+    snapshot payload from the MT4 Observer.
+
+    Phase 2.13.20: ``ts`` defaults to ``seq`` for backward
+    compatibility; callers can override explicitly.
+    """
+    if ts is None:
+        ts = seq
     fibo_dicts = []
     for sym, var, buy_cycle, sell_cycle in fibos:
         fibo_dicts.append({

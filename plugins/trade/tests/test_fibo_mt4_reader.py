@@ -56,6 +56,7 @@ def _make_good_observer_body(
     *,
     source: str = "obs-1",
     seq: int = 1,
+    ts: int = 1700000000,
     fibos: Optional[List[Dict[str, Any]]] = None,
     v: int = 1,
 ) -> Dict[str, Any]:
@@ -75,7 +76,7 @@ def _make_good_observer_body(
         "v": v,
         "source": source,
         "seq": seq,
-        "ts": "2026-08-25T03:14:02Z",
+        "ts": ts,
         "fibos": fibos,
     }
 
@@ -325,6 +326,10 @@ class ReaderProcessTests(unittest.TestCase):
         self.state_path = self.root / "mt4_reader_state.json"
         self.lock_path = self.root / "mt4_reader.lock"
         self.api_calls_offset: List[Optional[int]] = []
+        # Per-test monotonic ts counter (Phase 2.13.20): every
+        # _good_update auto-increments ts so consecutive accepts
+        # advance the ordering cursor naturally.
+        self._ts_counter = 0
 
     def _make_reader(
         self,
@@ -346,8 +351,14 @@ class ReaderProcessTests(unittest.TestCase):
         update_id: int,
         source: str = "obs-1",
         seq: int = 1,
+        ts: Optional[int] = None,
     ) -> Dict[str, Any]:
-        body = _make_good_observer_body(source=source, seq=seq)
+        # Auto-increment ts so each consecutive call from the same
+        # source advances the ordering cursor (Phase 2.13.20).
+        if ts is None:
+            ts = 1700000000 + self._ts_counter
+            self._ts_counter += 1
+        body = _make_good_observer_body(source=source, seq=seq, ts=ts)
         return _make_update(
             update_id=update_id,
             chat_id=-100,
@@ -359,10 +370,13 @@ class ReaderProcessTests(unittest.TestCase):
     # ---- source/seq policy -----------------------------------------
 
     def test_duplicate_seq_ignored(self) -> None:
+        # Phase 2.13.20: dedup is keyed by ts. Two updates with the
+        # same ts (and any seq) are duplicates.
+        ts = 1700000000
         reader = self._make_reader([
-            self._good_update(1, "obs-1", 10),
-            self._good_update(2, "obs-1", 10),  # duplicate
-            self._good_update(3, "obs-1", 10),  # duplicate
+            self._good_update(1, "obs-1", 10, ts=ts),
+            self._good_update(2, "obs-1", 10, ts=ts),  # duplicate
+            self._good_update(3, "obs-1", 10, ts=ts),  # duplicate
         ])
         outcomes = reader.run_once()
         codes = [o.code for o in outcomes]
@@ -371,9 +385,11 @@ class ReaderProcessTests(unittest.TestCase):
         self.assertEqual(codes[2], IGNORED_DUP)
 
     def test_older_seq_ignored(self) -> None:
+        # Phase 2.13.20: ordering is keyed by ts. Older ts is
+        # rejected even if the seq is "newer" (seq is diagnostic).
         reader = self._make_reader([
-            self._good_update(1, "obs-1", 100),
-            self._good_update(2, "obs-1", 99),  # older
+            self._good_update(1, "obs-1", 100, ts=1700000010),
+            self._good_update(2, "obs-1", 99, ts=1700000005),  # older ts
         ])
         outcomes = reader.run_once()
         codes = [o.code for o in outcomes]
@@ -465,15 +481,18 @@ class ReaderProcessTests(unittest.TestCase):
         self.assertEqual(reader2.state.current_source, "obs-1")
 
     def test_old_seq_after_restart_rejected(self) -> None:
-        # Pre-seed state as if a previous run accepted seq=100
+        # Phase 2.13.20: ordering is keyed by ts. Pre-seed state
+        # with a ts cursor that is HIGHER than the incoming
+        # update's ts; expect IGNORED_OLDER regardless of seq.
         prior = ReaderState(
             last_update_id=5,
             current_source="obs-1",
-            last_seq=100,
+            last_accepted_ts=1800000000,  # higher than the new ts
+            last_seq=100,  # diagnostic only; doesn't gate acceptance
         )
         prior.save(self.state_path)
-        # New reader resumes with a same-source but older seq
-        api = FakeApi([self._good_update(6, "obs-1", 99)])
+        # New reader resumes with same source and a smaller ts.
+        api = FakeApi([self._good_update(6, "obs-1", 99, ts=1700000000)])
         reader = Mt4ReaderProcess(
             bot_token="TOKEN",
             expected_chat_id=-100,

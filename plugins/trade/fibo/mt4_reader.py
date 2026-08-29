@@ -15,9 +15,11 @@ Phase 1 hardening (spec §15 + reader-hardening corrections):
 * Persists reader transport state to
   ``~/.hermes/fibo/mt4_reader_state.json`` with the SAME atomic
   helper so a restart can resume at ``last_update_id + 1``.
-* Source rollover safety: same source requires ``seq > last_seq``;
+* Source rollover safety: same source requires ``ts > last_accepted_ts``;
   new source is accepted and the previous source is retired; a
   retired source cannot reclaim the cache (``REJECTED_RETIRED_SOURCE``).
+  ``seq`` is captured for diagnostics only — it has NO effect on
+  whether a snapshot is accepted (Phase 2.13.20).
 * Single-reader OS lock via ``fcntl.flock(LOCK_EX | LOCK_NB)`` on the
   reader lock file, kept open for the lifetime of the process.
 * Advances ``last_update_id`` for conclusively rejected updates so a
@@ -123,11 +125,21 @@ class ReaderState:
         *,
         last_update_id: int = 0,
         current_source: str = "",
+        last_accepted_ts: int = 0,
         last_seq: int = 0,
         retired_sources: Optional[List[str]] = None,
     ) -> None:
+        # Phase 2.13.20: ``ts`` is the authoritative ordering key.
+        # ``seq`` is captured for diagnostics only and has ZERO
+        # effect on whether a snapshot is accepted.
         self.last_update_id = int(last_update_id)
         self.current_source = str(current_source or "")
+        # ``last_accepted_ts`` - the largest Observer ts we have
+        # ever accepted for the current source. On rollover this
+        # resets to 0 because the new source starts fresh.
+        self.last_accepted_ts = int(last_accepted_ts)
+        # ``last_seq`` is kept for diagnostic display only. It is
+        # NOT used to gate acceptance.
         self.last_seq = int(last_seq)
         self.retired_sources: List[str] = list(retired_sources or [])
 
@@ -139,9 +151,27 @@ class ReaderState:
 
     def accept_initial_source(self, source: str) -> None:
         self.current_source = str(source)
+        self.last_accepted_ts = 0
         self.last_seq = 0
 
+    def accept_newer_ts(self, ts: int, seq: int = 0) -> None:
+        """Record a freshly-accepted Observer message.
+
+        ``ts`` is the authoritative ordering key.
+        ``seq`` is captured for diagnostics only.
+        """
+        self.last_accepted_ts = int(ts)
+        self.last_seq = int(seq)
+
     def accept_newer_seq(self, seq: int) -> None:
+        """Backward-compatibility alias.
+
+        Phase 2.13.20: ordering is now keyed by ``ts``. This alias
+        is retained so that older test code (and any external
+        diagnostics tooling) can still call ``accept_newer_seq``.
+        Without an explicit ts, this is a no-op for ordering; it
+        records the seq diagnostic only.
+        """
         self.last_seq = int(seq)
 
     def retire_current_and_adopt_new(self, new_source: str) -> None:
@@ -153,6 +183,10 @@ class ReaderState:
                         -MAX_RETIRED_SOURCES:
                     ]
         self.current_source = str(new_source)
+        # New source: reset ordering cursor so any ts from the new
+        # source is accepted (the new source may restart with a
+        # lower seq, but its ts is the only authoritative key).
+        self.last_accepted_ts = 0
         self.last_seq = 0
 
     def is_retired(self, source: str) -> bool:
@@ -164,6 +198,9 @@ class ReaderState:
         return {
             "last_update_id": self.last_update_id,
             "current_source": self.current_source,
+            # Persist both ts and seq for diagnostics. ``ts`` is
+            # authoritative on load; ``seq`` is purely informational.
+            "last_accepted_ts": self.last_accepted_ts,
             "last_seq": self.last_seq,
             "retired_sources": list(self.retired_sources),
         }
@@ -196,6 +233,9 @@ class ReaderState:
         return cls(
             last_update_id=_safe_int(raw.get("last_update_id", 0)),
             current_source=str(raw.get("current_source", "") or ""),
+            # Phase 2.13.20: load both keys for backward compat
+            # with old state files that only have ``last_seq``.
+            last_accepted_ts=_safe_int(raw.get("last_accepted_ts", 0)),
             last_seq=_safe_int(raw.get("last_seq", 0)),
             retired_sources=retired_clean,
         )
@@ -283,7 +323,7 @@ def inspect_update(
       * message.from.is_bot must be true
       * the message must contain a parseable JSON text body
       * the body must pass ``parse_snapshot_payload``
-      * same source + non-increasing seq is rejected
+      * same source + non-increasing ts is rejected (seq is ignored)
       * new source not yet retired is accepted; the prior source is
         retired at the caller's layer
       * retired source cannot reclaim the cache
@@ -404,20 +444,24 @@ def inspect_update(
             update_id_for_cursor=update_id,
         )
 
-    seq = _safe_int(body.get("seq", 0))
-    if seq <= 0:
+    # Phase 2.13.20: validate ``ts`` (the authoritative ordering
+    # key). ``seq`` is allowed to be any non-negative integer (it is
+    # captured for diagnostics only). An absent or non-positive
+    # ``ts`` is a schema error.
+    ts = _safe_int(body.get("ts", 0))
+    if ts <= 0:
         return InspectionResult(
             outcome=UpdateOutcome(
-                REJECTED_SCHEMA, update_id, f"seq={seq}"
+                REJECTED_SCHEMA, update_id, f"ts={ts}"
             ),
             update_id_for_cursor=update_id,
         )
 
-    # Source / seq handling is left to the caller (Reader) because the
-    # current ``current_source`` and ``last_seq`` live there. We return
-    # the parsed body and let the caller decide ACCEPTED / IGNORED /
-    # RETIRED. To keep ``inspect_update`` pure, we surface the parsed
-    # body in the outcome detail via a sentinel dict.
+    # Source / ts handling is left to the caller (Reader) because the
+    # current ``current_source`` and ``last_accepted_ts`` live there.
+    # We return the parsed body and let the caller decide ACCEPTED /
+    # IGNORED / RETIRED. To keep ``inspect_update`` pure, we surface
+    # the parsed body in the outcome detail via a sentinel dict.
     return InspectionResult(
         outcome=UpdateOutcome(ACCEPTED, update_id),
         update_id_for_cursor=update_id,
@@ -726,6 +770,7 @@ class Mt4ReaderProcess:
         # accepted message and every successful getUpdates call.
         self._last_poll_attempt_at = _utc_iso_now()
         self._last_accepted_message_at: Optional[str] = None
+        self._last_ts_accepted: Optional[int] = None
         self._last_seq_accepted: Optional[int] = None
         self._accepted_message_count = 0
         self._transport_failure_count = 0
@@ -754,12 +799,14 @@ class Mt4ReaderProcess:
                 "pid": os.getpid(),
                 "last_poll_attempt_at": self._last_poll_attempt_at,
                 "last_accepted_message_at": self._last_accepted_message_at,
+                "last_ts_accepted": self._last_ts_accepted,
                 "last_seq_accepted": self._last_seq_accepted,
                 "accepted_message_count": self._accepted_message_count,
                 "transport_failure_count": self._transport_failure_count,
                 "consecutive_empty_polls": self._consecutive_empty_polls,
                 "current_offset": self._next_poll_offset,
                 "state_source": self._state.current_source or None,
+                "state_last_accepted_ts": self._state.last_accepted_ts or None,
                 "state_last_seq": self._state.last_seq or None,
                 "state_last_update_id": self._state.last_update_id or None,
                 "stop_requested": bool(self._stop_requested),
@@ -877,12 +924,22 @@ class Mt4ReaderProcess:
             if str(outcome).startswith("ACCEPTED"):
                 self._last_accepted_message_at = _utc_iso_now()
                 self._accepted_message_count += 1
-                try:
-                    seq = int(getattr(outcome, "seq", 0) or 0)
-                except (TypeError, ValueError):
-                    seq = 0
-                if seq > 0:
-                    self._last_seq_accepted = seq
+                # Parse ts/seq out of the outcome detail string
+                # (ts/seq are recorded by _process_update).
+                detail = getattr(outcome, "detail", "") or ""
+                import re as _re
+                ts_match = _re.search(r"ts=(\d+)", detail)
+                seq_match = _re.search(r"seq=(\d+)", detail)
+                if ts_match:
+                    try:
+                        self._last_ts_accepted = int(ts_match.group(1))
+                    except (TypeError, ValueError):
+                        pass
+                if seq_match:
+                    try:
+                        self._last_seq_accepted = int(seq_match.group(1))
+                    except (TypeError, ValueError):
+                        pass
                 break
         if outcomes:
             self._consecutive_empty_polls = 0
@@ -946,6 +1003,10 @@ class Mt4ReaderProcess:
         assert inspection.snapshot_to_publish is not None
         body = inspection.snapshot_to_publish.snapshot_payload
         source = str(body.get("source", "") or "").strip()
+        # Phase 2.13.20: ``ts`` is the authoritative ordering key.
+        # ``seq`` is captured for diagnostics only and has ZERO
+        # effect on whether a snapshot is accepted.
+        ts = _safe_int(body.get("ts", 0))
         seq = _safe_int(body.get("seq", 0))
 
         # Retired source cannot reclaim — no snapshot publish, no
@@ -964,45 +1025,52 @@ class Mt4ReaderProcess:
                 f"source={source} is retired",
             )
 
-        # Same source, seq gate.
+        # Same source, ts gate. A new Observer message is accepted
+        # iff its ts is strictly greater than the last accepted ts.
+        # An Observer restart that resets seq to 1 (but increases
+        # ts) is therefore accepted; the seq field has no effect on
+        # acceptance.
         if self._state.current_source and source == self._state.current_source:
-            if seq <= self._state.last_seq:
-                # Older or duplicate. No snapshot publish. Just
-                # advance cursor so we don't replay the older
-                # message on restart.
+            if ts <= self._state.last_accepted_ts:
+                # ts is not strictly greater: either equal (duplicate)
+                # or older (replay). No snapshot publish. Just advance
+                # cursor so we don't replay the older message.
                 if update_id > 0:
                     self._state.advance_update_id(update_id)
-                if seq == self._state.last_seq:
+                if ts == self._state.last_accepted_ts:
                     return UpdateOutcome(
-                        IGNORED_DUP, update_id, f"seq={seq}"
+                        IGNORED_DUP, update_id,
+                        f"ts={ts} seq={seq}",
                     )
                 return UpdateOutcome(
                     IGNORED_OLDER, update_id,
-                    f"seq={seq} <= {self._state.last_seq}",
+                    f"ts={ts} <= {self._state.last_accepted_ts} "
+                    f"seq={seq}",
                 )
-            # seq > last_seq: ACCEPT a newer seq. Publish first.
+            # ts > last_accepted_ts: ACCEPT. Publish first.
             self._publish_snapshot(body, inspection.snapshot_to_publish)
-            self._state.accept_newer_seq(seq)
+            self._state.accept_newer_ts(ts, seq=seq)
             if update_id > 0:
                 self._state.advance_update_id(update_id)
             return UpdateOutcome(
-                ACCEPTED, update_id, f"seq={seq}",
+                ACCEPTED, update_id, f"ts={ts} seq={seq}",
             )
 
         # New source — initial accept or rollover. Publish first.
-        # If publish raises, both source and last_seq stay unchanged,
-        # and the cursor is NOT advanced. The update replays.
+        # If publish raises, both source and last_accepted_ts stay
+        # unchanged, and the cursor is NOT advanced. The update
+        # replays.
         self._publish_snapshot(body, inspection.snapshot_to_publish)
         if self._state.current_source:
             self._state.retire_current_and_adopt_new(source)
         else:
             self._state.accept_initial_source(source)
-        self._state.accept_newer_seq(seq)
+        self._state.accept_newer_ts(ts, seq=seq)
         if update_id > 0:
             self._state.advance_update_id(update_id)
         return UpdateOutcome(
             ACCEPTED, update_id,
-            f"source={source} seq={seq}",
+            f"source={source} ts={ts} seq={seq}",
         )
 
     def _publish_snapshot(
