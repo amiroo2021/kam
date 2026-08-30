@@ -163,9 +163,25 @@ def build_running_screen(
         )
     else:
         blocks: List[str] = []
+        # Phase 2.13.22: derive the section title from the
+        # actual mode of the displayed registrations. If every
+        # active reconciliation result is a NOOP, the title
+        # says "Running Fibo (LIVE — read-only)". If any
+        # registration reports ERROR/STALE/SHOULD_FLATTEN/
+        # INCREASE/REDUCE, fall back to the legacy "(DRY RUN —
+        # read-only)" header so the operator can never confuse
+        # a per-registration fail-closed condition with the
+        # system-wide live convergence engine.
+        from .reconciler import DeltaAction
+        def _result_is_steady_noop(r) -> bool:
+            return getattr(r, "delta_action", "") == DeltaAction.NONE.value
+        if results and all(_result_is_steady_noop(r) for r in results):
+            title = "📋 Running Fibo (LIVE — read-only)"
+        else:
+            title = "📋 Running Fibo (DRY RUN — read-only)"
         for r in results:
             blocks.append(_compact_block(r))
-        body = "📋 Running Fibo (DRY RUN — read-only)\n\n" + "\n\n".join(blocks)
+        body = title + "\n\n" + "\n\n".join(blocks)
 
     return {
         "text": body,
