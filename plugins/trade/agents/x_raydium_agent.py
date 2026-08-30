@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -147,7 +148,17 @@ def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
 
 
 def capabilities() -> List[str]:
-    return ["balance", "positions_orders", "new_order", "ladder", "cancel_orders", "positions_management", "resolve_instrument"]
+    return [
+        "balance",
+        "positions_orders",
+        "new_order",
+        "ladder",
+        "cancel_orders",
+        "positions_management",
+        "resolve_instrument",
+        "list_instruments",
+        "market_price",
+    ]
 
 
 def _base58_decode(value: str) -> bytes:
@@ -1352,6 +1363,152 @@ def _raydium_resolve_instrument(account: str, request: Dict[str, Any]) -> Canoni
                         instrument=instrument)
 
 
+
+def _raydium_list_instruments(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Enumerate Orderly public futures markets used by Raydium Trade API."""
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        payload = _public_get("/v1/public/info")
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = []
+    if isinstance(data, dict):
+        rows = data.get("rows") or []
+    elif isinstance(data, list):
+        rows = data
+    if not isinstance(rows, list):
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message="Orderly public info missing rows.",
+        )
+    # Optional futures prices map
+    mark_by = {}
+    try:
+        fut = _public_get("/v1/public/futures")
+        fdata = fut.get("data") if isinstance(fut, dict) else None
+        frows = []
+        if isinstance(fdata, dict):
+            frows = fdata.get("rows") or []
+        elif isinstance(fdata, list):
+            frows = fdata
+        for row in frows or []:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").strip()
+            if not sym:
+                continue
+            mp = row.get("mark_price")
+            if mp is None:
+                mp = row.get("markPrice")
+            if mp is None:
+                mp = row.get("index_price") or row.get("indexPrice")
+            if mp is not None:
+                mark_by[sym] = mp
+    except Exception:  # noqa: BLE001
+        pass
+    instruments: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        orderly_symbol = str(row.get("symbol") or "").strip()
+        if not orderly_symbol:
+            continue
+        display = str(row.get("display_symbol_name") or _symbol_from_orderly(orderly_symbol) or orderly_symbol).strip()
+        entry: Dict[str, Any] = {
+            "instrument": orderly_symbol,
+            "display_name": display,
+            "base": display,
+            "market_type": "perp",
+        }
+        mp = mark_by.get(orderly_symbol)
+        if mp is not None:
+            try:
+                d = Decimal(str(mp))
+                if d.is_finite() and d > 0:
+                    entry["price"] = format(d.normalize(), "f")
+            except Exception:  # noqa: BLE001
+                pass
+        instruments.append(entry)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
+
+
+def _raydium_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        meta = _resolve_symbol_metadata(requested)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="INSTRUMENT_NOT_FOUND",
+            message=sanitize_error_message(str(exc)) or f"Instrument not found: {requested}",
+        )
+    native = str(meta.get("symbol") or "").strip()
+    mark = meta.get("mark_price")
+    try:
+        d = Decimal(str(mark))
+    except Exception:  # noqa: BLE001
+        d = Decimal("0")
+    if d <= 0:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    text = format(d.normalize(), "f")
+    display = str(meta.get("display_symbol") or native)
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account or "",
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=display,
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=native,
+            mark_price=text,
+            price=text,
+        ),
+    )
+
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     operation = str(request.get("operation") or "").strip().lower()
     account = str(request.get("account") or "").strip()
@@ -1375,6 +1532,10 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_cancel_order_group(request)
     if operation == "resolve_instrument":
         return _raydium_resolve_instrument(account, request)
+    if operation == "list_instruments":
+        return _raydium_list_instruments(account, request)
+    if operation == "market_price":
+        return _raydium_market_price(account, request)
     return make_failure(
         operation=operation or "unknown",
         exchange=name,

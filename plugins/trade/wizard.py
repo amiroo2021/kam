@@ -12,6 +12,7 @@ States (encoded as strings, stored per chat_id):
 - ``"select_account"``  — user has picked an exchange; picks an account.
 - ``"action"``          — user has picked an account; picks an action.
 - ``"balance"``         — balance view; refresh returns to itself.
+- ``"summative_report"`` — cross-exchange balances + positions summary.
 - ``"positions_orders"`` — read-only positions & orders view.
 - ``"new_order"``        — new-order symbol chooser.
 - ``"ladder"``          — ladder flow root.
@@ -35,8 +36,10 @@ does not use a plugin-handler registry for /trade.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
+from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
@@ -61,6 +64,7 @@ logger = logging.getLogger(__name__)
 BUTTON_EXIT = ("\u2715 Exit", "exit")
 BUTTON_BACK = ("\u25c0\ufe0f Back", "back")
 BUTTON_REFRESH = ("\u21bb Refresh", "refresh")
+BUTTON_SUMMATIVE_REPORT = ("\U0001f4ca Summative Report", "summative_report")
 BUTTON_CONTINUE = ("Continue", "continue")
 BUTTON_SYMBOL_BTC = ("BTC", "symbol:BTC")
 BUTTON_SYMBOL_ETH = ("ETH", "symbol:ETH")
@@ -75,6 +79,12 @@ BUTTON_LADDER_UNIFORM = ("Uniform", "distribution:uniform")
 BUTTON_LADDER_BUY = ("Buy", "side:buy")
 BUTTON_LADDER_SELL = ("Sell", "side:sell")
 BUTTON_LADDER_CONFIRM = ("✅ Confirm", "confirm")
+# Trade 2.0 — instrument resolution confirm / failure actions.
+BUTTON_RESOLVE_AGREE = ("Agree", "resolve:agree")
+BUTTON_RESOLVE_OTHER = ("Other...", "resolve:other")
+BUTTON_RESOLVE_RETRY = ("Retry", "resolve:retry")
+# Max priced instrument buttons on the picker (plus Other...).
+_INSTRUMENT_PICK_MAX = 5
 
 
 def _button_row(label: str, callback_suffix: str) -> Dict[str, str]:
@@ -141,6 +151,27 @@ def _direction_emoji(side: Any) -> str:
 
 def _display_or_dash(value: Any) -> str:
     return _comma_format(value)
+
+
+def _wizard_decimal(value: Any) -> Optional[Decimal]:
+    """Parse a numeric display value; return None if missing/invalid."""
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text or text in {"—", "-", "None", "null"}:
+        return None
+    try:
+        return Decimal(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_money(value: Decimal, places: str = "0.01") -> str:
+    try:
+        quantized = value.quantize(Decimal(places), rounding=ROUND_HALF_UP)
+    except Exception:  # noqa: BLE001
+        quantized = value
+    return _comma_format(format(quantized, "f"))
 
 
 def _display_protection(value: Any, count: Any = None) -> str:
@@ -246,6 +277,8 @@ class WizardState:
     symbol: Optional[str] = None
     requested_symbol: Optional[str] = None
     resolved_instrument: Optional[Dict[str, Any]] = None
+    # Ranked venue instruments for the picker (symbol + optional price).
+    instrument_candidates: List[Dict[str, Any]] = field(default_factory=list)
     order: Dict[str, Any] = field(default_factory=dict)
     flow: Optional[str] = None
     ladder: Dict[str, Any] = field(default_factory=dict)
@@ -300,6 +333,8 @@ class TradeWizard:
         state = self._state_for(chat_key)
         if state.state == "awaiting_symbol":
             return self._handle_awaiting_symbol(chat_key, text)
+        if state.state == "awaiting_native_symbol":
+            return self._handle_awaiting_native_symbol(chat_key, text)
         if state.state in {
             "awaiting_volume",
             "awaiting_price",
@@ -343,6 +378,8 @@ class TradeWizard:
             return self._handle_action(chat_key, suffix)
         if state.state == "balance":
             return self._handle_balance(chat_key, suffix)
+        if state.state == "summative_report":
+            return self._handle_summative_report(chat_key, suffix)
         if state.state == "positions_orders":
             return self._handle_positions_orders(chat_key, suffix)
         if state.state == "positions_management":
@@ -389,6 +426,12 @@ class TradeWizard:
             return self._handle_cancel_result(chat_key, suffix)
         if state.state == "awaiting_symbol":
             return self._handle_awaiting_symbol_callback(chat_key, suffix)
+        if state.state == "instrument_confirm":
+            return self._handle_instrument_confirm(chat_key, suffix)
+        if state.state == "instrument_unresolved":
+            return self._handle_instrument_unresolved(chat_key, suffix)
+        if state.state == "awaiting_native_symbol":
+            return self._handle_awaiting_native_symbol_callback(chat_key, suffix)
         if state.state == "awaiting_ladder_order_count":
             return self._handle_ladder_text_callback(chat_key, suffix, "order_count")
         if state.state == "awaiting_ladder_total_volume":
@@ -422,6 +465,7 @@ class TradeWizard:
         rows: List[List[Dict[str, str]]] = []
         for ex in exchanges:
             rows.append([_button_row(ex, f"exchange:{ex}")])
+        rows.append([_button_row(*BUTTON_SUMMATIVE_REPORT)])
         rows.append([_button_row(*BUTTON_EXIT)])
         return Screen(
             text=(
@@ -440,6 +484,8 @@ class TradeWizard:
         state = self._state_for(chat_key)
         if suffix == "back":
             return self.open(chat_key)
+        if suffix == "summative_report":
+            return self._render_summative_report(chat_key, refresh=False)
         if not suffix.startswith("exchange:"):
             return self._render_select_exchange(chat_key)
         exchange = suffix[len("exchange:"):].strip()
@@ -588,6 +634,893 @@ class TradeWizard:
             state="action",
         )
 
+    # -- Trade 2.0: instrument resolution + priced picker (once) --------
+
+    def _agent_capabilities(self, exchange: Optional[str]) -> List[str]:
+        """Return desk capabilities for ``exchange``, or ``[]``."""
+        if not exchange:
+            return []
+        caps_fn = getattr(self._desk, "capabilities", None)
+        if not callable(caps_fn):
+            return []
+        try:
+            caps = caps_fn(exchange) or []
+        except Exception:  # noqa: BLE001
+            return []
+        if not isinstance(caps, list):
+            return []
+        return [c for c in caps if isinstance(c, str)]
+
+    def _agent_supports_resolve(self, exchange: Optional[str]) -> bool:
+        """True when the exchange agent advertises ``resolve_instrument``."""
+        return "resolve_instrument" in self._agent_capabilities(exchange)
+
+    def _agent_supports_list_instruments(self, exchange: Optional[str]) -> bool:
+        return "list_instruments" in self._agent_capabilities(exchange)
+
+    def _agent_supports_market_price(self, exchange: Optional[str]) -> bool:
+        return "market_price" in self._agent_capabilities(exchange)
+
+    def _agent_supports_instrument_lookup(self, exchange: Optional[str]) -> bool:
+        """True when resolve and/or catalog listing is available."""
+        caps = self._agent_capabilities(exchange)
+        return "resolve_instrument" in caps or "list_instruments" in caps
+
+    def _call_resolve_instrument(
+        self,
+        exchange: str,
+        account: str,
+        symbol: str,
+    ) -> CanonicalResponse:
+        """Dispatch once through TradeDesk to the agent's existing resolver."""
+        return self._desk.execute(
+            {
+                "operation": "resolve_instrument",
+                "exchange": exchange,
+                "account": account,
+                "symbol": symbol,
+            }
+        )
+
+    def _call_list_instruments(
+        self, exchange: str, account: str
+    ) -> List[Dict[str, Any]]:
+        """Read venue catalog via ``list_instruments`` (empty on failure)."""
+        try:
+            response = self._desk.execute(
+                {
+                    "operation": "list_instruments",
+                    "exchange": exchange,
+                    "account": account,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_instruments failed: %s", exc)
+            return []
+        if not getattr(response, "success", False):
+            return []
+        data = getattr(response, "data", None)
+        if not isinstance(data, dict):
+            return []
+        records = data.get("instruments")
+        if not isinstance(records, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in records:
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+
+    def _call_market_price(
+        self, exchange: str, account: str, symbol: str
+    ) -> Optional[str]:
+        """Best-effort mark/last price string; ``None`` when unavailable."""
+        if not self._agent_supports_market_price(exchange):
+            return None
+        try:
+            response = self._desk.execute(
+                {
+                    "operation": "market_price",
+                    "exchange": exchange,
+                    "account": account,
+                    "symbol": symbol,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market_price(%s) failed: %s", symbol, exc)
+            return None
+        if not getattr(response, "success", False):
+            return None
+        candidates: List[Any] = []
+        mp_obj = getattr(response, "market_price", None)
+        if mp_obj is not None:
+            if isinstance(mp_obj, dict):
+                candidates.extend(
+                    [
+                        mp_obj.get("mark_price"),
+                        mp_obj.get("price"),
+                        mp_obj.get("last_external_price"),
+                    ]
+                )
+            else:
+                candidates.extend(
+                    [
+                        getattr(mp_obj, "mark_price", None),
+                        getattr(mp_obj, "price", None),
+                        getattr(mp_obj, "last_external_price", None),
+                    ]
+                )
+        data = getattr(response, "data", None)
+        if isinstance(data, dict):
+            candidates.extend(
+                [data.get("mark_price"), data.get("price"), data.get("mark")]
+            )
+        for raw in candidates:
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            try:
+                dec = Decimal(text)
+            except Exception:  # noqa: BLE001
+                continue
+            if dec.is_finite():
+                return format(dec.normalize(), "f")
+        return None
+
+    def _candidate_symbol(self, item: Any) -> str:
+        if isinstance(item, dict):
+            return str(
+                item.get("symbol")
+                or item.get("instrument")
+                or item.get("market")
+                or ""
+            ).strip()
+        return str(item or "").strip()
+
+    # Concept groups expand free-text (OIL, GOLD, …) into catalog tokens.
+    # Matching still requires the venue catalog to contain the market —
+    # these never invent an instrument id.
+    _CONCEPT_GROUPS: Tuple[frozenset, ...] = (
+        frozenset({"GOLD", "XAU", "XAUUSD", "XAUUSDT"}),
+        frozenset({"SILVER", "XAG", "XAGUSD", "XAGUSDT"}),
+        frozenset({"OIL", "WTI", "BRENT", "CRUDE", "CL", "OILUSD", "CRUDEOIL"}),
+        frozenset({"NATGAS", "NG", "GAS", "HENRY", "NATGASUSD"}),
+        frozenset({"BTC", "BITCOIN", "XBT", "BTCUSD", "BTCUSDT"}),
+        frozenset({"ETH", "ETHEREUM", "ETHER", "ETHUSD", "ETHUSDT"}),
+        frozenset({"SOL", "SOLANA", "SOLUSD", "SOLUSDT"}),
+    )
+    _QUOTE_NOISE = frozenset(
+        {"USD", "USDT", "USDC", "PERP", "P", "USDTM", "USDCM"}
+    )
+
+    def _tokenize_instrument(self, text: str) -> List[str]:
+        raw = str(text or "").strip().upper()
+        if not raw:
+            return []
+        parts = [p for p in re.split(r"[^A-Z0-9]+", raw) if p]
+        out: List[str] = []
+        for p in parts:
+            if p in self._QUOTE_NOISE:
+                continue
+            out.append(p)
+            # Peel trailing quote suffixes stuck to a base (WTIUSD → WTI).
+            for suffix in ("USDT", "USDC", "USD", "PERP"):
+                if p.endswith(suffix) and len(p) > len(suffix):
+                    base = p[: -len(suffix)]
+                    if base and base not in out:
+                        out.append(base)
+        return out
+
+    def _symbol_search_hints(self, requested: str) -> List[str]:
+        """Expand user text into catalog search tokens (never venue ids)."""
+        raw = str(requested or "").strip().upper()
+        if not raw:
+            return []
+        hints: List[str] = [raw]
+        hints.extend(self._tokenize_instrument(raw))
+        for suffix in ("USDT", "USDC", "USD", "PERP"):
+            if raw.endswith(suffix) and len(raw) > len(suffix):
+                prefix = raw[: -len(suffix)]
+                if prefix and prefix not in hints:
+                    hints.append(prefix)
+        # Expand concept groups (OIL → WTI/BRENT/CRUDE, GOLD → XAU, …).
+        expanded: List[str] = []
+        for seed in list(hints):
+            for group in self._CONCEPT_GROUPS:
+                if seed in group:
+                    for token in group:
+                        if token not in hints and token not in expanded:
+                            expanded.append(token)
+        hints.extend(expanded)
+        # De-dupe preserve order.
+        seen: set[str] = set()
+        out: List[str] = []
+        for h in hints:
+            if h and h not in seen:
+                seen.add(h)
+                out.append(h)
+        return out
+
+    def _rank_catalog_candidates(
+        self, catalog: List[Dict[str, Any]], requested: str
+    ) -> List[Dict[str, Any]]:
+        """Rank venue catalog rows against free-text ``requested``.
+
+        Strategy (exchange-agnostic):
+        1. Prefer fibo ranker when the fibo package is installed.
+        2. Else score each catalog row with exact / concept-token /
+           field-substring / SequenceMatcher signals.
+        3. If nothing scores, still return the closest fuzzy top-N so the
+           user can pick (never invent symbols outside the catalog).
+        """
+        if not catalog:
+            return []
+        try:
+            from plugins.trade.fibo.candidates import rank_candidates
+
+            ranked = rank_candidates(catalog, requested)
+            out: List[Dict[str, Any]] = []
+            for cand in ranked:
+                if int(getattr(cand, "score", 0) or 0) <= 0:
+                    continue
+                sym = str(getattr(cand, "instrument", "") or "").strip()
+                if not sym:
+                    continue
+                price = getattr(cand, "price", None)
+                entry: Dict[str, Any] = {
+                    "symbol": sym,
+                    "display_name": str(getattr(cand, "display_name", "") or "").strip(),
+                    "score": int(getattr(cand, "score", 0) or 0),
+                }
+                if price is not None:
+                    entry["price"] = (
+                        format(price.normalize(), "f")
+                        if hasattr(price, "normalize")
+                        else str(price)
+                    )
+                out.append(entry)
+            if out:
+                # Apply the same strength filter as the builtin ranker.
+                best = max(int(e.get("score") or 0) for e in out)
+                floor = 40 if best >= 40 else max(15, int(best * 0.5))
+                strong = [
+                    e for e in out
+                    if int(e.get("score") or 0) >= floor
+                ]
+                return strong or out[: min(3, len(out))]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("rank_candidates fallback: %s", exc)
+
+        req = str(requested or "").strip().upper()
+        hints = self._symbol_search_hints(req)
+        hint_set = {h.upper() for h in hints}
+        scored: List[Tuple[int, float, str, Dict[str, Any]]] = []
+
+        for raw in catalog:
+            if not isinstance(raw, dict):
+                continue
+            sym = self._candidate_symbol(raw)
+            if not sym:
+                continue
+            up = sym.upper()
+            base = str(raw.get("base") or "").strip().upper()
+            display = str(
+                raw.get("display_name") or raw.get("displayName") or ""
+            ).strip().upper()
+            desc = str(
+                raw.get("description")
+                or raw.get("long_name")
+                or raw.get("longName")
+                or ""
+            ).strip().upper()
+            tokens = set(self._tokenize_instrument(up))
+            if base:
+                tokens.update(self._tokenize_instrument(base))
+            if display:
+                tokens.update(self._tokenize_instrument(display))
+            if desc:
+                tokens.update(self._tokenize_instrument(desc))
+
+            score = 0
+            if up == req:
+                score += 100
+            if base and base == req:
+                score += 80
+            # Concept / hint token hits on instrument tokens.
+            overlap = tokens & hint_set
+            if overlap:
+                score += 90 if any(t == req or t in hint_set for t in overlap) else 60
+                # Prefer more specific token hits.
+                if any(len(t) >= 3 and t in tokens for t in hint_set):
+                    score += 10
+            # Substring presence in fields.
+            blob = " ".join(x for x in (up, base, display, desc) if x)
+            for h in hint_set:
+                if len(h) >= 2 and h in blob:
+                    score += 25
+                    break
+            # Fuzzy similarity against symbol / base / tokens.
+            best_ratio = 0.0
+            for cand_txt in (up, base, display, *tokens):
+                if not cand_txt:
+                    continue
+                r = SequenceMatcher(None, req, cand_txt).ratio()
+                if r > best_ratio:
+                    best_ratio = r
+                for h in hint_set:
+                    if h == req:
+                        continue
+                    r2 = SequenceMatcher(None, h, cand_txt).ratio()
+                    if r2 > best_ratio:
+                        best_ratio = r2
+            if best_ratio >= 0.75:
+                score += 40
+            elif best_ratio >= 0.55:
+                score += 20
+            elif best_ratio >= 0.4:
+                score += 8
+
+            entry = {
+                "symbol": sym,
+                "display_name": str(
+                    raw.get("display_name") or raw.get("displayName") or ""
+                ).strip(),
+                "score": score,
+                "fuzzy": round(best_ratio, 3),
+            }
+            if raw.get("price") is not None:
+                entry["price"] = str(raw.get("price"))
+            scored.append((score, best_ratio, up, entry))
+
+        # Prefer positive semantic scores; drop weak fuzzy noise.
+        positive = [t for t in scored if t[0] > 0]
+        positive.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        if positive:
+            best = positive[0][0]
+            # Keep strong hits (exact/concept/substring). Require either a
+            # solid score floor or proximity to the best match so weak
+            # SequenceMatcher noise (OIL≈ETH) does not appear as a pick.
+            floor = 40 if best >= 40 else max(15, int(best * 0.5))
+            keep = [
+                t
+                for t in positive
+                if t[0] >= floor or (t[0] >= 25 and t[1] >= 0.7)
+            ]
+            if not keep:
+                keep = positive[: min(3, len(positive))]
+            return [t[3] for t in keep]
+
+        # No semantic hit — still offer closest catalog rows by fuzzy ratio.
+        fuzzy = [t for t in scored if t[1] >= 0.45]
+        fuzzy.sort(key=lambda t: (-t[1], t[2]))
+        out_fuzzy: List[Dict[str, Any]] = []
+        for _score, ratio, _up, entry in fuzzy[:_INSTRUMENT_PICK_MAX]:
+            row = dict(entry)
+            row["score"] = max(1, int(ratio * 100))
+            out_fuzzy.append(row)
+        return out_fuzzy
+
+    def _enrich_candidate_prices(
+        self,
+        exchange: str,
+        account: str,
+        candidates: List[Dict[str, Any]],
+        *,
+        limit: int = _INSTRUMENT_PICK_MAX,
+    ) -> List[Dict[str, Any]]:
+        """Attach market prices to the top ``limit`` candidates (best-effort)."""
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in candidates:
+            sym = self._candidate_symbol(item)
+            if not sym:
+                continue
+            key = sym.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = dict(item) if isinstance(item, dict) else {"symbol": sym}
+            entry["symbol"] = sym
+            if not entry.get("price") and self._agent_supports_market_price(exchange):
+                price = self._call_market_price(exchange, account, sym)
+                if price:
+                    entry["price"] = price
+            out.append(entry)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _build_priced_candidates(
+        self,
+        exchange: str,
+        account: str,
+        requested: str,
+        *,
+        primary_native: Optional[str] = None,
+        agent_candidates: Optional[List[Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Merge resolver primary + similar catalog hits, then attach prices."""
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _push(sym: str, **extra: Any) -> None:
+            key = sym.upper()
+            if not sym or key in seen:
+                return
+            seen.add(key)
+            row = {"symbol": sym}
+            row.update({k: v for k, v in extra.items() if v is not None and v != ""})
+            merged.append(row)
+
+        if primary_native:
+            _push(str(primary_native).strip(), score=1000, primary=True)
+
+        for item in agent_candidates or []:
+            sym = self._candidate_symbol(item)
+            if not sym:
+                continue
+            extra: Dict[str, Any] = {}
+            if isinstance(item, dict):
+                if item.get("price") is not None:
+                    extra["price"] = item.get("price")
+                if item.get("display_name"):
+                    extra["display_name"] = item.get("display_name")
+            _push(sym, score=900, **extra)
+
+        if self._agent_supports_list_instruments(exchange):
+            catalog = self._call_list_instruments(exchange, account)
+            for ranked in self._rank_catalog_candidates(catalog, requested):
+                _push(
+                    str(ranked.get("symbol") or "").strip(),
+                    score=ranked.get("score"),
+                    display_name=ranked.get("display_name"),
+                    price=ranked.get("price"),
+                )
+
+        if not merged and primary_native:
+            _push(str(primary_native).strip(), score=1000, primary=True)
+
+        return self._enrich_candidate_prices(
+            exchange, account, merged, limit=_INSTRUMENT_PICK_MAX
+        )
+
+    def _instrument_button_label(self, entry: Dict[str, Any]) -> str:
+        sym = self._candidate_symbol(entry) or "?"
+        price = entry.get("price")
+        if price is None or str(price).strip() == "":
+            return sym
+        return f"{sym} · {_comma_format(price)}"
+
+    def _commit_native_symbol(self, chat_key: Tuple[Any, ...], native: str) -> None:
+        """Store the exchange-native instrument for all downstream /trade ops."""
+        state = self._state_for(chat_key)
+        native_sym = str(native or "").strip()
+        state.symbol = native_sym
+        if state.flow == "ladder":
+            state.ladder["symbol"] = native_sym
+        else:
+            state.order["symbol"] = native_sym
+
+    def _continue_after_symbol(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        if state.flow == "ladder":
+            return self._render_ladder_side(chat_key)
+        return self._render_new_order_side(chat_key)
+
+    def _symbol_chooser_screen(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        if state.flow == "ladder":
+            return self._render_ladder_symbol(chat_key)
+        return self._render_new_order(chat_key)
+
+    def _flow_title(self, chat_key: Tuple[Any, ...]) -> str:
+        return "Ladder" if self._state_for(chat_key).flow == "ladder" else "New Order"
+
+    def _extract_resolved_native(self, response: CanonicalResponse) -> Optional[str]:
+        inst = getattr(response, "instrument", None)
+        if inst is None:
+            return None
+        if isinstance(inst, dict):
+            sym = str(inst.get("symbol") or "").strip()
+        else:
+            sym = str(getattr(inst, "symbol", "") or "").strip()
+        return sym or None
+
+    def _instrument_payload(self, response: CanonicalResponse) -> Dict[str, Any]:
+        inst = getattr(response, "instrument", None)
+        if inst is None:
+            return {}
+        if hasattr(inst, "to_dict") and callable(inst.to_dict):
+            try:
+                data = inst.to_dict()
+                if isinstance(data, dict):
+                    return dict(data)
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(inst, dict):
+            return dict(inst)
+        return {
+            "symbol": str(getattr(inst, "symbol", "") or "").strip(),
+            "requested_symbol": str(getattr(inst, "requested_symbol", "") or "").strip(),
+            "display_name": str(getattr(inst, "display_name", "") or "").strip(),
+        }
+
+    def _apply_entered_instrument(
+        self,
+        chat_key: Tuple[Any, ...],
+        entered: str,
+        *,
+        manual_native: bool = False,
+    ) -> Screen:
+        """Resolve once at the earliest common point (exchange+account+symbol).
+
+        - No resolve/list capability → legacy pass-through.
+        - ``manual_native`` (Other path) → store typed value as-is, no resolve.
+        - Resolver and/or catalog → priced instrument buttons + Other...
+        - User must pick a button (never auto-guess on ambiguity).
+        - After pick, continue New Order / Ladder params; confirm still
+          dispatches ``new_order`` / ``ladder`` via the exchange agent API.
+        """
+        state = self._state_for(chat_key)
+        raw = str(entered or "").strip()
+        if not raw:
+            title = self._flow_title(chat_key)
+            state.state = "awaiting_symbol"
+            return Screen(
+                text=(
+                    f"{title}\n\n"
+                    "Enter another symbol:\n\n"
+                    "Instrument not found."
+                ),
+                buttons=[
+                    [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
+                ],
+                state="awaiting_symbol",
+            )
+
+        requested = raw.upper()
+        state.requested_symbol = requested
+        state.resolved_instrument = None
+        state.instrument_candidates = []
+
+        if manual_native:
+            self._commit_native_symbol(chat_key, requested)
+            return self._continue_after_symbol(chat_key)
+
+        exchange = str(state.exchange or "").strip()
+        account = str(state.account or "").strip()
+        if (
+            not exchange
+            or not account
+            or not self._agent_supports_instrument_lookup(exchange)
+        ):
+            # No resolver/catalog — keep legacy /trade pass-through.
+            self._commit_native_symbol(chat_key, requested)
+            return self._continue_after_symbol(chat_key)
+
+        primary_native: Optional[str] = None
+        payload: Dict[str, Any] = {"requested_symbol": requested}
+        agent_error_candidates: List[Any] = []
+        resolve_error_code: Optional[str] = None
+        resolve_error_message: Optional[str] = None
+
+        if self._agent_supports_resolve(exchange):
+            try:
+                response = self._call_resolve_instrument(exchange, account, requested)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("resolve_instrument failed: %s", exc)
+                resolve_error_code = "AGENT_EXCEPTION"
+                resolve_error_message = str(exc)
+                response = None
+            if response is not None:
+                if getattr(response, "success", False):
+                    primary_native = self._extract_resolved_native(response)
+                    if primary_native:
+                        payload = self._instrument_payload(response)
+                        payload["requested_symbol"] = requested
+                        payload["symbol"] = primary_native
+                    else:
+                        resolve_error_code = "INSTRUMENT_NOT_FOUND"
+                        resolve_error_message = "Instrument not found."
+                else:
+                    err = getattr(response, "error", None)
+                    resolve_error_code = str(
+                        getattr(err, "code", "") or "INSTRUMENT_NOT_FOUND"
+                    )
+                    resolve_error_message = str(
+                        getattr(err, "message", "") or "Instrument not found."
+                    )
+                    data = getattr(response, "data", None)
+                    if isinstance(data, dict):
+                        raw_cands = data.get("candidates")
+                        if isinstance(raw_cands, list):
+                            agent_error_candidates = list(raw_cands)
+
+        candidates = self._build_priced_candidates(
+            exchange,
+            account,
+            requested,
+            primary_native=primary_native,
+            agent_candidates=agent_error_candidates,
+        )
+        state.instrument_candidates = list(candidates)
+
+        if candidates:
+            if primary_native:
+                payload["symbol"] = primary_native
+            else:
+                # Catalog-only hit — stage first candidate as default Agree target.
+                payload["symbol"] = self._candidate_symbol(candidates[0])
+            payload["candidates"] = candidates
+            state.resolved_instrument = payload
+            return self._render_instrument_confirm(chat_key)
+
+        state.resolved_instrument = {
+            "requested_symbol": requested,
+            "error_code": resolve_error_code or "INSTRUMENT_NOT_FOUND",
+            "error_message": resolve_error_message or "Instrument not found.",
+            "candidates": [],
+        }
+        return self._render_instrument_unresolved(chat_key)
+
+    def _render_instrument_confirm(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "instrument_confirm"
+        info = state.resolved_instrument or {}
+        source = str(state.requested_symbol or info.get("requested_symbol") or "").strip()
+        candidates = list(state.instrument_candidates or info.get("candidates") or [])
+        if candidates and not state.instrument_candidates:
+            state.instrument_candidates = list(candidates)
+        title = self._flow_title(chat_key)
+        lines = [
+            f"{title}",
+            "",
+            "Select Instrument",
+            f"Source: {source}",
+        ]
+        if candidates:
+            lines.append("")
+            for idx, entry in enumerate(candidates[:_INSTRUMENT_PICK_MAX], start=1):
+                if not isinstance(entry, dict):
+                    entry = {"symbol": self._candidate_symbol(entry)}
+                sym = self._candidate_symbol(entry)
+                price = entry.get("price")
+                if price is not None and str(price).strip() != "":
+                    lines.append(f"{idx}. {sym}  ·  {_comma_format(price)}")
+                else:
+                    lines.append(f"{idx}. {sym}")
+        else:
+            resolved = str(info.get("symbol") or "").strip()
+            if resolved:
+                lines.extend(["", f"Resolved: {resolved}"])
+
+        buttons: List[List[Dict[str, str]]] = []
+        if candidates:
+            for idx, entry in enumerate(candidates[:_INSTRUMENT_PICK_MAX]):
+                if not isinstance(entry, dict):
+                    entry = {"symbol": self._candidate_symbol(entry)}
+                buttons.append(
+                    [
+                        _button_row(
+                            self._instrument_button_label(entry),
+                            f"resolve:pick:{idx}",
+                        )
+                    ]
+                )
+        else:
+            # Fallback: Agree on staged resolved id (legacy single-match).
+            buttons.append(
+                [_button_row(*BUTTON_RESOLVE_AGREE), _button_row(*BUTTON_RESOLVE_OTHER)]
+            )
+        if candidates:
+            buttons.append([_button_row(*BUTTON_RESOLVE_OTHER)])
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
+        return Screen(
+            text="\n".join(lines),
+            buttons=buttons,
+            state="instrument_confirm",
+        )
+
+    def _render_instrument_unresolved(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "instrument_unresolved"
+        info = state.resolved_instrument or {}
+        source = str(state.requested_symbol or info.get("requested_symbol") or "").strip()
+        code = str(info.get("error_code") or "INSTRUMENT_NOT_FOUND")
+        message = str(info.get("error_message") or "Instrument not found.")
+        candidates = list(state.instrument_candidates or info.get("candidates") or [])
+        title = self._flow_title(chat_key)
+        lines = [
+            f"{title}",
+            "",
+            "Instrument Resolution",
+            f"Source: {source}",
+            "Resolved: (not found)",
+            "",
+            message,
+            f"({code})",
+        ]
+        buttons: List[List[Dict[str, str]]] = []
+        # Prefer clickable similar instruments when we have them.
+        clickable = [c for c in candidates if self._candidate_symbol(c)]
+        if clickable:
+            state.instrument_candidates = [
+                c if isinstance(c, dict) else {"symbol": self._candidate_symbol(c)}
+                for c in clickable[:_INSTRUMENT_PICK_MAX]
+            ]
+            lines.append("")
+            lines.append("Similar instruments:")
+            for idx, entry in enumerate(state.instrument_candidates, start=1):
+                label = self._instrument_button_label(entry)
+                lines.append(f"{idx}. {self._candidate_symbol(entry)}")
+                buttons.append(
+                    [_button_row(label, f"resolve:pick:{idx - 1}")]
+                )
+            buttons.append(
+                [
+                    _button_row(*BUTTON_RESOLVE_RETRY),
+                    _button_row(*BUTTON_RESOLVE_OTHER),
+                ]
+            )
+        else:
+            if isinstance(candidates, list) and candidates:
+                lines.append("")
+                lines.append("Candidates:")
+                for item in candidates[:8]:
+                    label = self._candidate_symbol(item)
+                    if label:
+                        lines.append(f"• {label}")
+            buttons.append(
+                [
+                    _button_row(*BUTTON_RESOLVE_RETRY),
+                    _button_row(*BUTTON_RESOLVE_OTHER),
+                ]
+            )
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
+        return Screen(
+            text="\n".join(lines),
+            buttons=buttons,
+            state="instrument_unresolved",
+        )
+
+    def _render_awaiting_native_symbol(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "awaiting_native_symbol"
+        title = self._flow_title(chat_key)
+        source = str(state.requested_symbol or "").strip()
+        extra = f"\nSource: {source}" if source else ""
+        return Screen(
+            text=(
+                f"{title}\n\n"
+                "Enter the exchange-native instrument:"
+                f"{extra}"
+            ),
+            buttons=[
+                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
+            ],
+            state="awaiting_native_symbol",
+        )
+
+    def _pick_instrument_candidate(
+        self, chat_key: Tuple[Any, ...], index: int
+    ) -> Screen:
+        state = self._state_for(chat_key)
+        candidates = list(state.instrument_candidates or [])
+        if index < 0 or index >= len(candidates):
+            if state.resolved_instrument and state.resolved_instrument.get("symbol"):
+                return self._render_instrument_confirm(chat_key)
+            return self._render_instrument_unresolved(chat_key)
+        entry = candidates[index]
+        native = self._candidate_symbol(entry)
+        if not native:
+            return self._render_instrument_unresolved(chat_key)
+        info = dict(state.resolved_instrument or {})
+        info["symbol"] = native
+        if isinstance(entry, dict) and entry.get("price") is not None:
+            info["price"] = entry.get("price")
+        state.resolved_instrument = info
+        self._commit_native_symbol(chat_key, native)
+        return self._continue_after_symbol(chat_key)
+
+    def _handle_instrument_confirm(
+        self, chat_key: Tuple[Any, ...], suffix: str
+    ) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix == "back":
+            state.resolved_instrument = None
+            state.instrument_candidates = []
+            state.symbol = None
+            return self._symbol_chooser_screen(chat_key)
+        if suffix.startswith("resolve:pick:"):
+            raw_idx = suffix[len("resolve:pick:") :].strip()
+            try:
+                idx = int(raw_idx)
+            except ValueError:
+                return self._render_instrument_confirm(chat_key)
+            return self._pick_instrument_candidate(chat_key, idx)
+        if suffix == "resolve:agree":
+            # Legacy Agree: first candidate, else staged resolved symbol.
+            if state.instrument_candidates:
+                return self._pick_instrument_candidate(chat_key, 0)
+            info = state.resolved_instrument or {}
+            native = str(info.get("symbol") or "").strip()
+            if not native:
+                return self._render_instrument_unresolved(chat_key)
+            self._commit_native_symbol(chat_key, native)
+            return self._continue_after_symbol(chat_key)
+        if suffix == "resolve:other":
+            return self._render_awaiting_native_symbol(chat_key)
+        return self._render_instrument_confirm(chat_key)
+
+    def _handle_instrument_unresolved(
+        self, chat_key: Tuple[Any, ...], suffix: str
+    ) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix == "back":
+            state.resolved_instrument = None
+            state.instrument_candidates = []
+            state.symbol = None
+            return self._symbol_chooser_screen(chat_key)
+        if suffix.startswith("resolve:pick:"):
+            raw_idx = suffix[len("resolve:pick:") :].strip()
+            try:
+                idx = int(raw_idx)
+            except ValueError:
+                return self._render_instrument_unresolved(chat_key)
+            return self._pick_instrument_candidate(chat_key, idx)
+        if suffix == "resolve:retry":
+            requested = str(state.requested_symbol or "").strip()
+            if not requested:
+                return self._symbol_chooser_screen(chat_key)
+            return self._apply_entered_instrument(chat_key, requested)
+        if suffix == "resolve:other":
+            return self._render_awaiting_native_symbol(chat_key)
+        return self._render_instrument_unresolved(chat_key)
+
+    def _handle_awaiting_native_symbol(
+        self, chat_key: Tuple[Any, ...], text: str
+    ) -> Screen:
+        native = (text or "").strip()
+        if not native:
+            return self._render_awaiting_native_symbol(chat_key)
+        state = self._state_for(chat_key)
+        exchange = str(state.exchange or "").strip()
+        # Prefer agent resolve/catalog when available so aliases like
+        # GOLD → XAU still surface a pickable venue id. Only fall back
+        # to a raw as-is commit when the exchange has no lookup ops.
+        if self._agent_supports_instrument_lookup(exchange):
+            return self._apply_entered_instrument(
+                chat_key, native, manual_native=False
+            )
+        # Legacy / no-resolve desks: operator-supplied value as-is.
+        return self._apply_entered_instrument(
+            chat_key, native, manual_native=True
+        )
+
+    def _handle_awaiting_native_symbol_callback(
+        self, chat_key: Tuple[Any, ...], suffix: str
+    ) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix == "back":
+            info = state.resolved_instrument or {}
+            if state.instrument_candidates or info.get("symbol"):
+                return self._render_instrument_confirm(chat_key)
+            if info.get("error_code"):
+                return self._render_instrument_unresolved(chat_key)
+            return self._symbol_chooser_screen(chat_key)
+        return self._render_awaiting_native_symbol(chat_key)
+
     # -- new order symbol selection -------------------------------------
 
     def _render_new_order(self, chat_key: Tuple[Any, ...]) -> Screen:
@@ -597,6 +1530,7 @@ class TradeWizard:
         state.symbol = None
         state.requested_symbol = None
         state.resolved_instrument = None
+        state.instrument_candidates = []
         state.order.clear()
         state.ladder.clear()
         return Screen(
@@ -667,32 +1601,11 @@ class TradeWizard:
                 return self._render_new_order_awaiting_symbol(chat_key)
             if not symbol:
                 return self._render_new_order(chat_key)
-            state.symbol = symbol.strip().upper()
-            state.order["symbol"] = state.symbol
-            return self._render_new_order_side(chat_key)
+            return self._apply_entered_instrument(chat_key, symbol)
         return self._render_new_order(chat_key)
 
     def _handle_awaiting_symbol(self, chat_key: Tuple[Any, ...], text: str) -> Screen:
-        symbol = (text or "").strip()
-        if not symbol:
-            return Screen(
-                text=(
-                    "New Order\n\n"
-                    "Enter another symbol:\n\n"
-                    "Instrument not found."
-                ),
-                buttons=[
-                    [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
-                ],
-                state="awaiting_symbol",
-            )
-        state = self._state_for(chat_key)
-        state.symbol = symbol.upper()
-        if state.flow == "ladder":
-            state.ladder["symbol"] = state.symbol
-            return self._render_ladder_side(chat_key)
-        state.order["symbol"] = state.symbol
-        return self._render_new_order_side(chat_key)
+        return self._apply_entered_instrument(chat_key, text)
 
     def _handle_awaiting_symbol_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
         if suffix == "back":
@@ -1014,9 +1927,7 @@ class TradeWizard:
                 return self._render_ladder_awaiting_symbol(chat_key)
             if not symbol:
                 return self._render_ladder_symbol(chat_key)
-            state.symbol = symbol.strip().upper()
-            state.ladder["symbol"] = state.symbol
-            return self._render_ladder_side(chat_key)
+            return self._apply_entered_instrument(chat_key, symbol)
         return self._render_ladder_symbol(chat_key)
 
     def _render_ladder_side(self, chat_key: Tuple[Any, ...]) -> Screen:
@@ -2077,6 +2988,217 @@ class TradeWizard:
             self.reset(chat_key)
             return Screen(text="Trade closed.", buttons=[], state="closed")
         return self._render_balance(chat_key, refresh=False)
+
+    # -- summative report (all exchanges / accounts) --------------------
+
+    def _render_summative_report(
+        self,
+        chat_key: Tuple[Any, ...],
+        refresh: bool,
+    ) -> Screen:
+        """Cross-exchange snapshot: summed balances + all open positions.
+
+        Read-only. Walks every discovered exchange/account via the desk's
+        canonical ``balance`` and ``positions_orders`` ops. Failures on a
+        single account are listed without aborting the rest.
+        """
+        del refresh  # always live-fetch; kept for Refresh button parity
+        state = self._state_for(chat_key)
+        state.state = "summative_report"
+        # Report is venue-agnostic; clear single-venue selection so Back
+        # returns cleanly to the exchange picker.
+        state.exchange = None
+        state.account = None
+
+        balance_by_unit: Dict[str, Decimal] = {}
+        account_value_by_unit: Dict[str, Decimal] = {}
+        per_account_lines: List[str] = []
+        position_lines: List[str] = []
+        position_net: Dict[Tuple[str, str], Decimal] = {}  # (symbol, side) -> size
+        pnl_total = Decimal("0")
+        pnl_any = False
+        errors: List[str] = []
+        accounts_ok = 0
+        accounts_seen = 0
+
+        exchanges = list(self._desk.list_exchanges() or [])
+        for exchange in exchanges:
+            try:
+                accounts = list(self._desk.list_accounts(exchange) or [])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{exchange}: list_accounts failed ({exc})")
+                continue
+            for entry in accounts:
+                alias, label = _account_option_parts(entry)
+                if not alias:
+                    continue
+                accounts_seen += 1
+                display_name = label or alias
+                bal_value: Optional[Decimal] = None
+                bal_unit = "USDT"
+                acct_value: Optional[Decimal] = None
+
+                try:
+                    bal_resp: CanonicalResponse = self._desk.execute(
+                        {
+                            "operation": "balance",
+                            "exchange": exchange,
+                            "account": alias,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{exchange}/{display_name}: balance error ({exc})")
+                    bal_resp = None  # type: ignore[assignment]
+
+                if bal_resp is not None and bal_resp.success and bal_resp.balance is not None:
+                    bal_value = _wizard_decimal(bal_resp.balance.value)
+                    bal_unit = str(bal_resp.balance.unit or "USDT").strip() or "USDT"
+                    if bal_value is not None:
+                        balance_by_unit[bal_unit] = balance_by_unit.get(bal_unit, Decimal("0")) + bal_value
+                    summary = getattr(bal_resp, "portfolio_summary", None)
+                    if summary is not None:
+                        acct_value = _wizard_decimal(getattr(summary, "account_value", None))
+                        sum_unit = str(getattr(summary, "unit", None) or bal_unit).strip() or bal_unit
+                        if acct_value is not None:
+                            account_value_by_unit[sum_unit] = (
+                                account_value_by_unit.get(sum_unit, Decimal("0")) + acct_value
+                            )
+                    accounts_ok += 1
+                elif bal_resp is not None and not bal_resp.success:
+                    err = bal_resp.error
+                    msg = getattr(err, "message", None) or "balance unavailable"
+                    errors.append(f"{exchange}/{display_name}: {msg}")
+
+                try:
+                    pos_resp: CanonicalResponse = self._desk.execute(
+                        {
+                            "operation": "positions_orders",
+                            "exchange": exchange,
+                            "account": alias,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{exchange}/{display_name}: positions error ({exc})")
+                    pos_resp = None  # type: ignore[assignment]
+
+                positions = []
+                if pos_resp is not None and pos_resp.success:
+                    positions = list(pos_resp.positions or [])
+                elif pos_resp is not None and not pos_resp.success:
+                    err = pos_resp.error
+                    msg = getattr(err, "message", None) or "positions unavailable"
+                    # Avoid duplicate noise if balance already failed hard.
+                    errors.append(f"{exchange}/{display_name}: positions {msg}")
+
+                bal_txt = (
+                    f"{_format_money(bal_value)} {bal_unit}"
+                    if bal_value is not None
+                    else "—"
+                )
+                if acct_value is not None:
+                    bal_txt += f" (AV {_format_money(acct_value)})"
+                per_account_lines.append(f"• {exchange} / {display_name}: {bal_txt}")
+
+                for position in positions:
+                    symbol = str(getattr(position, "symbol", "") or "").strip() or "?"
+                    side = str(getattr(position, "side", "") or "").strip().lower() or "?"
+                    size_d = _wizard_decimal(getattr(position, "size", None))
+                    pnl_d = _wizard_decimal(getattr(position, "pnl", None))
+                    if size_d is not None and size_d != 0:
+                        key = (symbol.upper(), side)
+                        position_net[key] = position_net.get(key, Decimal("0")) + size_d
+                    if pnl_d is not None:
+                        pnl_total += pnl_d
+                        pnl_any = True
+                    position_lines.append(
+                        " ".join(
+                            [
+                                f"{_direction_emoji(side)} {exchange}/{display_name}",
+                                symbol,
+                                f"sz {_display_or_dash(getattr(position, 'size', None))}",
+                                f"@ {_display_or_dash(getattr(position, 'entry_price', None))}",
+                                f"PnL {_pnl_format(getattr(position, 'pnl', None))}",
+                            ]
+                        )
+                    )
+
+        lines: List[str] = [
+            "📊 Summative Report",
+            "",
+            f"Accounts scanned: {accounts_ok}/{accounts_seen}"
+            if accounts_seen
+            else "Accounts scanned: 0",
+            "",
+            "Balances (sum by unit)",
+        ]
+        if balance_by_unit:
+            for unit in sorted(balance_by_unit.keys()):
+                lines.append(f"• {unit}: {_format_money(balance_by_unit[unit])}")
+        else:
+            lines.append("• No balances available.")
+
+        if account_value_by_unit:
+            lines.append("")
+            lines.append("Account value (sum by unit)")
+            for unit in sorted(account_value_by_unit.keys()):
+                lines.append(f"• {unit}: {_format_money(account_value_by_unit[unit])}")
+
+        lines.extend(["", "Per account"])
+        if per_account_lines:
+            lines.extend(per_account_lines)
+        else:
+            lines.append("• No configured accounts.")
+
+        lines.extend(["", "Open positions (all venues)"])
+        if position_lines:
+            lines.extend(position_lines)
+            if position_net:
+                lines.extend(["", "Position size net by symbol/side"])
+                for (symbol, side), size in sorted(position_net.items()):
+                    lines.append(
+                        f"{_direction_emoji(side)} {symbol} {side}: {_display_or_dash(format(size, 'f'))}"
+                    )
+            if pnl_any:
+                lines.append("")
+                lines.append(f"Total unrealized PnL (reported): {_pnl_format(pnl_total)}")
+        else:
+            lines.append("No open positions.")
+
+        if errors:
+            lines.extend(["", "Issues"])
+            # Cap error noise for Telegram length.
+            for err_line in errors[:12]:
+                lines.append(f"• {err_line}")
+            if len(errors) > 12:
+                lines.append(f"• …and {len(errors) - 12} more")
+
+        text = "\n".join(lines).rstrip()
+        # Telegram hard limit ~4096; keep a safety margin for markdown/wrapping.
+        if len(text) > 3800:
+            text = text[:3750].rstrip() + "\n\n…truncated. Refresh or open per-exchange views for detail."
+
+        return Screen(
+            text=text,
+            buttons=[
+                [_button_row(*BUTTON_REFRESH)],
+                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
+            ],
+            state="summative_report",
+        )
+
+    def _handle_summative_report(
+        self,
+        chat_key: Tuple[Any, ...],
+        suffix: str,
+    ) -> Screen:
+        if suffix == "refresh":
+            return self._render_summative_report(chat_key, refresh=True)
+        if suffix == "back":
+            return self._render_select_exchange(chat_key)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        return self._render_summative_report(chat_key, refresh=False)
 
 
 # ---------------------------------------------------------------------------

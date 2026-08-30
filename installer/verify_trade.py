@@ -501,9 +501,23 @@ def main(argv: List[str]) -> int:
                 max_commands = int(raw_max)
             except (TypeError, ValueError):
                 max_commands = 60
-            if max_commands < 61:
+            # Core Hermes commands alone can exceed 60; require the Bot API ceiling
+            # (or at least enough headroom that prioritized /trade + /fibo fit).
+            if max_commands < 100:
                 raise AssertionError(
-                    f"Telegram command menu max_commands={max_commands} leaves /fibo trimmed; expected >= 61"
+                    f"Telegram command menu max_commands={max_commands} can still "
+                    f"trim plugin commands under a full core set; expected >= 100"
+                )
+            priority = menu_cfg.get("priority") if isinstance(menu_cfg, dict) else None
+            priority_names = {
+                str(item).strip().lower()
+                for item in (priority or [])
+                if str(item).strip()
+            }
+            if "trade" not in priority_names:
+                raise AssertionError(
+                    "Telegram command_menu.priority must include 'trade' so "
+                    "/trade stays in the BotCommand picker"
                 )
 
             recorded: Dict[str, Dict[str, Any]] = {}

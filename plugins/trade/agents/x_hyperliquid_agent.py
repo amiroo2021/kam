@@ -47,6 +47,7 @@ from ..canonical import (
     CanonicalBalance,
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -234,8 +235,8 @@ def list_accounts() -> List[str]:
 def capabilities() -> List[str]:
     """Return the operations this agent supports."""
     return ["balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
- # Phase 2.4: read-only catalog enumeration via documented POST /info.
- "list_instruments"]
+ # Phase 2.4: catalog + mark price (metaAndAssetCtxs).
+ "list_instruments", "market_price"]
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
@@ -294,6 +295,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_resolve_instrument(account, request)
     if operation == "list_instruments":
         return _execute_list_instruments(account, request)
+    if operation == "market_price":
+        return _execute_market_price(account, request)
     if operation == "new_order":
         return _execute_new_order(account, request)
     if operation == "cancel_order_group":
@@ -568,6 +571,11 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                 precision = _decimal_places_from_text(ctx.get("prevDayPx"))
             if precision is None:
                 precision = _decimal_places_from_text(ctx.get("oraclePx"))
+            mark = None
+            for key in ("markPx", "midPx", "prevDayPx", "oraclePx"):
+                mark = _decimal_or_none(ctx.get(key))
+                if mark is not None and mark > 0:
+                    break
             candidates.append(
                 {
                     "dex": dex,
@@ -586,6 +594,7 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                     "price_increment": _price_increment_from_precision(precision),
                     "size_increment": _size_increment_from_sz_decimals(instrument.get("szDecimals")),
                     "sz_decimals": instrument.get("szDecimals"),
+                    "mark_price": _decimal_text(mark) if mark is not None else None,
                 }
             )
     return candidates
@@ -633,6 +642,9 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
     public = str(candidate.get("public_symbol") or "").strip()
     if public and public != instrument:
         out["display_name"] = public
+    mark = candidate.get("mark_price")
+    if mark is not None and str(mark).strip():
+        out["price"] = str(mark).strip()
     dex = str(candidate.get("dex") or "").strip()
     # All surviving entries are perpetuals.
     out["market_type"] = "perp"
@@ -659,8 +671,8 @@ def _execute_list_instruments(
     ``plugins/trade/fibo/discovery.py``) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id (the route_symbol used by the
-    existing write paths). No price is attached — Hyperliquid
-    does not currently expose a market_price operation.
+    existing write paths). Mark price is attached when present on
+    the metaAndAssetCtxs snapshot.
 
     The catalog is fetched via the existing ``/info`` POST with
     payload type ``metaAndAssetCtxs`` (a documented read
@@ -698,6 +710,67 @@ def _execute_list_instruments(
         exchange=name,
         account=account,
         data={"instruments": instruments},
+    )
+
+
+def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return mark/mid price for one Hyperliquid instrument."""
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        candidates = _fetch_perp_market_candidates()
+        candidate, error_code = _resolve_instrument_candidate(requested, candidates)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="PRICE_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if candidate is None:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code=error_code or "INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    price = _decimal_or_none(candidate.get("mark_price"))
+    if price is None or price <= 0:
+        price = _fetch_candidate_mark_price(candidate)
+    if price is None or price <= 0:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    native = str(candidate.get("route_symbol") or candidate.get("internal_name") or requested).strip()
+    text = _decimal_text(price)
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account,
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=str(candidate.get("public_symbol") or native),
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=native,
+            mark_price=text,
+            price=text,
+        ),
     )
 
 

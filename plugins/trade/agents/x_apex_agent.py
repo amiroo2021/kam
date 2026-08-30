@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -143,6 +144,8 @@ def capabilities() -> List[str]:
         "close_position",
         "ladder",
         "resolve_instrument",
+        "list_instruments",
+        "market_price",
     ]
 
 
@@ -188,6 +191,172 @@ def _apex_resolve_instrument(account: str, request: Dict[str, Any]) -> Canonical
                         instrument=instrument)
 
 
+def _apex_list_instruments(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Enumerate Apex perps + prelaunch + TradFi/stock contracts for the picker."""
+    credentials, error = _resolve_credentials(account)
+    if error:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code=error["code"],
+            message=error["message"],
+        )
+    assert credentials is not None
+    try:
+        client = _client_for_credentials(credentials)
+        client.set_default_account_type("primary")
+        try:
+            client.configs_v3()
+        except Exception:  # noqa: BLE001
+            pass
+        # Prefer section-tagged fetch so TradFi (stock) rows are labeled.
+        config = getattr(client, "configV3", None) or {}
+        cc = (config.get("contractConfig") or {}) if isinstance(config, dict) else {}
+        sections = (
+            ("perp", list(cc.get("perpetualContract") or [])),
+            ("prelaunch", list(cc.get("prelaunchContract") or [])),
+            ("tradfi", list(cc.get("stockContract") or [])),
+        )
+        if not any(rows for _label, rows in sections):
+            # Fallback to the unified helper if configV3 is empty.
+            contracts = _apex_fetch_supported_markets(client)
+            sections = (("perp", list(contracts)),)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=credentials["account"],
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+
+    instruments: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for section, rows in sections:
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            key = symbol.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            display = str(
+                row.get("symbolDisplayName") or row.get("crossSymbolName") or ""
+            ).strip()
+            base = symbol.split("-", 1)[0].strip() or display
+            entry: Dict[str, Any] = {
+                "instrument": symbol,
+                "display_name": display or symbol,
+                "base": base,
+                "market_type": section,
+                "description": f"{display or symbol} [{section}]",
+            }
+            instruments.append(entry)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=credentials["account"],
+        data={"instruments": instruments},
+    )
+
+
+def _apex_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return mark price via Apex ticker_v3 for one symbol."""
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    credentials, error = _resolve_credentials(account)
+    if error:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code=error["code"],
+            message=error["message"],
+        )
+    assert credentials is not None
+    try:
+        client = _client_for_credentials(credentials)
+        client.set_default_account_type("primary")
+        contracts = _apex_fetch_supported_markets(client)
+        meta = _apex_resolve_symbol(requested, contracts)
+    except ValueError as exc:
+        code = (
+            "INSTRUMENT_AMBIGUOUS"
+            if str(exc) == "INSTRUMENT_AMBIGUOUS"
+            else "INSTRUMENT_NOT_FOUND"
+        )
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code=code,
+            message=f"Instrument not found: {requested}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code="PRICE_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if meta is None:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    native = str(meta.get("symbol") or "").strip()
+    mark = _apex_fetch_mark_price(client, native)
+    if mark is None or mark <= 0:
+        display = str(meta.get("symbolDisplayName") or meta.get("crossSymbolName") or "").strip()
+        if display:
+            mark = _apex_fetch_mark_price(client, display)
+    if mark is None or mark <= 0:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    try:
+        text = _format_apex_decimal(mark)
+    except Exception:  # noqa: BLE001
+        text = format(mark.normalize(), "f")
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=credentials["account"],
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=str(
+                meta.get("symbolDisplayName") or meta.get("crossSymbolName") or native
+            ),
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=native,
+            mark_price=text,
+            price=text,
+        ),
+    )
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     """Dispatch to the requested operation.
 
@@ -226,6 +395,10 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _apex_position_management(account)
         if operation == "resolve_instrument":
             return _apex_resolve_instrument(account, request)
+        if operation == "list_instruments":
+            return _apex_list_instruments(account, request)
+        if operation == "market_price":
+            return _apex_market_price(account, request)
         if operation == "set_tp":
             return _apex_set_tp(request)
         if operation == "set_sl":
@@ -426,6 +599,171 @@ def _client_for_credentials(credentials: Dict[str, Any]) -> Any:
     return client
 
 
+def _apex_stock_symbol_set(client: Any) -> set[str]:
+    """Return uppercased venue symbols that live under stockContract (TradFi)."""
+    try:
+        config = getattr(client, "configV3", None) or {}
+        cc = (config.get("contractConfig") or {}) if isinstance(config, dict) else {}
+        rows = list(cc.get("stockContract") or [])
+    except Exception:  # noqa: BLE001
+        return set()
+    out: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("symbol", "symbolDisplayName", "crossSymbolName"):
+            val = str(row.get(key) or "").strip().upper()
+            if val:
+                out.add(val)
+    return out
+
+
+def _apex_is_stock_symbol(client: Any, symbol: str) -> bool:
+    target = str(symbol or "").strip().upper()
+    if not target:
+        return False
+    return target in _apex_stock_symbol_set(client)
+
+
+def _apex_prepare_trading_context(client: Any, *, symbol: str) -> str:
+    """Select primary vs RWA/stock account context for order placement.
+
+    Apex TradFi (``stockContract``) symbols such as ``XAU-USDT`` MUST be
+    signed and submitted under the RWA/stock sub-account. Crypto perps use
+    the primary contract account. Returns the active account_type string
+    to pass into ``create_order_v3``.
+    """
+    is_stock = _apex_is_stock_symbol(client, symbol)
+    if not is_stock:
+        try:
+            client.set_default_account_type("primary")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hasattr(client, "use_primary_account"):
+                client.use_primary_account()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            client.get_account_v3(account_type="primary")
+        except Exception:  # noqa: BLE001
+            pass
+        return "primary"
+
+    rwa_type = str(getattr(client, "rwa_account_type", None) or "rwa")
+    # 1) Ensure primary is loaded (eth address, fees, l2Key).
+    try:
+        client.set_default_account_type("primary")
+    except Exception:  # noqa: BLE001
+        pass
+    primary = {}
+    try:
+        primary = client.get_account_v3(account_type="primary") or {}
+    except Exception:  # noqa: BLE001
+        primary = {}
+    if not isinstance(primary, dict):
+        primary = {}
+
+    # 2) Discover stock sub-account id via /v3/stock/account (auth with primary).
+    stock_id = None
+    stock_payload: Dict[str, Any] = {}
+    try:
+        path = client._rwa_path("/account") if hasattr(client, "_rwa_path") else None
+        if path:
+            res = client._get(endpoint=path, params={}, account_type="primary")
+            data = res.get("data") if isinstance(res, dict) else None
+            if isinstance(data, dict):
+                stock_payload = dict(data)
+                subs = (data.get("contractAccount") or {}).get("subAccountInfo") or []
+                for sub in subs:
+                    if not isinstance(sub, Mapping):
+                        continue
+                    if str(sub.get("accountType") or "") == "SUB_STOCK_ACCOUNT":
+                        stock_id = str(sub.get("accountId") or "").strip() or None
+                        break
+                if not stock_id:
+                    stock_id = str(
+                        data.get("stockAccountId") or data.get("id") or ""
+                    ).strip() or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("apex stock account lookup failed: %s", exc)
+
+    if not stock_id:
+        raise RuntimeError(
+            "Apex TradFi/stock account is not available for this user. "
+            "Open Apex Omni, enable the TradFi/stock account, then retry."
+        )
+
+    # 3) Build RWA account context (fees from primary when stock payload is sparse).
+    pca = dict(primary.get("contractAccount") or {})
+    ca = dict(stock_payload.get("contractAccount") or {})
+    for fee_key in ("takerFeeRate", "makerFeeRate"):
+        if not ca.get(fee_key) and pca.get(fee_key):
+            ca[fee_key] = pca.get(fee_key)
+    if not ca.get("takerFeeRate"):
+        ca["takerFeeRate"] = "0.0005"
+    if not ca.get("makerFeeRate"):
+        ca["makerFeeRate"] = "0.0002"
+    rwa_ctx: Dict[str, Any] = dict(stock_payload)
+    rwa_ctx.update(
+        {
+            "id": stock_id,
+            "stockAccountId": stock_id,
+            "subAccountId": stock_id,
+            "contractAccount": ca,
+            "l2Key": rwa_ctx.get("l2Key") or primary.get("l2Key"),
+            "ethereumAddress": rwa_ctx.get("ethereumAddress")
+            or primary.get("ethereumAddress"),
+        }
+    )
+    try:
+        client._set_account_context(rwa_ctx, account_type=rwa_type)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to set Apex stock account context: {exc}") from exc
+
+    # 4) Ensure RWA API credentials exist (server maps key → stock account).
+    try:
+        rwa_creds = None
+        if hasattr(client, "_get_api_credentials"):
+            rwa_creds = client._get_api_credentials(rwa_type)
+        if not rwa_creds and hasattr(client, "generate_rwa_api_v3"):
+            if getattr(client, "network_id", None) is None:
+                try:
+                    client.network_id = 1
+                except Exception:  # noqa: BLE001
+                    pass
+            client.generate_rwa_api_v3(
+                wallet_name="KAM Auto RWA",
+                account_id=stock_id,
+                eth_address=primary.get("ethereumAddress") or rwa_ctx.get("ethereumAddress"),
+                chain_id=getattr(client, "network_id", None) or 1,
+            )
+            # generate_rwa_api_v3 may clobber context — restore.
+            client._set_account_context(rwa_ctx, account_type=rwa_type)
+            rwa_creds = client._get_api_credentials(rwa_type)
+        if not rwa_creds:
+            raise RuntimeError("Apex RWA/stock API credentials are not available.")
+        client.api_key_credentials = rwa_creds
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Apex TradFi orders require a stock (RWA) API key. "
+            f"Setup failed: {sanitize_error_message(str(exc))}"
+        ) from exc
+
+    # 5) Prefer derived RWA zk seeds for stock signing when available.
+    try:
+        if hasattr(client, "_derive_rwa_seed") and client.zk_seeds:
+            client.rwa_zk_seeds = client._derive_rwa_seed(client.zk_seeds)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        client.set_default_account_type(rwa_type)
+    except Exception:  # noqa: BLE001
+        pass
+    return rwa_type
+
+
 # ---------------------------------------------------------------------------
 # Read: balance
 # ---------------------------------------------------------------------------
@@ -488,6 +826,9 @@ def _positions_orders(account: str) -> CanonicalResponse:
 
     The wizard's "💼 Positions & Orders" view consumes this single payload
     so we fold the three reads into one round-trip per source endpoint.
+
+    Apex TradFi (stock) positions/orders live on the RWA sub-account; we
+    merge them with primary (perp) data so the wizard sees both.
     """
     credentials, error = _resolve_credentials(account)
     if error:
@@ -497,12 +838,16 @@ def _positions_orders(account: str) -> CanonicalResponse:
     assert credentials is not None
     try:
         client = _client_for_credentials(credentials)
-        raw_account = client.get_account_v3()
+        try:
+            client.configs_v3()
+        except Exception:  # noqa: BLE001
+            pass
+        snapshots = _apex_fetch_all_account_snapshots(client)
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="positions_orders", exchange=name,
                             account=account, code="APEX_ERROR",
                             message=sanitize_error_message(str(exc)))
-    positions = _normalize_positions(raw_account)
+    positions = _normalize_positions_merged(snapshots)
     open_orders = _extract_open_orders(client)
     open_count, order_groups = _group_open_orders(open_orders)
     protections = _enrich_positions_with_tpsl(client, positions)
@@ -599,13 +944,12 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
     # --- bootstrap client + market metadata ---
     try:
         client = _client_for_credentials(credentials)
-        # Apex's HttpPrivateRwaSign defaults to the stock (RWA) account
-        # context, whose ``accountV3`` lacks ``contractAccount``. The
-        # perp ``create_order_v3`` path requires the primary (perpetual)
-        # account context — otherwise the SDK crashes inside its fee/signer
-        # step with ``'NoneType' object has no attribute 'get'``. Force the
-        # primary context first; this is idempotent.
-        client.set_default_account_type("primary")
+        # Start on primary for catalog/account bootstrap; switch later if
+        # the resolved symbol is TradFi/stock.
+        try:
+            client.set_default_account_type("primary")
+        except Exception:  # noqa: BLE001
+            pass
         # The create_order_v3 path needs both configsV3 and accountV3
         # populated. Without these, the SDK raises "No config provided"
         # or "No accountId provided". Both calls are idempotent on the
@@ -627,6 +971,16 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
         tick_size = _safe_decimal(meta.get("tickSize"))
         step_size = _safe_decimal(meta.get("stepSize") or meta.get("lotSize"))
         min_notional = _safe_decimal(meta.get("minOrderNotional") or meta.get("minNotional") or "0")
+        try:
+            account_type = _apex_prepare_trading_context(client, symbol=str(symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="new_order", exchange=name,
                             account=credentials["account"],
@@ -669,6 +1023,7 @@ def _new_order(request: Dict[str, Any]) -> CanonicalResponse:
             reduceOnly=reduce_only,
             timeInForce="GOOD_TIL_CANCEL",
             clientId=client_id,
+            account_type=account_type,
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="new_order", exchange=name,
@@ -734,14 +1089,18 @@ def _apex_resolve_symbol(requested: str,
     """Resolve a wizard-supplied symbol to an Apex contract config row.
 
     Accepts any of:
-      - bare base asset: ``BTC``, ``ETH``, ``SOL``, ``HYPE``
-      - explicit pair: ``BTC-USDT``, ``BTCUSDT``
-      - display name: ``BTCUSDT`` (Apex's ``symbolDisplayName`` — note:
-        no separator)
+      - bare base asset: ``BTC``, ``ETH``, ``SOL``, ``HYPE``, ``XAU``
+      - human aliases: ``GOLD`` → ``XAU-USDT`` (TradFi stock contract)
+      - explicit pair: ``BTC-USDT``, ``BTCUSDT``, ``XAUUSDT``
+      - display / cross name: ``BTCUSDT``, ``XAUUSDT``
 
-    The Apex config has two distinct fields:
-      - ``symbol``           = ``"BTC-USDT"`` (canonical, dash-separated)
-      - ``symbolDisplayName`` = ``"BTCUSDT"`` (no separator)
+    The Apex config has distinct fields:
+      - ``symbol``            = ``\"XAU-USDT\"`` (canonical, dash-separated)
+      - ``symbolDisplayName`` = ``\"XAUUSDT\"``
+      - ``crossSymbolName``   = often the same compact form
+
+    TradFi instruments live under ``stockContract`` but are merged into
+    ``contracts`` by ``_apex_fetch_supported_markets``.
 
     Returns the matching config dict, raises ``ValueError("INSTRUMENT_AMBIGUOUS")``
     when more than one contract matches, or ``None`` if nothing matches.
@@ -749,11 +1108,25 @@ def _apex_resolve_symbol(requested: str,
     target = (requested or "").strip().upper()
     if not target:
         return None
-    target_base = target.split("-", 1)[0]
-    if target_base.endswith("USDT"):
-        target_base = target_base[:-4]
-    elif target_base.endswith("USDC"):
-        target_base = target_base[:-4]
+
+    # Human commodity aliases (catalog still owns the venue id).
+    _ALIAS_BASES = {
+        "GOLD": "XAU",
+        "SILVER": "XAG",
+        "OIL": "USO",  # Apex lists USO-USDT in TradFi; WTI may be crypto/perp
+        "CRUDE": "USO",
+    }
+
+    def _peel_base(token: str) -> str:
+        base = token.split("-", 1)[0]
+        for suffix in ("USDT", "USDC", "USD"):
+            if base.endswith(suffix) and len(base) > len(suffix):
+                base = base[: -len(suffix)]
+                break
+        return _ALIAS_BASES.get(base, base)
+
+    target_base = _peel_base(target)
+    alias_base = _ALIAS_BASES.get(target, target_base)
 
     candidates_for_target = {
         target,
@@ -761,14 +1134,26 @@ def _apex_resolve_symbol(requested: str,
         f"{target}USDT",
         f"{target}-USDC",
         f"{target}USDC",
+        f"{target}-USD",
+        f"{target}USD",
     }
-    candidates_for_base = {
-        target_base,
-        f"{target_base}-USDT",
-        f"{target_base}USDT",
-        f"{target_base}-USDC",
-        f"{target_base}USDC",
-    }
+    bases = {target_base, alias_base}
+    candidates_for_base: set[str] = set()
+    for base in bases:
+        if not base:
+            continue
+        candidates_for_base.update(
+            {
+                base,
+                f"{base}-USDT",
+                f"{base}USDT",
+                f"{base}-USDC",
+                f"{base}USDC",
+                f"{base}-USD",
+                f"{base}USD",
+            }
+        )
+
     exact_symbol_matches: List[Mapping[str, Any]] = []
     for row in contracts:
         symbol = str(row.get("symbol") or "").upper()
@@ -778,22 +1163,48 @@ def _apex_resolve_symbol(requested: str,
         return exact_symbol_matches[0]
     if len(exact_symbol_matches) > 1:
         raise ValueError("INSTRUMENT_AMBIGUOUS")
+
     matches: List[Mapping[str, Any]] = []
     seen_ids = set()
     for row in contracts:
         symbol = str(row.get("symbol") or "").upper()
         display = str(row.get("symbolDisplayName") or "").upper()
+        cross = str(row.get("crossSymbolName") or "").upper()
         row_id = row.get("id") if isinstance(row, Mapping) else None
-        if (symbol == target or display == target
-                or symbol in candidates_for_target or display in candidates_for_target
-                or symbol in candidates_for_base or display in candidates_for_base):
-            if row_id in seen_ids:
+        names = {symbol, display, cross}
+        if (
+            target in names
+            or names & candidates_for_target
+            or names & candidates_for_base
+            or any(n in candidates_for_base for n in names if n)
+            or any(
+                _peel_base(n) in bases
+                for n in names
+                if n
+            )
+        ):
+            # Prefer unique id; fall back to symbol when id missing.
+            dedupe = row_id if row_id is not None else symbol
+            if dedupe in seen_ids:
                 continue
-            seen_ids.add(row_id)
+            seen_ids.add(dedupe)
             matches.append(row)
     if not matches:
         return None
     if len(matches) > 1:
+        # Prefer exact base match on XAU over fuzzy multi-hits.
+        preferred: List[Mapping[str, Any]] = []
+        for row in matches:
+            symbol = str(row.get("symbol") or "").upper()
+            display = str(row.get("symbolDisplayName") or "").upper()
+            cross = str(row.get("crossSymbolName") or "").upper()
+            base = _peel_base(symbol or display or cross)
+            if base == alias_base or base == target_base:
+                preferred.append(row)
+        if len(preferred) == 1:
+            return preferred[0]
+        if len(preferred) > 1:
+            raise ValueError("INSTRUMENT_AMBIGUOUS")
         raise ValueError("INSTRUMENT_AMBIGUOUS")
     return matches[0]
 
@@ -991,6 +1402,17 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
                                 code="INSTRUMENT_NOT_FOUND",
                                 message=f"Apex symbol '{symbol}' is not available.")
         canonical_symbol = meta["symbol"]
+        # TradFi cancels must run under the stock/RWA account context.
+        try:
+            _apex_prepare_trading_context(client, symbol=str(canonical_symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="cancel_order_group",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
     except ValueError as exc:
         if str(exc) == "INSTRUMENT_AMBIGUOUS":
             return make_failure(operation="cancel_order_group", exchange=name,
@@ -1045,6 +1467,19 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
         return make_success(operation="cancel_order_group", exchange=name,
                             account=credentials["account"],
                             cancel_group=cancel_group)
+
+    # Re-select the correct account context for deletes (extract_open_orders
+    # restores primary in its finally block).
+    try:
+        _apex_prepare_trading_context(client, symbol=str(canonical_symbol))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="APEX_ACCOUNT_TYPE_ERROR",
+            message=sanitize_error_message(str(exc)),
+        )
 
     # Cancel each target one at a time. The SDK's ``delete_order_v3``
     # accepts ``id=<orderId_str>`` and returns the deleted order id
@@ -1586,6 +2021,7 @@ def _apex_place_position_tpsl(
         isPositionTpsl=True,
         clientId=client_id,
         timeInForce="GOOD_TIL_CANCEL",
+        account_type=getattr(client, "_default_account_type", None) or "primary",
     )
     if isinstance(response, Mapping):
         return dict(response)
@@ -1647,6 +2083,16 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
         tick_size = meta["tick_size"]
         step_size = meta["step_size"]
         symbol = meta["symbol"]
+        try:
+            _apex_prepare_trading_context(client, symbol=str(symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="set_tp",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
     except ValueError as exc:
         if str(exc) == "INSTRUMENT_AMBIGUOUS":
             return make_failure(operation="set_tp", exchange=name,
@@ -1812,6 +2258,16 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
         meta = _apex_normalize_meta(meta_raw)
         tick_size = meta["tick_size"]
         symbol = meta["symbol"]
+        try:
+            _apex_prepare_trading_context(client, symbol=str(symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="set_sl",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
     except ValueError as exc:
         if str(exc) == "INSTRUMENT_AMBIGUOUS":
             return make_failure(operation="set_sl", exchange=name,
@@ -1958,6 +2414,16 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
         meta = _apex_normalize_meta(meta_raw)
         tick_size = meta["tick_size"]
         symbol = meta["symbol"]
+        try:
+            _apex_prepare_trading_context(client, symbol=str(symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
     except ValueError as exc:
         if str(exc) == "INSTRUMENT_AMBIGUOUS":
             return make_failure(operation="close_position", exchange=name,
@@ -2039,6 +2505,7 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
             reduceOnly=True,
             clientId=client_id,
             timeInForce="GOOD_TIL_CANCEL",
+            account_type=getattr(client, "_default_account_type", None) or "primary",
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="close_position", exchange=name,
@@ -2365,10 +2832,6 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
         client.set_default_account_type("primary")
         client.configs_v3()
         client.get_account_v3()
-        config = client.configV3 or {}
-        contracts = (
-            (config.get("contractConfig") or {}).get("perpetualContract") or []
-        )
         all_contracts = _apex_fetch_supported_markets(client)
         meta = _apex_resolve_symbol(requested_symbol, all_contracts)
         if meta is None:
@@ -2394,6 +2857,22 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
                                 account=credentials["account"],
                                 code="INSTRUMENT_NOT_FOUND",
                                 message=f"Apex market '{requested_symbol}' has no stepSize; cannot ladder.")
+        # TradFi/stock (XAU, CL, …) must sign under the RWA/stock account.
+        # Crypto perps stay on primary. apexomni create_batch_orders_v3 also
+        # omits stockContract lookup — stock ladders must use create_order_v3.
+        try:
+            account_type = _apex_prepare_trading_context(client, symbol=str(symbol))
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=credentials["account"],
+                code="APEX_ACCOUNT_TYPE_ERROR",
+                message=sanitize_error_message(str(exc)),
+            )
+        is_stock_ladder = bool(_apex_is_stock_symbol(client, str(symbol))) or (
+            str(account_type).lower() not in {"", "primary"}
+        )
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="ladder", exchange=name,
                             account=credentials["account"],
@@ -2434,82 +2913,122 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             ladder=ladder,
         )
 
-    # Submit in chunks of _APEX_LADDER_BATCH_SIZE = 10 via create_batch_orders_v3.
-    # Apex's SDK builds a single zk-link signed payload per child and submits
-    # them together; the server treats them as a batch and rejects the whole
-    # batch if any single child is malformed, so we pre-build the dict list
-    # and pass it through.
+    # Submit children.
+    # - Crypto perps: chunks of _APEX_LADDER_BATCH_SIZE via create_batch_orders_v3
+    # - TradFi/stock: serial create_order_v3 (batch path has no stockContract lookup
+    #   in apexomni and raises NoneType.get on settleAssetId).
     accepted_child_count = 0
     child_order_ids: List[int] = []
     batches: List[Dict[str, Any]] = []
-    # Pull the per-account fields the SDK needs off self.accountV3 so we
-    # don't rely on attribute fallbacks (which can fail under __slots__).
-    _acct_v3 = client.accountV3 or {}
-    _per_child_account_id = _acct_v3.get("id")
-    _per_child_sub_account_id = (
-        _acct_v3.get("spotAccount") or {}
-    ).get("defaultSubAccountId")
-    _contract_acct = _acct_v3.get("contractAccount") or {}
-    _per_child_taker_fee_rate = _contract_acct.get("takerFeeRate")
-    _per_child_maker_fee_rate = _contract_acct.get("makerFeeRate")
     try:
-        for chunk_start in range(0, len(children), _APEX_LADDER_BATCH_SIZE):
-            chunk = children[chunk_start: chunk_start + _APEX_LADDER_BATCH_SIZE]
-            # The SDK's create_batch_orders_v3 accepts any object with
-            # ``.price`` / ``.size`` / ``.side`` / ``.clientId`` / ``.symbol``
-            # / ``.accountId`` / ``.subAccountId`` / ``.takerFeeRate`` /
-            # ``.makerFeeRate`` / ``.timestampSeconds`` attributes (duck-typed).
-            # We pre-fill the account-level fields from the live account
-            # snapshot so the SDK's `attribute or fallback` paths always see
-            # a real value.
-            models = [_ApexLadderOrder(
-                symbol=c["symbol"], side=c["side"], price=c["price"],
-                size=c["size"], client_id=c["client_id"],
-                account_id=_per_child_account_id,
-                sub_account_id=_per_child_sub_account_id,
-                taker_fee_rate=_per_child_taker_fee_rate,
-                maker_fee_rate=_per_child_maker_fee_rate,
-            ) for c in chunk]
-            response = client.create_batch_orders_v3(models)
-            # The SDK response is either a dict with ``data: [...]`` or a list
-            # of dicts. Normalise.
-            batch_rows = _extract_batch_rows(response)
-            batch_index = len(batches)
+        if is_stock_ladder:
+            batch_index = 0
             accepted_in_batch = 0
-            for response_row in batch_rows:
-                if not isinstance(response_row, Mapping):
+            first_error: Optional[str] = None
+            for c in children:
+                sdk_side = "BUY" if str(c["side"]).lower() == "buy" else "SELL"
+                try:
+                    raw = client.create_order_v3(
+                        symbol=str(c["symbol"]),
+                        side=sdk_side,
+                        type="LIMIT",
+                        size=str(c["size"]),
+                        price=str(c["price"]),
+                        reduceOnly=False,
+                        timeInForce="GOOD_TIL_CANCEL",
+                        clientId=str(c["client_id"]),
+                        account_type=account_type,
+                    )
+                except Exception as child_exc:  # noqa: BLE001
+                    first_error = first_error or sanitize_error_message(str(child_exc))
                     continue
-                # Server error envelope on a child?
-                if response_row.get("error") or (response_row.get("code")
-                                                  and "orderId" not in response_row
-                                                  and "id" not in response_row):
-                    batches.append({
-                        "batch_index": batch_index,
-                        "submitted": len(chunk),
-                        "accepted": accepted_in_batch,
-                        "ok": False,
-                        "reason": response_row.get("error") or response_row.get("msg")
-                                                  or f"code={response_row.get('code')}",
-                    })
+                oid = _apex_extract_order_id(raw)
+                if oid is None and isinstance(raw, Mapping) and raw.get("code") and raw.get("msg"):
+                    first_error = first_error or sanitize_error_message(
+                        f"{raw.get('msg')} (code={raw.get('code')})"
+                    )
                     continue
-                raw_oid = response_row.get("id") or response_row.get("orderId")
-                if raw_oid is None:
+                if oid is None:
+                    first_error = first_error or "order placed without order id"
                     continue
                 try:
-                    child_order_ids.append(int(raw_oid))
-                    accepted_in_batch += 1
-                    accepted_child_count += 1
+                    child_order_ids.append(int(oid))
                 except (TypeError, ValueError):
-                    child_order_ids.append(raw_oid)  # type: ignore[arg-type]
-                    accepted_in_batch += 1
-                    accepted_child_count += 1
+                    child_order_ids.append(oid)  # type: ignore[arg-type]
+                accepted_in_batch += 1
+                accepted_child_count += 1
             batches.append({
                 "batch_index": batch_index,
-                "submitted": len(chunk),
+                "submitted": len(children),
                 "accepted": accepted_in_batch,
-                "ok": accepted_in_batch == len(chunk) and len(batch_rows) == len(chunk),
-                "response_count": len(batch_rows),
+                "ok": accepted_in_batch == len(children),
+                "mode": "serial_create_order_v3",
+                "account_type": str(account_type),
+                "reason": None if accepted_in_batch == len(children) else first_error,
             })
+            if accepted_child_count == 0 and first_error:
+                raise RuntimeError(first_error)
+        else:
+            # Pull the per-account fields the SDK needs off self.accountV3 so we
+            # don't rely on attribute fallbacks (which can fail under __slots__).
+            _acct_v3 = client.accountV3 if isinstance(client.accountV3, Mapping) else {}
+            _per_child_account_id = _acct_v3.get("id")
+            _spot = _acct_v3.get("spotAccount") if isinstance(_acct_v3.get("spotAccount"), Mapping) else {}
+            _per_child_sub_account_id = _spot.get("defaultSubAccountId") or "0"
+            _contract_acct = (
+                _acct_v3.get("contractAccount")
+                if isinstance(_acct_v3.get("contractAccount"), Mapping)
+                else {}
+            )
+            _per_child_taker_fee_rate = _contract_acct.get("takerFeeRate") or "0.0005"
+            _per_child_maker_fee_rate = _contract_acct.get("makerFeeRate") or "0.0002"
+            for chunk_start in range(0, len(children), _APEX_LADDER_BATCH_SIZE):
+                chunk = children[chunk_start: chunk_start + _APEX_LADDER_BATCH_SIZE]
+                models = [_ApexLadderOrder(
+                    symbol=c["symbol"], side=c["side"], price=c["price"],
+                    size=c["size"], client_id=c["client_id"],
+                    account_id=_per_child_account_id,
+                    sub_account_id=_per_child_sub_account_id,
+                    taker_fee_rate=_per_child_taker_fee_rate,
+                    maker_fee_rate=_per_child_maker_fee_rate,
+                ) for c in chunk]
+                response = client.create_batch_orders_v3(models)
+                batch_rows = _extract_batch_rows(response)
+                batch_index = len(batches)
+                accepted_in_batch = 0
+                for response_row in batch_rows:
+                    if not isinstance(response_row, Mapping):
+                        continue
+                    if response_row.get("error") or (response_row.get("code")
+                                                      and "orderId" not in response_row
+                                                      and "id" not in response_row):
+                        batches.append({
+                            "batch_index": batch_index,
+                            "submitted": len(chunk),
+                            "accepted": accepted_in_batch,
+                            "ok": False,
+                            "reason": response_row.get("error") or response_row.get("msg")
+                                                      or f"code={response_row.get('code')}",
+                        })
+                        continue
+                    raw_oid = response_row.get("id") or response_row.get("orderId")
+                    if raw_oid is None:
+                        continue
+                    try:
+                        child_order_ids.append(int(raw_oid))
+                        accepted_in_batch += 1
+                        accepted_child_count += 1
+                    except (TypeError, ValueError):
+                        child_order_ids.append(raw_oid)  # type: ignore[arg-type]
+                        accepted_in_batch += 1
+                        accepted_child_count += 1
+                batches.append({
+                    "batch_index": batch_index,
+                    "submitted": len(chunk),
+                    "accepted": accepted_in_batch,
+                    "ok": accepted_in_batch == len(chunk) and len(batch_rows) == len(chunk),
+                    "response_count": len(batch_rows),
+                })
     except Exception as exc:  # noqa: BLE001
         ladder = CanonicalLadderResult(
             symbol=symbol, side=requested_side, distribution=distribution,
@@ -2746,26 +3265,140 @@ def _normalize_apex_position(raw: Mapping[str, Any]) -> CanonicalPosition:
 
 
 def _extract_open_orders(client: Any) -> List[Mapping[str, Any]]:
-    """Pull active open orders via the apexomni client.
+    """Pull active open orders from primary AND TradFi/stock accounts.
 
-    The SDK exposes order reads via ``open_orders_v3`` (or the v2
-    ``open_orders``); both surface a list of dicts. We probe for v3
-    first and fall back gracefully.
+    Crypto perps rest on the primary account; TradFi (XAU, CL, AAPL, …)
+    rest on the RWA/stock sub-account. The wizard cancel menu consumes a
+    single merged list, so we query both contexts and de-dupe by order id.
     """
     fn = getattr(client, "open_orders_v3", None) or getattr(client, "open_orders", None)
     if fn is None:
         logger.warning("apexomni client exposes no open-orders method")
         return []
+
+    def _fetch_once() -> List[Mapping[str, Any]]:
+        try:
+            result = fn()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Apex open-orders fetch failed: %s", exc)
+            return []
+        if isinstance(result, Mapping):
+            result = result.get("orders") or result.get("data") or []
+        if not isinstance(result, list):
+            return []
+        return [r for r in result if isinstance(r, Mapping)]
+
+    merged: List[Mapping[str, Any]] = []
+    seen: set[str] = set()
+
+    def _absorb(rows: List[Mapping[str, Any]]) -> None:
+        for row in rows:
+            raw_id = row.get("id") or row.get("orderId") or row.get("clientId")
+            key = str(raw_id).strip() if raw_id is not None else ""
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(row)
+
+    # --- primary ---
     try:
-        result = fn()
+        if hasattr(client, "use_primary_account"):
+            client.use_primary_account()
+        client.set_default_account_type("primary")
+        client.get_account_v3(account_type="primary")
+    except Exception:  # noqa: BLE001
+        pass
+    _absorb(_fetch_once())
+
+    # --- TradFi / stock ---
+    try:
+        stock_syms = _apex_stock_symbol_set(client)
+        sample = ""
+        for cand in ("XAU-USDT", "XAG-USDT", "CL-USDT"):
+            if cand in stock_syms:
+                sample = cand
+                break
+        if not sample:
+            for sym in sorted(stock_syms):
+                if "-" in sym:
+                    sample = sym
+                    break
+        if sample:
+            _apex_prepare_trading_context(client, symbol=sample)
+            _absorb(_fetch_once())
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Apex open-orders fetch failed: %s", exc)
-        return []
-    if isinstance(result, Mapping):
-        result = result.get("orders") or result.get("data") or []
-    if not isinstance(result, list):
-        return []
-    return [r for r in result if isinstance(r, Mapping)]
+        logger.warning("Apex stock open-orders fetch failed: %s", exc)
+    finally:
+        try:
+            if hasattr(client, "use_primary_account"):
+                client.use_primary_account()
+            client.set_default_account_type("primary")
+        except Exception:  # noqa: BLE001
+            pass
+
+    return merged
+
+
+def _apex_fetch_all_account_snapshots(client: Any) -> List[Dict[str, Any]]:
+    """Return account snapshots for primary + stock (when available)."""
+    snapshots: List[Dict[str, Any]] = []
+    try:
+        if hasattr(client, "use_primary_account"):
+            client.use_primary_account()
+        client.set_default_account_type("primary")
+        primary = client.get_account_v3(account_type="primary") or {}
+        if isinstance(primary, dict):
+            snapshots.append(primary)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Apex primary account snapshot failed: %s", exc)
+
+    try:
+        stock_syms = _apex_stock_symbol_set(client)
+        sample = ""
+        for cand in ("XAU-USDT", "XAG-USDT", "CL-USDT"):
+            if cand in stock_syms:
+                sample = cand
+                break
+        if not sample:
+            for sym in sorted(stock_syms):
+                if "-" in sym:
+                    sample = sym
+                    break
+        if sample:
+            _apex_prepare_trading_context(client, symbol=sample)
+            rwa_type = str(getattr(client, "rwa_account_type", None) or "rwa")
+            stock_acct = None
+            try:
+                stock_acct = client.get_account_v3(account_type=rwa_type)
+            except Exception:  # noqa: BLE001
+                stock_acct = client._get_account_context(rwa_type)
+            if isinstance(stock_acct, dict) and stock_acct:
+                snapshots.append(stock_acct)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Apex stock account snapshot failed: %s", exc)
+    finally:
+        try:
+            if hasattr(client, "use_primary_account"):
+                client.use_primary_account()
+            client.set_default_account_type("primary")
+        except Exception:  # noqa: BLE001
+            pass
+    return snapshots
+
+
+def _normalize_positions_merged(snapshots: List[Any]) -> List[CanonicalPosition]:
+    """Normalize positions from multiple account snapshots; de-dupe by symbol+side."""
+    out: List[CanonicalPosition] = []
+    seen: set[Tuple[str, str]] = set()
+    for snap in snapshots:
+        for pos in _normalize_positions(snap):
+            key = (str(pos.symbol or "").upper(), str(pos.side or "").lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(pos)
+    return out
 
 
 def _group_open_orders(raw_orders: List[Mapping[str, Any]]

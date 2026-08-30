@@ -82,6 +82,7 @@ from ..canonical import (
     CanonicalBalance,
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -386,8 +387,9 @@ def capabilities() -> List[str]:
         "set_tp",
         "set_sl",
         "resolve_instrument",
-        # Phase 2.4: read-only catalog enumeration.
+        # Phase 2.4: catalog + public mark price.
         "list_instruments",
+        "market_price",
     ]
 
 
@@ -446,6 +448,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _resolve_instrument(account, request)
         if operation == "list_instruments":
             return _execute_list_instruments(account, request)
+        if operation == "market_price":
+            return _execute_market_price(account, request)
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation=operation,
@@ -927,6 +931,112 @@ def _execute_list_instruments(
         exchange=name,
         account=account,
         data={"instruments": instruments},
+    )
+
+
+def _hibachi_venue_symbol_for_price(requested: str) -> Optional[str]:
+    """Map free-text / canonical id to Hibachi ``ETH/USDT-P`` wire symbol."""
+    raw = str(requested or "").strip()
+    if not raw:
+        return None
+    if "/" in raw:
+        return raw
+    try:
+        payload = _fetch_exchange_info()
+        contracts = _hibachi_live_descriptors(payload if isinstance(payload, dict) else {})
+    except Exception:  # noqa: BLE001
+        contracts = []
+    target = (_canonical_symbol_from_request(raw) or raw).upper()
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        canon = str(contract.get("underlying_symbol") or "").strip().upper()
+        sym = str(contract.get("symbol") or "").strip()
+        if not sym:
+            continue
+        if canon == target or sym.upper() == raw.upper():
+            return sym
+        if (_canonical_symbol_from_request(sym) or "").upper() == target:
+            return sym
+    return None
+
+
+def _fetch_hibachi_mark_price(venue_symbol: str) -> Optional[str]:
+    """Public GET ``/market/data/prices?symbol=...`` (data-api)."""
+    symbol = str(venue_symbol or "").strip()
+    if not symbol:
+        return None
+    base = _market_api_base().rstrip("/")
+    import urllib.parse
+    url = f"{base}/market/data/prices?{urllib.parse.urlencode({'symbol': symbol})}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "kam-trade/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode() or "{}")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").lower() == "failed":
+        return None
+    for key in ("markPrice", "tradePrice", "spotPrice", "bidPrice", "askPrice"):
+        val = payload.get(key)
+        if val is None or str(val).strip() == "":
+            continue
+        try:
+            d = Decimal(str(val))
+        except Exception:  # noqa: BLE001
+            continue
+        if d.is_finite() and d > 0:
+            return format(d.normalize(), "f")
+    return None
+
+
+def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return mark/trade price for one Hibachi instrument."""
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    venue = _hibachi_venue_symbol_for_price(requested)
+    if not venue:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    price = _fetch_hibachi_mark_price(venue)
+    if not price:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    native = _canonical_symbol_from_request(venue) or venue
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account or "",
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=venue,
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=native,
+            mark_price=price,
+            price=price,
+        ),
     )
 
 

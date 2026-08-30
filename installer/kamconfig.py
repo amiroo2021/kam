@@ -380,7 +380,13 @@ def disable_trade(
 
 
 DEFAULT_TELEGRAM_MENU_MAX = 60
-MINIMUM_TELEGRAM_MENU_MAX = 61
+# Hermes core slash set has grown past 60. A fixed +1 slot for /trade is no
+# longer enough — plugin commands land at the end of telegram_bot_commands and
+# get trimmed from setMyCommands. Use Telegram's Bot API ceiling so capacity
+# is not the failure mode; pair with priority so /trade stays visible.
+MINIMUM_TELEGRAM_MENU_MAX = 100
+TELEGRAM_BOT_API_MAX_COMMANDS = 100
+KAM_TELEGRAM_MENU_PRIORITY = ("trade", "fibo")
 
 
 def get_telegram_menu_max_commands(config: Dict[str, Any]) -> int:
@@ -404,6 +410,35 @@ def get_telegram_menu_max_commands(config: Dict[str, Any]) -> int:
         return DEFAULT_TELEGRAM_MENU_MAX
 
 
+def _telegram_menu_section(config: Dict[str, Any]) -> Dict[str, Any]:
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return {}
+    telegram = platforms.get("telegram")
+    if not isinstance(telegram, dict):
+        return {}
+    extra = telegram.get("extra")
+    if not isinstance(extra, dict):
+        return {}
+    menu = extra.get("command_menu")
+    return dict(menu) if isinstance(menu, dict) else {}
+
+
+def _menu_needs_kam_priority(menu: Dict[str, Any]) -> bool:
+    """True when trade/fibo are not guaranteed near the front of the menu."""
+    mode = str(menu.get("priority_mode") or "prepend").strip().lower()
+    raw = menu.get("priority")
+    names: list[str] = []
+    if isinstance(raw, list):
+        names = [str(item).strip().lower() for item in raw if str(item).strip()]
+    # prepend + trade first is the durable shape for the Telegram `/` picker.
+    if mode not in {"prepend", "replace"}:
+        return True
+    if "trade" not in names:
+        return True
+    return False
+
+
 def ensure_telegram_menu_capacity(
     config_path: Path,
     backup_dir: Optional[Path] = None,
@@ -411,54 +446,84 @@ def ensure_telegram_menu_capacity(
     dry_run: bool = False,
     minimum: int = MINIMUM_TELEGRAM_MENU_MAX,
 ) -> Dict[str, Any]:
-    """Ensure Telegram BotCommand menu capacity can hold /trade.
+    """Ensure Telegram BotCommand menu publishes /trade (and /fibo).
 
-    Hermes defaults to 60 slots. With a full native command set, plugin
-    commands at the end of the menu are trimmed from ``setMyCommands`` even
-    though dispatch still works when typed. Raising
-    ``platforms.telegram.extra.command_menu.max_commands`` to *minimum*
-    (default 61) is the smallest config change that publishes it.
+    Hermes defaults to 60 slots. Core commands alone can exceed that, so
+    plugin commands at the end of the menu are trimmed from ``setMyCommands``
+    even though typing ``/trade`` still dispatches. This helper:
+
+    1. Raises ``max_commands`` to at least *minimum* (default 100).
+    2. Prepends ``trade`` / ``fibo`` on ``command_menu.priority`` so they
+       survive the cap and appear at the top of the Telegram `/` picker.
     """
     if yaml is None:
         raise ConfigError("PyYAML unavailable; cannot adjust Telegram menu capacity")
     before = parse_config(config_path)
     current = get_telegram_menu_max_commands(before)
-    if current >= minimum:
+    menu_before = _telegram_menu_section(before)
+    need_capacity = current < minimum
+    need_priority = _menu_needs_kam_priority(menu_before)
+    if not need_capacity and not need_priority:
         return {
             "path": str(config_path),
             "action": "already-sufficient",
             "max_commands": current,
             "minimum_max_commands": minimum,
+            "priority": list(menu_before.get("priority") or []),
+            "priority_mode": menu_before.get("priority_mode") or "prepend",
         }
     if dry_run:
         return {
             "path": str(config_path),
             "action": "would-set",
             "max_commands_before": current,
-            "max_commands_after": minimum,
+            "max_commands_after": max(current, int(minimum)),
             "minimum_max_commands": minimum,
+            "would_set_priority": need_priority,
+            "priority_commands": list(KAM_TELEGRAM_MENU_PRIORITY),
         }
 
-    # Mutate a deep copy via nested dicts, then dump. Preserve all top-level
-    # keys that parse_config saw; values for unrelated sections are taken
-    # from the parsed tree (comments may be lost — acceptable for this
-    # nested platforms path where hermes_cli is the production alternative).
     after = dict(before)
     platforms = dict(after.get("platforms") or {}) if isinstance(after.get("platforms"), dict) else {}
     telegram = dict(platforms.get("telegram") or {}) if isinstance(platforms.get("telegram"), dict) else {}
     extra = dict(telegram.get("extra") or {}) if isinstance(telegram.get("extra"), dict) else {}
     menu = dict(extra.get("command_menu") or {}) if isinstance(extra.get("command_menu"), dict) else {}
-    menu["max_commands"] = int(minimum)
+    if need_capacity:
+        menu["max_commands"] = max(int(current), int(minimum), TELEGRAM_BOT_API_MAX_COMMANDS)
+        # Clamp to Telegram Bot API hard limit.
+        menu["max_commands"] = min(int(menu["max_commands"]), TELEGRAM_BOT_API_MAX_COMMANDS)
+    if need_priority:
+        existing: list[str] = []
+        raw_priority = menu.get("priority")
+        if isinstance(raw_priority, list):
+            existing = [str(item).strip() for item in raw_priority if str(item).strip()]
+        # Keep operator extras, but force KAM commands to the front.
+        merged: list[str] = []
+        seen: set[str] = set()
+        for name in list(KAM_TELEGRAM_MENU_PRIORITY) + existing:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(name)
+        menu["priority"] = merged
+        # Only set mode when missing/unknown — don't clobber an explicit replace.
+        mode = str(menu.get("priority_mode") or "").strip().lower()
+        if mode not in {"prepend", "append", "replace"}:
+            menu["priority_mode"] = "prepend"
+        elif mode == "append":
+            # append puts custom names after defaults — trade would still lose
+            # the race under a tight cap. Force prepend for KAM visibility.
+            menu["priority_mode"] = "prepend"
     extra["command_menu"] = menu
     telegram["extra"] = extra
     platforms["telegram"] = telegram
     after["platforms"] = platforms
 
-    # Preserve other top-level keys.
     missing = set(before) - set(after)
     if missing:
         raise ConfigError(f"menu capacity edit would drop top-level keys: {sorted(missing)}")
-    if get_telegram_menu_max_commands(after) < minimum:
+    if get_telegram_menu_max_commands(after) < minimum and need_capacity:
         raise ConfigError("menu capacity edit did not raise max_commands")
 
     new_text = yaml.safe_dump(after, default_flow_style=False, sort_keys=False, allow_unicode=True)
@@ -469,6 +534,10 @@ def ensure_telegram_menu_capacity(
         "path": str(config_path),
         "action": "set",
         "max_commands_before": current,
-        "max_commands_after": minimum,
+        "max_commands_after": get_telegram_menu_max_commands(after),
         "minimum_max_commands": minimum,
+        "priority": list((_telegram_menu_section(after).get("priority") or [])),
+        "priority_mode": _telegram_menu_section(after).get("priority_mode"),
+        "updated_capacity": need_capacity,
+        "updated_priority": need_priority,
     }

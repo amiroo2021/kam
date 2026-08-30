@@ -100,6 +100,24 @@ class InstrumentCandidate:
 # NOT mutate the original token. Returns a list of search hints.
 _SOURCE_NORMALIZE_RE = re.compile(r"^#|\s+|[._/-]")
 
+# Common commodity / metal synonyms (bidirectional). Used ONLY as
+# ranking hints so e.g. user "GOLD" can surface venue "XAU". Never
+# invents a venue id that is absent from the catalog.
+_COMMON_SYMBOL_SYNONYMS: Dict[str, tuple] = {
+    "GOLD": ("XAU", "XAUUSD"),
+    "XAU": ("GOLD", "XAUUSD"),
+    "XAUUSD": ("XAU", "GOLD"),
+    "XAUUSDT": ("XAU", "GOLD"),
+    "SILVER": ("XAG", "XAGUSD"),
+    "XAG": ("SILVER", "XAGUSD"),
+    "XAGUSD": ("XAG", "SILVER"),
+    "XAGUSDT": ("XAG", "SILVER"),
+    "OIL": ("WTI", "BRENT", "CRUDE", "CL"),
+    "CRUDE": ("WTI", "BRENT", "OIL", "CL"),
+    "WTI": ("OIL", "CRUDE", "BRENT"),
+    "BRENT": ("OIL", "CRUDE", "WTI"),
+}
+
 
 def _search_hints(source_symbol: str) -> List[str]:
     """Return a list of search tokens derived from the source symbol.
@@ -109,6 +127,7 @@ def _search_hints(source_symbol: str) -> List[str]:
         "ETHUSD"  → ["ETHUSD", "ETH"]
         "BTCUSD"  → ["BTCUSD", "BTC"]
         "XAUUSD"  → ["XAUUSD", "XAU", "GOLD"]
+        "GOLD"    → ["GOLD", "XAU", "XAUUSD"]
 
     These are HINTS ONLY. The final instrument must come from the
     exchange catalog; this function never proposes a venue id.
@@ -130,6 +149,11 @@ def _search_hints(source_symbol: str) -> List[str]:
     cleaned2 = re.sub(r"\d{3,}$", "", cleaned)
     if cleaned2 and cleaned2 not in hints:
         hints.append(cleaned2)
+    # Commodity synonyms (GOLD ↔ XAU, etc.).
+    for seed in list(hints):
+        for syn in _COMMON_SYMBOL_SYNONYMS.get(seed, ()):
+            if syn and syn not in hints:
+                hints.append(syn)
     # Drop empty hints.
     return [h for h in hints if h]
 
@@ -246,6 +270,10 @@ def rank_candidates(
         if src_up and src_up == instrument.upper():
             score += 100
             reasons.append("exact instrument match")
+        # 1b. synonym → venue instrument (GOLD hint matches XAU).
+        elif hints and instrument.upper() in {h.upper() for h in hints}:
+            score += 95
+            reasons.append("synonym instrument match")
         # 2. exact display_name.
         if src_up and display_name and src_up == display_name.upper():
             score += 80
@@ -262,6 +290,10 @@ def rank_candidates(
         if src_up and base and src_up == base.upper():
             score += 40
             reasons.append("exact base match")
+        # 5b. synonym matches base (GOLD → base XAU).
+        elif hints and base and base.upper() in {h.upper() for h in hints}:
+            score += 40
+            reasons.append("synonym base match")
         # 6. substring match against any hint in display/long/underlying.
         for hint in hints:
             if not hint:

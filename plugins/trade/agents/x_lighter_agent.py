@@ -794,8 +794,8 @@ def capabilities() -> List[str]:
     return [
         "balance", "positions_orders", "positions_management",
         "new_order", "ladder", "cancel_orders",
-        # Phase 2.4: read-only catalog enumeration + price reader.
-        "list_instruments", "market_price",
+        # Public instrument resolve + Phase 2.4 catalog/price readers.
+        "resolve_instrument", "list_instruments", "market_price",
     ]
 
 
@@ -1101,6 +1101,22 @@ def _fetch_market_catalog(base_url: str) -> List[Dict[str, Any]]:
 
 _LIGHTER_QUOTE_SUFFIXES = {"USD", "USDT", "USDC", "PERP"}
 
+# Common human aliases → Lighter venue symbols (catalog is the source
+# of truth; these only expand match keys). GOLD is not listed on
+# Lighter; the gold perp is ``XAU``.
+_LIGHTER_SYMBOL_SYNONYMS: Dict[str, str] = {
+    "GOLD": "XAU",
+    "XAUUSD": "XAU",
+    "XAUUSDT": "XAU",
+    "XAU-USD": "XAU",
+    "XAU-USDT": "XAU",
+    "SILVER": "XAG",
+    "XAGUSD": "XAG",
+    "XAGUSDT": "XAG",
+    "XAG-USD": "XAG",
+    "XAG-USDT": "XAG",
+}
+
 
 def _lighter_alias_keys(symbol: str) -> List[str]:
     raw = str(symbol or "").strip().upper()
@@ -1111,6 +1127,17 @@ def _lighter_alias_keys(symbol: str) -> List[str]:
         base, rest = raw.split("-", 1)
         if rest in _LIGHTER_QUOTE_SUFFIXES and base:
             keys.append(base)
+    # Strip common quote suffixes (XAUUSD → XAU) even without a dash.
+    for suffix in ("USDT", "USDC", "USD", "PERP"):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            prefix = raw[: -len(suffix)]
+            if prefix and prefix not in keys:
+                keys.append(prefix)
+    # Human synonyms (GOLD → XAU, SILVER → XAG, …).
+    for seed in list(keys):
+        mapped = _LIGHTER_SYMBOL_SYNONYMS.get(seed)
+        if mapped and mapped not in keys:
+            keys.append(mapped)
     return keys
 
 

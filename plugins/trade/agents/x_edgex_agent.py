@@ -40,6 +40,7 @@ from edgex_sdk.quote.client import PriceType
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -118,8 +119,9 @@ def capabilities() -> List[str]:
         "cancel_orders", "cancel_order_group",
         "set_tp", "set_sl", "close_position",
         "resolve_instrument",
-        # Phase 2.4: read-only catalog enumeration.
+        # Phase 2.4: catalog + public ticker/mark price.
         "list_instruments",
+        "market_price",
     ]
 
 
@@ -916,6 +918,116 @@ def _execute_list_instruments(
         data={"instruments": instruments},
     )
 
+def _edgex_fetch_ticker(contract_id: str) -> Optional[Dict[str, Any]]:
+    """Public GET ``/api/v2/public/quote/getTicker?contractId=...``."""
+    cid = str(contract_id or "").strip()
+    if not cid:
+        return None
+    try:
+        req = urllib.request.Request(
+            BASE_URL + "/api/v2/public/quote/getTicker?" + urllib.parse.urlencode({"contractId": cid}),
+            headers={"User-Agent": "curl/8.0", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict) or payload.get("code") != "SUCCESS":
+        return None
+    data = payload.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Return mark/last price for one EdgeX contract."""
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        resolved = _resolve_contract(requested)
+    except ValueError as exc:
+        code = "INSTRUMENT_AMBIGUOUS" if str(exc) == "INSTRUMENT_AMBIGUOUS" else "INSTRUMENT_NOT_FOUND"
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code=code,
+            message=f"Instrument not found: {requested}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    if not resolved:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    contract_id, native = resolved
+    ticker = _edgex_fetch_ticker(contract_id)
+    if not ticker:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    price = None
+    for key in ("markPrice", "oraclePrice", "indexPrice", "lastPrice", "close"):
+        raw = ticker.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            d = Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            continue
+        if d.is_finite() and d > 0:
+            price = format(d.normalize(), "f")
+            break
+    if not price:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account or "",
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=str(native).upper(),
+            display_name=str(native).upper(),
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=str(native).upper(),
+            mark_price=price,
+            price=price,
+        ),
+    )
+
+
 
 def _resolve_instrument(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     requested = str(request.get("symbol") or "").strip()
@@ -984,6 +1096,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _resolve_instrument(account, request)
     if operation == "list_instruments":
         return _execute_list_instruments(account, request)
+    if operation == "market_price":
+        return _execute_market_price(account, request)
     return make_failure(
         operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED",
         message=f"EdgeX does not implement '{operation}' yet.",

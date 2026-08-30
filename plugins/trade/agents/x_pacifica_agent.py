@@ -61,6 +61,7 @@ import base58
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -405,6 +406,8 @@ def capabilities() -> List[str]:
         "set_sl",
         "close_position",
         "resolve_instrument",
+        "list_instruments",
+        "market_price",
     ]
 
 
@@ -3855,6 +3858,137 @@ def _execute_resolve_instrument(account: str, request: Dict[str, Any]) -> Canoni
     )
 
 
+
+def _pacifica_all_market_rows() -> List[Dict[str, Any]]:
+    """Return cached rows from GET /api/v1/info (refresh via _get_market_info)."""
+    # Warm cache with a dummy lookup that triggers fetch.
+    try:
+        _get_market_info("BTC")
+    except Exception:  # noqa: BLE001
+        pass
+    cache = _PACIFICA_MARKET_INFO_CACHE or {}
+    return [dict(v) for v in cache.values() if isinstance(v, dict)]
+
+
+def _execute_list_instruments(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    if not account:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        rows = _pacifica_all_market_rows()
+        marks = {}
+        try:
+            marks = _get_mark_prices()
+        except Exception:  # noqa: BLE001
+            marks = {}
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    instruments: List[Dict[str, Any]] = []
+    for row in rows:
+        sym = str(row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        entry: Dict[str, Any] = {
+            "instrument": sym,
+            "display_name": sym,
+            "base": sym,
+            "market_type": "perp",
+        }
+        mark = marks.get(sym)
+        if mark is None:
+            # prices dict may be keyed with original case
+            for k, v in marks.items():
+                if str(k).upper() == sym:
+                    mark = v
+                    break
+        if mark is not None:
+            try:
+                entry["price"] = format(Decimal(str(mark)).normalize(), "f")
+            except Exception:  # noqa: BLE001
+                pass
+        instruments.append(entry)
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=account,
+        data={"instruments": instruments},
+    )
+
+
+def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="MISSING_SYMBOL",
+            message="Symbol is required.",
+        )
+    try:
+        native = _canonical_market_symbol(requested)
+        marks = _get_mark_prices()
+    except ValueError:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Instrument not found: {requested}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    mark = marks.get(native)
+    if mark is None:
+        for k, v in marks.items():
+            if str(k).upper() == native.upper():
+                mark = v
+                break
+    if mark is None or mark <= 0:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account or "",
+            code="PRICE_UNAVAILABLE",
+            message=f"Price unavailable for {requested}",
+        )
+    text = format(Decimal(str(mark)).normalize(), "f")
+    return make_success(
+        operation="market_price",
+        exchange=name,
+        account=account or "",
+        instrument=CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=native,
+        ),
+        market_price=CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=native,
+            mark_price=text,
+            price=text,
+        ),
+    )
+
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     if not isinstance(request, dict):
         return make_failure(
@@ -3905,6 +4039,10 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_close_position(account, request)
     if operation == "resolve_instrument":
         return _execute_resolve_instrument(account, request)
+    if operation == "list_instruments":
+        return _execute_list_instruments(account, request)
+    if operation == "market_price":
+        return _execute_market_price(account, request)
 
     return make_failure(
         operation=operation,
