@@ -587,6 +587,103 @@ async def handle_fibo_command(adapter: Any, msg: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+async def _build_running_fibo_screen() -> Optional[dict]:
+    """Build the Running Fibo screen dict (READ-ONLY).
+
+    Reads the latest MT4 snapshot and active registrations and
+    composes the wizard screen dict (text + buttons). NEVER
+    invokes convergence, places orders, cancels orders, closes
+    positions, or mutates cycle_state / registrations. The only
+    exchange calls are ``positions_orders`` (read) performed by
+    ``FiboReconciler._fetch_exchange_state`` and by the shadow
+    executor's ``positions_orders`` read; both are documented as
+    read-only paths in ``reconciler.py`` and ``shadow.py``.
+
+    Returns ``None`` if a build error occurred (after logging it);
+    the caller should ack the query and not edit the screen in
+    that case.
+    """
+    from .fibo.dryrun import build_running_screen
+    from .fibo.reconciler import FiboReconciler
+    # The wizard shim owns the same TradeDesk singleton the
+    # StartFiboFlow was built with. Reuse it so the dry-run sees
+    # exactly the same exchange/account surface as /trade and the
+    # Start Fibo flow.
+    from .tradedesk import get_tradedesk
+    desk = get_tradedesk()
+    # The StartFiboFlow's stores live inside the flow singleton.
+    # Reconstruct the same store paths so the dry-run reads what
+    # the flow writes.
+    hermes_home = _resolve_hermes_home_for_flow()
+    from .fibo.snapshot import Mt4SnapshotStore
+    from .fibo.store import FiboRegistrationStore
+    try:
+        reconciler = FiboReconciler(
+            registration_store=FiboRegistrationStore(
+                hermes_home / "fibo" / "registrations.jsonl"
+            ),
+            snapshot_store=Mt4SnapshotStore(
+                hermes_home / "fibo" / "mt4_snapshot.json"
+            ),
+            execute_fn=desk.execute,
+        )
+        screen_dict = build_running_screen(reconciler)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "fibo_wizard: running fibo screen build failed: %s",
+            exc, exc_info=True,
+        )
+        return None
+    # Phase 2.9 — append shadow-mode convergence hints
+    # (read-only, ZERO writes) so the operator sees the
+    # would-be target-convergence actions next to the dry-run
+    # reconciler output. The shadow executor lives in
+    # ``plugins/trade/fibo/shadow.py`` and NEVER invokes write
+    # operations.
+    try:
+        from .fibo.shadow import (
+            shadow_run as _shadow_run,
+        )
+        snap = Mt4SnapshotStore(
+            hermes_home / "fibo" / "mt4_snapshot.json"
+        ).load()
+        reg_store = FiboRegistrationStore(
+            hermes_home / "fibo" / "registrations.jsonl"
+        )
+        if snap is not None:
+            active = [
+                r for r in reg_store.load_all()
+                if r.is_active
+            ]
+            shadow_lines = [
+                "",
+                "🛰️ Shadow (read-only, ZERO writes)",
+            ]
+            for r in active:
+                s = _shadow_run(r, snap,
+                                 execute_fn=desk.execute)
+                shadow_lines.append(
+                    f"  {s.registration_key}: "
+                    f"target={s.target_size} "
+                    f"actual={s.actual_side} "
+                    f"{s.actual_size} "
+                    f"would_cancel="
+                    f"{len(s.would_cancel)} "
+                    f"would_order="
+                    f"{s.would_order.volume if s.would_order else 0} "
+                    f"status={s.status}"
+                )
+            screen_dict["text"] = (
+                screen_dict.get("text", "") + "\n"
+                + "\n".join(shadow_lines)
+            )
+    except Exception:  # noqa: BLE001
+        # Shadow wiring is best-effort; do not break the dry-run
+        # if shadow itself errors.
+        pass
+    return screen_dict
+
+
 async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
     """Handle a ``fibo:`` prefixed callback query.
 
@@ -613,6 +710,12 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
     try:
         suffix = _strip_namespace(data, "fibo")
         callback_data = f"fibo:{suffix}" if suffix else data
+        # Back to the /fibo entry menu (Running Fibo → entry).
+        if callback_data == "fibo:back":
+            await _edit(query, _build_entry_screen())
+            _answer(query)
+            return
+
         # Exit is a UI-only close: bypass the placeholder path entirely.
         if callback_data == "fibo:exit":
             # Also drop any in-flight Start Fibo session for this user.
@@ -696,87 +799,25 @@ async def handle_fibo_callback(adapter: Any, query: Any, data: str) -> None:
         # test_fibo_skeleton.py::test_no_exchange_write_path_invoked).
         # The shadow executor itself, including all read/write
         # operation strings, lives in ``plugins/trade/fibo/shadow.py``.
+        # Phase 2.13.22 — explicit Refresh button on the Running
+        # Fibo screen. Behaviorally identical to ``fibo:running``:
+        # rebuild the screen from the latest MT4 snapshot /
+        # reconciler state. READ-ONLY (no exchange writes, no
+        # convergence invocation, no cycle_state / registrations
+        # mutation). Kept as a separate callback_data token so
+        # the wizard's button row can carry an explicit Refresh
+        # affordance without re-using the entry-screen callback.
+        if callback_data == "fibo:running:refresh":
+            screen_dict = await _build_running_fibo_screen()
+            if screen_dict is not None:
+                await _edit(query, screen_dict)
+            _answer(query)
+            return
+
         if callback_data == "fibo:running":
-            try:
-                from .fibo.dryrun import build_running_screen
-                from .fibo.reconciler import FiboReconciler
-                # The wizard shim owns the same TradeDesk singleton
-                # the StartFiboFlow was built with. Reuse it so the
-                # dry-run sees exactly the same exchange/account
-                # surface as /trade and the Start Fibo flow.
-                from .tradedesk import get_tradedesk
-                desk = get_tradedesk()
-                # The StartFiboFlow's stores live inside the flow
-                # singleton. Reconstruct the same store paths so the
-                # dry-run reads what the flow writes.
-                hermes_home = _resolve_hermes_home_for_flow()
-                from .fibo.snapshot import Mt4SnapshotStore
-                from .fibo.store import FiboRegistrationStore
-                reconciler = FiboReconciler(
-                    registration_store=FiboRegistrationStore(
-                        hermes_home / "fibo" / "registrations.jsonl"
-                    ),
-                    snapshot_store=Mt4SnapshotStore(
-                        hermes_home / "fibo" / "mt4_snapshot.json"
-                    ),
-                    execute_fn=desk.execute,
-                )
-                screen_dict = build_running_screen(reconciler)
-                # Phase 2.9 — append shadow-mode convergence hints
-                # (read-only, ZERO writes) so the operator sees the
-                # would-be target-convergence actions next to the
-                # dry-run reconciler output. The shadow executor
-                # lives in ``plugins/trade/fibo/shadow.py`` and
-                # NEVER invokes write operations.
-                try:
-                    from .fibo.shadow import (
-                        shadow_run as _shadow_run,
-                    )
-                    snap = Mt4SnapshotStore(
-                        hermes_home / "fibo" / "mt4_snapshot.json"
-                    ).load()
-                    reg_store = FiboRegistrationStore(
-                        hermes_home / "fibo" / "registrations.jsonl"
-                    )
-                    if snap is not None:
-                        active = [
-                            r for r in reg_store.load_all()
-                            if r.is_active
-                        ]
-                        shadow_lines = [
-                            "",
-                            "🛰️ Shadow (read-only, ZERO writes)",
-                        ]
-                        for r in active:
-                            s = _shadow_run(r, snap,
-                                             execute_fn=desk.execute)
-                            shadow_lines.append(
-                                f"  {s.registration_key}: "
-                                f"target={s.target_size} "
-                                f"actual={s.actual_side} "
-                                f"{s.actual_size} "
-                                f"would_cancel="
-                                f"{len(s.would_cancel)} "
-                                f"would_order="
-                                f"{s.would_order.volume if s.would_order else 0} "
-                                f"status={s.status}"
-                            )
-                        screen_dict["text"] = (
-                            screen_dict.get("text", "") + "\n"
-                            + "\n".join(shadow_lines)
-                        )
-                except Exception:  # noqa: BLE001
-                    # Shadow wiring is best-effort; do not break
-                    # the dry-run if shadow itself errors.
-                    pass
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "fibo_wizard: running fibo screen build failed: %s",
-                    exc, exc_info=True,
-                )
-                _answer(query)
-                return
-            await _edit(query, screen_dict)
+            screen_dict = await _build_running_fibo_screen()
+            if screen_dict is not None:
+                await _edit(query, screen_dict)
             _answer(query)
             return
 

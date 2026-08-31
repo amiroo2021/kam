@@ -34,6 +34,30 @@ from .reconciler import (
 logger = logging.getLogger(__name__)
 
 
+# Running Fibo inline-keyboard layout. One button per row, in this
+# exact top-to-bottom order:
+#   row 0: [Back]     (← Back to the main /fibo entry menu)
+#   row 1: [Refresh]  (🔄 re-render the screen from the latest
+#                       MT4 snapshot / reconciler state — READ-ONLY)
+#   row 2: [Exit]     (✖️ UI-only close, unchanged behavior)
+#
+# No button invokes convergence, places orders, closes positions,
+# cancels orders, modifies cycle_state, or modifies registrations.
+# `fibo:running` and `fibo:running:refresh` are equivalent — both
+# re-build the screen from the latest snapshot/reconciler state.
+_RUNNING_BUTTONS: List[List[dict]] = [
+    [
+        {"text": "⬅️ Back", "callback_data": "fibo:back"},
+    ],
+    [
+        {"text": "🔄 Refresh", "callback_data": "fibo:running:refresh"},
+    ],
+    [
+        {"text": "✖️ Exit", "callback_data": "fibo:exit"},
+    ],
+]
+
+
 # Compact per-registration block for the wizard screen.
 def _compact_block(r: ReconciliationResult) -> str:
     # Phase 2.1: show source vs exchange distinctly. For legacy
@@ -150,9 +174,7 @@ def build_running_screen(
                 f"{exc}\n\n"
                 "The reconciler is read-only and never executes trades."
             ),
-            "buttons": [
-                [{"text": "❌ Exit", "callback_data": "fibo:exit"}],
-            ],
+            "buttons": _RUNNING_BUTTONS,
         }
 
     if not results:
@@ -185,9 +207,7 @@ def build_running_screen(
 
     return {
         "text": body,
-        "buttons": [
-            [{"text": "❌ Exit", "callback_data": "fibo:exit"}],
-        ],
+        "buttons": _RUNNING_BUTTONS,
     }
 
 

@@ -1258,16 +1258,23 @@ class RunningFiboRenderTests(_Base):
     def test_dryrun_screen_with_no_registrations_renders_clean(self) -> None:
         """Phase 2 §11: the wizard's Running Fibo screen must render
         even when no registrations exist — with a friendly body and
-        only a ❌ Exit button (no executable actions)."""
+        only Back/Refresh/Exit buttons (no executable actions)."""
         from plugins.trade.fibo.dryrun import build_running_screen
         rec = self.fx.reconciler()  # empty store
         screen = build_running_screen(rec)
         self.assertIn("No persisted Fibo registrations", screen["text"])
-        # The only button is Exit.
+        # Three rows, one button per row: [Back] [Refresh] [Exit].
         flat = [b for row in screen["buttons"] for b in row]
-        self.assertEqual(len(flat), 1)
-        self.assertEqual(flat[0]["text"], "❌ Exit")
-        self.assertEqual(flat[0]["callback_data"], "fibo:exit")
+        self.assertEqual(len(flat), 3)
+        cbs = {b["callback_data"] for b in flat}
+        self.assertEqual(cbs, {"fibo:back", "fibo:running:refresh", "fibo:exit"})
+        # Row order: Back on row 0, Refresh on row 1, Exit on row 2.
+        self.assertEqual(screen["buttons"][0][0]["callback_data"], "fibo:back")
+        self.assertEqual(screen["buttons"][0][0]["text"], "⬅️ Back")
+        self.assertEqual(screen["buttons"][1][0]["callback_data"], "fibo:running:refresh")
+        self.assertEqual(screen["buttons"][1][0]["text"], "🔄 Refresh")
+        self.assertEqual(screen["buttons"][2][0]["callback_data"], "fibo:exit")
+        self.assertEqual(screen["buttons"][2][0]["text"], "✖️ Exit")
 
     def test_dryrun_screen_with_one_registration_shows_dry_run_marker(self) -> None:
         from plugins.trade.fibo.dryrun import build_running_screen
@@ -1287,10 +1294,11 @@ class RunningFiboRenderTests(_Base):
         self.assertIn("BITGET", screen["text"])
         self.assertIn("OPEN_SHORT", screen["text"])
         self.assertIn("Target: SHORT 0.001", screen["text"])
-        # No buttons except Exit.
+        # Buttons: Back, Refresh, Exit — NO write buttons.
         flat = [b for row in screen["buttons"] for b in row]
-        self.assertEqual(len(flat), 1)
-        self.assertEqual(flat[0]["callback_data"], "fibo:exit")
+        self.assertEqual(len(flat), 3)
+        cbs = {b["callback_data"] for b in flat}
+        self.assertEqual(cbs, {"fibo:back", "fibo:running:refresh", "fibo:exit"})
         # And the screen has NO callback_data that starts with a
         # write operation prefix.
         for b in flat:
