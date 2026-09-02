@@ -1129,18 +1129,27 @@ def _execute_stop(idx: int) -> dict:
     reg = active[idx]
     try:
         from .fibo.store import FiboRegistrationStore
+        from .fibo.lifecycle import lifecycle_mark_stopped
         from .fibo.timer_lifecycle import (
             convergence_status_lines,
             format_stop_timer_warning,
-            reconcile_convergence_timer,
         )
         hermes_home = _resolve_hermes_home_for_flow()
         store = FiboRegistrationStore(
             hermes_home / "fibo" / "registrations.jsonl"
         )
-        # Persist stopped/tombstone FIRST under the store lock;
-        # active_count is computed under that same lock.
-        _stopped, active_count = store.mark_stopped(reg.registration_key)
+        # Serialize persist-stop + fresh active recount + timer
+        # reconcile under the cross-process lifecycle lock.
+        runner = globals().get("_FIBO_SYSTEMCTL_RUNNER")
+        life = lifecycle_mark_stopped(
+            store,
+            reg.registration_key,
+            systemctl_runner=runner,
+            hermes_home=hermes_home,
+        )
+        _stopped = life.registration
+        active_count = life.active_count
+        timer_result = life.timer
     except (KeyError, ValueError) as exc:
         # Already stopped or no longer exists: refresh the picker.
         logger.info(
@@ -1174,21 +1183,14 @@ def _execute_stop(idx: int) -> dict:
             ],
         }
 
-    # Timer reconcile AFTER successful stop persistence. Never rolls
-    # back the stopped registration. Never stops fibo-converge.service,
+    # Timer already reconciled under lifecycle lock. Never rolls back
+    # the stopped registration. Never stops fibo-converge.service,
     # gateway, or mt4-reader.
-    timer_result = None
     timer_warn = ""
     try:
         from .fibo.timer_lifecycle import (
             convergence_status_lines,
             format_stop_timer_warning,
-            reconcile_convergence_timer,
-        )
-        runner = globals().get("_FIBO_SYSTEMCTL_RUNNER")
-        timer_result = reconcile_convergence_timer(
-            int(active_count or 0),
-            runner=runner,
         )
         if (
             int(active_count or 0) == 0
@@ -1205,19 +1207,12 @@ def _execute_stop(idx: int) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "fibo_wizard: stop — timer reconcile failed: %s", exc,
+            "fibo_wizard: stop — status render failed: %s", exc,
             exc_info=True,
         )
         status_lines = [
             "⚠️ Convergence: status unknown — scheduler needs attention",
         ]
-        if int(active_count or 0) == 0:
-            timer_warn = (
-                "⚠️ Fibo registration stopped, but the convergence timer "
-                "could not be disabled.\n\n"
-                f"Active registrations: 0\n"
-                f"Detail: {exc}\n\n"
-            )
 
     src = reg.source_symbol or reg.symbol or "?"
     venue = reg.exchange_instrument or src

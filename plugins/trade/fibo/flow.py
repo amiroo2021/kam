@@ -1258,7 +1258,13 @@ class StartFiboFlow:
             return self._render_invalid_callback(sess.session_key)
 
         try:
-            active_count = self._registration_store.append(registration)
+            from .lifecycle import lifecycle_append
+            life = lifecycle_append(
+                self._registration_store,
+                registration,
+                systemctl_runner=getattr(self, "_systemctl_runner", None),
+                hermes_home=self._hermes_home_for_lifecycle(),
+            )
         except DuplicateRegistrationError as exc:
             # Phase 2.7: if the existing latest row for this key
             # is ``stopped``, reactivate it instead of refusing
@@ -1274,10 +1280,12 @@ class StartFiboFlow:
                 target=target,
             )
             if restarted is not None:
-                restarted_reg, restarted_count = restarted
+                restarted_reg, restarted_count, restarted_timer = restarted
                 self._sessions.reset(*sess.session_key)
                 return self._render_restarted(
-                    restarted_reg, active_count=restarted_count
+                    restarted_reg,
+                    active_count=restarted_count,
+                    timer_result=restarted_timer,
                 )
             return self._render_duplicate(sess, snap, exc.registration_key)
         except Exception as exc:  # noqa: BLE001 - surface generically
@@ -1286,13 +1294,13 @@ class StartFiboFlow:
             )
             return self._render_store_error(sess, snap, str(exc))
 
-        # Persist succeeded FIRST. Only then reconcile the timer.
-        timer_result = self._reconcile_timer_after_mutation(active_count)
+        # Persist + fresh active recount + timer reconcile already
+        # completed under the lifecycle lock inside lifecycle_append.
         self._sessions.reset(*sess.session_key)
         return self._render_registered(
-            registration,
-            active_count=active_count,
-            timer_result=timer_result,
+            life.registration,
+            active_count=life.active_count,
+            timer_result=life.timer,
         )
 
     # ------------------------------------------------------------------
@@ -1330,8 +1338,12 @@ class StartFiboFlow:
         if starting_volume is None or starting_volume <= 0:
             return None
         percentage = self._current_percentage(snap, sess)
-        reactivated, active_count = self._registration_store.reactivate(
-            registration_key,
+        from .lifecycle import lifecycle_reactivate
+        life = lifecycle_reactivate(
+            self._registration_store,
+            registration_key=registration_key,
+            systemctl_runner=getattr(self, "_systemctl_runner", None),
+            hermes_home=self._hermes_home_for_lifecycle(),
             source_symbol=sess.symbol or "",
             exchange_instrument=sess.exchange_instrument or "",
             starting_volume=starting_volume,
@@ -1343,7 +1355,7 @@ class StartFiboFlow:
             source_percentage=percentage,
             source_snapshot_received_at=snap.received_at,
         )
-        return reactivated, active_count
+        return life.registration, life.active_count, life.timer
 
     @staticmethod
     def _current_percentage(snap: Mt4Snapshot, sess: "FiboSession") -> Decimal:
@@ -2079,6 +2091,20 @@ class StartFiboFlow:
             ]],
         )
 
+
+
+    def _hermes_home_for_lifecycle(self):
+        """Resolve HERMES_HOME for the lifecycle lock path."""
+        import os
+        from pathlib import Path
+        env = os.environ.get("HERMES_HOME")
+        if env and str(env).strip():
+            return Path(env).expanduser()
+        # Prefer the registration store parent parent (.../fibo/../)
+        try:
+            return Path(self._registration_store.path).resolve().parent.parent
+        except Exception:  # noqa: BLE001
+            return Path.home() / ".hermes"
 
     def _reconcile_timer_after_mutation(self, active_count: int):
         """Reconcile fibo-converge.timer from effective active count.
