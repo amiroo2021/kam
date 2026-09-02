@@ -1943,6 +1943,9 @@ def _arcus_position_context(
     openOrders failures (e.g. 429) do NOT null the whole context when the
     account/position endpoint succeeded — open_orders is returned as [] and
     callers that need order identity must check emptiness / require_open_orders.
+
+    Arcus reports short sizes as **negative** decimals. We always return a
+    positive ``current_size`` and derive side from ``side`` (or the sign).
     """
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -1953,18 +1956,47 @@ def _arcus_position_context(
         return None
     positions = account_payload.get("positions", {}) or {}
     position = None
+    requested = _normalize_symbol(symbol)
+    identity: Optional[Dict[str, Any]] = None
+    try:
+        identity = _resolve_identity(str(symbol or ""))
+    except Exception:  # noqa: BLE001
+        identity = None
     for _mid, row in positions.items():
         if not isinstance(row, dict):
             continue
-        if str(row.get("marketDisplayName") or "").upper() == symbol.upper():
+        row_sym = _row_market_symbol(row)
+        if row_sym == requested:
             position = row
             break
+        if identity is not None and _symbol_matches_identity(row_sym, identity):
+            position = row
+            break
+        # marketId match when identity resolved
+        if identity is not None:
+            try:
+                if int(_mid) == int(identity.get("market_id") or 0) and int(identity.get("market_id") or 0) > 0:
+                    position = row
+                    break
+            except Exception:  # noqa: BLE001
+                pass
     if not position:
         return None
     side_text = str(position.get("side") or "").strip().lower()
-    if side_text not in {"long", "short"}:
-        return None
-    size = _decimal_or_zero(position.get("size"))
+    signed_size = _decimal_or_zero(position.get("size"))
+    if side_text not in {"long", "short", "buy", "sell"}:
+        # Infer from signed size when side missing.
+        if signed_size > 0:
+            side_text = "long"
+        elif signed_size < 0:
+            side_text = "short"
+        else:
+            return None
+    if side_text in {"buy"}:
+        side_text = "long"
+    elif side_text in {"sell"}:
+        side_text = "short"
+    size = abs(signed_size)
     if size <= 0:
         return None
     mark = _decimal_or_zero(position.get("markPx") or position.get("markPrice"))

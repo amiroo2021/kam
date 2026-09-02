@@ -794,7 +794,9 @@ def _balance(account: str) -> CanonicalResponse:
         return make_failure(operation="balance", exchange=name, account=account,
                             code="APEX_ERROR", message=sanitize_error_message(str(exc)))
     summary = _normalize_balance(raw_balance, raw_account)
-    positions = _normalize_positions(raw_account)
+    positions = _apex_enrich_positions_with_mark_pnl(
+        client, _normalize_positions(raw_account)
+    )
     return make_success(
         operation="balance", exchange=name, account=credentials["account"],
         balance=normalize_balance(summary.account_value, "USD"),
@@ -847,7 +849,9 @@ def _positions_orders(account: str) -> CanonicalResponse:
         return make_failure(operation="positions_orders", exchange=name,
                             account=account, code="APEX_ERROR",
                             message=sanitize_error_message(str(exc)))
-    positions = _normalize_positions_merged(snapshots)
+    positions = _apex_enrich_positions_with_mark_pnl(
+        client, _normalize_positions_merged(snapshots)
+    )
     open_orders = _extract_open_orders(client)
     open_count, order_groups = _group_open_orders(open_orders)
     protections = _enrich_positions_with_tpsl(client, positions)
@@ -1716,20 +1720,107 @@ def _apex_fetch_mark_price(client: Any, symbol: str) -> Decimal:
     data = response.get("data") if isinstance(response, Mapping) else None
     if not isinstance(data, list) or not data:
         return Decimal("0")
-    target = symbol.upper()
-    # Find the matching symbol; the ticker rows use ``symbolDisplayName``
-    # form (e.g. ``BTCUSDT`` without dash) or canonical ``BTC-USDT``.
+    target = symbol.upper().replace("-", "")
+    # Find the matching symbol; ticker rows often use ``BTCUSDT`` (no dash)
+    # while account positions use ``BTC-USDT``.
     for row in data:
         if not isinstance(row, Mapping):
             continue
-        row_symbol = str(row.get("symbol") or "").upper().replace("USDT", "-USDT")
-        if row_symbol == target:
+        row_symbol = str(row.get("symbol") or "").upper().replace("-", "")
+        if row_symbol == target or row_symbol.replace("USDT", "") == target.replace("USDT", ""):
             mark = row.get("markPrice") or row.get("oraclePrice") or row.get("indexPrice") or row.get("lastPrice")
             try:
-                return Decimal(str(mark))
+                value = Decimal(str(mark))
             except Exception:
                 return Decimal("0")
+            return value if value > 0 else Decimal("0")
+    # Fallback: first row when the request was symbol-scoped.
+    if len(data) == 1 and isinstance(data[0], Mapping):
+        mark = data[0].get("markPrice") or data[0].get("lastPrice")
+        try:
+            value = Decimal(str(mark))
+        except Exception:
+            return Decimal("0")
+        return value if value > 0 else Decimal("0")
     return Decimal("0")
+
+
+def _apex_compute_unrealized_pnl(
+    *,
+    side: str,
+    size: Decimal,
+    entry: Decimal,
+    mark: Decimal,
+) -> Decimal:
+    """Unrealized PnL from mark vs entry (Apex account rows omit uPnL)."""
+    if size <= 0 or entry <= 0 or mark <= 0:
+        return Decimal("0")
+    side_l = str(side or "").strip().lower()
+    if side_l in {"short", "sell"}:
+        return (entry - mark) * size
+    return (mark - entry) * size
+
+
+def _apex_enrich_positions_with_mark_pnl(
+    client: Any,
+    positions: List[CanonicalPosition],
+) -> List[CanonicalPosition]:
+    """Fill missing/zero position PnL using live ticker marks.
+
+    Apex ``get_account_v3`` position objects do not include
+    ``unrealizedPnl`` or ``markPrice`` (only entry/size/side/fees). The
+    balance endpoint has an *account-level* unrealizedPnl total but not
+    per-position. Per-row PnL is therefore computed as:
+
+      long:  (mark - entry) * size
+      short: (entry - mark) * size
+    """
+    if not positions:
+        return positions
+    enriched: List[CanonicalPosition] = []
+    mark_cache: Dict[str, Decimal] = {}
+    for position in positions:
+        symbol = str(position.symbol or "").strip()
+        try:
+            size = abs(Decimal(str(position.size or "0")))
+        except Exception:  # noqa: BLE001
+            size = Decimal("0")
+        try:
+            entry = Decimal(str(position.entry_price or "0"))
+        except Exception:  # noqa: BLE001
+            entry = Decimal("0")
+        existing = _safe_decimal(position.pnl)
+        # Keep a non-zero server-provided PnL if present; otherwise compute.
+        if existing != 0:
+            enriched.append(position)
+            continue
+        if not symbol or size <= 0 or entry <= 0:
+            enriched.append(position)
+            continue
+        if symbol not in mark_cache:
+            mark_cache[symbol] = _apex_fetch_mark_price(client, symbol)
+        mark = mark_cache[symbol]
+        pnl = _apex_compute_unrealized_pnl(
+            side=str(position.side or ""),
+            size=size,
+            entry=entry,
+            mark=mark,
+        )
+        enriched.append(
+            CanonicalPosition(
+                symbol=position.symbol,
+                side=position.side,
+                size=position.size,
+                entry_price=position.entry_price,
+                pnl=_format_decimal(pnl),
+                tp=position.tp,
+                sl=position.sl,
+                tp_count=position.tp_count,
+                sl_count=position.sl_count,
+                exchange_instrument=getattr(position, "exchange_instrument", None),
+            )
+        )
+    return enriched
 
 
 def _apex_closing_side(position_side: str) -> str:

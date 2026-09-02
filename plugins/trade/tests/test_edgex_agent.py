@@ -77,6 +77,18 @@ class EdgeXAgentTests(unittest.TestCase):
         with mock.patch.object(edgex, "_metadata", return_value={"3":"SOLUSDC"}):
             self.assertEqual(edgex._resolve_contract("SOL"), ("3", "SOLUSDC"))
 
+    def test_gold_aliases_resolve_to_xauusdc(self):
+        catalog = {"30000005": "XAUUSDC", "30000006": "XAGUSDC", "3": "SOLUSDC"}
+        with mock.patch.object(edgex, "_metadata", return_value=catalog):
+            for raw in ("XAUUSD", "XAUUSDT", "XAU-USD", "XAU", "GOLD", "xauusdc"):
+                self.assertEqual(
+                    edgex._resolve_contract(raw),
+                    ("30000005", "XAUUSDC"),
+                    msg=raw,
+                )
+            self.assertEqual(edgex._resolve_contract("SILVER"), ("30000006", "XAGUSDC"))
+            self.assertEqual(edgex._resolve_contract("XAGUSD"), ("30000006", "XAGUSDC"))
+
     def test_ladder_prices_are_quantized_to_contract_tick(self):
         prices=edgex._ladder_prices(Decimal("100"),Decimal("120"),20,Decimal("0.01"))
         self.assertEqual(prices[1],Decimal("101.05"))

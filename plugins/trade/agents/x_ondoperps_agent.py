@@ -4154,8 +4154,20 @@ def _close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
 
     direction = str(target.get("direction") or "").strip().lower()
     closing_side = "sell" if direction == "long" else "buy"
+    # Prefer direction field; treat netQuantity magnitude as size. If a
+    # build ever returns signed shorts (negative qty), abs() keeps close
+    # working the same way display normalization already does.
     size_value = _decimal_or_none(target.get("netQuantity"))
-    if size_value is None or size_value <= 0:
+    if size_value is None:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="POSITION_NOT_FOUND",
+            message=f"Open {requested_symbol} position has zero size; nothing to close.",
+        )
+    size_value = abs(size_value)
+    if size_value <= 0:
         return make_failure(
             operation="close_position",
             exchange=name,
@@ -4226,7 +4238,7 @@ def _close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             if direct == "neutral":
                 continue
             qty = _decimal_or_none(row.get("netQuantity")) or Decimal("0")
-            if qty > 0:
+            if abs(qty) > 0:
                 still_open = True
                 break
         if not still_open:

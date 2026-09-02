@@ -209,11 +209,37 @@ def run(
                     record["daemon_reload"] = "ok"
                 except Exception as exc:  # noqa: BLE001
                     record["daemon_reload"] = f"error: {exc}"
+                # /fibo Start/Running menus require a live MT4 snapshot.
+                # The reader is a Fibo-owned independent unit (must NOT
+                # be tied to hermes-gateway). Enable + start it on
+                # install so a fresh --fibo does not leave the wizard
+                # stuck on "No MT4 data yet". Converge timer stays
+                # operator-opt-in (not auto-started here).
+                try:
+                    en = subprocess.run(
+                        ["systemctl", "enable", "--now", "fibo-mt4-reader.service"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    record["mt4_reader"] = {
+                        "action": "enable --now",
+                        "returncode": int(en.returncode),
+                        "stderr": (en.stderr or "")[-400:],
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    record["mt4_reader"] = {"action": "enable --now", "error": str(exc)}
             else:
                 record["daemon_reload"] = (
                     "skipped: systemctl not on PATH; operator must "
                     "run 'systemctl daemon-reload' manually"
                 )
+                record["mt4_reader"] = {
+                    "action": "skipped",
+                    "reason": "systemctl not on PATH; run "
+                    "'systemctl enable --now fibo-mt4-reader.service'",
+                }
 
     return record
 

@@ -105,6 +105,83 @@ CB_CANCEL = "fibo:s:cancel"
 CB_REFRESH = "fibo:s:refresh"
 CB_VCONFIRM = "fibo:s:v"        # volume-confirmed ack (used after text input)
 
+# Browse markets: page size for Telegram button rows.
+_BROWSE_PAGE_SIZE = 10
+
+
+def _catalog_instrument_id(entry: Any) -> str:
+    """Venue-native id from a browse catalog entry (str or dict)."""
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        for key in ("instrument", "symbol", "market", "id"):
+            val = entry.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text
+    return ""
+
+
+def _catalog_short_symbol(instrument_id: str) -> str:
+    """BTC-USD / BTC-USDT / ETH-USD.P → BTC / ETH."""
+    text = str(instrument_id or "").strip()
+    if not text:
+        return "?"
+    # Prefer base before quote separators.
+    for sep in ("-", "/", "_"):
+        if sep in text:
+            base = text.split(sep, 1)[0].strip()
+            if base:
+                # strip trailing contract suffixes like .P already gone with split
+                return base
+    if "." in text:
+        return text.split(".", 1)[0].strip() or text
+    return text
+
+
+def _catalog_display_symbol(entry: Any) -> str:
+    """Button symbol: prefer base/display_name, else short instrument id."""
+    if isinstance(entry, dict):
+        for key in ("base", "display_name"):
+            val = entry.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text
+    inst = _catalog_instrument_id(entry)
+    return _catalog_short_symbol(inst) if inst else "?"
+
+
+def _catalog_price_text(entry: Any) -> Optional[str]:
+    """Optional pre-populated price string from a catalog record."""
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("price")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    try:
+        d = Decimal(text.replace(",", ""))
+    except Exception:  # noqa: BLE001
+        return text
+    if not d.is_finite():
+        return None
+    rendered = format(d, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    try:
+        if "." in rendered:
+            whole, frac = rendered.split(".", 1)
+            return f"{int(whole):,}.{frac}"
+        return f"{int(rendered):,}"
+    except Exception:  # noqa: BLE001
+        return rendered
+
 
 # Side button tokens (single char keeps callback short).
 SIDE_TOKEN_BUY = "b"
@@ -807,14 +884,25 @@ class StartFiboFlow:
             return self._render_no_data(sess)
         sess.instrument_page = 0
         # Refresh market list (the Phase 2.1 lister is reused).
+        instruments: List[Any] = []
         if self._list_instruments is not None and sess.exchange and sess.account:
             try:
-                instruments = self._list_instruments(
+                raw = self._list_instruments(
                     str(sess.exchange), str(sess.account)
                 )
             except Exception:
+                raw = []
+            # list_market_catalog returns either a list of records or the
+            # sentinel string \"unavailable\". Never expand a string into chars.
+            if isinstance(raw, list):
+                instruments = [
+                    entry
+                    for entry in raw
+                    if _catalog_instrument_id(entry)
+                ]
+            else:
                 instruments = []
-            sess.choices_instruments = list(instruments or [])
+        sess.choices_instruments = list(instruments)
         sess.state = SessionState.AWAITING_MARKET_BROWSE
         return self._render_market_browse(sess, snap)
 
@@ -826,13 +914,13 @@ class StartFiboFlow:
     ) -> Screen:
         if snap is None:
             return self._render_no_data(sess)
-        # CB_BROWSEPG: -1 for prev, 1..N for direct page jump.
+        # CB_BROWSEPG: -1 for prev, 1..N for 1-based page jump.
         try:
             delta = int(data[len(CB_BROWSEPG):])
         except ValueError:
             return self._render_invalid_callback(sess.session_key)
         if delta == -1:
-            sess.instrument_page = max(0, sess.instrument_page - 1)
+            sess.instrument_page = max(0, int(sess.instrument_page or 0) - 1)
         elif delta > 0:
             sess.instrument_page = max(0, delta - 1)
         return self._render_market_browse(sess, snap)
@@ -853,7 +941,9 @@ class StartFiboFlow:
         idx = self._parse_index(data, len(CB_INSTSEL))
         if idx is None or idx >= len(sess.choices_instruments):
             return self._render_invalid_callback(sess.session_key)
-        candidate = sess.choices_instruments[idx]
+        candidate = _catalog_instrument_id(sess.choices_instruments[idx])
+        if not candidate:
+            return self._render_invalid_callback(sess.session_key)
         # Run the candidate through the SAME agent path so the
         # user sees the canonical id (browse can return the
         # canonical id directly, but we re-resolve for safety).
@@ -890,6 +980,7 @@ class StartFiboFlow:
         if idx is None or idx >= len(sess.choices_instruments):
             return self._render_invalid_callback(sess.session_key)
         candidate = sess.choices_instruments[idx]
+        # Reuse browse pick path (handles dict or str entries).
         return self._handle_browse_market_pick(
             sess, snap, f"{CB_INSTSEL}{idx}"
         )
@@ -1457,7 +1548,12 @@ class StartFiboFlow:
         for i, inst in enumerate(sess.choices_instruments):
             # Truncate the label so even a long instrument name fits
             # in a single button.
-            label = inst if len(inst) <= 28 else (inst[:25] + "...")
+            label = _catalog_display_symbol(inst)
+            price = _catalog_price_text(inst)
+            if price:
+                label = f"{label} · {price}"
+            if len(label) > 28:
+                label = label[:25] + "..."
             rows.append([
                 {"text": label, "callback_data": f"{CB_INST}{i}"},
             ])
@@ -1656,48 +1752,104 @@ class StartFiboFlow:
     ) -> Screen:
         """Spec §5: compact paginated market list.
 
-        Each row is one instrument; the button's callback_data is
-        an INDEX (not the raw market string), so we stay under the
-        64-byte Telegram limit regardless of instrument name."""
+        Each row is one instrument button labeled ``BASE · price``
+        (falls back to a short venue id). Callback_data is an INDEX
+        (not the raw market string), so we stay under the 64-byte
+        Telegram limit regardless of instrument name.
+        """
         from .session import SESSION_TTL_SECONDS  # noqa: F401  (sanity)
         age = snap.age_seconds(self._now_fn())
         header = self._age_header(age)
-        page_size = 8
+        page_size = _BROWSE_PAGE_SIZE
         total = len(sess.choices_instruments)
-        page = max(0, min(sess.instrument_page, max(0, (total - 1) // page_size)))
+        page_count = max(1, (total + page_size - 1) // page_size) if total else 1
+        page = max(0, min(int(sess.instrument_page or 0), max(0, page_count - 1)))
+        sess.instrument_page = page
         start = page * page_size
         end = min(start + page_size, total)
         rows: List[List[Dict[str, str]]] = []
         for i in range(start, end):
-            inst = sess.choices_instruments[i]
-            label = inst if len(inst) <= 28 else (inst[:25] + "...")
+            entry = sess.choices_instruments[i]
+            label = self._browse_button_label(sess, entry)
+            if len(label) > 28:
+                label = label[:25] + "..."
             rows.append([
                 {"text": label, "callback_data": f"{CB_INSTSEL}{i}"},
             ])
         nav_row: List[Dict[str, str]] = []
         if page > 0:
+            # 1-based page jump for previous page.
             nav_row.append(
-                {"text": "◀ Prev", "callback_data": f"{CB_BROWSEPG}-1"}
+                {"text": "◀ Prev", "callback_data": f"{CB_BROWSEPG}{page}"}
             )
         if end < total:
+            # Next page is 1-based page+2 because handler uses delta-1.
             nav_row.append(
-                {"text": "Next ▶", "callback_data": f"{CB_BROWSEPG}1"}
+                {"text": "Next ▶", "callback_data": f"{CB_BROWSEPG}{page + 2}"}
             )
         if nav_row:
             rows.append(nav_row)
         rows.append([
             {"text": "◀️ Back", "callback_data": CB_BACK},
-            {"text": "� Cancel", "callback_data": CB_CANCEL},
+            {"text": "❌ Cancel", "callback_data": CB_CANCEL},
         ])
         text = (
             f"{header}"
             f"📋 Markets on {sess.exchange}/{sess.account}\n\n"
-            f"Page {page + 1} of {max(1, (total + page_size - 1) // page_size)}"
+            f"Page {page + 1} of {page_count}"
             f"  ·  {total} markets\n\n"
             f"Pick a market to propose it as the canonical contract.\n"
             f"You'll still need to Agree on the next screen."
         )
         return Screen(text=text, buttons=rows)
+
+    def _browse_button_label(self, sess: FiboSession, entry: Any) -> str:
+        """Human button text: preferred ``BTC · 95,000`` style."""
+        short = _catalog_display_symbol(entry)
+        price = _catalog_price_text(entry)
+        if not price:
+            inst_id = _catalog_instrument_id(entry)
+            if inst_id and sess.exchange and sess.account:
+                price = self._lookup_browse_price(
+                    str(sess.exchange), str(sess.account), inst_id
+                )
+                # Cache on dict entries so Next/Prev does not re-hit every time.
+                if price and isinstance(entry, dict):
+                    entry["price"] = price
+        if price:
+            return f"{short} · {price}"
+        return short
+
+    def _lookup_browse_price(
+        self, exchange: str, account: str, instrument: str
+    ) -> Optional[str]:
+        """Best-effort live price for browse buttons (read-only)."""
+        try:
+            from .discovery import get_market_price
+            px = get_market_price(exchange, account, instrument)
+        except Exception:  # noqa: BLE001
+            return None
+        if px is None:
+            return None
+        try:
+            d = Decimal(str(px))
+        except Exception:  # noqa: BLE001
+            return None
+        if not d.is_finite():
+            return None
+        # Compact display: drop trailing zeros, keep readability.
+        text = format(d.normalize(), "f") if d == d.to_integral() else format(d, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        # thousands separators for large marks
+        try:
+            if "." in text:
+                whole, frac = text.split(".", 1)
+                whole = f"{int(whole):,}"
+                return f"{whole}.{frac}"
+            return f"{int(text):,}"
+        except Exception:  # noqa: BLE001
+            return text
 
     def _render_volume_screen(
         self,

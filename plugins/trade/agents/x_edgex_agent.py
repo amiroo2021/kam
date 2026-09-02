@@ -166,25 +166,97 @@ def _metadata() -> Dict[str, str]:
     }
 
 
+# Catalog remains source of truth; these only expand match keys so human
+# inputs (XAUUSD, GOLD, XAU-USDC) hit venue names like XAUUSDC.
+_EDGEX_QUOTE_SUFFIXES = ("USDT", "USDC", "USD")
+_EDGEX_SYMBOL_SYNONYMS: Dict[str, str] = {
+    "GOLD": "XAU",
+    "SILVER": "XAG",
+}
+
+
+def _edgex_norm_token(symbol: Any) -> str:
+    return (
+        str(symbol or "")
+        .strip()
+        .upper()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+def _edgex_alias_keys(symbol: Any) -> List[str]:
+    """Expand a wizard symbol into compact match keys against contractName."""
+    raw = _edgex_norm_token(symbol)
+    if not raw:
+        return []
+    seeds: List[str] = [raw]
+    base = raw
+    for suffix in _EDGEX_QUOTE_SUFFIXES:
+        if base.endswith(suffix) and len(base) > len(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base and base not in seeds:
+        seeds.append(base)
+    for seed in list(seeds):
+        mapped = _EDGEX_SYMBOL_SYNONYMS.get(seed)
+        if mapped and mapped not in seeds:
+            seeds.append(mapped)
+    keys: List[str] = []
+    for seed in seeds:
+        if seed not in keys:
+            keys.append(seed)
+        for suffix in _EDGEX_QUOTE_SUFFIXES:
+            cand = f"{seed}{suffix}"
+            if cand not in keys:
+                keys.append(cand)
+    return keys
+
+
 def _resolve_contract(symbol: Any) -> Optional[Tuple[str, str]]:
-    """Map a wizard symbol (e.g. 'SOL', 'SOLUSDC', 'BTC-USDC') to (contractId, native)."""
-    requested = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    """Map a wizard symbol (e.g. 'SOL', 'XAUUSD', 'BTC-USDC') to (contractId, native).
+
+    Matching order:
+      1. Exact compact contractName (SOLUSDC, XAUUSDC)
+      2. Expanded aliases (SOL→SOLUSDC, XAUUSD/GOLD/XAU→XAUUSDC)
+    """
+    requested = _edgex_norm_token(symbol)
     if not requested:
         return None
     try:
         metadata = _metadata()
     except Exception as exc:
         raise RuntimeError("METADATA_UNAVAILABLE") from exc
-    exact = [(cid, native) for cid, native in metadata.items() if native.upper() == requested]
+
+    exact = [
+        (cid, native)
+        for cid, native in metadata.items()
+        if _edgex_norm_token(native) == requested
+    ]
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
         raise ValueError("INSTRUMENT_AMBIGUOUS")
-    candidates = [(cid, native) for cid, native in metadata.items()
-                  if native.upper() in {requested + "USDC", requested + "USDT"}]
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
+
+    keys = set(_edgex_alias_keys(requested))
+    candidates = [
+        (cid, native)
+        for cid, native in metadata.items()
+        if _edgex_norm_token(native) in keys
+    ]
+    # De-dupe by contract id while preserving order.
+    seen: set[str] = set()
+    unique: List[Tuple[str, str]] = []
+    for cid, native in candidates:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        unique.append((cid, native))
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
         raise ValueError("INSTRUMENT_AMBIGUOUS")
     return None
 

@@ -159,6 +159,18 @@ class TestEdgeXCanonicalResolution(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertEqual(a[0], "30000001")
 
+    def test_xauusd_and_gold_resolve_to_xauusdc(self) -> None:
+        catalog = {"30000005": "XAUUSDC", "30000006": "XAGUSDC", "30000001": "BTCUSDC"}
+        with mock.patch.object(edgex, "_metadata", return_value=catalog):
+            for raw in ("XAUUSD", "XAUUSDT", "GOLD", "XAU", "XAU-USDC"):
+                resolved = edgex._resolve_contract(raw)
+                self.assertEqual(resolved, ("30000005", "XAUUSDC"), msg=raw)
+                resp = edgex.execute(
+                    {"operation": "resolve_instrument", "account": "main", "symbol": raw}
+                )
+                self.assertTrue(resp.success, msg=raw)
+                self.assertEqual(resp.instrument.symbol, "XAUUSDC", msg=raw)
+
     def test_unknown_is_instrument_not_found(self) -> None:
         with mock.patch.object(edgex, "_metadata", return_value={"30000001": "BTCUSDC"}):
             self.assertIsNone(edgex._resolve_contract("NOTAMARKET"))

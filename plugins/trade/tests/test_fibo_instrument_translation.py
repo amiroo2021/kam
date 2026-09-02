@@ -215,7 +215,7 @@ def _flow(
     *,
     resolver: Optional[_FakeResolver] = None,
     alias_memory: Optional[AliasMemory] = None,
-    instruments: Optional[List[str]] = None,
+    instruments: Optional[List[Any]] = None,
 ) -> StartFiboFlow:
     """Build a StartFiboFlow rooted at ``fx``.
 
@@ -257,7 +257,7 @@ def _navigate_to_proposal(
     resolver: Optional[_FakeResolver] = None,
     alias_memory: Optional[AliasMemory] = None,
     fibo: Optional[Mt4Fibo] = None,
-    instruments: Optional[List[str]] = None,
+    instruments: Optional[List[Any]] = None,
 ):
     """Drive a session from /fibo to the AWAITING_INSTRUMENT_CONFIRM
     screen and return ``(flow, screen)``.
@@ -692,6 +692,73 @@ class BrowseReadOnlyTests(unittest.TestCase):
         flat = [b for row in screen.buttons for b in row]
         self.assertIn(CB_AGREE, [b["callback_data"] for b in flat])
 
+    def test_browse_dict_catalog_shows_base_and_price_buttons(self) -> None:
+        """Catalog dict records must not dump as Python repr on buttons."""
+        resolver = _FakeResolver({"BTC-USD": "BTC-USD", "ETH-USD": "ETH-USD"})
+        catalog = [
+            {
+                "instrument": "BTC-USD",
+                "display_name": None,
+                "base": "BTC",
+                "quote": "USD",
+                "price": "95000.5",
+            },
+            {
+                "instrument": "ETH-USD",
+                "base": "ETH",
+                "quote": "USD",
+                "price": "3500",
+            },
+        ]
+        flow, _ = _navigate_to_proposal(
+            self.fx,
+            resolver=resolver,
+            instruments=catalog,
+        )
+        screen = flow.handle_callback("chat-1", "user-1", CB_BROWSE)
+        flat = [b for row in screen.buttons for b in row]
+        labels = [b["text"] for b in flat if b["callback_data"].startswith(CB_INSTSEL)]
+        self.assertTrue(labels, "expected instrument buttons")
+        for label in labels:
+            self.assertNotIn("{", label)
+            self.assertNotIn("instrument", label)
+        self.assertTrue(any(label.startswith("BTC") for label in labels))
+        self.assertTrue(any("95,000.5" in label or "95000" in label for label in labels))
+        # Pick BTC by index 0 must resolve via instrument id, not dict.
+        screen2 = flow.handle_callback("chat-1", "user-1", f"{CB_INSTSEL}0")
+        self.assertIn("BTC-USD", screen2.text)
+
+    def test_browse_next_advances_to_next_page(self) -> None:
+        """Next must show the following page (not stay on page 1)."""
+        resolver = _FakeResolver({})
+        instruments = [
+            {"instrument": f"MKT-{i:02d}-USD", "base": f"B{i:02d}", "price": str(100 + i)}
+            for i in range(25)
+        ]
+        flow, _ = _navigate_to_proposal(
+            self.fx,
+            resolver=resolver,
+            instruments=instruments,
+        )
+        screen = flow.handle_callback("chat-1", "user-1", CB_BROWSE)
+        self.assertIn("Page 1 of", screen.text)
+        flat = [b for row in screen.buttons for b in row]
+        next_btns = [b for b in flat if b["text"].startswith("Next")]
+        self.assertEqual(len(next_btns), 1)
+        screen2 = flow.handle_callback(
+            "chat-1", "user-1", next_btns[0]["callback_data"]
+        )
+        self.assertIn("Page 2 of", screen2.text)
+        labels2 = [
+            b["text"]
+            for row in screen2.buttons
+            for b in row
+            if b["callback_data"].startswith(CB_INSTSEL)
+        ]
+        # Page 2 starts at index 10 → base B10
+        self.assertTrue(any(t.startswith("B10") for t in labels2), labels2)
+        self.assertFalse(any(t.startswith("B00") for t in labels2), labels2)
+
 
 class ConfirmationFieldsTests(unittest.TestCase):
     """Spec §13.17: final confirmation shows Symbol: canonical and
@@ -1039,10 +1106,17 @@ class AliasMemorySafetyTests(unittest.TestCase):
             instruments=instruments,
         )
         screen = flow.handle_callback("chat-1", "user-1", CB_BROWSE)
-        # Navigate forward 5 pages.
+        # Navigate forward using the real Next button callback each page.
         for _ in range(5):
+            flat = [b for row in screen.buttons for b in row]
+            next_btns = [
+                b for b in flat
+                if str(b.get("text") or "").startswith("Next")
+            ]
+            if not next_btns:
+                break
             screen = flow.handle_callback(
-                "chat-1", "user-1", f"{CB_BROWSEPG}1"
+                "chat-1", "user-1", next_btns[0]["callback_data"]
             )
         flat = [b for row in screen.buttons for b in row]
         for b in flat:
