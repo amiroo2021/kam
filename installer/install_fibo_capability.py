@@ -128,8 +128,12 @@ def run(
     # ``kam/installer/systemd/`` and are copied to the target
     # systemd unit directory (``--systemd-dir``, default
     # ``/etc/systemd/system``). The install does NOT enable or start
-    # the timer; that requires a separate operator action
-    # (``systemctl enable --now fibo-converge.timer``). The units
+    # the timer. Timer lifecycle is owned by Fibo registration
+    # Start/Stop (active-count driven): first active registration
+    # enables the timer; last stop disables it. See
+    # ``plugins/trade/fibo/timer_lifecycle.py``.
+    # (Legacy note: operators previously ran
+    # ``systemctl enable --now fibo-converge.timer`` manually.) The units
     # are intentionally NOT installed if ``--systemd-dir`` is the
     # empty string (caller signals "skip systemd").
     #

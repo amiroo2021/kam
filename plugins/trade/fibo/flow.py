@@ -1258,7 +1258,7 @@ class StartFiboFlow:
             return self._render_invalid_callback(sess.session_key)
 
         try:
-            self._registration_store.append(registration)
+            active_count = self._registration_store.append(registration)
         except DuplicateRegistrationError as exc:
             # Phase 2.7: if the existing latest row for this key
             # is ``stopped``, reactivate it instead of refusing
@@ -1274,8 +1274,11 @@ class StartFiboFlow:
                 target=target,
             )
             if restarted is not None:
+                restarted_reg, restarted_count = restarted
                 self._sessions.reset(*sess.session_key)
-                return self._render_restarted(restarted)
+                return self._render_restarted(
+                    restarted_reg, active_count=restarted_count
+                )
             return self._render_duplicate(sess, snap, exc.registration_key)
         except Exception as exc:  # noqa: BLE001 - surface generically
             logger.error(
@@ -1283,8 +1286,14 @@ class StartFiboFlow:
             )
             return self._render_store_error(sess, snap, str(exc))
 
+        # Persist succeeded FIRST. Only then reconcile the timer.
+        timer_result = self._reconcile_timer_after_mutation(active_count)
         self._sessions.reset(*sess.session_key)
-        return self._render_registered(registration)
+        return self._render_registered(
+            registration,
+            active_count=active_count,
+            timer_result=timer_result,
+        )
 
     # ------------------------------------------------------------------
     # Phase 2.7 — Restart helper for stopped registrations
@@ -1305,9 +1314,10 @@ class StartFiboFlow:
         the CURRENT snapshot fields taken from the new Start
         wizard session.
 
-        Returns the reactivated registration on success, or
-        ``None`` if the existing row is not stopped (in which
-        case the caller falls back to the duplicate screen).
+        Returns ``(reactivated_registration, active_count)`` on
+        success, or ``None`` if the existing row is not stopped
+        (in which case the caller falls back to the duplicate
+        screen).
 
         Failure modes that raise ``ValueError`` (identity
         mismatch, missing registration, etc.) propagate up and
@@ -1320,7 +1330,7 @@ class StartFiboFlow:
         if starting_volume is None or starting_volume <= 0:
             return None
         percentage = self._current_percentage(snap, sess)
-        return self._registration_store.reactivate(
+        reactivated, active_count = self._registration_store.reactivate(
             registration_key,
             source_symbol=sess.symbol or "",
             exchange_instrument=sess.exchange_instrument or "",
@@ -1333,6 +1343,7 @@ class StartFiboFlow:
             source_percentage=percentage,
             source_snapshot_received_at=snap.received_at,
         )
+        return reactivated, active_count
 
     @staticmethod
     def _current_percentage(snap: Mt4Snapshot, sess: "FiboSession") -> Decimal:
@@ -2068,8 +2079,54 @@ class StartFiboFlow:
             ]],
         )
 
-    def _render_registered(self, registration: FiboRegistration) -> Screen:
-        text = (
+
+    def _reconcile_timer_after_mutation(self, active_count: int):
+        """Reconcile fibo-converge.timer from effective active count.
+
+        Never invokes converge_once / fibo-converge.service / exchange
+        writes. Failures are returned to the caller as a result object;
+        the registration mutation is never rolled back.
+        """
+        from .timer_lifecycle import reconcile_convergence_timer
+        runner = getattr(self, "_systemctl_runner", None)
+        try:
+            return reconcile_convergence_timer(
+                int(active_count or 0),
+                runner=runner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "fibo_flow: timer reconcile failed: %s", exc, exc_info=True
+            )
+            from .timer_lifecycle import TimerReconcileResult
+            return TimerReconcileResult(
+                desired_active=bool(int(active_count or 0) > 0),
+                already_ok=False,
+                ok=False,
+                changed=False,
+                enabled=None,
+                active=None,
+                message=str(exc),
+            )
+
+    def _render_registered(
+        self,
+        registration: FiboRegistration,
+        *,
+        active_count: int = 1,
+        timer_result=None,
+    ) -> Screen:
+        from .timer_lifecycle import (
+            convergence_status_lines,
+            format_start_timer_warning,
+        )
+        if timer_result is None:
+            timer_result = self._reconcile_timer_after_mutation(active_count)
+        status_lines = convergence_status_lines(
+            active_registration_count=active_count,
+            timer_result=timer_result,
+        )
+        body = (
             f"✅ Registered: {registration.registration_key}\n\n"
             f"Exchange:    {registration.exchange}\n"
             f"Account:     {registration.account}\n"
@@ -2082,17 +2139,44 @@ class StartFiboFlow:
             f"Cycle ID:    {registration.source_cycle_id}\n"
             f"Cum weight:  {registration.source_cumulative_weight}\n"
             f"Percentage:  {registration.source_percentage}\n\n"
-            f"Persisted to ~/.hermes/fibo/registrations.jsonl"
+            f"Active registrations: {active_count}\n"
+            + "\n".join(status_lines)
+            + "\n\nPersisted to ~/.hermes/fibo/registrations.jsonl"
         )
-        return Screen(text=text, buttons=[], no_keyboard=True)
+        if timer_result is not None and not timer_result.ok:
+            body = (
+                format_start_timer_warning(
+                    registration_key=registration.registration_key,
+                    timer_result=timer_result,
+                )
+                + "\n\n"
+                + body
+            )
+        return Screen(text=body, buttons=[], no_keyboard=True)
 
-    def _render_restarted(self, registration: FiboRegistration) -> Screen:
+    def _render_restarted(
+        self,
+        registration: FiboRegistration,
+        *,
+        active_count: int = 1,
+        timer_result=None,
+    ) -> Screen:
         """Phase 2.7 render for a successfully reactivated
         registration. The screen confirms the reactivation and
         shows the canonical identity + the new mutable /
         snapshot fields.
         """
-        text = (
+        from .timer_lifecycle import (
+            convergence_status_lines,
+            format_start_timer_warning,
+        )
+        if timer_result is None:
+            timer_result = self._reconcile_timer_after_mutation(active_count)
+        status_lines = convergence_status_lines(
+            active_registration_count=active_count,
+            timer_result=timer_result,
+        )
+        body = (
             "✅ Fibo restarted\n\n"
             f"Source symbol:       {registration.source_symbol}\n"
             f"Exchange instrument: {registration.exchange_instrument}\n"
@@ -2101,9 +2185,20 @@ class StartFiboFlow:
             f"Exchange:            {registration.exchange}\n"
             f"Account:             {registration.account}\n"
             f"Volume:              {registration.starting_volume}\n\n"
-            "Fibo reconciliation is active again."
+            f"Active registrations: {active_count}\n"
+            + "\n".join(status_lines)
+            + "\n\nFibo reconciliation is active again."
         )
-        return Screen(text=text, buttons=[], no_keyboard=True)
+        if timer_result is not None and not timer_result.ok:
+            body = (
+                format_start_timer_warning(
+                    registration_key=registration.registration_key,
+                    timer_result=timer_result,
+                )
+                + "\n\n"
+                + body
+            )
+        return Screen(text=body, buttons=[], no_keyboard=True)
 
     # ------------------------------------------------------------------
     # Format helper

@@ -177,10 +177,24 @@ def build_running_screen(
             "buttons": _RUNNING_BUTTONS,
         }
 
+    # Scheduler status is distinct from per-registration Mode: LIVE.
+    # Mode = registration eligible for live execution (cycle_state).
+    # Convergence = autonomous fibo-converge.timer is actually armed.
+    try:
+        from .timer_lifecycle import convergence_status_lines
+        active_n = len(results or [])
+        conv_lines = convergence_status_lines(
+            active_registration_count=active_n,
+        )
+    except Exception:  # noqa: BLE001
+        conv_lines = []
+    conv_header = ("\n".join(conv_lines) + "\n\n") if conv_lines else ""
+
     if not results:
         body = (
             "📋 Running Fibo\n\n"
-            "No persisted Fibo registrations yet.\n"
+            + conv_header
+            + "No persisted Fibo registrations yet.\n"
             "Use ▶️ Start Fibo to create one."
         )
     else:
@@ -203,7 +217,7 @@ def build_running_screen(
             title = "📋 Running Fibo (DRY RUN — read-only)"
         for r in results:
             blocks.append(_compact_block(r))
-        body = title + "\n\n" + "\n\n".join(blocks)
+        body = title + "\n\n" + conv_header + "\n\n".join(blocks)
 
     return {
         "text": body,

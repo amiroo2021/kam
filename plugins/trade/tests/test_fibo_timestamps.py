@@ -282,7 +282,7 @@ class MarkStoppedTimestampTests(unittest.TestCase):
         _CLOCK.advance(3600)
 
         # Phase 2: stop the row.
-        stopped = self.store.mark_stopped(reg.registration_key)
+        stopped, _active_count = self.store.mark_stopped(reg.registration_key)
         # created_at preserved (historical).
         self.assertEqual(stopped.created_at, original_created)
         # updated_at refreshed to the post-advance current_time.
@@ -331,7 +331,7 @@ class ReactivateTimestampTests(unittest.TestCase):
         stopped_time_before = _CLOCK.utc_iso_now()
         _CLOCK._calls = 0
 
-        reactivated = self.store.reactivate(
+        reactivated, _active_count = self.store.reactivate(
             reg.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
@@ -393,7 +393,7 @@ class FullLifecycleTimestampTests(unittest.TestCase):
 
         # Phase 2: stop the row.
         stopped_time = _CLOCK.utc_iso_now()
-        stopped = self.store.mark_stopped(reg.registration_key)
+        stopped, _active_count = self.store.mark_stopped(reg.registration_key)
         # created_at preserved (== registered_time).
         self.assertEqual(stopped.created_at, registered_time)
         # updated_at refreshed to stopped_time.
@@ -406,7 +406,7 @@ class FullLifecycleTimestampTests(unittest.TestCase):
 
         # Phase 3: reactivate the row.
         react_time = _CLOCK.utc_iso_now()
-        reactivated = self.store.reactivate(
+        reactivated, _active_count = self.store.reactivate(
             reg.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",

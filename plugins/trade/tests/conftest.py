@@ -43,6 +43,9 @@ import os
 import sys
 from pathlib import Path
 
+# Never let offline Fibo tests mutate host fibo-converge.timer.
+os.environ.setdefault("FIBO_TIMER_LIFECYCLE_DRY_RUN", "1")
+
 import pytest
 
 # ---------------------------------------------------------------------------

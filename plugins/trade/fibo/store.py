@@ -454,7 +454,7 @@ class FiboRegistrationStore:
 
     # -- write --------------------------------------------------------
 
-    def append(self, registration: FiboRegistration) -> None:
+    def append(self, registration: FiboRegistration) -> int:
         """Append a registration as one JSON line.
 
         Allowed transitions:
@@ -528,6 +528,7 @@ class FiboRegistrationStore:
                         registration.registration_key
                     )
             self._write_under_lock(f, registration)
+            return self._count_active_under_lock(f)
 
     def _write_under_lock(self, f, registration: FiboRegistration) -> None:
         """Atomic-write a registration row to the JSONL file.
@@ -708,7 +709,7 @@ class FiboRegistrationStore:
         registration_key: str,
         *,
         updated_at: Optional[str] = None,
-    ) -> FiboRegistration:
+    ) -> tuple:
         """Append a "stopped" status transition row for ``registration_key``.
 
         The store is append-only JSONL with "latest per key wins"
@@ -725,6 +726,11 @@ class FiboRegistrationStore:
         Phase 2.6 scope: only Stop is implemented. Resume is
         deferred to a later phase.
 
+        Returns:
+            ``(stopped_registration, active_count)`` where
+            ``active_count`` is computed under the same lock
+            after the write (latest-per-key + is_active).
+
         Raises:
             KeyError: no registration with that key exists.
             ValueError: the registration is already stopped (no-op
@@ -738,6 +744,7 @@ class FiboRegistrationStore:
         #   2. validate latest.is_stopped is False
         #   3. build stopped row
         #   4. write under the same lock
+        #   5. count effective actives under the same lock
         # Concurrent mark_stopped callers are serialized; only the
         # first one observes latest.is_active and writes; the loser
         # observes latest.is_stopped=True and raises ValueError.
@@ -790,7 +797,8 @@ class FiboRegistrationStore:
                     f"already stopped"
                 )
             self._write_under_lock(f, stopped)
-            return stopped
+            active_count = self._count_active_under_lock(f)
+            return stopped, active_count
 
     def reactivate(
         self,
@@ -811,9 +819,12 @@ class FiboRegistrationStore:
         source_percentage: Decimal,
         source_snapshot_received_at: str,
         updated_at: Optional[str] = None,
-    ) -> FiboRegistration:
+    ) -> tuple:
         """Append a "registered" transition row for a stopped
         registration (Phase 2.7 Restart).
+
+        Returns ``(reactivated_registration, active_count)`` where
+        ``active_count`` is computed under the same lock after write.
 
         The store is append-only JSONL with "latest per key wins"
         semantics. Appending a new row that preserves the original
@@ -924,7 +935,53 @@ class FiboRegistrationStore:
                     f"{(recheck.status if recheck else None)!r}"
                 )
             self._write_under_lock(f, reactivated)
-            return reactivated
+            active_count = self._count_active_under_lock(f)
+            return reactivated, active_count
+
+
+    def _count_active_under_lock(self, f) -> int:
+        """Count effective active registrations while holding the lock.
+
+        Replays the same latest-per-key semantics as ``load_all``
+        against the locked file handle (including the row just
+        written). Historical stopped lines that lost to a later
+        row do not count; a latest ``status="stopped"`` row is
+        inactive via ``is_active``.
+        """
+        try:
+            f.seek(0, os.SEEK_SET)
+            data = f.read()
+        except OSError as exc:
+            logger.warning(
+                "fibo_registrations: lock-held active count failed: %s", exc
+            )
+            return 0
+        latest_by_key: Dict[str, FiboRegistration] = {}
+        for raw_line in data.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                obj = json.loads(
+                    raw_line.decode("utf-8", errors="replace").strip()
+                )
+            except (json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            try:
+                reg = FiboRegistration.from_dict(obj)
+            except (ValueError, KeyError, TypeError):
+                continue
+            latest_by_key[reg.registration_key] = reg
+        return sum(1 for reg in latest_by_key.values() if reg.is_active)
+
+    def count_active(self) -> int:
+        """Return the effective active-registration count (unlocked read).
+
+        Prefer the under-lock count returned by ``append`` /
+        ``mark_stopped`` / ``reactivate`` for scheduler decisions.
+        """
+        return sum(1 for reg in self.load_all() if reg.is_active)
 
     # -- read ---------------------------------------------------------
 

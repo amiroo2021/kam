@@ -221,7 +221,7 @@ class SerializedConcurrentTransitionTests(_BaseTest):
         )
         store.mark_stopped(reg.registration_key)
         # First reactivate succeeds.
-        out = store.reactivate(
+        out, _active_count = store.reactivate(
             reg.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
@@ -307,7 +307,8 @@ class ThreadedConcurrentTransitionTests(_BaseTest):
         )
 
         def _do_stop():
-            return store.mark_stopped(reg.registration_key)
+            _reg, _n = store.mark_stopped(reg.registration_key)
+            return _reg
 
         out_a, out_b = self._race(first_call=_do_stop, second_call=_do_stop)
 
@@ -343,7 +344,7 @@ class ThreadedConcurrentTransitionTests(_BaseTest):
         store.mark_stopped(reg.registration_key)
 
         def _do_reactivate():
-            return store.reactivate(
+            _reg, _n = store.reactivate(
                 reg.registration_key,
                 source_symbol="ETHUSD",
                 exchange_instrument="ETH-USD.P",
@@ -355,6 +356,7 @@ class ThreadedConcurrentTransitionTests(_BaseTest):
                 source_percentage=Decimal("0.01"),
                 source_snapshot_received_at="2026-08-27T05:00:00Z",
             )
+            return _reg
 
         out_a, out_b = self._race(first_call=_do_reactivate,
                                  second_call=_do_reactivate)
@@ -404,14 +406,15 @@ class ThreadedConcurrentTransitionTests(_BaseTest):
         )
 
         def _do_stop():
-            return store.mark_stopped(reg.registration_key)
+            _reg, _n = store.mark_stopped(reg.registration_key)
+            return _reg
 
         def _do_reactivate():
             # The row is currently registered. If reactivate runs
             # BEFORE mark_stopped commits, it sees registered and
             # raises ValueError. If it runs AFTER, it sees
             # stopped and successfully reactivates.
-            return store.reactivate(
+            _reg, _n = store.reactivate(
                 reg.registration_key,
                 source_symbol="ETHUSD",
                 exchange_instrument="ETH-USD.P",
@@ -423,6 +426,7 @@ class ThreadedConcurrentTransitionTests(_BaseTest):
                 source_percentage=Decimal("0.01"),
                 source_snapshot_received_at="2026-08-27T05:00:00Z",
             )
+            return _reg
 
         out_a, out_b = self._race(first_call=_do_stop,
                                  second_call=_do_reactivate)

@@ -193,12 +193,12 @@ class FullTransitionCycleTests(_RestartTestBase):
         self.assertTrue(original.is_active)
         self.assertFalse(original.is_stopped)
         # Stop it
-        stopped = store.mark_stopped(original.registration_key)
+        stopped, _active_count = store.mark_stopped(original.registration_key)
         self.assertEqual(stopped.status, "stopped")
         self.assertTrue(stopped.is_stopped)
         self.assertFalse(stopped.is_active)
         # Reactivate via the canonical method
-        reactivated = store.reactivate(
+        reactivated, _active_count = store.reactivate(
             original.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
@@ -288,7 +288,7 @@ class ReactivateInvariantTests(_RestartTestBase):
         original_updated_at = original.updated_at
 
         store.mark_stopped(original.registration_key)
-        reactivated = store.reactivate(
+        reactivated, _active_count = store.reactivate(
             original.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
@@ -396,7 +396,7 @@ class StoppedDuplicateCanReactivateTests(_RestartTestBase):
         with self.assertRaises(DuplicateRegistrationError):
             store.append(new)
         # But reactivate works.
-        out = store.reactivate(
+        out, _active_count = store.reactivate(
             reg.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
@@ -640,7 +640,7 @@ class NewSnapshotFieldsAppliedTests(_RestartTestBase):
         )
         store.mark_stopped(reg.registration_key)
         # Reactivate with brand-new snapshot fields.
-        out = store.reactivate(
+        out, _active_count = store.reactivate(
             reg.registration_key,
             source_symbol="ETHUSD",
             exchange_instrument="ETH-USD.P",
