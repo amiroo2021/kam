@@ -75,6 +75,13 @@ FIBO_REL_PATHS = [
     # regardless of launcher (systemd timer, manual run,
     # accidental second shell, old gateway cron).
     Path("plugins") / "trade" / "fibo" / "singleton_lock.py",
+    # Active-registration-driven fibo-converge.timer lifecycle.
+    Path("plugins") / "trade" / "fibo" / "timer_lifecycle.py",
+    Path("plugins") / "trade" / "fibo" / "lifecycle.py",
+    # Live convergence dependencies (imported by live.py / converge_once).
+    Path("plugins") / "trade" / "fibo" / "live_eligibility.py",
+    Path("plugins") / "trade" / "fibo" / "cycle_state.py",
+    Path("plugins") / "trade" / "fibo" / "cycle_decide.py",
     # Phase 2.3 agent-side regression tests live under
     # plugins/trade/agents/tests. They are pure unit tests and are
     # copied alongside the agent so the verifier can import them

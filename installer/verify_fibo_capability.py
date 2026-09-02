@@ -51,6 +51,16 @@ FIBO_SUBPACKAGE_FILES = (
     "discovery.py",
     "dryrun.py",
     "reconciler.py",
+    "executor.py",
+    "shadow.py",
+    "live.py",
+    "converge_once.py",
+    "singleton_lock.py",
+    "timer_lifecycle.py",
+    "lifecycle.py",
+    "live_eligibility.py",
+    "cycle_state.py",
+    "cycle_decide.py",
 )
 
 
