@@ -1983,6 +1983,8 @@ def _arcus_position_context(
     if not position:
         return None
     side_text = str(position.get("side") or "").strip().lower()
+    # Arcus shorts often carry a NEGATIVE size on /v1/account. Treat
+    # magnitude only; side comes from the side field (or sign fallback).
     signed_size = _decimal_or_zero(position.get("size"))
     if side_text not in {"long", "short", "buy", "sell"}:
         # Infer from signed size when side missing.
@@ -2698,17 +2700,24 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
         and str(row.get("orderId") or "").strip()
     ]
     try:
-        if not opposite_side_rows:
-            # Safe symbol-wide cancel: only closing side (+ TPSL) exist.
-            _submit_cancel_all(credentials, market_id=market_id, operation="close_position")
-        else:
-            # Preserve opposite side: batch-cancel exactly the closing-side OIDs.
-            for chunk in _cancellation_batches(closing_side_rows):
-                _submit_batch_cancel(credentials, market_id, chunk, operation="close_position")
-            if existing_tp is not None:
-                _arcus_cancel_one_tpsl(credentials, market_id, existing_tp)
-            if existing_sl is not None:
-                _arcus_cancel_one_tpsl(credentials, market_id, existing_sl)
+        # Prefer OID batch cancel (typed Scheme-1). cancelAllOrders is
+        # currently signature-broken on the legacy path; do not rely on it.
+        rows_to_cancel = list(closing_side_rows)
+        if existing_tp is not None:
+            rows_to_cancel.append(existing_tp)
+        if existing_sl is not None:
+            rows_to_cancel.append(existing_sl)
+        # de-dupe by orderId
+        seen_oids: set = set()
+        deduped: List[Dict[str, Any]] = []
+        for row in rows_to_cancel:
+            oid = str(row.get("orderId") or "").strip()
+            if not oid or oid in seen_oids:
+                continue
+            seen_oids.add(oid)
+            deduped.append(row)
+        for chunk in _cancellation_batches(deduped):
+            _submit_batch_cancel(credentials, market_id, chunk, operation="close_position")
     except _ArcusRateLimitedError as rl:
         return make_failure(
             operation="close_position", exchange=name, account=account,
@@ -3056,33 +3065,30 @@ def _cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             return make_success(operation="cancel_order_group", exchange=name, account=credentials["account"], cancel_group=cancel_group)
 
         # --- Cancellation hierarchy (authoritative Arcus capabilities) ---
-        # 1. If the symbol has open orders ONLY on the selected side (no
-        #    opposite-side orders to preserve AND no TPSL rows we keep), a
-        #    single `cancelAllOrders(marketId)` cancels exactly those orders
-        #    (~1 request instead of hundreds). cancelAllOrders cancels TPSL
-        #    within scope — acceptable here because the whole symbol/group is
-        #    being cleared. If the symbol ALSO has opposite-side orders, we
-        #    must NOT use symbol-wide cancel-all (it would remove the opposite
-        #    side), so we fall to exact-OID batch cancellation.
-        # 2. batchCancelOrders cancels exactly the selected OIDs (<=100 per
-        #    request), preserving opposite-side and unrelated orders.
-        # 3. Fallback: paced individual cancelOrder.
+        # Prefer batchCancelOrders (Scheme-1 typed signatures) over
+        # cancelAllOrders. Live cancelAllOrders currently returns
+        # "invalid signature" with the legacy timestamp+action body
+        # scheme, while place/close and batchCancel succeed. Always
+        # cancel exact OIDs in <=100 batches so ladder cancels work.
         cancelled = 0
         batches: List[Dict[str, Any]] = []
-        method: str = "cancel_all_order"
+        method: str = "cancel_batch"
         try:
-            if not same_symbol_other_side:
-                # Safe: symbol has only the selected side -> symbol-wide cancel.
-                cancelled = len(targets)
-                _submit_cancel_all(credentials, market_id=market_id, operation="cancel_order_group")
-                batches.append({"method": "cancel_all", "targeted": len(targets), "ok": True})
-            else:
-                method = "cancel_batch"
-                for chunk in _cancellation_batches(targets):
-                    batch_order_ids = [t["order_id"] for t in chunk]
-                    _submit_batch_cancel(credentials, market_id, chunk, operation="cancel_order_group")
-                    cancelled += len(chunk)
-                    batches.append({"method": "cancel_batch", "submitted": len(chunk), "accepted": len(chunk), "ok": True, "order_ids": batch_order_ids})
+            for chunk in _cancellation_batches([t["row"] for t in targets]):
+                batch_order_ids = [
+                    str(row.get("orderId") or row.get("order_id") or "").strip()
+                    for row in chunk
+                    if str(row.get("orderId") or row.get("order_id") or "").strip()
+                ]
+                _submit_batch_cancel(credentials, market_id, chunk, operation="cancel_order_group")
+                cancelled += len(chunk)
+                batches.append({
+                    "method": "cancel_batch",
+                    "submitted": len(chunk),
+                    "accepted": len(chunk),
+                    "ok": True,
+                    "order_ids": batch_order_ids,
+                })
         except _ArcusRateLimitedError as rl:
             return make_failure(
                 operation="cancel_order_group", exchange=name, account=credentials["account"],

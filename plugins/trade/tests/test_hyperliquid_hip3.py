@@ -370,6 +370,270 @@ class Hip3RoutingTests(unittest.TestCase):
         self.assertTrue(response.success, f"cancel failed: {response.error}")
         self.assertEqual(captured.get("coins"), ["xyz:SP500", "xyz:SP500"])
 
+    def test_set_tp_uses_route_symbol_and_positionTpsl_grouping(self):
+        hl = _hl_module()
+        captured: Dict[str, Any] = {}
+
+        class _FakeExchange:
+            def bulk_orders(self, order_requests, *a, **k):
+                captured["coin"] = order_requests[0]["coin"]
+                captured["grouping"] = k.get("grouping")
+                captured["tpsl"] = (
+                    order_requests[0]
+                    .get("order_type", {})
+                    .get("trigger", {})
+                    .get("tpsl")
+                )
+                return {
+                    "status": "ok",
+                    "response": {
+                        "data": {
+                            "statuses": [{"resting": {"oid": 555}}]
+                        }
+                    },
+                }
+
+        fake = _FakeExchange()
+        position = CanonicalPosition(
+            symbol="xyz:SP500",
+            side="short",
+            size="47.7",
+            entry_price="7770.085",
+            pnl="+3285",
+            tp=None,
+            sl=None,
+        )
+
+        def fake_positions_orders(account, request):
+            return make_success(
+                operation="positions_orders",
+                exchange="hyperliquid",
+                account=account,
+                positions=[position],
+                open_order_count=0,
+                order_groups=[],
+            )
+
+        with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), \
+             mock.patch.object(hl, "_lookup_credentials",
+                               return_value=("0x4FE260D11bf48BA3a94459771259c910a398ac59", "secret")), \
+             mock.patch.object(hl, "_fetch_perp_market_candidates", lambda: [self.SP500]), \
+             mock.patch.object(hl, "_resolve_instrument_candidate",
+                               lambda requested, candidates: (candidates[0], "")), \
+             mock.patch.object(hl, "_execute_positions_orders", side_effect=fake_positions_orders), \
+             mock.patch.object(hl, "_fetch_open_orders_snapshot", lambda wallet: []), \
+             mock.patch.object(hl, "_fetch_candidate_mark_price", lambda cand: Decimal("7770.085")), \
+             mock.patch.object(hl, "_build_exchange_client",
+                               lambda account: (fake, "0x4FE260D11bf48BA3a94459771259c910a398ac59", "secret")), \
+             mock.patch.object(hl, "_verify_position_protection_submission",
+                               return_value=({
+                                   "open_orders": [{"oid": 555, "coin": "xyz:SP500"}],
+                                   "current_side": "short",
+                                   "current_size": Decimal("47.7"),
+                               }, None, 555)):
+            response = hl.execute({
+                "operation": "set_tp", "exchange": "hyperliquid", "account": "FLEX",
+                # wizard often passes the bare alias; routing must still use
+                # the full HIP-3 route coin on the wire.
+                "symbol": "SP500", "price": "7000",
+            })
+        self.assertTrue(response.success, f"set_tp failed: {response.error}")
+        self.assertEqual(captured.get("coin"), "xyz:SP500")
+        self.assertEqual(captured.get("grouping"), "positionTpsl")
+        self.assertEqual(captured.get("tpsl"), "tp")
+
+    def test_set_sl_uses_route_symbol_and_positionTpsl_grouping(self):
+        hl = _hl_module()
+        captured: Dict[str, Any] = {}
+
+        class _FakeExchange:
+            def bulk_orders(self, order_requests, *a, **k):
+                captured["coin"] = order_requests[0]["coin"]
+                captured["grouping"] = k.get("grouping")
+                captured["tpsl"] = (
+                    order_requests[0]
+                    .get("order_type", {})
+                    .get("trigger", {})
+                    .get("tpsl")
+                )
+                return {
+                    "status": "ok",
+                    "response": {
+                        "data": {
+                            "statuses": [{"resting": {"oid": 556}}]
+                        }
+                    },
+                }
+
+        fake = _FakeExchange()
+        position = CanonicalPosition(
+            symbol="xyz:SP500",
+            side="short",
+            size="47.7",
+            entry_price="7770.085",
+            pnl="+3285",
+            tp=None,
+            sl=None,
+        )
+
+        def fake_positions_orders(account, request):
+            return make_success(
+                operation="positions_orders",
+                exchange="hyperliquid",
+                account=account,
+                positions=[position],
+                open_order_count=0,
+                order_groups=[],
+            )
+
+        with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), \
+             mock.patch.object(hl, "_lookup_credentials",
+                               return_value=("0x4FE260D11bf48BA3a94459771259c910a398ac59", "secret")), \
+             mock.patch.object(hl, "_fetch_perp_market_candidates", lambda: [self.SP500]), \
+             mock.patch.object(hl, "_resolve_instrument_candidate",
+                               lambda requested, candidates: (candidates[0], "")), \
+             mock.patch.object(hl, "_execute_positions_orders", side_effect=fake_positions_orders), \
+             mock.patch.object(hl, "_fetch_open_orders_snapshot", lambda wallet: []), \
+             mock.patch.object(hl, "_fetch_candidate_mark_price", lambda cand: Decimal("7770.085")), \
+             mock.patch.object(hl, "_build_exchange_client",
+                               lambda account: (fake, "0x4FE260D11bf48BA3a94459771259c910a398ac59", "secret")), \
+             mock.patch.object(hl, "_verify_position_protection_submission",
+                               return_value=({
+                                   "open_orders": [{"oid": 556, "coin": "xyz:SP500"}],
+                                   "current_side": "short",
+                                   "current_size": Decimal("47.7"),
+                               }, None, 556)):
+            response = hl.execute({
+                "operation": "set_sl", "exchange": "hyperliquid", "account": "FLEX",
+                "symbol": "xyz:SP500", "price": "8200",
+            })
+        self.assertTrue(response.success, f"set_sl failed: {response.error}")
+        self.assertEqual(captured.get("coin"), "xyz:SP500")
+        self.assertEqual(captured.get("grouping"), "positionTpsl")
+        self.assertEqual(captured.get("tpsl"), "sl")
+
+    def test_build_position_trigger_request_prefers_route_over_public(self):
+        hl = _hl_module()
+        candidate = self.SP500
+        position = CanonicalPosition(
+            symbol="xyz:SP500", side="short", size="10",
+            entry_price="7770", pnl="0", tp=None, sl=None,
+        )
+        payload = hl._build_position_trigger_request(
+            candidate, position, "buy", Decimal("7000"), "tp",
+        )
+        self.assertEqual(payload["coin"], "xyz:SP500")
+        self.assertNotEqual(payload["coin"], "SP500")
+        self.assertEqual(payload["order_type"]["trigger"]["tpsl"], "tp")
+        self.assertTrue(payload["reduce_only"])
+        self.assertTrue(payload["is_buy"])  # closing a short
+
+
+class TpSlClassificationTests(unittest.TestCase):
+    """Short-side SL must not be labeled TP via bare 'price above'."""
+
+    def test_short_stop_market_price_above_is_sl_not_tp(self):
+        """Hyperliquid short SL: Stop Market + price above.
+
+        The old classifier treated any 'price above' as TP, so a short
+        SL (e.g. HYPE short) was displayed and managed as TP.
+        """
+        hl = _hl_module()
+        order = {
+            "coin": "HYPE",
+            "side": "B",  # buy to close short
+            "sz": "10",
+            "limitPx": "45.5",
+            "triggerPx": "45.5",
+            "oid": 1001,
+            "reduceOnly": True,
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "orderType": "Stop Market",
+            "triggerCondition": "price above",
+            "tpsl": "sl",
+        }
+        tp, sl = hl._maybe_tp_sl_price(order)
+        self.assertIsNone(tp)
+        self.assertEqual(sl, "45.5")
+        self.assertEqual(hl._protection_order_tpsl(order), "sl")
+
+    def test_short_take_profit_price_below_is_tp(self):
+        hl = _hl_module()
+        order = {
+            "coin": "HYPE",
+            "side": "B",
+            "sz": "10",
+            "limitPx": "30",
+            "triggerPx": "30",
+            "oid": 1002,
+            "reduceOnly": True,
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "orderType": "Take Profit Market",
+            "triggerCondition": "price below",
+            "tpsl": "tp",
+        }
+        tp, sl = hl._maybe_tp_sl_price(order)
+        self.assertEqual(tp, "30")
+        self.assertIsNone(sl)
+        self.assertEqual(hl._protection_order_tpsl(order), "tp")
+
+    def test_bare_price_above_without_type_is_unknown(self):
+        """No orderType / tpsl — do NOT guess from price above alone."""
+        hl = _hl_module()
+        order = {
+            "coin": "HYPE",
+            "triggerCondition": "price above",
+            "triggerPx": "50",
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+        }
+        tp, sl = hl._maybe_tp_sl_price(order)
+        self.assertIsNone(tp)
+        self.assertIsNone(sl)
+        self.assertIsNone(hl._protection_order_tpsl(order))
+
+    def test_stop_market_price_above_without_explicit_tpsl_is_still_sl(self):
+        """Even without tpsl field, Stop Market + price above is SL."""
+        hl = _hl_module()
+        order = {
+            "coin": "HYPE",
+            "orderType": "Stop Market",
+            "triggerCondition": "price above",
+            "triggerPx": "48",
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+        }
+        tp, sl = hl._maybe_tp_sl_price(order)
+        self.assertIsNone(tp)
+        self.assertEqual(sl, "48")
+        self.assertEqual(hl._protection_order_tpsl(order), "sl")
+
+    def test_normalize_preserves_tpsl_and_classifies_short_sl(self):
+        hl = _hl_module()
+        raw = [{
+            "coin": "HYPE",
+            "side": "B",
+            "sz": "5",
+            "limitPx": "42",
+            "triggerPx": "42",
+            "oid": 77,
+            "reduceOnly": True,
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "orderType": "Stop Market",
+            "triggerCondition": "price above",
+            "tpsl": "sl",
+        }]
+        rows = hl._normalize_open_orders(raw)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.get("tpsl"), "sl")
+        self.assertEqual(row.get("sl"), "42")
+        self.assertIsNone(row.get("tp"))
+        self.assertEqual(hl._protection_order_tpsl(row), "sl")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -426,7 +426,27 @@ def _normalize_positions(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, A
         size = _decimal_or_zero(row.get("position_qty"))
         if size == 0:
             continue
-        pnl_value = _decimal_or_zero(row.get("unsettled_pnl")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        entry = _decimal_or_zero(row.get("average_open_price"))
+        mark = _decimal_or_zero(
+            row.get("mark_price")
+            if row.get("mark_price") not in (None, "")
+            else row.get("markPrice")
+        )
+        # Prefer full mark-to-entry unrealized PnL when mark is present.
+        # Orderly ``unsettled_pnl`` is relative to ``settle_price`` (last
+        # funding settlement), NOT average open — so a short that is
+        # underwater vs entry can still show a large positive unsettled
+        # value (HYPE short entry ~81.8 / mark ~85 → true uPnL negative,
+        # unsettled_pnl was +232). Display what traders expect: entry MTM.
+        if mark > 0 and entry > 0:
+            # Signed qty: long>0 → (mark-entry)*size; short<0 → same formula.
+            pnl_value = ((mark - entry) * size).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        else:
+            pnl_value = _decimal_or_zero(row.get("unsettled_pnl")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
         pnl_text = _decimal_text(pnl_value)
         if pnl_value > 0:
             pnl_text = f"+{pnl_text}"
@@ -439,7 +459,7 @@ def _normalize_positions(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, A
             symbol=symbol,
             side="long" if size > 0 else "short",
             size=_format_decimal_places(abs(size), size_precision),
-            entry_price=_format_decimal_places(_decimal_or_zero(row.get("average_open_price")), price_precision),
+            entry_price=_format_decimal_places(entry, price_precision),
             pnl=pnl_text,
         ))
     positions.sort(key=lambda item: (item.symbol, item.side))

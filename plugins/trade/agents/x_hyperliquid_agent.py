@@ -1803,26 +1803,73 @@ def _open_order_side(raw_side: Any) -> str:
 
 
 def _maybe_tp_sl_price(order: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Classify a Hyperliquid open-order row as TP and/or SL price.
+
+    Priority (highest first):
+      1. Explicit ``tpsl`` / ``tpSl`` field (``tp`` or ``sl``)
+      2. Order-type / trigger-condition text that names take-profit or stop
+      3. ``isPositionTpsl`` + orderType ``tp``/``sl``
+
+    IMPORTANT: do NOT classify from bare ``price above`` / ``price below``.
+    Those are side-relative on Hyperliquid:
+      long  TP = price above, long  SL = price below
+      short TP = price below, short SL = price above
+    Using them without position side swaps TP/SL on shorts (e.g. HYPE short
+    SL shows/acts as TP). Prefer unknown over wrong.
+    """
     order_type = str(order.get("orderType") or order.get("order_type") or "").strip().lower()
     trigger_condition = str(order.get("triggerCondition") or order.get("trigger_condition") or "").strip().lower()
     tpsl = str(order.get("tpsl") or order.get("tpSl") or order.get("tp_sl") or "").strip().lower()
     is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
     trigger_px = order.get("triggerPx") or order.get("trigger_px")
     limit_px = order.get("limitPx") or order.get("px") or order.get("limit_px")
-    price_px = order.get("price") or order.get("triggerPx") or order.get("trigger_px") or order.get("limitPx") or order.get("px") or order.get("limit_px")
+    price_px = (
+        order.get("price")
+        or order.get("triggerPx")
+        or order.get("trigger_px")
+        or order.get("limitPx")
+        or order.get("px")
+        or order.get("limit_px")
+    )
 
     def _price_text() -> Optional[str]:
-        price = price_px if price_px not in (None, "", "0", "0.0") else (trigger_px if trigger_px not in (None, "", "0", "0.0") else limit_px)
+        price = (
+            price_px
+            if price_px not in (None, "", "0", "0.0")
+            else (trigger_px if trigger_px not in (None, "", "0", "0.0") else limit_px)
+        )
         return _decimal_text(price)
 
-    if tpsl == "tp" or "take profit" in order_type or "take profit" in trigger_condition or "price above" in trigger_condition:
+    if tpsl == "tp":
         return (_price_text(), None)
-    if tpsl == "sl" or "stop loss" in order_type or "stop market" in order_type or "stop" in order_type or "price below" in trigger_condition:
+    if tpsl == "sl":
         return (None, _price_text())
+
+    # Named order types / conditions — side-independent and reliable.
+    if (
+        "take profit" in order_type
+        or "take profit" in trigger_condition
+        or order_type == "tp"
+        or trigger_condition == "tp"
+    ):
+        return (_price_text(), None)
+    if (
+        "stop loss" in order_type
+        or "stop market" in order_type
+        or "stop" in order_type
+        or "stop loss" in trigger_condition
+        or order_type == "sl"
+        or trigger_condition == "sl"
+    ):
+        return (None, _price_text())
+
     if is_position_tpsl and (order_type == "tp" or order_type == "sl"):
         if order_type == "tp":
             return (_price_text(), None)
         return (None, _price_text())
+
+    # Bare "price above"/"price below" is intentionally ignored — needs
+    # position side and is too easy to invert on shorts.
     return (None, None)
 
 
@@ -1830,6 +1877,12 @@ def _protection_order_tpsl(order: Dict[str, Any]) -> Optional[str]:
     tpsl = str(order.get("tpsl") or order.get("tpSl") or order.get("tp_sl") or "").strip().lower()
     if tpsl in {"tp", "sl"}:
         return tpsl
+
+    # Prefer already-normalized tp/sl legs if present (from _normalize_open_orders).
+    if order.get("tp") is not None and order.get("sl") is None:
+        return "tp"
+    if order.get("sl") is not None and order.get("tp") is None:
+        return "sl"
 
     tp, sl = _maybe_tp_sl_price(order)
     if tp is not None and sl is None:
@@ -1908,6 +1961,7 @@ def _normalize_open_orders(payload: Any) -> List[Dict[str, Any]]:
         if not symbol or side == "unknown" or size is None or size <= 0 or price is None or oid is None:
             continue
         tp, sl = _maybe_tp_sl_price(order)
+        raw_tpsl = str(order.get("tpsl") or order.get("tpSl") or order.get("tp_sl") or "").strip().lower()
         rows.append(
             {
                 "symbol": symbol,
@@ -1915,11 +1969,15 @@ def _normalize_open_orders(payload: Any) -> List[Dict[str, Any]]:
                 "oid": oid,
                 "size": size,
                 "price": price,
+                "trigger_px": _decimal_or_none(order.get("triggerPx") or order.get("trigger_px")),
                 "is_trigger": bool(order.get("isTrigger")),
-                "is_position_tpsl": bool(order.get("isPositionTpsl")),
-                "reduce_only": bool(order.get("reduceOnly")),
-                "order_type": str(order.get("orderType") or "").strip(),
-                "trigger_condition": str(order.get("triggerCondition") or "").strip(),
+                "is_position_tpsl": bool(order.get("isPositionTpsl") or order.get("is_position_tpsl")),
+                "reduce_only": bool(order.get("reduceOnly") or order.get("reduce_only")),
+                "order_type": str(order.get("orderType") or order.get("order_type") or "").strip(),
+                "trigger_condition": str(order.get("triggerCondition") or order.get("trigger_condition") or "").strip(),
+                # Preserve explicit tpsl so later classification does not
+                # re-derive from side-relative trigger conditions.
+                "tpsl": raw_tpsl if raw_tpsl in {"tp", "sl"} else None,
                 "tp": tp,
                 "sl": sl,
             }
@@ -2302,16 +2360,45 @@ def _build_position_trigger_request(
     price: Decimal,
     tpsl: str,
 ) -> Dict[str, Any]:
-    symbol = str(candidate.get("public_symbol") or getattr(current_position, "symbol", "") or "").strip()
+    # HIP-3 / native: coin MUST be the full route identifier (e.g.
+    # ``xyz:SP500``), same as new_order / close_position / cancel.
+    # Using public_symbol (dex-stripped ``SP500``) makes the SDK reject
+    # or mis-route positionTpsl orders on HIP-3 DEXes.
+    coin = str(
+        candidate.get("route_symbol")
+        or candidate.get("internal_name")
+        or candidate.get("public_symbol")
+        or getattr(current_position, "symbol", "")
+        or ""
+    ).strip()
     size = _decimal_or_none(getattr(current_position, "size", None))
     if size is None:
         size = Decimal("0")
+    size_increment = _decimal_or_none(candidate.get("size_increment"))
+    if size_increment is not None and size_increment > 0 and size > 0:
+        try:
+            size = _quantize_to_increment(size, size_increment)
+        except Exception:  # noqa: BLE001
+            pass
+    sz_decimals = candidate.get("sz_decimals")
+    try:
+        norm_price = _normalize_hyperliquid_order_price(price, sz_decimals)
+    except Exception:  # noqa: BLE001
+        norm_price = price
+    if norm_price <= 0:
+        norm_price = price
     return {
-        "coin": symbol,
+        "coin": coin,
         "is_buy": closing_side == "buy",
         "sz": float(size),
-        "limit_px": float(price),
-        "order_type": {"trigger": {"triggerPx": float(price), "isMarket": True, "tpsl": tpsl}},
+        "limit_px": float(norm_price),
+        "order_type": {
+            "trigger": {
+                "triggerPx": float(norm_price),
+                "isMarket": True,
+                "tpsl": tpsl,
+            }
+        },
         "reduce_only": True,
     }
 
@@ -2616,7 +2703,17 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         return failure
     assert context is not None
 
-    symbol = str(requested_symbol or "").strip().upper()
+    # Preserve route-symbol case for Hyperliquid wire ops (HIP-3 coins are
+    # case-sensitive prefixes like ``xyz:SP500``). Classification compares
+    # case-insensitively via .upper().
+    route_coin = str(
+        (context.get("candidate") or {}).get("route_symbol")
+        or (context.get("candidate") or {}).get("internal_name")
+        or requested_symbol
+        or ""
+    ).strip()
+    symbol = route_coin
+    match_key = route_coin.upper()
     current_side = str(context["current_side"] or "").strip().lower()
     current_position = context["current_position"]
     reference_price = context["reference_price"]
@@ -2627,7 +2724,7 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     }
 
     if price_value == 0:
-        protection_state = _classify_position_protection_orders(context["open_orders"], symbol, context["closing_side"])
+        protection_state = _classify_position_protection_orders(context["open_orders"], match_key, context["closing_side"])
         if protection_state["unknown"]:
             return make_failure(operation="set_tp", exchange=name, account=account, code="AMBIGUOUS_PROTECTION_STATE", message="Protection ownership could not be determined safely.")
         if len(protection_state["tp"]) > 1:
@@ -2758,7 +2855,7 @@ def _execute_set_tp(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         if current_side == "short" and price_value >= reference_price:
             return make_failure(operation="set_tp", exchange=name, account=account, code="INVALID_TP_PRICE", message="TP price must be below the current reference price.")
 
-    protection_state = _classify_position_protection_orders(context["open_orders"], symbol, context["closing_side"])
+    protection_state = _classify_position_protection_orders(context["open_orders"], match_key, context["closing_side"])
     if protection_state["unknown"]:
         return make_failure(operation="set_tp", exchange=name, account=account, code="AMBIGUOUS_PROTECTION_STATE", message="Protection ownership could not be determined safely.")
     if len(protection_state["tp"]) > 1:
@@ -2934,7 +3031,17 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         return failure
     assert context is not None
 
-    symbol = str(requested_symbol or "").strip().upper()
+    # Preserve route-symbol case for Hyperliquid wire ops (HIP-3 coins are
+    # case-sensitive prefixes like ``xyz:SP500``). Classification compares
+    # case-insensitively via .upper().
+    route_coin = str(
+        (context.get("candidate") or {}).get("route_symbol")
+        or (context.get("candidate") or {}).get("internal_name")
+        or requested_symbol
+        or ""
+    ).strip()
+    symbol = route_coin
+    match_key = route_coin.upper()
     current_side = str(context["current_side"] or "").strip().lower()
     current_position = context["current_position"]
     reference_price = context["reference_price"]
@@ -2945,7 +3052,7 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     }
 
     if price_value == 0:
-        protection_state = _classify_position_protection_orders(context["open_orders"], symbol, context["closing_side"])
+        protection_state = _classify_position_protection_orders(context["open_orders"], match_key, context["closing_side"])
         if protection_state["unknown"]:
             return make_failure(operation="set_sl", exchange=name, account=account, code="AMBIGUOUS_PROTECTION_STATE", message="Protection ownership could not be determined safely.")
         if len(protection_state["sl"]) > 1:
@@ -3076,7 +3183,7 @@ def _execute_set_sl(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         if current_side == "short" and price_value <= reference_price:
             return make_failure(operation="set_sl", exchange=name, account=account, code="INVALID_SL_PRICE", message="SL price must be above the current reference price.")
 
-    protection_state = _classify_position_protection_orders(context["open_orders"], symbol, context["closing_side"])
+    protection_state = _classify_position_protection_orders(context["open_orders"], match_key, context["closing_side"])
     if protection_state["unknown"]:
         return make_failure(operation="set_sl", exchange=name, account=account, code="AMBIGUOUS_PROTECTION_STATE", message="Protection ownership could not be determined safely.")
     if len(protection_state["sl"]) > 1:

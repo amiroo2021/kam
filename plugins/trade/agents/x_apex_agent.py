@@ -1708,7 +1708,8 @@ def _apex_fetch_mark_price(client: Any, symbol: str) -> Decimal:
     Apex position rows do NOT carry the live mark price (only
     ``entryPrice``, ``fee``, ``fundingFee``, etc.), so we MUST hit the
     ticker endpoint to get a recent mark before placing a close-order
-    limit at the right price.
+    limit at the right price — and to compute unrealized PnL for the
+    Manage Positions display.
     """
     fn = getattr(client, "ticker_v3", None)
     if fn is None:
@@ -1720,20 +1721,40 @@ def _apex_fetch_mark_price(client: Any, symbol: str) -> Decimal:
     data = response.get("data") if isinstance(response, Mapping) else None
     if not isinstance(data, list) or not data:
         return Decimal("0")
-    target = symbol.upper().replace("-", "")
-    # Find the matching symbol; ticker rows often use ``BTCUSDT`` (no dash)
-    # while account positions use ``BTC-USDT``.
+    target = str(symbol or "").strip().upper()
+    target_keys = {
+        target,
+        target.replace("-", ""),
+        target.replace("_", ""),
+        target.replace("-", "").replace("_", ""),
+    }
+    # Find the matching symbol; ticker rows often use undashed form
+    # (e.g. ``BTCUSDT``) while positions use ``BTC-USDT``.
     for row in data:
         if not isinstance(row, Mapping):
             continue
-        row_symbol = str(row.get("symbol") or "").upper().replace("-", "")
-        if row_symbol == target or row_symbol.replace("USDT", "") == target.replace("USDT", ""):
-            mark = row.get("markPrice") or row.get("oraclePrice") or row.get("indexPrice") or row.get("lastPrice")
-            try:
-                value = Decimal(str(mark))
-            except Exception:
-                return Decimal("0")
-            return value if value > 0 else Decimal("0")
+        raw = str(row.get("symbol") or row.get("symbolDisplayName") or "").strip().upper()
+        if not raw:
+            continue
+        row_keys = {
+            raw,
+            raw.replace("-", ""),
+            raw.replace("_", ""),
+            raw.replace("USDT", "-USDT") if "USDT" in raw and "-" not in raw else raw,
+        }
+        if target_keys.isdisjoint(row_keys):
+            continue
+        mark = (
+            row.get("markPrice")
+            or row.get("oraclePrice")
+            or row.get("indexPrice")
+            or row.get("lastPrice")
+        )
+        try:
+            value = Decimal(str(mark))
+        except Exception:
+            return Decimal("0")
+        return value if value > 0 else Decimal("0")
     # Fallback: first row when the request was symbol-scoped.
     if len(data) == 1 and isinstance(data[0], Mapping):
         mark = data[0].get("markPrice") or data[0].get("lastPrice")
@@ -1752,13 +1773,19 @@ def _apex_compute_unrealized_pnl(
     entry: Decimal,
     mark: Decimal,
 ) -> Decimal:
-    """Unrealized PnL from mark vs entry (Apex account rows omit uPnL)."""
+    """Unrealized PnL from mark vs entry (Apex account rows omit uPnL).
+
+    long  = (mark - entry) * size
+    short = (entry - mark) * size
+    """
     if size <= 0 or entry <= 0 or mark <= 0:
         return Decimal("0")
     side_l = str(side or "").strip().lower()
     if side_l in {"short", "sell"}:
         return (entry - mark) * size
-    return (mark - entry) * size
+    if side_l in {"long", "buy"}:
+        return (mark - entry) * size
+    return Decimal("0")
 
 
 def _apex_enrich_positions_with_mark_pnl(
@@ -1798,8 +1825,14 @@ def _apex_enrich_positions_with_mark_pnl(
             enriched.append(position)
             continue
         if symbol not in mark_cache:
-            mark_cache[symbol] = _apex_fetch_mark_price(client, symbol)
+            mark = _apex_fetch_mark_price(client, symbol)
+            if mark <= 0 and "-" in symbol:
+                mark = _apex_fetch_mark_price(client, symbol.replace("-", ""))
+            mark_cache[symbol] = mark
         mark = mark_cache[symbol]
+        if mark <= 0:
+            enriched.append(position)
+            continue
         pnl = _apex_compute_unrealized_pnl(
             side=str(position.side or ""),
             size=size,
@@ -3324,6 +3357,11 @@ def _normalize_apex_position(raw: Mapping[str, Any]) -> CanonicalPosition:
     The side field on Apex is a string ``"LONG"`` / ``"SHORT"`` (or
     ``"BUY"`` / ``"SELL"`` in some v3 paths). We canonicalize to
     ``"long"`` / ``"short"`` for the wizard.
+
+    Note: live Apex Omni ``get_account_v3`` position rows for this
+    account currently do NOT include ``unrealizedPnl`` or ``markPrice``
+    (only entry/size/side/fee/funding). Callers that need display PnL
+    must run ``_apex_enrich_positions_with_mark_pnl`` after normalize.
     """
     side_raw = str(raw.get("side") or "").strip().lower()
     if side_raw in {"buy", "long"}:
@@ -3345,7 +3383,16 @@ def _normalize_apex_position(raw: Mapping[str, Any]) -> CanonicalPosition:
         entry = Decimal(str(raw.get("entryPrice") or raw.get("avgEntryPrice") or "0"))
     except Exception:  # noqa: BLE001
         entry = Decimal("0")
-    pnl_text = str(raw.get("unrealizedPnl") or raw.get("pnl") or "0")
+    # Prefer any exchange-provided unrealized field when present; many
+    # live account snapshots omit it entirely (falls through to "0").
+    pnl_text = str(
+        raw.get("unrealizedPnl")
+        or raw.get("unrealizedPNL")
+        or raw.get("unRealizedPnl")
+        or raw.get("uPnl")
+        or raw.get("pnl")
+        or "0"
+    )
     return CanonicalPosition(
         symbol=symbol,
         side=side,
