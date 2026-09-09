@@ -35,6 +35,7 @@ does not use a plugin-handler registry for /trade.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -3289,8 +3290,13 @@ async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
     originating message in place to the next screen, and
     acknowledges the query.
 
+    Long exchange writes (especially large ladders) run in a worker
+    thread via ``asyncio.to_thread`` so the gateway event loop stays
+    responsive. Blocking the loop causes the shutdown watchdog to exit
+    with code 75 mid-submit and leave partial books on the venue.
+
     On any failure, the query is still acknowledged (so the user
-    doesn't see a stuck "loading\u2026" indicator) and the failure
+    doesn't see a stuck "loading…" indicator) and the failure
     is logged. The wizard's state is left untouched.
     """
     try:
@@ -3302,7 +3308,33 @@ async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
             suffix = suffix[len("trade:"):]
         query_message = getattr(query, "message", None)
         chat_key = _chat_key_from_message(query_message)
-        screen = _WIZARD.handle_callback(chat_key, suffix)
+
+        # Ack early so Telegram does not show a stuck spinner while a
+        # multi-minute ladder runs off the event loop.
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        # ladder_confirm + confirm → show progress before the long write.
+        if suffix == "confirm":
+            try:
+                state = _WIZARD._state_for(chat_key)
+                if getattr(state, "state", None) == "ladder_confirm":
+                    await query.edit_message_text(
+                        text=(
+                            "⏳ Submitting ladder…\n"
+                            "Large books can take 1–3 minutes. "
+                            "Keep this chat open; the result will replace this message."
+                        ),
+                        reply_markup=None,
+                    )
+            except Exception:
+                pass
+
+        # NEVER call sync desk/exchange I/O on the gateway event-loop
+        # thread — watchdog liveness probes will fail (exit 75).
+        screen = await asyncio.to_thread(_WIZARD.handle_callback, chat_key, suffix)
         # Build the inline keyboard for the new screen.
         from plugins.platforms.telegram.adapter import (
             InlineKeyboardButton,
@@ -3339,10 +3371,6 @@ async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
             if chat_id is not None:
                 metadata = _metadata_from_message(query_message)
                 await _send_screen(adapter, str(chat_id), screen, metadata=metadata)
-        try:
-            await query.answer()
-        except Exception:
-            pass
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "trade wizard: callback dispatch failed: %s", exc, exc_info=True,
@@ -3358,7 +3386,8 @@ async def handle_trade_text(adapter: Any, msg: Any) -> bool:
     try:
         chat_key = _chat_key_from_message(msg)
         text = getattr(msg, "text", "") or ""
-        screen = _WIZARD.handle_text(chat_key, text)
+        # Off-loop: free-text steps can still trigger exchange I/O.
+        screen = await asyncio.to_thread(_WIZARD.handle_text, chat_key, text)
         if screen is None:
             return False
         chat_id = _chat_id_from_message(msg)

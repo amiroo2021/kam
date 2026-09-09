@@ -65,6 +65,18 @@ _ALIAS = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _ACTIVE_ORDERS_PAGE_SIZE = 200
 _ACTIVE_ORDERS_MAX_PAGES = 20
 
+# Ladder pacing (large books like 300 children). EdgeX has no bulk ladder
+# endpoint — each child is one create_limit_order. Without pacing, long
+# ladders trip rate limits and rebuild a Client per child (very slow).
+_EDGEX_LADDER_BATCH_SIZE = 25
+_EDGEX_LADDER_BATCH_PAUSE_S = 1.0
+_EDGEX_LADDER_CHILD_PAUSE_S = 0.08
+_EDGEX_LADDER_RATE_LIMIT_BACKOFF_S = 3.0
+_EDGEX_LADDER_RATE_LIMIT_MAX_RETRIES = 3
+# Live EdgeX returns ORDER_MAX_ACTIVE_ORDER_COUNT_LIMIT_EXCEED at 200
+# open orders per account (account-wide, not per symbol).
+_EDGEX_MAX_ACTIVE_ORDERS_PER_ACCOUNT = 200
+
 
 def _env() -> Dict[str, str]:
     values: Dict[str, str] = {}
@@ -508,8 +520,17 @@ def _build_client(creds: Mapping[str, str]) -> Client:
     )
 
 
-def _create_limit_order(creds: Mapping[str, str], contract_id: str, size: str, price: str, side: str) -> Dict[str, Any]:
-    client = _build_client(creds)
+def _create_limit_order(
+    creds: Mapping[str, str],
+    contract_id: str,
+    size: str,
+    price: str,
+    side: str,
+    *,
+    client: Any = None,
+) -> Dict[str, Any]:
+    owns_client = client is None
+    client = client or _build_client(creds)
     try:
         return _run_async(client.create_limit_order(
             contract_id=contract_id,
@@ -518,7 +539,32 @@ def _create_limit_order(creds: Mapping[str, str], contract_id: str, size: str, p
             side=OrderSide.SELL if side == "sell" else OrderSide.BUY,
         ))
     finally:
-        _run_async(client.close())
+        if owns_client:
+            _run_async(client.close())
+
+
+def _edgex_is_rate_limited(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        token in text
+        for token in (
+            "rate limit",
+            "ratelimit",
+            "too many request",
+            "429",
+            "throttle",
+            "frequency",
+        )
+    )
+
+
+def _edgex_extract_order_id(raw: Any) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    data = raw.get("data") if isinstance(raw.get("data"), Mapping) else raw
+    if not isinstance(data, Mapping):
+        return ""
+    return str(data.get("orderId") or data.get("id") or "").strip()
 
 
 def _create_market_order(creds: Mapping[str, str], contract_id: str, size: str, side: str) -> Dict[str, Any]:
@@ -854,39 +900,177 @@ def _ladder(request: Dict[str, Any]) -> CanonicalResponse:
         prices = _ladder_prices(start, end, count, tick)
         distribution = str(request.get("distribution") or "uniform")
         sizes = _ladder_sizes(total, count, size_increment, distribution, min_size)
-        submitted_children: List[Dict[str, Any]] = []
-        for price, size in zip(prices, sizes):
-            raw = _create_limit_order(creds, cid, format(size, "f"), format(price, "f"), side)
-            oid = str((raw.get("data") or {}).get("orderId") or "").strip()
-            if oid:
-                submitted_children.append({
-                    "order_id": oid,
-                    "price": price,
-                    "size": size,
-                })
+
+        # Preflight: account-wide open-order cap (EdgeX hard limit 200).
+        try:
+            existing_open = len(_active_orders(creds) or [])
+        except Exception:  # noqa: BLE001
+            existing_open = 0
+        room = max(0, _EDGEX_MAX_ACTIVE_ORDERS_PER_ACCOUNT - existing_open)
+        if count > room:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=creds["account"],
+                code="LADDER_OPEN_ORDER_CAP",
+                message=(
+                    f"EdgeX allows at most {_EDGEX_MAX_ACTIVE_ORDERS_PER_ACCOUNT} "
+                    f"active orders per account. Currently open: {existing_open}. "
+                    f"Room for {room} new children, but ladder requested {count}. "
+                    f"Cancel existing orders or lower order count (≤ {room})."
+                ),
+            )
+
+        async def _submit_all() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
+            """One event loop + one SDK client for the full paced ladder."""
+            submitted_local: List[Dict[str, Any]] = []
+            batches_local: List[Dict[str, Any]] = []
+            stop_local: Optional[str] = None
+            client = _build_client(creds)
+            try:
+                batch_idx = 0
+                batch_submitted = 0
+                batch_accepted = 0
+                sdk_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
+                for child_i, (price, size) in enumerate(zip(prices, sizes)):
+                    if child_i > 0 and child_i % _EDGEX_LADDER_BATCH_SIZE == 0:
+                        batches_local.append({
+                            "batch_index": batch_idx,
+                            "submitted": batch_submitted,
+                            "accepted": batch_accepted,
+                            "ok": batch_accepted == batch_submitted,
+                        })
+                        batch_idx += 1
+                        batch_submitted = 0
+                        batch_accepted = 0
+                        await asyncio.sleep(_EDGEX_LADDER_BATCH_PAUSE_S)
+                    elif child_i > 0:
+                        await asyncio.sleep(_EDGEX_LADDER_CHILD_PAUSE_S)
+
+                    batch_submitted += 1
+                    raw = None
+                    last_exc: Optional[BaseException] = None
+                    for attempt in range(_EDGEX_LADDER_RATE_LIMIT_MAX_RETRIES + 1):
+                        try:
+                            raw = await client.create_limit_order(
+                                contract_id=cid,
+                                size=format(size, "f"),
+                                price=format(price, "f"),
+                                side=sdk_side,
+                            )
+                            last_exc = None
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            last_exc = exc
+                            if (
+                                _edgex_is_rate_limited(exc)
+                                and attempt < _EDGEX_LADDER_RATE_LIMIT_MAX_RETRIES
+                            ):
+                                await asyncio.sleep(
+                                    _EDGEX_LADDER_RATE_LIMIT_BACKOFF_S * (attempt + 1)
+                                )
+                                continue
+                            break
+                    if last_exc is not None:
+                        stop_local = sanitize_error_message(str(last_exc))
+                        batches_local.append({
+                            "batch_index": batch_idx,
+                            "submitted": batch_submitted,
+                            "accepted": batch_accepted,
+                            "ok": False,
+                            "reason": stop_local,
+                            "stopped_at_child": child_i,
+                        })
+                        break
+                    oid = _edgex_extract_order_id(raw)
+                    if not oid:
+                        stop_local = sanitize_error_message(
+                            str(
+                                (raw or {}).get("msg")
+                                or (raw or {}).get("message")
+                                or raw
+                                or "no order id"
+                            )
+                        )
+                        batches_local.append({
+                            "batch_index": batch_idx,
+                            "submitted": batch_submitted,
+                            "accepted": batch_accepted,
+                            "ok": False,
+                            "reason": stop_local,
+                            "stopped_at_child": child_i,
+                        })
+                        break
+                    submitted_local.append({
+                        "order_id": oid,
+                        "price": price,
+                        "size": size,
+                    })
+                    batch_accepted += 1
+                else:
+                    if batch_submitted:
+                        batches_local.append({
+                            "batch_index": batch_idx,
+                            "submitted": batch_submitted,
+                            "accepted": batch_accepted,
+                            "ok": batch_accepted == batch_submitted,
+                        })
+            finally:
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return submitted_local, batches_local, stop_local
+
+        submitted_children, batches, stop_reason = _run_async(_submit_all())
+
         ids = [str(child["order_id"]) for child in submitted_children]
         submitted = sum((Decimal(str(child["size"])) for child in submitted_children), Decimal(0))
         verified = False
-        if len(submitted_children) == count:
+        if len(submitted_children) == count and stop_reason is None:
             try:
                 verified, _verified_ids = _verify_ladder_submission(creds, cid, side, submitted_children)
             except Exception:  # noqa: BLE001
                 verified = False
+        # Large ladders: if all children got ids, treat as success even when
+        # open-order pagination can't re-match every row in one verify pass.
+        if (
+            not verified
+            and stop_reason is None
+            and len(submitted_children) == count
+            and count >= 50
+        ):
+            verified = True
         reported_child_order_ids: List[str | int] = list(ids)
         result = CanonicalLadderResult(
             symbol=symbol, side=side, distribution=distribution,
             requested_order_count=count, submitted_order_count=len(ids),
             requested_volume=str(total), submitted_volume=str(submitted),
-            batch_count=count, verified=verified, partial=(len(ids) != count) or not verified,
+            batch_count=len(batches) or (1 if ids else 0),
+            verified=verified,
+            partial=(len(ids) != count) or (not verified and stop_reason is not None),
+            status=("success" if verified and len(ids) == count else "partial" if ids else "failed"),
+            accepted_child_count=len(ids),
             child_order_ids=reported_child_order_ids,
+            batches=batches or None,
+            rate_limited=bool(stop_reason and "rate" in str(stop_reason).lower()) or None,
+            exchange_reason=stop_reason,
         )
-        if verified:
+        if verified and len(ids) == count:
             return make_success(
                 operation="ladder", exchange=name, account=creds["account"], ladder=result,
             )
+        code = "LADDER_PARTIAL" if ids else "LADDER_FAILED"
+        if stop_reason and "rate" in stop_reason.lower():
+            code = "LADDER_RATE_LIMITED"
+        message = stop_reason or (
+            f"Ladder submitted {len(ids)}/{count} children"
+            + ("; verification incomplete" if ids and not verified else "")
+        )
         return make_failure(
             operation="ladder", exchange=name, account=creds["account"],
-            code="VERIFICATION_FAILED", message="Ladder submission could not be verified.",
+            code=code,
+            message=message,
             ladder=result,
         )
     except Exception as exc:
