@@ -2,18 +2,23 @@
 
 Owns all Nado-specific behavior for the /trade stack.
 
-Phase 1 (balance):
-  - Credential discovery from ``NADO_<ALIAS>_SUBACCOUNT_OWNER`` and
-    ``NADO_<ALIAS>_PRIVATE_KEY`` (optional for read-only balance),
-    plus optional ``NADO_<ALIAS>_SUBACCOUNT_NAME`` (default ``default``).
-  - Public gateway query ``subaccount_info`` (no signature required).
-  - Canonical balance / portfolio summary from health assets (USDT0).
+Credentials (``.env`` / environment):
+  ``NADO_<ALIAS>_SUBACCOUNT_OWNER``  wallet address (required)
+  ``NADO_<ALIAS>_PRIVATE_KEY``       owner or linked-signer key (required for writes)
+  ``NADO_<ALIAS>_SUBACCOUNT_NAME``   optional, default ``default``
+  ``NADO_<ALIAS>_GATEWAY_URL``       optional REST base
 
 Docs: https://docs.nado.xyz/developer-resources/api
 Gateway: ``https://api.prod.nado.xyz/gateway/v1``
 
-TradeDesk and the Telegram wizard MUST remain exchange-agnostic and
-MUST NOT parse ``NADO_*`` environment variables or Nado-native payloads.
+Operations:
+  - balance
+  - positions_orders / positions_management
+  - new_order (limit)
+  - cancel_order_group
+  - resolve_instrument / list_instruments / market_price
+
+TradeDesk and the Telegram wizard MUST remain exchange-agnostic.
 """
 
 from __future__ import annotations
@@ -23,14 +28,25 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 import urllib.error
 import urllib.request
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 
 from ..canonical import (
+    CanonicalCancelGroupResult,
+    CanonicalInstrument,
+    CanonicalMarketPrice,
+    CanonicalOrderGroup,
+    CanonicalOrderResult,
     CanonicalPortfolioSummary,
+    CanonicalPosition,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -44,16 +60,30 @@ name = "nado"
 
 DEFAULT_GATEWAY_REST = "https://api.prod.nado.xyz/gateway/v1"
 DEFAULT_SUBACCOUNT_NAME = "default"
-API_TIMEOUT_SECONDS = 20
-X18 = Decimal("1000000000000000000")  # 1e18
+API_TIMEOUT_SECONDS = 25
+X18 = Decimal("1000000000000000000")
+X18_INT = 10**18
+# recv_time window: engine accepts current < recv_time <= current + 100s
+_NONCE_RECV_AHEAD_MS = 50_000
+_ORDER_TTL_SECONDS = 7 * 24 * 3600
+_APPENDIX_DEFAULT = 1  # protocol version 1, default limit
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
-
-# Required for account discovery. Private key is optional for balance-only.
 _OWNER_ALIASES = ("SUBACCOUNT_OWNER", "OWNER", "ADDRESS", "WALLET")
 _KEY_ALIASES = ("PRIVATE_KEY", "PRIVATEKEY", "SIGNER_KEY", "SECRET")
 _NAME_ALIASES = ("SUBACCOUNT_NAME", "SUBACCOUNT", "NAME")
 _BASE_ALIASES = ("GATEWAY_URL", "BASE_URL", "API_URL")
+
+_symbols_cache: Dict[str, Any] = {"ts": 0.0, "by_symbol": {}, "by_pid": {}}
+_contracts_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_CACHE_TTL = 300.0
+
+_USER_AGENT = "kam-nado-agent/1.0 (+https://github.com/amiroo2021/kam)"
+
+
+# ---------------------------------------------------------------------------
+# Env / credentials
+# ---------------------------------------------------------------------------
 
 
 def _hermes_home() -> Path:
@@ -134,7 +164,6 @@ def _discover_credential_map() -> Dict[str, Dict[str, str]]:
             slot.setdefault("subaccount_name", val)
         elif suffix in _BASE_ALIASES:
             slot.setdefault("gateway_url", val.rstrip("/"))
-    # Balance-only needs owner; private_key optional until writes.
     complete: Dict[str, Dict[str, str]] = {}
     for alias, fields in buckets.items():
         if fields.get("owner"):
@@ -147,7 +176,16 @@ def list_accounts() -> List[str]:
 
 
 def capabilities() -> List[str]:
-    return ["balance"]
+    return [
+        "balance",
+        "positions_orders",
+        "positions_management",
+        "new_order",
+        "cancel_order_group",
+        "resolve_instrument",
+        "list_instruments",
+        "market_price",
+    ]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -160,21 +198,29 @@ def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
     owner = fields["owner"].strip()
     if not owner.startswith("0x") and not owner.startswith("0X"):
         owner = "0x" + owner
+    pk = (fields.get("private_key") or "").strip()
+    if pk and not pk.startswith("0x"):
+        pk = "0x" + pk
     return {
         "account": alias,
         "owner": owner,
-        "private_key": fields.get("private_key") or "",
+        "private_key": pk,
         "subaccount_name": (fields.get("subaccount_name") or DEFAULT_SUBACCOUNT_NAME).strip()
         or DEFAULT_SUBACCOUNT_NAME,
         "gateway_url": fields.get("gateway_url") or DEFAULT_GATEWAY_REST,
     }
 
 
-def _subaccount_bytes32(owner: str, subaccount_name: str) -> str:
-    """Build Nado sender/subaccount hex: address(20) || name(12).
+def _require_signer(credentials: Mapping[str, str]) -> str:
+    pk = str(credentials.get("private_key") or "").strip()
+    if not pk:
+        raise ValueError("MISSING_PRIVATE_KEY")
+    # Validate key parses
+    Account.from_key(pk)
+    return pk
 
-    Example default name pads as ``64656661756c740000000000``.
-    """
+
+def _subaccount_bytes32(owner: str, subaccount_name: str) -> str:
     addr = owner.lower().replace("0x", "")
     if len(addr) != 40 or any(c not in "0123456789abcdef" for c in addr):
         raise ValueError("Invalid subaccount owner address")
@@ -182,6 +228,10 @@ def _subaccount_bytes32(owner: str, subaccount_name: str) -> str:
     name_bytes = name.encode("utf-8")[:12]
     name_bytes = name_bytes + b"\x00" * (12 - len(name_bytes))
     return "0x" + addr + name_bytes.hex()
+
+
+def _sender_hex(credentials: Mapping[str, str]) -> str:
+    return _subaccount_bytes32(credentials["owner"], credentials["subaccount_name"])
 
 
 def _redact(text: Any, credentials: Optional[Mapping[str, str]] = None) -> str:
@@ -193,7 +243,13 @@ def _redact(text: Any, credentials: Optional[Mapping[str, str]] = None) -> str:
                 rendered = rendered.replace(v, "***")
                 if v.startswith("0x") and len(v) > 10:
                     rendered = rendered.replace(v[2:], "***")
+                    rendered = rendered.replace(v[2:].lower(), "***")
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 
 
 def _decode_body(raw: bytes, content_encoding: str = "") -> bytes:
@@ -206,9 +262,14 @@ def _decode_body(raw: bytes, content_encoding: str = "") -> bytes:
     return raw
 
 
-def _gateway_query(credentials: Mapping[str, str], payload: Mapping[str, Any]) -> Dict[str, Any]:
+def _http_json(
+    credentials: Mapping[str, str],
+    *,
+    path: str,
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
     base = str(credentials.get("gateway_url") or DEFAULT_GATEWAY_REST).rstrip("/")
-    url = base + "/query"
+    url = base + path
     body = json.dumps(dict(payload)).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -217,10 +278,8 @@ def _gateway_query(credentials: Mapping[str, str], payload: Mapping[str, Any]) -
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            # Nado gateway requires Accept-Encoding to include gzip/br/deflate.
             "Accept-Encoding": "gzip, deflate",
-            # Cloudflare on api.prod.nado.xyz bans bare-Python urllib UA (1010).
-            "User-Agent": "kam-nado-agent/1.0 (+https://github.com/amiroo2021/kam)",
+            "User-Agent": _USER_AGENT,
         },
     )
     try:
@@ -229,24 +288,44 @@ def _gateway_query(credentials: Mapping[str, str], payload: Mapping[str, Any]) -
             parsed = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            err_body = _decode_body(exc.read(), exc.headers.get("Content-Encoding", "") if exc.headers else "")
+            err_body = _decode_body(
+                exc.read(),
+                exc.headers.get("Content-Encoding", "") if exc.headers else "",
+            )
             parsed = json.loads(err_body.decode("utf-8"))
             if isinstance(parsed, dict):
                 return parsed
         except Exception:  # noqa: BLE001
             pass
-        raise RuntimeError(f"HTTP {exc.code} on Nado query: {exc.reason}") from exc
+        raise RuntimeError(f"HTTP {exc.code} on Nado {path}: {exc.reason}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("Nado returned a non-object JSON payload.")
     return parsed
 
 
+def _gateway_query(credentials: Mapping[str, str], payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return _http_json(credentials, path="/query", payload=payload)
+
+
+def _gateway_execute(credentials: Mapping[str, str], payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return _http_json(credentials, path="/execute", payload=payload)
+
+
+# ---------------------------------------------------------------------------
+# Math / formatting
+# ---------------------------------------------------------------------------
+
+
 def _x18_to_decimal(value: Any) -> Decimal:
     try:
-        raw = Decimal(str(value or "0"))
+        return Decimal(str(value or "0")) / X18
     except Exception:  # noqa: BLE001
         return Decimal("0")
-    return raw / X18
+
+
+def _to_x18_int(value: Decimal, *, rounding=ROUND_DOWN) -> int:
+    scaled = (value * X18).to_integral_value(rounding=rounding)
+    return int(scaled)
 
 
 def _format_decimal(value: Decimal) -> str:
@@ -257,29 +336,277 @@ def _format_decimal(value: Decimal) -> str:
     return text or "0"
 
 
-def _balance_from_subaccount_info(data: Mapping[str, Any]) -> Tuple[Decimal, Decimal, Decimal, str]:
-    """Return (account_value, withdrawable_est, margin_used_est, unit).
+def _round_to_step_x18(amount_x18: int, step_x18: int, *, rounding=ROUND_DOWN) -> int:
+    if step_x18 <= 0:
+        return amount_x18
+    if rounding == ROUND_UP:
+        if amount_x18 <= 0:
+            return 0
+        return ((amount_x18 + step_x18 - 1) // step_x18) * step_x18
+    return (amount_x18 // step_x18) * step_x18
 
-    Prefer initial health assets as account value (USDT0-denominated).
-    Spot product 0 is typically the quote (USDT0) free balance.
-    """
+
+def _gen_nonce(ahead_ms: int = _NONCE_RECV_AHEAD_MS) -> int:
+    ms = int(time.time() * 1000) + max(1, min(ahead_ms, 90_000))
+    return (ms << 20) + secrets.randbelow(1 << 20)
+
+
+def _product_verifying_contract(product_id: int) -> str:
+    return "0x" + int(product_id).to_bytes(20, "big").hex()
+
+
+def _hex_to_bytes32(value: str) -> bytes:
+    h = value[2:] if value.startswith("0x") else value
+    raw = bytes.fromhex(h)
+    if len(raw) > 32:
+        raise ValueError("bytes32 overflow")
+    return raw + b"\x00" * (32 - len(raw))
+
+
+# ---------------------------------------------------------------------------
+# Catalog
+# ---------------------------------------------------------------------------
+
+
+def _ensure_contracts(credentials: Mapping[str, str]) -> Dict[str, Any]:
+    now = time.time()
+    if _contracts_cache["data"] and now - float(_contracts_cache["ts"]) < _CACHE_TTL:
+        return dict(_contracts_cache["data"])
+    payload = _gateway_query(credentials, {"type": "contracts"})
+    if str(payload.get("status") or "").lower() != "success":
+        raise RuntimeError(str(payload.get("error") or "contracts query failed"))
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise RuntimeError("contracts payload missing data")
+    out = {
+        "chain_id": int(data.get("chain_id")),
+        "endpoint_addr": str(data.get("endpoint_addr") or "").lower(),
+    }
+    _contracts_cache["ts"] = now
+    _contracts_cache["data"] = out
+    return dict(out)
+
+
+def _ensure_symbols(credentials: Mapping[str, str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    now = time.time()
+    if _symbols_cache["by_symbol"] and now - float(_symbols_cache["ts"]) < _CACHE_TTL:
+        return dict(_symbols_cache["by_symbol"]), dict(_symbols_cache["by_pid"])
+    payload = _gateway_query(credentials, {"type": "symbols"})
+    if str(payload.get("status") or "").lower() != "success":
+        raise RuntimeError(str(payload.get("error") or "symbols query failed"))
+    symbols = (payload.get("data") or {}).get("symbols") or {}
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    by_pid: Dict[int, Dict[str, Any]] = {}
+    if isinstance(symbols, Mapping):
+        for key, row in symbols.items():
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                pid = int(row.get("product_id"))
+            except Exception:  # noqa: BLE001
+                continue
+            sym = str(row.get("symbol") or key).strip()
+            meta = {
+                "product_id": pid,
+                "symbol": sym,
+                "type": str(row.get("type") or "").lower(),
+                "price_increment_x18": int(str(row.get("price_increment_x18") or "1")),
+                "size_increment": int(str(row.get("size_increment") or "1")),
+                "min_size": int(str(row.get("min_size") or "0")),  # notional x18
+                "tick_size": _x18_to_decimal(row.get("price_increment_x18")),
+                "qty_step": Decimal(str(row.get("size_increment") or "1")) / X18,
+                "min_notional": _x18_to_decimal(row.get("min_size")),
+                "trading_status": str(row.get("trading_status") or ""),
+            }
+            by_symbol[sym.upper()] = meta
+            # bare base for perps: BTC-PERP -> BTC
+            if meta["type"] == "perp" and "-" in sym:
+                base = sym.split("-", 1)[0].upper()
+                by_symbol.setdefault(base, meta)
+            by_pid[pid] = meta
+    _symbols_cache["ts"] = now
+    _symbols_cache["by_symbol"] = by_symbol
+    _symbols_cache["by_pid"] = by_pid
+    return dict(by_symbol), dict(by_pid)
+
+
+def _resolve_symbol_meta(credentials: Mapping[str, str], requested: str) -> Dict[str, Any]:
+    by_symbol, by_pid = _ensure_symbols(credentials)
+    raw = str(requested or "").strip()
+    if not raw:
+        raise ValueError("INSTRUMENT_NOT_FOUND")
+    key = raw.upper().replace("/", "-").replace("_", "-")
+    if key in by_symbol:
+        return dict(by_symbol[key])
+    # numeric product id
+    if key.isdigit() and int(key) in by_pid:
+        return dict(by_pid[int(key)])
+    # BTCUSDT -> BTC
+    for suffix in ("USDT", "USDT0", "USD", "PERP"):
+        if key.endswith(suffix) and len(key) > len(suffix):
+            base = key[: -len(suffix)]
+            if base.endswith("-"):
+                base = base[:-1]
+            if base in by_symbol:
+                return dict(by_symbol[base])
+            if f"{base}-PERP" in by_symbol:
+                return dict(by_symbol[f"{base}-PERP"])
+    if f"{key}-PERP" in by_symbol:
+        return dict(by_symbol[f"{key}-PERP"])
+    raise ValueError("INSTRUMENT_NOT_FOUND")
+
+
+def _display_symbol(meta: Mapping[str, Any]) -> str:
+    sym = str(meta.get("symbol") or "")
+    if meta.get("type") == "perp" and "-" in sym:
+        return sym.split("-", 1)[0]
+    return sym or str(meta.get("product_id") or "")
+
+
+def _oracle_price(credentials: Mapping[str, str], product_id: int) -> Decimal:
+    payload = _gateway_query(credentials, {"type": "all_products"})
+    if str(payload.get("status") or "").lower() != "success":
+        raise RuntimeError(str(payload.get("error") or "all_products failed"))
+    data = payload.get("data") or {}
+    for bucket in ("perp_products", "spot_products"):
+        for row in data.get(bucket) or []:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                if int(row.get("product_id")) == int(product_id):
+                    return _x18_to_decimal(row.get("oracle_price_x18"))
+            except Exception:  # noqa: BLE001
+                continue
+    # fallback bid/ask mid
+    mp = _gateway_query(credentials, {"type": "market_prices", "product_ids": [int(product_id)]})
+    rows = ((mp.get("data") or {}).get("market_prices") or [])
+    if rows and isinstance(rows[0], Mapping):
+        bid = _x18_to_decimal(rows[0].get("bid_x18"))
+        ask = _x18_to_decimal(rows[0].get("ask_x18"))
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        return bid or ask
+    raise RuntimeError(f"No oracle/mark for product {product_id}")
+
+
+# ---------------------------------------------------------------------------
+# Signing
+# ---------------------------------------------------------------------------
+
+
+def _sign_typed(private_key: str, full_message: Mapping[str, Any]) -> str:
+    signable = encode_typed_data(full_message=dict(full_message))
+    signed = Account.from_key(private_key).sign_message(signable)
+    sig = signed.signature.hex()
+    return sig if sig.startswith("0x") else ("0x" + sig)
+
+
+def _eip712_domain(chain_id: int, verifying_contract: str) -> Dict[str, Any]:
+    return {
+        "name": "Nado",
+        "version": "0.0.1",
+        "chainId": int(chain_id),
+        "verifyingContract": verifying_contract,
+    }
+
+
+_EIP712_DOMAIN_TYPES = [
+    {"name": "name", "type": "string"},
+    {"name": "version", "type": "string"},
+    {"name": "chainId", "type": "uint256"},
+    {"name": "verifyingContract", "type": "address"},
+]
+
+
+def _sign_place_order(
+    *,
+    private_key: str,
+    chain_id: int,
+    product_id: int,
+    sender_hex: str,
+    price_x18: int,
+    amount_x18: int,
+    expiration: int,
+    nonce: int,
+    appendix: int,
+) -> str:
+    message = {
+        "sender": _hex_to_bytes32(sender_hex),
+        "priceX18": int(price_x18),
+        "amount": int(amount_x18),
+        "expiration": int(expiration),
+        "nonce": int(nonce),
+        "appendix": int(appendix),
+    }
+    full = {
+        "types": {
+            "EIP712Domain": _EIP712_DOMAIN_TYPES,
+            "Order": [
+                {"name": "sender", "type": "bytes32"},
+                {"name": "priceX18", "type": "int128"},
+                {"name": "amount", "type": "int128"},
+                {"name": "expiration", "type": "uint64"},
+                {"name": "nonce", "type": "uint64"},
+                {"name": "appendix", "type": "uint128"},
+            ],
+        },
+        "primaryType": "Order",
+        "domain": _eip712_domain(chain_id, _product_verifying_contract(product_id)),
+        "message": message,
+    }
+    return _sign_typed(private_key, full)
+
+
+def _sign_cancel_orders(
+    *,
+    private_key: str,
+    chain_id: int,
+    endpoint_addr: str,
+    sender_hex: str,
+    product_ids: Sequence[int],
+    digests: Sequence[str],
+    nonce: int,
+) -> str:
+    message = {
+        "sender": _hex_to_bytes32(sender_hex),
+        "productIds": [int(p) for p in product_ids],
+        "digests": [_hex_to_bytes32(d) for d in digests],
+        "nonce": int(nonce),
+    }
+    full = {
+        "types": {
+            "EIP712Domain": _EIP712_DOMAIN_TYPES,
+            "Cancellation": [
+                {"name": "sender", "type": "bytes32"},
+                {"name": "productIds", "type": "uint32[]"},
+                {"name": "digests", "type": "bytes32[]"},
+                {"name": "nonce", "type": "uint64"},
+            ],
+        },
+        "primaryType": "Cancellation",
+        "domain": _eip712_domain(chain_id, endpoint_addr),
+        "message": message,
+    }
+    return _sign_typed(private_key, full)
+
+
+# ---------------------------------------------------------------------------
+# Balance
+# ---------------------------------------------------------------------------
+
+
+def _balance_from_subaccount_info(data: Mapping[str, Any]) -> Tuple[Decimal, Decimal, Decimal, str]:
     unit = "USDT0"
     healths = data.get("healths") or []
-    assets = Decimal("0")
-    liabilities = Decimal("0")
-    health = Decimal("0")
-    if isinstance(healths, list) and healths:
-        h0 = healths[0] if isinstance(healths[0], Mapping) else {}
+    assets = liabilities = health = Decimal("0")
+    if isinstance(healths, list) and healths and isinstance(healths[0], Mapping):
+        h0 = healths[0]
         assets = _x18_to_decimal(h0.get("assets"))
         liabilities = _x18_to_decimal(h0.get("liabilities"))
         health = _x18_to_decimal(h0.get("health"))
-    # Quote spot free balance (product_id 0) when present.
     quote_free = Decimal("0")
     for row in data.get("spot_balances") or []:
-        if not isinstance(row, Mapping):
-            continue
-        # product_id 0 is valid — do not use ``or`` (0 is falsy).
-        if "product_id" not in row:
+        if not isinstance(row, Mapping) or "product_id" not in row:
             continue
         try:
             pid = int(row.get("product_id"))
@@ -291,10 +618,7 @@ def _balance_from_subaccount_info(data: Mapping[str, Any]) -> Tuple[Decimal, Dec
         quote_free = _x18_to_decimal(bal.get("amount"))
         break
     account_value = assets if assets > 0 else max(quote_free, health)
-    if liabilities > 0:
-        margin_used = liabilities
-    else:
-        margin_used = max(account_value - quote_free, Decimal("0"))
+    margin_used = liabilities if liabilities > 0 else max(account_value - quote_free, Decimal("0"))
     withdrawable = quote_free if quote_free != 0 else max(min(health, account_value), Decimal("0"))
     if withdrawable < 0:
         withdrawable = Decimal("0")
@@ -309,26 +633,18 @@ def _balance(account: str) -> CanonicalResponse:
             exchange=name,
             account=account,
             code="ACCOUNT_NOT_FOUND",
-            message=(
-                "Unknown or incomplete Nado account. Set "
-                "NADO_<ACCOUNT>_SUBACCOUNT_OWNER (and optional "
-                "NADO_<ACCOUNT>_SUBACCOUNT_NAME, default 'default')."
-            ),
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER (optional SUBACCOUNT_NAME).",
         )
     try:
-        sub = _subaccount_bytes32(credentials["owner"], credentials["subaccount_name"])
-        payload = _gateway_query(
-            credentials,
-            {"type": "subaccount_info", "subaccount": sub},
-        )
+        sub = _sender_hex(credentials)
+        payload = _gateway_query(credentials, {"type": "subaccount_info", "subaccount": sub})
         if str(payload.get("status") or "").lower() != "success":
-            err = payload.get("error") or payload.get("error_code") or "Nado query failed"
             return make_failure(
                 operation="balance",
                 exchange=name,
                 account=credentials["account"],
                 code="NADO_ERROR",
-                message=_redact(sanitize_error_message(str(err)), credentials),
+                message=_redact(sanitize_error_message(str(payload.get("error") or payload.get("error_code"))), credentials),
             )
         data = payload.get("data")
         if not isinstance(data, Mapping):
@@ -345,28 +661,23 @@ def _balance(account: str) -> CanonicalResponse:
                 exchange=name,
                 account=credentials["account"],
                 code="SUBACCOUNT_NOT_FOUND",
-                message=(
-                    f"Nado subaccount '{credentials['subaccount_name']}' does not exist "
-                    "for this owner yet (deposit once to create it)."
-                ),
+                message="Nado subaccount does not exist yet (deposit once to create it).",
             )
         account_value, withdrawable, margin_used, unit = _balance_from_subaccount_info(data)
-        balance = normalize_balance(account_value, unit)
-        portfolio = CanonicalPortfolioSummary(
-            account_value=normalize_balance(account_value, unit).value,
-            withdrawable=normalize_balance(withdrawable, unit).value,
-            margin_used=normalize_balance(margin_used, unit).value,
-            total_position_value=normalize_balance(
-                max(account_value - withdrawable, Decimal("0")), unit
-            ).value,
-            unit=unit,
-        )
         return make_success(
             operation="balance",
             exchange=name,
             account=credentials["account"],
-            balance=balance,
-            portfolio_summary=portfolio,
+            balance=normalize_balance(account_value, unit),
+            portfolio_summary=CanonicalPortfolioSummary(
+                account_value=normalize_balance(account_value, unit).value,
+                withdrawable=normalize_balance(withdrawable, unit).value,
+                margin_used=normalize_balance(margin_used, unit).value,
+                total_position_value=normalize_balance(
+                    max(account_value - withdrawable, Decimal("0")), unit
+                ).value,
+                unit=unit,
+            ),
             data={
                 "subaccount": sub,
                 "subaccount_name": credentials["subaccount_name"],
@@ -383,6 +694,760 @@ def _balance(account: str) -> CanonicalResponse:
             code="NADO_ERROR",
             message=_redact(sanitize_error_message(str(exc)), credentials),
         )
+
+
+# ---------------------------------------------------------------------------
+# Positions + orders
+# ---------------------------------------------------------------------------
+
+
+def _normalize_positions(
+    credentials: Mapping[str, str],
+    data: Mapping[str, Any],
+) -> List[CanonicalPosition]:
+    _, by_pid = _ensure_symbols(credentials)
+    out: List[CanonicalPosition] = []
+    for row in data.get("perp_balances") or []:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            pid = int(row.get("product_id"))
+        except Exception:  # noqa: BLE001
+            continue
+        bal = row.get("balance") if isinstance(row.get("balance"), Mapping) else {}
+        amount = _x18_to_decimal(bal.get("amount"))
+        if amount == 0:
+            continue
+        side = "long" if amount > 0 else "short"
+        size = abs(amount)
+        v_quote = _x18_to_decimal(bal.get("v_quote_balance"))
+        # entry approx: -v_quote / amount for perps
+        entry = Decimal("0")
+        if amount != 0:
+            try:
+                entry = abs(v_quote / amount)
+            except Exception:  # noqa: BLE001
+                entry = Decimal("0")
+        mark = Decimal("0")
+        try:
+            mark = _oracle_price(credentials, pid)
+        except Exception:  # noqa: BLE001
+            pass
+        # rough uPnL: amount*mark + v_quote
+        pnl = amount * mark + v_quote if mark > 0 else Decimal("0")
+        meta = by_pid.get(pid) or {"symbol": str(pid), "type": "perp", "product_id": pid}
+        out.append(
+            CanonicalPosition(
+                symbol=_display_symbol(meta),
+                side=side,
+                size=_format_decimal(size),
+                entry_price=_format_decimal(entry) if entry > 0 else "0",
+                pnl=_format_decimal(pnl),
+                exchange_instrument=str(meta.get("symbol") or pid),
+            )
+        )
+    return out
+
+
+def _fetch_open_orders(
+    credentials: Mapping[str, str],
+    *,
+    product_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    sender = _sender_hex(credentials)
+    ids = sorted({int(p) for p in product_ids if int(p) >= 0})
+    if not ids:
+        return []
+    # multi-product query
+    payload = _gateway_query(
+        credentials,
+        {"type": "orders", "sender": sender, "product_ids": ids},
+    )
+    if str(payload.get("status") or "").lower() != "success":
+        # fallback per product
+        rows: List[Dict[str, Any]] = []
+        for pid in ids:
+            one = _gateway_query(
+                credentials,
+                {"type": "subaccount_orders", "sender": sender, "product_id": int(pid)},
+            )
+            if str(one.get("status") or "").lower() != "success":
+                continue
+            for o in (one.get("data") or {}).get("orders") or []:
+                if isinstance(o, Mapping):
+                    rows.append(dict(o))
+        return rows
+    data = payload.get("data")
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, Mapping):
+        # multi-product: data.product_orders = [{product_id, orders:[...]}]
+        product_orders = data.get("product_orders")
+        if isinstance(product_orders, list):
+            for block in product_orders:
+                if not isinstance(block, Mapping):
+                    continue
+                for o in block.get("orders") or []:
+                    if isinstance(o, Mapping):
+                        rows.append(dict(o))
+        elif isinstance(data.get("orders"), list):
+            for o in data["orders"]:
+                if isinstance(o, Mapping):
+                    rows.append(dict(o))
+        else:
+            for key, val in data.items():
+                if key in {"sender", "product_orders"}:
+                    continue
+                if isinstance(val, list):
+                    for o in val:
+                        if isinstance(o, Mapping):
+                            rows.append(dict(o))
+                elif isinstance(val, Mapping) and isinstance(val.get("orders"), list):
+                    for o in val["orders"]:
+                        if isinstance(o, Mapping):
+                            rows.append(dict(o))
+    elif isinstance(data, list):
+        for o in data:
+            if isinstance(o, Mapping):
+                rows.append(dict(o))
+    return rows
+
+
+def _group_open_orders(
+    credentials: Mapping[str, str],
+    order_rows: Sequence[Mapping[str, Any]],
+) -> Tuple[int, List[CanonicalOrderGroup]]:
+    _, by_pid = _ensure_symbols(credentials)
+    buckets: Dict[Tuple[str, str], List[Tuple[Decimal, Decimal, str]]] = {}
+    for row in order_rows:
+        try:
+            pid = int(row.get("product_id"))
+        except Exception:  # noqa: BLE001
+            continue
+        amt = _x18_to_decimal(row.get("unfilled_amount") or row.get("amount"))
+        if amt == 0:
+            continue
+        side = "buy" if amt > 0 else "sell"
+        size = abs(amt)
+        price = _x18_to_decimal(row.get("price_x18") or row.get("priceX18"))
+        meta = by_pid.get(pid) or {"symbol": str(pid)}
+        sym = _display_symbol(meta)
+        digest = str(row.get("digest") or "")
+        buckets.setdefault((sym, side), []).append((price, size, digest))
+    groups: List[CanonicalOrderGroup] = []
+    total = 0
+    for (sym, side), legs in sorted(buckets.items()):
+        total += len(legs)
+        sizes = [s for _, s, _ in legs]
+        prices = [p for p, _, _ in legs if p > 0]
+        notional = sum((p * s for p, s, _ in legs), Decimal("0"))
+        total_size = sum(sizes, Decimal("0"))
+        vwap = (notional / total_size) if total_size > 0 and prices else Decimal("0")
+        groups.append(
+            CanonicalOrderGroup(
+                symbol=sym,
+                side=side,
+                order_count=len(legs),
+                total_size=_format_decimal(total_size),
+                vwap=_format_decimal(vwap) if vwap > 0 else "",
+                min_price=_format_decimal(min(prices)) if prices else "",
+                max_price=_format_decimal(max(prices)) if prices else "",
+            )
+        )
+    return total, groups
+
+
+def _positions_orders(account: str) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="positions_orders",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER.",
+        )
+    try:
+        sub = _sender_hex(credentials)
+        info = _gateway_query(credentials, {"type": "subaccount_info", "subaccount": sub})
+        if str(info.get("status") or "").lower() != "success":
+            return make_failure(
+                operation="positions_orders",
+                exchange=name,
+                account=credentials["account"],
+                code="NADO_ERROR",
+                message=_redact(sanitize_error_message(str(info.get("error") or info.get("error_code"))), credentials),
+            )
+        data = info.get("data") if isinstance(info.get("data"), Mapping) else {}
+        positions = _normalize_positions(credentials, data)
+        # product ids: open perps + any with non-zero open interest in symbols? limit to positions + known recent
+        _, by_pid = _ensure_symbols(credentials)
+        pids = set()
+        for row in data.get("perp_balances") or []:
+            if isinstance(row, Mapping) and "product_id" in row:
+                try:
+                    pids.add(int(row.get("product_id")))
+                except Exception:  # noqa: BLE001
+                    pass
+        # also query top liquid perps (BTC/ETH etc) for resting orders without position
+        for key in ("BTC-PERP", "ETH-PERP", "SOL-PERP"):
+            meta = by_pid and None
+        by_symbol, _ = _ensure_symbols(credentials)
+        for key in ("BTC-PERP", "ETH-PERP", "SOL-PERP", "HYPE-PERP"):
+            if key in by_symbol:
+                pids.add(int(by_symbol[key]["product_id"]))
+        # if still empty, scan a handful of perp products
+        if not pids:
+            pids.update(list(by_pid.keys())[:20])
+        order_rows = _fetch_open_orders(credentials, product_ids=sorted(pids))
+        # expand: if we found orders on unknown pids only, fine
+        open_count, groups = _group_open_orders(credentials, order_rows)
+        return make_success(
+            operation="positions_orders",
+            exchange=name,
+            account=credentials["account"],
+            positions=positions,
+            open_order_count=open_count,
+            order_groups=groups,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="positions_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+# ---------------------------------------------------------------------------
+# New order
+# ---------------------------------------------------------------------------
+
+
+def _quantize_price_x18(price: Decimal, tick_x18: int) -> int:
+    if tick_x18 <= 0:
+        tick_x18 = 1
+    raw = _to_x18_int(price, rounding=ROUND_DOWN)
+    return (raw // tick_x18) * tick_x18
+
+
+def _quantize_size_x18(size: Decimal, step_x18: int, *, rounding=ROUND_DOWN) -> int:
+    raw = _to_x18_int(size, rounding=rounding)
+    return _round_to_step_x18(raw, step_x18, rounding=rounding)
+
+
+def _ensure_min_notional(size_x18: int, price_x18: int, min_notional_x18: int, step_x18: int) -> int:
+    """abs(amount)*price_human >= min_notional  → amount_x18 * price_x18 / 1e18 >= min_x18."""
+    if min_notional_x18 <= 0 or price_x18 <= 0:
+        return size_x18
+    # need size_x18 >= ceil(min_notional_x18 * 1e18 / price_x18)
+    need = (min_notional_x18 * X18_INT + price_x18 - 1) // price_x18
+    need = _round_to_step_x18(need, step_x18, rounding=ROUND_UP)
+    return max(size_x18, need)
+
+
+def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER and PRIVATE_KEY.",
+        )
+    try:
+        pk = _require_signer(credentials)
+    except ValueError:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_PRIVATE_KEY",
+            message="Set NADO_<ACCOUNT>_PRIVATE_KEY (owner or linked signer).",
+        )
+    side = str(request.get("side") or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_SIDE",
+            message="side must be buy or sell.",
+        )
+    try:
+        volume = Decimal(str(request.get("volume") or request.get("size") or "0"))
+        price = Decimal(str(request.get("price") or "0"))
+    except Exception:  # noqa: BLE001
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="volume and price must be numbers.",
+        )
+    if volume <= 0 or price <= 0:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="volume and price must be positive.",
+        )
+    try:
+        meta = _resolve_symbol_meta(credentials, str(request.get("symbol") or ""))
+        contracts = _ensure_contracts(credentials)
+        pid = int(meta["product_id"])
+        tick_x18 = int(meta["price_increment_x18"])
+        step_x18 = int(meta["size_increment"])
+        min_notional_x18 = int(meta["min_size"])
+        price_x18 = _quantize_price_x18(price, tick_x18)
+        size_x18 = _quantize_size_x18(volume, step_x18, rounding=ROUND_DOWN)
+        if size_x18 <= 0:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="SIZE_TOO_SMALL",
+                message=f"Size rounds to zero (step={meta['qty_step']}).",
+            )
+        size_x18 = _ensure_min_notional(size_x18, price_x18, min_notional_x18, step_x18)
+        amount_x18 = size_x18 if side == "buy" else -size_x18
+        sender = _sender_hex(credentials)
+        expiration = int(time.time()) + _ORDER_TTL_SECONDS
+        nonce = _gen_nonce()
+        appendix = _APPENDIX_DEFAULT
+        sig = _sign_place_order(
+            private_key=pk,
+            chain_id=int(contracts["chain_id"]),
+            product_id=pid,
+            sender_hex=sender,
+            price_x18=price_x18,
+            amount_x18=amount_x18,
+            expiration=expiration,
+            nonce=nonce,
+            appendix=appendix,
+        )
+        payload = _gateway_execute(
+            credentials,
+            {
+                "place_order": {
+                    "product_id": pid,
+                    "order": {
+                        "sender": sender,
+                        "priceX18": str(price_x18),
+                        "amount": str(amount_x18),
+                        "expiration": str(expiration),
+                        "nonce": str(nonce),
+                        "appendix": str(appendix),
+                    },
+                    "signature": sig,
+                }
+            },
+        )
+        if str(payload.get("status") or "").lower() != "success":
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="ORDER_REJECTED",
+                message=_redact(
+                    sanitize_error_message(str(payload.get("error") or payload.get("error_code") or "rejected")),
+                    credentials,
+                ),
+            )
+        digest = str((payload.get("data") or {}).get("digest") or "").strip() or None
+        filled = "0"
+        # verify resting or filled via open orders
+        time.sleep(0.35)
+        rows = _fetch_open_orders(credentials, product_ids=[pid])
+        resting = 0
+        for row in rows:
+            if digest and str(row.get("digest") or "") == digest:
+                resting = 1
+                break
+        status = "resting" if resting else ("submitted" if digest else "unknown")
+        submitted_vol = _format_decimal(Decimal(size_x18) / X18)
+        submitted_px = _format_decimal(Decimal(price_x18) / X18)
+        return make_success(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            order=CanonicalOrderResult(
+                symbol=_display_symbol(meta),
+                side=side,
+                order_type="limit",
+                requested_volume=_format_decimal(volume),
+                requested_price=_format_decimal(price),
+                submitted_volume=submitted_vol,
+                submitted_price=submitted_px,
+                verified=bool(digest),
+                status=status,
+                exchange_order_id=digest,
+                client_order_id=str(nonce),
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"INSTRUMENT_NOT_FOUND", "MISSING_PRIVATE_KEY"} else "INVALID_REQUEST",
+            message="Instrument not found." if code == "INSTRUMENT_NOT_FOUND" else sanitize_error_message(str(exc)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cancel
+# ---------------------------------------------------------------------------
+
+
+def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER and PRIVATE_KEY.",
+        )
+    try:
+        pk = _require_signer(credentials)
+    except ValueError:
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_PRIVATE_KEY",
+            message="Set NADO_<ACCOUNT>_PRIVATE_KEY (owner or linked signer).",
+        )
+    side = str(request.get("side") or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_SIDE",
+            message="side must be buy or sell.",
+        )
+    try:
+        meta = _resolve_symbol_meta(credentials, str(request.get("symbol") or ""))
+        pid = int(meta["product_id"])
+        rows = _fetch_open_orders(credentials, product_ids=[pid])
+        want: List[Tuple[int, str]] = []
+        for row in rows:
+            try:
+                rpid = int(row.get("product_id"))
+            except Exception:  # noqa: BLE001
+                rpid = pid
+            if rpid != pid:
+                continue
+            amt = _x18_to_decimal(row.get("unfilled_amount") or row.get("amount"))
+            if amt == 0:
+                continue
+            rside = "buy" if amt > 0 else "sell"
+            if rside != side:
+                continue
+            digest = str(row.get("digest") or "").strip()
+            if digest:
+                want.append((rpid, digest))
+        if not want:
+            return make_success(
+                operation="cancel_order_group",
+                exchange=name,
+                account=credentials["account"],
+                cancel_group=CanonicalCancelGroupResult(
+                    symbol=_display_symbol(meta),
+                    side=side,
+                    targeted_order_count=0,
+                    cancelled_order_count=0,
+                    confirmed_absent_count=0,
+                    remaining_target_count=0,
+                    verified=True,
+                    status="noop",
+                ),
+            )
+        contracts = _ensure_contracts(credentials)
+        sender = _sender_hex(credentials)
+        cancelled = 0
+        batch = 20
+        batch_count = 0
+        for i in range(0, len(want), batch):
+            chunk = want[i : i + batch]
+            product_ids = [p for p, _ in chunk]
+            digests = [d for _, d in chunk]
+            nonce = _gen_nonce()
+            sig = _sign_cancel_orders(
+                private_key=pk,
+                chain_id=int(contracts["chain_id"]),
+                endpoint_addr=str(contracts["endpoint_addr"]),
+                sender_hex=sender,
+                product_ids=product_ids,
+                digests=digests,
+                nonce=nonce,
+            )
+            payload = _gateway_execute(
+                credentials,
+                {
+                    "cancel_orders": {
+                        "tx": {
+                            "sender": sender,
+                            "productIds": product_ids,
+                            "digests": digests,
+                            "nonce": str(nonce),
+                        },
+                        "signature": sig,
+                    }
+                },
+            )
+            batch_count += 1
+            if str(payload.get("status") or "").lower() != "success":
+                return make_failure(
+                    operation="cancel_order_group",
+                    exchange=name,
+                    account=credentials["account"],
+                    code="CANCEL_FAILED",
+                    message=_redact(
+                        sanitize_error_message(
+                            str(payload.get("error") or payload.get("error_code") or "cancel failed")
+                        ),
+                        credentials,
+                    ),
+                    cancel_group=CanonicalCancelGroupResult(
+                        symbol=_display_symbol(meta),
+                        side=side,
+                        targeted_order_count=len(want),
+                        cancelled_order_count=cancelled,
+                        confirmed_absent_count=cancelled,
+                        remaining_target_count=max(len(want) - cancelled, 0),
+                        verified=False,
+                        partial=cancelled > 0,
+                        status="failed",
+                        batch_count=batch_count,
+                        requested_cancel_count=len(want),
+                        verified_cancel_count=cancelled,
+                        exchange_reason=_redact(
+                            sanitize_error_message(str(payload.get("error") or "")),
+                            credentials,
+                        ),
+                    ),
+                )
+            cancelled += len((payload.get("data") or {}).get("cancelled_orders") or chunk)
+            time.sleep(0.05)
+        time.sleep(0.3)
+        left = _fetch_open_orders(credentials, product_ids=[pid])
+        remaining = 0
+        for row in left:
+            amt = _x18_to_decimal(row.get("unfilled_amount") or row.get("amount"))
+            if amt == 0:
+                continue
+            rside = "buy" if amt > 0 else "sell"
+            if rside == side:
+                remaining += 1
+        verified = remaining == 0
+        return make_success(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            cancel_group=CanonicalCancelGroupResult(
+                symbol=_display_symbol(meta),
+                side=side,
+                targeted_order_count=len(want),
+                cancelled_order_count=cancelled,
+                confirmed_absent_count=len(want) - remaining,
+                remaining_target_count=remaining,
+                verified=verified,
+                partial=remaining > 0 and cancelled > 0,
+                status="success" if verified else "partial",
+                batch_count=batch_count,
+                requested_cancel_count=len(want),
+                verified_cancel_count=len(want) - remaining,
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"INSTRUMENT_NOT_FOUND", "MISSING_PRIVATE_KEY"} else "INVALID_REQUEST",
+            message="Instrument not found." if code == "INSTRUMENT_NOT_FOUND" else sanitize_error_message(str(exc)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Instruments / market price
+# ---------------------------------------------------------------------------
+
+
+def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER.",
+        )
+    try:
+        meta = _resolve_symbol_meta(credentials, str(request.get("symbol") or request.get("query") or ""))
+        requested = str(request.get("symbol") or request.get("query") or "")
+        disp = _display_symbol(meta)
+        inst = CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=str(meta.get("symbol") or disp),
+            display_name=disp,
+            price_increment=_format_decimal(meta["tick_size"]),
+            size_increment=_format_decimal(meta["qty_step"]),
+            minimum_size=_format_decimal(meta["qty_step"]),
+        )
+        return make_success(
+            operation="resolve_instrument",
+            exchange=name,
+            account=credentials["account"],
+            instrument=inst,
+        )
+    except ValueError:
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_NOT_FOUND",
+            message="Instrument not found on Nado.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+def _list_instruments(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER.",
+        )
+    try:
+        by_symbol, _ = _ensure_symbols(credentials)
+        q = str(request.get("query") or request.get("symbol") or "").strip().upper()
+        out: List[CanonicalInstrument] = []
+        seen = set()
+        for key, meta in sorted(by_symbol.items()):
+            if meta.get("type") != "perp":
+                continue
+            # only native SYMBOL-PERP keys
+            if not str(meta.get("symbol") or "").endswith("-PERP"):
+                continue
+            if key != str(meta.get("symbol") or "").upper():
+                continue
+            if q and q not in key and q not in _display_symbol(meta).upper():
+                continue
+            disp = _display_symbol(meta)
+            if disp in seen:
+                continue
+            seen.add(disp)
+            out.append(
+                CanonicalInstrument(
+                    requested_symbol=disp,
+                    symbol=str(meta.get("symbol")),
+                    display_name=disp,
+                    price_increment=_format_decimal(meta["tick_size"]),
+                    size_increment=_format_decimal(meta["qty_step"]),
+                    minimum_size=_format_decimal(meta["qty_step"]),
+                )
+            )
+            if len(out) >= 50:
+                break
+        return make_success(
+            operation="list_instruments",
+            exchange=name,
+            account=credentials["account"],
+            instruments=out,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="list_instruments",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+def _market_price(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER.",
+        )
+    try:
+        meta = _resolve_symbol_meta(credentials, str(request.get("symbol") or ""))
+        requested = str(request.get("symbol") or "")
+        mark = _oracle_price(credentials, int(meta["product_id"]))
+        return make_success(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            market_price=CanonicalMarketPrice(
+                requested_symbol=requested,
+                market=str(meta.get("symbol") or _display_symbol(meta)),
+                mark_price=_format_decimal(mark),
+                oracle_price=_format_decimal(mark),
+                price=_format_decimal(mark),
+            ),
+        )
+    except ValueError:
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_NOT_FOUND",
+            message="Instrument not found on Nado.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="market_price",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+# ---------------------------------------------------------------------------
+# execute
+# ---------------------------------------------------------------------------
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
@@ -415,6 +1480,18 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
     try:
         if operation == "balance":
             return _balance(account)
+        if operation in {"positions_orders", "positions_management"}:
+            return _positions_orders(account)
+        if operation == "new_order":
+            return _new_order(account, request)
+        if operation == "cancel_order_group":
+            return _cancel_order_group(account, request)
+        if operation == "resolve_instrument":
+            return _resolve_instrument(account, request)
+        if operation == "list_instruments":
+            return _list_instruments(account, request)
+        if operation == "market_price":
+            return _market_price(account, request)
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation=operation,
