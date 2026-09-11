@@ -54,6 +54,7 @@ SHARED_AGENT_NAMES = [
     "x_lighter_agent.py",
     "x_ondoperps_agent.py",
     "x_pacifica_agent.py",
+    "x_phemex_agent.py",
     "x_raydium_agent.py",
     "x_rise_agent.py",
 ]

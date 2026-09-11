@@ -183,7 +183,7 @@ class CleanFiboInstallTests(unittest.TestCase):
         for p in shared:
             self.assertTrue(p.is_file(), f"shared file missing: {p}")
         self.assertTrue(agents_dir.is_dir(), f"agents/ missing: {agents_dir}")
-        # At least the 10 known agents are installed.
+        # At least the known shared agents are installed.
         for agent in (
             "x_apex_agent.py",
             "x_arcus_agent.py",
@@ -193,6 +193,7 @@ class CleanFiboInstallTests(unittest.TestCase):
             "x_lighter_agent.py",
             "x_ondoperps_agent.py",
             "x_pacifica_agent.py",
+            "x_phemex_agent.py",
             "x_raydium_agent.py",
             "x_rise_agent.py",
         ):
