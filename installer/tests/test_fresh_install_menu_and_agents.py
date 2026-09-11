@@ -142,7 +142,7 @@ class FullAgentPayloadTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_expected_agent_set_is_complete(self):
-        # Contract: main ships these 11 agents via SHARED_REL_PATHS.
+        # Contract: main ships these 12 agents via SHARED_REL_PATHS.
         self.assertEqual(
             EXPECTED_AGENTS,
             [
@@ -152,6 +152,7 @@ class FullAgentPayloadTests(unittest.TestCase):
                 "x_hibachi_agent.py",
                 "x_hyperliquid_agent.py",
                 "x_lighter_agent.py",
+                "x_nado_agent.py",
                 "x_ondoperps_agent.py",
                 "x_pacifica_agent.py",
                 "x_phemex_agent.py",
