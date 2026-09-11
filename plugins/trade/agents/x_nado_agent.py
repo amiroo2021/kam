@@ -15,6 +15,7 @@ Operations:
   - balance
   - positions_orders / positions_management
   - new_order (limit)
+  - ladder (uniform / half_gaussian child limits)
   - cancel_order_group
   - resolve_instrument / list_instruments / market_price
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -42,6 +44,7 @@ from eth_account.messages import encode_typed_data
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalLadderResult,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -67,6 +70,8 @@ X18_INT = 10**18
 _NONCE_RECV_AHEAD_MS = 50_000
 _ORDER_TTL_SECONDS = 7 * 24 * 3600
 _APPENDIX_DEFAULT = 1  # protocol version 1, default limit
+LADDER_ABSOLUTE_MAX_ORDERS = 50
+LADDER_CHILD_PAUSE_SECONDS = 0.12
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _OWNER_ALIASES = ("SUBACCOUNT_OWNER", "OWNER", "ADDRESS", "WALLET")
@@ -181,6 +186,7 @@ def capabilities() -> List[str]:
         "positions_orders",
         "positions_management",
         "new_order",
+        "ladder",
         "cancel_order_group",
         "resolve_instrument",
         "list_instruments",
@@ -1111,6 +1117,409 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
 # ---------------------------------------------------------------------------
 
 
+def _ladder_prices(start: Decimal, end: Decimal, count: int, tick: Decimal) -> List[Decimal]:
+    if count <= 0:
+        return []
+    if count == 1:
+        raw = [start]
+    else:
+        raw = [start + (end - start) * Decimal(i) / Decimal(count - 1) for i in range(count)]
+    out: List[Decimal] = []
+    for value in raw:
+        # quantize via ROUND_HALF_UP on tick grid
+        if tick <= 0:
+            out.append(value)
+            continue
+        units = (value / tick).to_integral_value(rounding=ROUND_HALF_UP)
+        out.append(units * tick)
+    return out
+
+
+def _ladder_sizes(
+    total: Decimal,
+    count: int,
+    increment: Decimal,
+    distribution: str,
+    min_size: Decimal = Decimal("0"),
+) -> List[Decimal]:
+    key = str(distribution or "").strip().lower().replace(" ", "_")
+    if key == "uniform":
+        weights = [Decimal(1)] * count
+    elif key == "half_gaussian":
+        if count == 1:
+            weights = [Decimal(1)]
+        else:
+            span = Decimal(count - 1)
+            weights = [
+                Decimal(
+                    str(
+                        math.exp(
+                            -(float(Decimal("3") * (span - Decimal(i)) / span) ** 2) / 2
+                        )
+                    )
+                )
+                for i in range(count)
+            ]
+    else:
+        raise ValueError(f"Unsupported ladder distribution: {distribution}")
+    if increment <= 0:
+        raise ValueError("Invalid size increment")
+    minimum_units = (
+        int((min_size / increment).to_integral_value(rounding=ROUND_UP)) if min_size > 0 else 0
+    )
+    total_units = int((total / increment).to_integral_value(rounding=ROUND_DOWN))
+    if total_units <= 0:
+        raise ValueError("Total volume rounds to zero at the size step")
+    if total_units < minimum_units * count:
+        raise ValueError("Total volume is too small for the exchange minimum on every ladder child")
+    distributable = total_units - minimum_units * count
+    weight_sum = sum(weights)
+    raw = [Decimal(distributable) * w / weight_sum for w in weights]
+    allocated = [minimum_units + int(x) for x in raw]
+    residual = total_units - sum(allocated)
+    remainders = [raw[i] - int(raw[i]) for i in range(count)]
+    order = sorted(range(count), key=lambda i: (remainders[i], -i), reverse=True)
+    for i in order[: max(residual, 0)]:
+        allocated[i] += 1
+    return [Decimal(x) * increment for x in allocated]
+
+
+def _place_limit_child(
+    credentials: Mapping[str, str],
+    *,
+    private_key: str,
+    contracts: Mapping[str, Any],
+    meta: Mapping[str, Any],
+    side: str,
+    price: Decimal,
+    size: Decimal,
+) -> Dict[str, Any]:
+    """Place one ladder child; returns ok/digest/error/price/size."""
+    pid = int(meta["product_id"])
+    tick_x18 = int(meta["price_increment_x18"])
+    step_x18 = int(meta["size_increment"])
+    min_notional_x18 = int(meta["min_size"])
+    price_x18 = _quantize_price_x18(price, tick_x18)
+    size_x18 = _quantize_size_x18(size, step_x18, rounding=ROUND_DOWN)
+    if size_x18 <= 0 or price_x18 <= 0:
+        return {
+            "ok": False,
+            "digest": None,
+            "error": "rounded_to_zero",
+            "price": Decimal(price_x18) / X18 if price_x18 else Decimal("0"),
+            "size": Decimal("0"),
+        }
+    # Check min notional without auto-bump (ladder budget is fixed).
+    notional_x18 = (size_x18 * price_x18) // X18_INT
+    if min_notional_x18 > 0 and notional_x18 < min_notional_x18:
+        return {
+            "ok": False,
+            "digest": None,
+            "error": "below_min_notional",
+            "price": Decimal(price_x18) / X18,
+            "size": Decimal(size_x18) / X18,
+        }
+    amount_x18 = size_x18 if side == "buy" else -size_x18
+    sender = _sender_hex(credentials)
+    expiration = int(time.time()) + _ORDER_TTL_SECONDS
+    nonce = _gen_nonce()
+    appendix = _APPENDIX_DEFAULT
+    try:
+        sig = _sign_place_order(
+            private_key=private_key,
+            chain_id=int(contracts["chain_id"]),
+            product_id=pid,
+            sender_hex=sender,
+            price_x18=price_x18,
+            amount_x18=amount_x18,
+            expiration=expiration,
+            nonce=nonce,
+            appendix=appendix,
+        )
+        payload = _gateway_execute(
+            credentials,
+            {
+                "place_order": {
+                    "product_id": pid,
+                    "order": {
+                        "sender": sender,
+                        "priceX18": str(price_x18),
+                        "amount": str(amount_x18),
+                        "expiration": str(expiration),
+                        "nonce": str(nonce),
+                        "appendix": str(appendix),
+                    },
+                    "signature": sig,
+                }
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "digest": None,
+            "error": str(exc),
+            "price": Decimal(price_x18) / X18,
+            "size": Decimal(size_x18) / X18,
+        }
+    if str(payload.get("status") or "").lower() != "success":
+        return {
+            "ok": False,
+            "digest": None,
+            "error": str(payload.get("error") or payload.get("error_code") or "rejected"),
+            "price": Decimal(price_x18) / X18,
+            "size": Decimal(size_x18) / X18,
+        }
+    digest = str((payload.get("data") or {}).get("digest") or "").strip() or None
+    return {
+        "ok": bool(digest),
+        "digest": digest,
+        "error": None if digest else "missing_digest",
+        "price": Decimal(price_x18) / X18,
+        "size": Decimal(size_x18) / X18,
+        "nonce": nonce,
+    }
+
+
+def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER and PRIVATE_KEY.",
+        )
+    try:
+        pk = _require_signer(credentials)
+    except ValueError:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_PRIVATE_KEY",
+            message="Set NADO_<ACCOUNT>_PRIVATE_KEY (owner or linked signer).",
+        )
+    requested_symbol = str(request.get("symbol") or "").strip()
+    side_in = str(request.get("side") or "").strip().lower()
+    distribution = str(request.get("distribution") or "uniform").strip().lower().replace(" ", "_")
+    try:
+        count = int(str(request.get("order_count") or "0").strip())
+        total = Decimal(str(request.get("total_volume") or "0").strip())
+        start = Decimal(str(request.get("start_price") or "0").strip())
+        end = Decimal(str(request.get("end_price") or "0").strip())
+    except Exception:  # noqa: BLE001
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="order_count, total_volume, start_price and end_price are required numbers.",
+        )
+    if side_in not in {"buy", "sell"}:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_SIDE",
+            message="Side must be buy or sell.",
+        )
+    if count < 1:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="order_count must be >= 1.",
+        )
+    if count > LADDER_ABSOLUTE_MAX_ORDERS:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message=f"order_count exceeds safety cap ({LADDER_ABSOLUTE_MAX_ORDERS}).",
+        )
+    if total <= 0 or start <= 0 or end <= 0:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="total_volume, start_price and end_price must be positive.",
+        )
+    if side_in == "buy" and not (end < start):
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="For a BUY ladder, end_price must be lower than start_price.",
+        )
+    if side_in == "sell" and not (end > start):
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="For a SELL ladder, end_price must be higher than start_price.",
+        )
+    if distribution not in {"uniform", "half_gaussian"}:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_REQUEST",
+            message="distribution must be uniform or half_gaussian.",
+        )
+    try:
+        meta = _resolve_symbol_meta(credentials, requested_symbol)
+        contracts = _ensure_contracts(credentials)
+        tick = meta["tick_size"] if meta.get("tick_size") and meta["tick_size"] > 0 else Decimal("1")
+        step = meta["qty_step"] if meta.get("qty_step") and meta["qty_step"] > 0 else Decimal("0.0001")
+        prices = _ladder_prices(start, end, count, tick)
+        # Nado min_size is notional (USDT0). Worst (lowest) price needs the largest coin size.
+        min_notional = meta.get("min_notional") or Decimal("0")
+        worst_price = min(prices) if prices else min(start, end)
+        min_coin = Decimal("0")
+        if min_notional > 0 and worst_price > 0:
+            min_coin = (min_notional / worst_price).quantize(step, rounding=ROUND_UP)
+            if min_coin < step:
+                min_coin = step
+        sizes = _ladder_sizes(total, count, step, distribution, min_coin)
+
+        submitted_children: List[Dict[str, Any]] = []
+        batches: List[Dict[str, Any]] = []
+        omitted_below_minimum = 0
+        first_error: Optional[str] = None
+        rate_limited = False
+
+        for idx, (price, size) in enumerate(zip(prices, sizes)):
+            child = _place_limit_child(
+                credentials,
+                private_key=pk,
+                contracts=contracts,
+                meta=meta,
+                side=side_in,
+                price=price,
+                size=size,
+            )
+            batches.append(
+                {
+                    "index": idx,
+                    "price": _format_decimal(child.get("price") or price),
+                    "size": _format_decimal(child.get("size") or size),
+                    "ok": bool(child.get("ok")),
+                    "order_id": child.get("digest"),
+                    "error": child.get("error"),
+                }
+            )
+            if child.get("ok") and child.get("digest"):
+                submitted_children.append(
+                    {
+                        "order_id": child["digest"],
+                        "price": child["price"],
+                        "size": child["size"],
+                    }
+                )
+            else:
+                err = str(child.get("error") or "failed")
+                if err in {"below_min_notional", "rounded_to_zero", "below_min_qty"}:
+                    omitted_below_minimum += 1
+                if "rate" in err.lower() or "23000" in err:
+                    rate_limited = True
+                if first_error is None:
+                    first_error = err
+            if idx + 1 < count:
+                time.sleep(LADDER_CHILD_PAUSE_SECONDS)
+
+        ids = [str(c["order_id"]) for c in submitted_children]
+        submitted_volume = sum((Decimal(str(c["size"])) for c in submitted_children), Decimal("0"))
+
+        verified = False
+        if ids:
+            try:
+                time.sleep(0.4)
+                live = _fetch_open_orders(credentials, product_ids=[int(meta["product_id"])])
+                live_ids = {str(r.get("digest") or "").strip() for r in live}
+                verified = all(oid in live_ids for oid in ids)
+            except Exception:  # noqa: BLE001
+                verified = len(ids) == count
+
+        partial = (len(ids) != count) or (not verified and bool(ids))
+        result = CanonicalLadderResult(
+            symbol=_display_symbol(meta),
+            side=side_in,
+            distribution=distribution,
+            requested_order_count=count,
+            submitted_order_count=len(ids),
+            requested_volume=_format_decimal(total),
+            submitted_volume=_format_decimal(submitted_volume),
+            batch_count=len(batches),
+            verified=verified and len(ids) == count,
+            partial=partial,
+            status=(
+                "success"
+                if (verified and len(ids) == count)
+                else ("partial" if ids else "failed")
+            ),
+            accepted_child_count=len(ids),
+            omitted_order_count=count - len(ids),
+            omitted_below_minimum=omitted_below_minimum or None,
+            child_order_ids=list(ids),
+            batches=batches,
+            rate_limited=rate_limited or None,
+            exchange_reason=(
+                _redact(first_error, credentials)
+                if first_error and (not ids or partial)
+                else None
+            ),
+        )
+        if result.verified:
+            return make_success(
+                operation="ladder",
+                exchange=name,
+                account=credentials["account"],
+                ladder=result,
+            )
+        if ids:
+            return make_success(
+                operation="ladder",
+                exchange=name,
+                account=credentials["account"],
+                ladder=result,
+            )
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="LADDER_FAILED",
+            message=_redact(
+                sanitize_error_message(first_error or "No ladder children accepted."),
+                credentials,
+            ),
+            ladder=result,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        code = "INSTRUMENT_NOT_FOUND" if msg == "INSTRUMENT_NOT_FOUND" else "INVALID_REQUEST"
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code=code,
+            message=sanitize_error_message(msg),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
 def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -1484,6 +1893,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _positions_orders(account)
         if operation == "new_order":
             return _new_order(account, request)
+        if operation == "ladder":
+            return _ladder(account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(account, request)
         if operation == "resolve_instrument":
