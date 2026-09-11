@@ -419,6 +419,8 @@ class TradeWizard:
             return self._handle_ladder_side(chat_key, suffix)
         if state.state == "ladder_confirm":
             return self._handle_ladder_confirm(chat_key, suffix)
+        if state.state == "ladder_result":
+            return self._handle_ladder_result(chat_key, suffix)
         if state.state == "cancel_orders":
             return self._handle_cancel_orders(chat_key, suffix)
         if state.state == "cancel_group_confirm":
@@ -784,7 +786,7 @@ class TradeWizard:
     # Matching still requires the venue catalog to contain the market —
     # these never invent an instrument id.
     _CONCEPT_GROUPS: Tuple[frozenset, ...] = (
-        frozenset({"GOLD", "XAU", "XAUUSD", "XAUUSDT"}),
+        frozenset({"GOLD", "XAU", "XAUUSD", "XAUUSDT", "XAUUST"}),
         frozenset({"SILVER", "XAG", "XAGUSD", "XAGUSDT"}),
         frozenset({"OIL", "WTI", "BRENT", "CRUDE", "CL", "OILUSD", "CRUDEOIL"}),
         frozenset({"NATGAS", "NG", "GAS", "HENRY", "NATGASUSD"}),
@@ -2167,6 +2169,18 @@ class TradeWizard:
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
             state="ladder_result",
         )
+
+    def _handle_ladder_result(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        """Back from ladder result goes to the account action menu (not full restart)."""
+        if suffix == "back":
+            state = self._state_for(chat_key)
+            state.ladder.clear()
+            state.flow = None
+            return self._render_action(chat_key)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        return self._render_action(chat_key)
 
     def _render_cancel_orders(self, chat_key: Tuple[Any, ...], refresh: bool) -> Screen:
         state = self._state_for(chat_key)

@@ -38,7 +38,7 @@ class NadoAgentTests(unittest.TestCase):
 
     def test_capabilities_include_write_ops(self) -> None:
         caps = nado.capabilities()
-        for op in ("balance", "positions_orders", "new_order", "ladder", "cancel_order_group"):
+        for op in ("balance", "positions_orders", "new_order", "ladder", "cancel_order_group", "set_tp", "set_sl", "close_position"):
             self.assertIn(op, caps)
 
     def test_ladder_math(self) -> None:
@@ -129,7 +129,7 @@ class NadoAgentTests(unittest.TestCase):
     def test_not_implemented(self) -> None:
         os.environ["NADO_BITGET_SUBACCOUNT_OWNER"] = "0x" + "ab" * 20
         resp = nado.execute(
-            {"operation": "set_tp", "exchange": "nado", "account": "bitget"}
+            {"operation": "transfer", "exchange": "nado", "account": "bitget"}
         )
         self.assertFalse(resp.success)
         assert resp.error is not None

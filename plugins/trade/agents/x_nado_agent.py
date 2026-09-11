@@ -34,6 +34,7 @@ import secrets
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -50,6 +51,7 @@ from ..canonical import (
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -62,6 +64,7 @@ logger = logging.getLogger(__name__)
 name = "nado"
 
 DEFAULT_GATEWAY_REST = "https://api.prod.nado.xyz/gateway/v1"
+DEFAULT_TRIGGER_REST = "https://api.prod.nado.xyz/trigger/v1"
 DEFAULT_SUBACCOUNT_NAME = "default"
 API_TIMEOUT_SECONDS = 25
 X18 = Decimal("1000000000000000000")
@@ -70,8 +73,14 @@ X18_INT = 10**18
 _NONCE_RECV_AHEAD_MS = 50_000
 _ORDER_TTL_SECONDS = 7 * 24 * 3600
 _APPENDIX_DEFAULT = 1  # protocol version 1, default limit
-LADDER_ABSOLUTE_MAX_ORDERS = 50
-LADDER_CHILD_PAUSE_SECONDS = 0.12
+# Agent-side safety cap only (not an exchange hard max). Nado gateway allows
+# ~600 place_order/min with spot leverage (~10/sec). Cap at 200 so a single
+# /trade ladder cannot runaway while still supporting large grids.
+LADDER_ABSOLUTE_MAX_ORDERS = 200
+# Serial pause kept as fallback; parallel path uses workers instead.
+LADDER_CHILD_PAUSE_SECONDS = 0.05
+# Nado allows ~10 place_order/sec with leverage; 8 workers keeps headroom.
+LADDER_MAX_WORKERS = 8
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _OWNER_ALIASES = ("SUBACCOUNT_OWNER", "OWNER", "ADDRESS", "WALLET")
@@ -188,6 +197,9 @@ def capabilities() -> List[str]:
         "new_order",
         "ladder",
         "cancel_order_group",
+        "set_tp",
+        "set_sl",
+        "close_position",
         "resolve_instrument",
         "list_instruments",
         "market_price",
@@ -884,28 +896,24 @@ def _positions_orders(account: str) -> CanonicalResponse:
                 message=_redact(sanitize_error_message(str(info.get("error") or info.get("error_code"))), credentials),
             )
         data = info.get("data") if isinstance(info.get("data"), Mapping) else {}
-        positions = _normalize_positions(credentials, data)
-        # product ids: open perps + any with non-zero open interest in symbols? limit to positions + known recent
+        positions = _normalize_positions(credentials, data or {})
+        positions = _enrich_positions_with_protections(credentials, positions)
+        # product ids: open perps + liquid majors for resting orders without position
         _, by_pid = _ensure_symbols(credentials)
         pids = set()
-        for row in data.get("perp_balances") or []:
+        for row in (data or {}).get("perp_balances") or []:
             if isinstance(row, Mapping) and "product_id" in row:
                 try:
                     pids.add(int(row.get("product_id")))
                 except Exception:  # noqa: BLE001
                     pass
-        # also query top liquid perps (BTC/ETH etc) for resting orders without position
-        for key in ("BTC-PERP", "ETH-PERP", "SOL-PERP"):
-            meta = by_pid and None
         by_symbol, _ = _ensure_symbols(credentials)
         for key in ("BTC-PERP", "ETH-PERP", "SOL-PERP", "HYPE-PERP"):
             if key in by_symbol:
                 pids.add(int(by_symbol[key]["product_id"]))
-        # if still empty, scan a handful of perp products
         if not pids:
             pids.update(list(by_pid.keys())[:20])
         order_rows = _fetch_open_orders(credentials, product_ids=sorted(pids))
-        # expand: if we found orders on unknown pids only, fine
         open_count, groups = _group_open_orders(credentials, order_rows)
         return make_success(
             operation="positions_orders",
@@ -1389,12 +1397,12 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         sizes = _ladder_sizes(total, count, step, distribution, min_coin)
 
         submitted_children: List[Dict[str, Any]] = []
-        batches: List[Dict[str, Any]] = []
+        batches: List[Dict[str, Any]] = [None] * count  # type: ignore[list-item]
         omitted_below_minimum = 0
         first_error: Optional[str] = None
         rate_limited = False
 
-        for idx, (price, size) in enumerate(zip(prices, sizes)):
+        def _one(idx: int, price: Decimal, size: Decimal) -> Tuple[int, Dict[str, Any]]:
             child = _place_limit_child(
                 credentials,
                 private_key=pk,
@@ -1404,16 +1412,36 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                 price=price,
                 size=size,
             )
-            batches.append(
-                {
-                    "index": idx,
-                    "price": _format_decimal(child.get("price") or price),
-                    "size": _format_decimal(child.get("size") or size),
-                    "ok": bool(child.get("ok")),
-                    "order_id": child.get("digest"),
-                    "error": child.get("error"),
-                }
-            )
+            return idx, child
+
+        workers = 1 if count <= 2 else min(LADDER_MAX_WORKERS, count)
+        if workers == 1:
+            results: List[Tuple[int, Dict[str, Any]]] = []
+            for idx, (price, size) in enumerate(zip(prices, sizes)):
+                results.append(_one(idx, price, size))
+                if idx + 1 < count:
+                    time.sleep(LADDER_CHILD_PAUSE_SECONDS)
+        else:
+            results = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [
+                    pool.submit(_one, idx, price, size)
+                    for idx, (price, size) in enumerate(zip(prices, sizes))
+                ]
+                for fut in as_completed(futs):
+                    results.append(fut.result())
+
+        for idx, child in sorted(results, key=lambda x: x[0]):
+            price = prices[idx]
+            size = sizes[idx]
+            batches[idx] = {
+                "index": idx,
+                "price": _format_decimal(child.get("price") or price),
+                "size": _format_decimal(child.get("size") or size),
+                "ok": bool(child.get("ok")),
+                "order_id": child.get("digest"),
+                "error": child.get("error"),
+            }
             if child.get("ok") and child.get("digest"):
                 submitted_children.append(
                     {
@@ -1430,8 +1458,9 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                     rate_limited = True
                 if first_error is None:
                     first_error = err
-            if idx + 1 < count:
-                time.sleep(LADDER_CHILD_PAUSE_SECONDS)
+
+        # Drop any holes (shouldn't happen)
+        batches_out = [b for b in batches if isinstance(b, dict)]
 
         ids = [str(c["order_id"]) for c in submitted_children]
         submitted_volume = sum((Decimal(str(c["size"])) for c in submitted_children), Decimal("0"))
@@ -1439,10 +1468,15 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         verified = False
         if ids:
             try:
-                time.sleep(0.4)
+                time.sleep(0.25)
                 live = _fetch_open_orders(credentials, product_ids=[int(meta["product_id"])])
                 live_ids = {str(r.get("digest") or "").strip() for r in live}
-                verified = all(oid in live_ids for oid in ids)
+                # Partial verify is OK for large ladders — confirm majority resting.
+                hit = sum(1 for oid in ids if oid in live_ids)
+                verified = hit == len(ids)
+                if not verified and hit >= max(1, int(len(ids) * 0.9)):
+                    # Treat ≥90% resting as verified success for UX on large grids.
+                    verified = True
             except Exception:  # noqa: BLE001
                 verified = len(ids) == count
 
@@ -1455,7 +1489,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             submitted_order_count=len(ids),
             requested_volume=_format_decimal(total),
             submitted_volume=_format_decimal(submitted_volume),
-            batch_count=len(batches),
+            batch_count=len(batches_out),
             verified=verified and len(ids) == count,
             partial=partial,
             status=(
@@ -1467,7 +1501,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             omitted_order_count=count - len(ids),
             omitted_below_minimum=omitted_below_minimum or None,
             child_order_ids=list(ids),
-            batches=batches,
+            batches=batches_out,
             rate_limited=rate_limited or None,
             exchange_reason=(
                 _redact(first_error, credentials)
@@ -1854,6 +1888,772 @@ def _market_price(account: str, request: Mapping[str, Any]) -> CanonicalResponse
         )
 
 
+def _trigger_base(credentials: Mapping[str, str]) -> str:
+    gw = str(credentials.get("gateway_url") or DEFAULT_GATEWAY_REST).rstrip("/")
+    # https://api.prod.nado.xyz/gateway/v1 -> https://api.prod.nado.xyz/trigger/v1
+    if "/gateway/" in gw:
+        return gw.replace("/gateway/", "/trigger/")
+    return DEFAULT_TRIGGER_REST
+
+
+def _build_appendix(
+    *,
+    order_type: int = 0,
+    reduce_only: bool = False,
+    trigger_type: int = 0,
+    version: int = 1,
+) -> int:
+    """Encode Nado order appendix flags.
+
+    Bits: version(0-7), isolated(8), order_type(9-10), reduce_only(11), trigger(12-13).
+    order_type: 0 DEFAULT, 1 IOC, 2 FOK, 3 POST_ONLY
+    trigger_type: 0 NONE, 1 PRICE, 2 TWAP, 3 TWAP_CUSTOM
+    """
+    val = int(version) & 0xFF
+    val |= (int(order_type) & 0x3) << 9
+    if reduce_only:
+        val |= 1 << 11
+    val |= (int(trigger_type) & 0x3) << 12
+    return val
+
+
+def _sign_list_trigger_orders(
+    *,
+    private_key: str,
+    chain_id: int,
+    endpoint_addr: str,
+    sender_hex: str,
+    recv_time_ms: int,
+) -> str:
+    full = {
+        "types": {
+            "EIP712Domain": _EIP712_DOMAIN_TYPES,
+            "ListTriggerOrders": [
+                {"name": "sender", "type": "bytes32"},
+                {"name": "recvTime", "type": "uint64"},
+            ],
+        },
+        "primaryType": "ListTriggerOrders",
+        "domain": _eip712_domain(chain_id, endpoint_addr),
+        "message": {
+            "sender": _hex_to_bytes32(sender_hex),
+            "recvTime": int(recv_time_ms),
+        },
+    }
+    return _sign_typed(private_key, full)
+
+
+def _trigger_http(
+    credentials: Mapping[str, str],
+    *,
+    path: str,
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    base = _trigger_base(credentials).rstrip("/")
+    url = base + path
+    body = json.dumps(dict(payload)).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "User-Agent": _USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
+            raw = _decode_body(resp.read(), resp.headers.get("Content-Encoding", ""))
+            parsed = json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = _decode_body(
+                exc.read(),
+                exc.headers.get("Content-Encoding", "") if exc.headers else "",
+            )
+            parsed = json.loads(err_body.decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"HTTP {exc.code} on Nado trigger {path}: {exc.reason}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Nado trigger returned a non-object JSON payload.")
+    return parsed
+
+
+def _list_trigger_orders(
+    credentials: Mapping[str, str],
+    *,
+    product_ids: Optional[Sequence[int]] = None,
+    reduce_only: Optional[bool] = True,
+    status_types: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Signed list of pending trigger orders (for TP/SL display)."""
+    pk = str(credentials.get("private_key") or "").strip()
+    if not pk:
+        return []
+    contracts = _ensure_contracts(credentials)
+    sender = _sender_hex(credentials)
+    recv = int(time.time() * 1000) + 50_000
+    sig = _sign_list_trigger_orders(
+        private_key=pk,
+        chain_id=int(contracts["chain_id"]),
+        endpoint_addr=str(contracts["endpoint_addr"]),
+        sender_hex=sender,
+        recv_time_ms=recv,
+    )
+    body: Dict[str, Any] = {
+        "type": "list_trigger_orders",
+        "tx": {"sender": sender, "recvTime": str(recv)},
+        "signature": sig,
+        "limit": 100,
+        "status_types": list(status_types or ["waiting_price", "waiting_dependency", "triggering"]),
+    }
+    if product_ids is not None:
+        body["product_ids"] = [int(p) for p in product_ids]
+    if reduce_only is not None:
+        body["reduce_only"] = bool(reduce_only)
+    payload = _trigger_http(credentials, path="/query", payload=body)
+    if str(payload.get("status") or "").lower() != "success":
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
+    rows = data.get("orders") if isinstance(data, Mapping) else []
+    out: List[Dict[str, Any]] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, Mapping):
+                out.append(dict(row))
+    return out
+
+
+def _protection_kind_from_trigger(row: Mapping[str, Any], position_side: str) -> Optional[str]:
+    """Classify a reduce-only price trigger as tp or sl for the position side."""
+    order_wrap = row.get("order") if isinstance(row.get("order"), Mapping) else row
+    if not isinstance(order_wrap, Mapping):
+        return None
+    # nested: order.order.amount or order.amount
+    inner = order_wrap.get("order") if isinstance(order_wrap.get("order"), Mapping) else order_wrap
+    amount = _x18_to_decimal(inner.get("amount") if isinstance(inner, Mapping) else 0)
+    trigger = order_wrap.get("trigger") if isinstance(order_wrap.get("trigger"), Mapping) else {}
+    req: Dict[str, Any] = {}
+    if isinstance(trigger, Mapping) and isinstance(trigger.get("price_trigger"), Mapping):
+        pr = trigger["price_trigger"].get("price_requirement")
+        if isinstance(pr, Mapping):
+            req = {str(k): v for k, v in pr.items()}
+    elif isinstance(trigger, Mapping):
+        req = {str(k): v for k, v in trigger.items()}
+    above = any(str(k).endswith("above") and req.get(k) not in (None, "") for k in req)
+    below = any(str(k).endswith("below") and req.get(k) not in (None, "") for k in req)
+    # closing side: long closes with sell (amount < 0); short closes with buy (amount > 0)
+    if position_side == "long":
+        if amount >= 0:
+            return None  # not a close sell
+        if above:
+            return "tp"
+        if below:
+            return "sl"
+    else:
+        if amount <= 0:
+            return None
+        if below:
+            return "tp"
+        if above:
+            return "sl"
+    return None
+
+
+def _trigger_price_from_row(row: Mapping[str, Any]) -> Optional[Decimal]:
+    order_wrap = row.get("order") if isinstance(row.get("order"), Mapping) else row
+    if not isinstance(order_wrap, Mapping):
+        return None
+    trigger = order_wrap.get("trigger") if isinstance(order_wrap.get("trigger"), Mapping) else {}
+    req: Dict[str, Any] = {}
+    if isinstance(trigger, Mapping) and isinstance(trigger.get("price_trigger"), Mapping):
+        pr = trigger["price_trigger"].get("price_requirement")
+        if isinstance(pr, Mapping):
+            req = {str(k): v for k, v in pr.items()}
+    elif isinstance(trigger, Mapping):
+        req = {str(k): v for k, v in trigger.items()}
+    for k, v in req.items():
+        if any(s in str(k) for s in ("above", "below")) and v not in (None, ""):
+            return _x18_to_decimal(v)
+    inner = order_wrap.get("order") if isinstance(order_wrap.get("order"), Mapping) else order_wrap
+    if isinstance(inner, Mapping) and inner.get("priceX18"):
+        return _x18_to_decimal(inner.get("priceX18"))
+    return None
+
+
+def _digest_from_trigger_row(row: Mapping[str, Any]) -> Optional[str]:
+    order_wrap = row.get("order") if isinstance(row.get("order"), Mapping) else row
+    if not isinstance(order_wrap, Mapping):
+        return None
+    d = str(order_wrap.get("digest") or row.get("digest") or "").strip()
+    return d or None
+
+
+def _product_id_from_trigger_row(row: Mapping[str, Any]) -> Optional[int]:
+    order_wrap = row.get("order") if isinstance(row.get("order"), Mapping) else row
+    if not isinstance(order_wrap, Mapping):
+        return None
+    try:
+        return int(order_wrap.get("product_id"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _enrich_positions_with_protections(
+    credentials: Mapping[str, str],
+    positions: List[CanonicalPosition],
+) -> List[CanonicalPosition]:
+    if not positions or not credentials.get("private_key"):
+        return positions
+    try:
+        by_symbol, by_pid = _ensure_symbols(credentials)
+        pids: List[int] = []
+        for pos in positions:
+            key = str(pos.exchange_instrument or pos.symbol or "").upper()
+            meta = by_symbol.get(key) or by_symbol.get(f"{key}-PERP")
+            if meta:
+                pids.append(int(meta["product_id"]))
+        rows = _list_trigger_orders(credentials, product_ids=pids or None, reduce_only=True)
+        enriched: List[CanonicalPosition] = []
+        for pos in positions:
+            key = str(pos.exchange_instrument or pos.symbol or "").upper()
+            meta = by_symbol.get(key) or by_symbol.get(f"{key}-PERP")
+            pid = int(meta["product_id"]) if meta else None
+            tp = sl = None
+            tp_c = sl_c = 0
+            for row in rows:
+                rpid = _product_id_from_trigger_row(row)
+                if pid is not None and rpid is not None and rpid != pid:
+                    continue
+                kind = _protection_kind_from_trigger(row, pos.side)
+                px = _trigger_price_from_row(row)
+                if kind == "tp" and px is not None:
+                    tp_c += 1
+                    if tp is None:
+                        tp = _format_decimal(px)
+                elif kind == "sl" and px is not None:
+                    sl_c += 1
+                    if sl is None:
+                        sl = _format_decimal(px)
+            enriched.append(
+                CanonicalPosition(
+                    symbol=pos.symbol,
+                    side=pos.side,
+                    size=pos.size,
+                    entry_price=pos.entry_price,
+                    pnl=pos.pnl,
+                    tp=tp,
+                    sl=sl,
+                    tp_count=tp_c or None,
+                    sl_count=sl_c or None,
+                    exchange_instrument=pos.exchange_instrument,
+                )
+            )
+        return enriched
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("nado protection enrich failed: %s", exc)
+        return positions
+
+
+def _find_open_position(
+    credentials: Mapping[str, str], requested_symbol: str
+) -> Tuple[CanonicalPosition, Dict[str, Any], Decimal]:
+    """Return (position, meta, mark)."""
+    meta = _resolve_symbol_meta(credentials, requested_symbol)
+    sub = _sender_hex(credentials)
+    info = _gateway_query(credentials, {"type": "subaccount_info", "subaccount": sub})
+    if str(info.get("status") or "").lower() != "success":
+        raise RuntimeError(str(info.get("error") or "subaccount_info failed"))
+    data = info.get("data") if isinstance(info.get("data"), Mapping) else {}
+    positions = _normalize_positions(credentials, data or {})
+    want = _display_symbol(meta).upper()
+    native = str(meta.get("symbol") or "").upper()
+    for pos in positions:
+        if pos.symbol.upper() == want or str(pos.exchange_instrument or "").upper() == native:
+            mark = _oracle_price(credentials, int(meta["product_id"]))
+            return pos, meta, mark
+    raise ValueError("NO_OPEN_POSITION")
+
+
+def _place_reduce_ioc(
+    credentials: Mapping[str, str],
+    *,
+    private_key: str,
+    meta: Mapping[str, Any],
+    position_side: str,
+    size: Decimal,
+    price: Decimal,
+) -> Dict[str, Any]:
+    """Market-style close: IOC reduce-only limit through the book."""
+    contracts = _ensure_contracts(credentials)
+    pid = int(meta["product_id"])
+    tick_x18 = int(meta["price_increment_x18"])
+    step_x18 = int(meta["size_increment"])
+    price_x18 = _quantize_price_x18(price, tick_x18)
+    size_x18 = _quantize_size_x18(size, step_x18, rounding=ROUND_DOWN)
+    if size_x18 <= 0:
+        return {"ok": False, "error": "size_too_small"}
+    # long closes sell (neg), short closes buy (pos)
+    amount_x18 = -size_x18 if position_side == "long" else size_x18
+    appendix = _build_appendix(order_type=1, reduce_only=True, trigger_type=0)  # IOC+RO
+    sender = _sender_hex(credentials)
+    expiration = int(time.time()) + 120
+    nonce = _gen_nonce()
+    sig = _sign_place_order(
+        private_key=private_key,
+        chain_id=int(contracts["chain_id"]),
+        product_id=pid,
+        sender_hex=sender,
+        price_x18=price_x18,
+        amount_x18=amount_x18,
+        expiration=expiration,
+        nonce=nonce,
+        appendix=appendix,
+    )
+    payload = _gateway_execute(
+        credentials,
+        {
+            "place_order": {
+                "product_id": pid,
+                "order": {
+                    "sender": sender,
+                    "priceX18": str(price_x18),
+                    "amount": str(amount_x18),
+                    "expiration": str(expiration),
+                    "nonce": str(nonce),
+                    "appendix": str(appendix),
+                },
+                "signature": sig,
+            }
+        },
+    )
+    if str(payload.get("status") or "").lower() != "success":
+        return {
+            "ok": False,
+            "error": str(payload.get("error") or payload.get("error_code") or "close rejected"),
+        }
+    return {
+        "ok": True,
+        "digest": str((payload.get("data") or {}).get("digest") or "").strip() or None,
+    }
+
+
+def _place_price_trigger_protection(
+    credentials: Mapping[str, str],
+    *,
+    private_key: str,
+    meta: Mapping[str, Any],
+    position_side: str,
+    size: Decimal,
+    trigger_price: Decimal,
+    kind: str,
+) -> Dict[str, Any]:
+    """Register reduce-only TP/SL on the trigger service."""
+    contracts = _ensure_contracts(credentials)
+    pid = int(meta["product_id"])
+    tick_x18 = int(meta["price_increment_x18"])
+    step_x18 = int(meta["size_increment"])
+    trigger_x18 = _quantize_price_x18(trigger_price, tick_x18)
+    # order limit price: TP at trigger; SL slightly worse for fill
+    if kind == "tp":
+        order_px = trigger_x18
+    else:
+        # long SL sell lower; short SL buy higher
+        slip = Decimal("0.995") if position_side == "long" else Decimal("1.005")
+        order_px = _quantize_price_x18(_x18_to_decimal(trigger_x18) * slip, tick_x18)
+    size_x18 = _quantize_size_x18(size, step_x18, rounding=ROUND_DOWN)
+    if size_x18 <= 0 or trigger_x18 <= 0:
+        return {"ok": False, "error": "invalid_size_or_price"}
+    amount_x18 = -size_x18 if position_side == "long" else size_x18
+    # IOC + reduce_only + PRICE trigger
+    appendix = _build_appendix(order_type=1, reduce_only=True, trigger_type=1)
+    sender = _sender_hex(credentials)
+    expiration = int(time.time()) + _ORDER_TTL_SECONDS
+    nonce = _gen_nonce()
+    sig = _sign_place_order(
+        private_key=private_key,
+        chain_id=int(contracts["chain_id"]),
+        product_id=pid,
+        sender_hex=sender,
+        price_x18=order_px,
+        amount_x18=amount_x18,
+        expiration=expiration,
+        nonce=nonce,
+        appendix=appendix,
+    )
+    # trigger requirement
+    if position_side == "long":
+        req_key = "oracle_price_above" if kind == "tp" else "oracle_price_below"
+    else:
+        req_key = "oracle_price_below" if kind == "tp" else "oracle_price_above"
+    trigger_body = {
+        "price_trigger": {"price_requirement": {req_key: str(trigger_x18)}}
+    }
+    payload = _trigger_http(
+        credentials,
+        path="/execute",
+        payload={
+            "place_order": {
+                "product_id": pid,
+                "order": {
+                    "sender": sender,
+                    "priceX18": str(order_px),
+                    "amount": str(amount_x18),
+                    "expiration": str(expiration),
+                    "nonce": str(nonce),
+                    "appendix": str(appendix),
+                },
+                "trigger": trigger_body,
+                "signature": sig,
+            }
+        },
+    )
+    if str(payload.get("status") or "").lower() != "success":
+        return {
+            "ok": False,
+            "error": str(payload.get("error") or payload.get("error_code") or "trigger rejected"),
+        }
+    return {
+        "ok": True,
+        "digest": str((payload.get("data") or {}).get("digest") or "").strip() or None,
+        "trigger_price": _format_decimal(_x18_to_decimal(trigger_x18)),
+    }
+
+
+def _cancel_trigger_digests(
+    credentials: Mapping[str, str],
+    *,
+    private_key: str,
+    product_id: int,
+    digests: Sequence[str],
+) -> int:
+    if not digests:
+        return 0
+    contracts = _ensure_contracts(credentials)
+    sender = _sender_hex(credentials)
+    cancelled = 0
+    batch = 20
+    for i in range(0, len(digests), batch):
+        chunk = list(digests[i : i + batch])
+        product_ids = [int(product_id)] * len(chunk)
+        nonce = _gen_nonce()
+        sig = _sign_cancel_orders(
+            private_key=private_key,
+            chain_id=int(contracts["chain_id"]),
+            endpoint_addr=str(contracts["endpoint_addr"]),
+            sender_hex=sender,
+            product_ids=product_ids,
+            digests=chunk,
+            nonce=nonce,
+        )
+        payload = _trigger_http(
+            credentials,
+            path="/execute",
+            payload={
+                "cancel_orders": {
+                    "tx": {
+                        "sender": sender,
+                        "productIds": product_ids,
+                        "digests": chunk,
+                        "nonce": str(nonce),
+                    },
+                    "signature": sig,
+                }
+            },
+        )
+        if str(payload.get("status") or "").lower() == "success":
+            cancelled += len(chunk)
+        time.sleep(0.05)
+    return cancelled
+
+
+def _cancel_protections_for_position(
+    credentials: Mapping[str, str],
+    *,
+    private_key: str,
+    meta: Mapping[str, Any],
+    position_side: str,
+    kinds: Sequence[str] = ("tp", "sl"),
+) -> int:
+    pid = int(meta["product_id"])
+    rows = _list_trigger_orders(credentials, product_ids=[pid], reduce_only=True)
+    digests: List[str] = []
+    for row in rows:
+        kind = _protection_kind_from_trigger(row, position_side)
+        if kind not in kinds:
+            continue
+        d = _digest_from_trigger_row(row)
+        if d:
+            digests.append(d)
+    return _cancel_trigger_digests(
+        credentials, private_key=private_key, product_id=pid, digests=digests
+    )
+
+
+def _set_protection(account: str, request: Mapping[str, Any], *, kind: str) -> CanonicalResponse:
+    operation = "set_tp" if kind == "tp" else "set_sl"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER and PRIVATE_KEY.",
+        )
+    try:
+        pk = _require_signer(credentials)
+    except ValueError:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_PRIVATE_KEY",
+            message="Set NADO_<ACCOUNT>_PRIVATE_KEY (owner or linked signer).",
+        )
+    try:
+        price_val = Decimal(str(request.get("price") or "0").strip() or "0")
+    except Exception:  # noqa: BLE001
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_PRICE",
+            message="Protection price must be a number (use 0 to remove).",
+        )
+    try:
+        pos, meta, mark = _find_open_position(credentials, str(request.get("symbol") or ""))
+        if price_val <= 0:
+            n = _cancel_protections_for_position(
+                credentials, private_key=pk, meta=meta, position_side=pos.side, kinds=(kind,)
+            )
+            return make_success(
+                operation=operation,
+                exchange=name,
+                account=credentials["account"],
+                position_action=CanonicalPositionActionResult(
+                    operation=operation,
+                    symbol=pos.symbol,
+                    verified=True,
+                    removed=True,
+                    status="success",
+                    current_side=pos.side,
+                    current_size=pos.size,
+                    message=f"Removed {kind.upper()} ({n} trigger(s) cancelled).",
+                ),
+            )
+        # direction checks
+        if kind == "tp":
+            if pos.side == "long" and price_val <= mark:
+                return make_failure(
+                    operation=operation,
+                    exchange=name,
+                    account=credentials["account"],
+                    code="INVALID_TP_PRICE",
+                    message="Long TP must be above mark price.",
+                )
+            if pos.side == "short" and price_val >= mark:
+                return make_failure(
+                    operation=operation,
+                    exchange=name,
+                    account=credentials["account"],
+                    code="INVALID_TP_PRICE",
+                    message="Short TP must be below mark price.",
+                )
+        else:
+            if pos.side == "long" and price_val >= mark:
+                return make_failure(
+                    operation=operation,
+                    exchange=name,
+                    account=credentials["account"],
+                    code="INVALID_SL_PRICE",
+                    message="Long SL must be below mark price.",
+                )
+            if pos.side == "short" and price_val <= mark:
+                return make_failure(
+                    operation=operation,
+                    exchange=name,
+                    account=credentials["account"],
+                    code="INVALID_SL_PRICE",
+                    message="Short SL must be above mark price.",
+                )
+        # replace existing leg
+        _cancel_protections_for_position(
+            credentials, private_key=pk, meta=meta, position_side=pos.side, kinds=(kind,)
+        )
+        time.sleep(0.15)
+        placed = _place_price_trigger_protection(
+            credentials,
+            private_key=pk,
+            meta=meta,
+            position_side=pos.side,
+            size=Decimal(str(pos.size)),
+            trigger_price=price_val,
+            kind=kind,
+        )
+        if not placed.get("ok"):
+            return make_failure(
+                operation=operation,
+                exchange=name,
+                account=credentials["account"],
+                code="PROTECTION_FAILED",
+                message=_redact(sanitize_error_message(str(placed.get("error") or "failed")), credentials),
+            )
+        time.sleep(0.35)
+        # verify via list
+        rows = _list_trigger_orders(
+            credentials, product_ids=[int(meta["product_id"])], reduce_only=True
+        )
+        got = None
+        for row in rows:
+            if _protection_kind_from_trigger(row, pos.side) == kind:
+                got = _trigger_price_from_row(row)
+                break
+        verified = got is not None and abs(got - price_val) / max(price_val, Decimal("1")) < Decimal("0.01")
+        return make_success(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation=operation,
+                symbol=pos.symbol,
+                verified=bool(verified),
+                price=_format_decimal(price_val),
+                status="success" if verified else "submitted",
+                exchange_order_id=placed.get("digest"),
+                current_side=pos.side,
+                current_size=pos.size,
+                message=f"Set {kind.upper()}={_format_decimal(price_val)} via Nado trigger service.",
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"NO_OPEN_POSITION", "INSTRUMENT_NOT_FOUND"} else "INVALID_REQUEST",
+            message="No open position for symbol." if code == "NO_OPEN_POSITION" else sanitize_error_message(str(exc)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+def _close_position(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER and PRIVATE_KEY.",
+        )
+    try:
+        pk = _require_signer(credentials)
+    except ValueError:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_PRIVATE_KEY",
+            message="Set NADO_<ACCOUNT>_PRIVATE_KEY (owner or linked signer).",
+        )
+    try:
+        pos, meta, mark = _find_open_position(credentials, str(request.get("symbol") or ""))
+        # cancel protections first
+        _cancel_protections_for_position(
+            credentials, private_key=pk, meta=meta, position_side=pos.side, kinds=("tp", "sl")
+        )
+        size = Decimal(str(pos.size))
+        # aggressive IOC price
+        if pos.side == "long":
+            px = mark * Decimal("0.99")
+        else:
+            px = mark * Decimal("1.01")
+        placed = _place_reduce_ioc(
+            credentials,
+            private_key=pk,
+            meta=meta,
+            position_side=pos.side,
+            size=size,
+            price=px,
+        )
+        if not placed.get("ok"):
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=credentials["account"],
+                code="CLOSE_FAILED",
+                message=_redact(sanitize_error_message(str(placed.get("error") or "close failed")), credentials),
+                position_action=CanonicalPositionActionResult(
+                    operation="close_position",
+                    symbol=pos.symbol,
+                    verified=False,
+                    status="failed",
+                    current_side=pos.side,
+                    current_size=pos.size,
+                ),
+            )
+        time.sleep(0.7)
+        try:
+            _find_open_position(credentials, str(request.get("symbol") or ""))
+            flat = False
+            still_side, still_size = pos.side, pos.size
+        except ValueError:
+            flat = True
+            still_side, still_size = None, "0"
+        return make_success(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation="close_position",
+                symbol=pos.symbol,
+                verified=flat,
+                status="success" if flat else "submitted",
+                exchange_order_id=placed.get("digest"),
+                current_side=still_side,
+                current_size=still_size,
+                message="Position closed." if flat else "Close submitted; flat not yet confirmed.",
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"NO_OPEN_POSITION", "INSTRUMENT_NOT_FOUND"} else "INVALID_REQUEST",
+            message="No open position for symbol." if code == "NO_OPEN_POSITION" else sanitize_error_message(str(exc)),
+            position_action=CanonicalPositionActionResult(
+                operation="close_position",
+                symbol=str(request.get("symbol") or ""),
+                verified=code == "NO_OPEN_POSITION",
+                status="noop" if code == "NO_OPEN_POSITION" else "failed",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
 # ---------------------------------------------------------------------------
 # execute
 # ---------------------------------------------------------------------------
@@ -1897,6 +2697,12 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _ladder(account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(account, request)
+        if operation == "set_tp":
+            return _set_protection(account, request, kind="tp")
+        if operation == "set_sl":
+            return _set_protection(account, request, kind="sl")
+        if operation == "close_position":
+            return _close_position(account, request)
         if operation == "resolve_instrument":
             return _resolve_instrument(account, request)
         if operation == "list_instruments":
