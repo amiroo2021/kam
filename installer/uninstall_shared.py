@@ -41,6 +41,7 @@ SHARED_REL_PATHS = [
     Path("plugins") / "trade" / "agents" / "x_nado_agent.py",
     Path("plugins") / "trade" / "agents" / "x_ondoperps_agent.py",
     Path("plugins") / "trade" / "agents" / "x_pacifica_agent.py",
+    Path("plugins") / "trade" / "agents" / "x_perpl_agent.py",
     Path("plugins") / "trade" / "agents" / "x_phemex_agent.py",
     Path("plugins") / "trade" / "agents" / "x_raydium_agent.py",
     Path("plugins") / "trade" / "agents" / "x_rise_agent.py",

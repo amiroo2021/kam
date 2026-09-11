@@ -194,6 +194,7 @@ class CleanFiboInstallTests(unittest.TestCase):
             "x_nado_agent.py",
             "x_ondoperps_agent.py",
             "x_pacifica_agent.py",
+            "x_perpl_agent.py",
             "x_phemex_agent.py",
             "x_raydium_agent.py",
             "x_rise_agent.py",
