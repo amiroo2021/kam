@@ -344,19 +344,29 @@ def _contract_ok(payload: Mapping[str, Any]) -> bool:
 # Balance
 # ---------------------------------------------------------------------------
 
+# Contract collaterals treated as ~1:1 USD for portfolio rollup.
+_STABLE_CURRENCIES = frozenset({"USDT", "USDC", "USD", "USDE", "FDUSD", "BUSD", "TUSD", "DAI"})
 
-def _pick_usdt_asset(rows: Any) -> Optional[Mapping[str, Any]]:
-    if isinstance(rows, Mapping):
-        return rows
-    if not isinstance(rows, list):
-        return None
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        cur = str(row.get("currency") or row.get("displayCurrency") or "").upper()
-        if cur in {"USDT", "USD"}:
-            return row
-    return None
+
+def _asset_metrics(row: Mapping[str, Any]) -> Dict[str, Decimal]:
+    equity = _to_decimal(row.get("equity") if row.get("equity") is not None else row.get("cashBalance"))
+    available = _to_decimal(
+        row.get("availableBalance") if row.get("availableBalance") is not None else row.get("availableCash")
+    )
+    frozen = _to_decimal(row.get("frozenBalance"))
+    position_margin = _to_decimal(row.get("positionMargin"))
+    unrealized = _to_decimal(row.get("unrealized"))
+    bonus = _to_decimal(row.get("bonus"))
+    account_value = equity if equity != 0 else (available + frozen + position_margin)
+    return {
+        "equity": equity,
+        "available": available,
+        "frozen": frozen,
+        "position_margin": position_margin,
+        "unrealized": unrealized,
+        "bonus": bonus,
+        "account_value": account_value,
+    }
 
 
 def _balance(account: str) -> CanonicalResponse:
@@ -373,56 +383,85 @@ def _balance(account: str) -> CanonicalResponse:
             ),
         )
     try:
-        # Prefer single-currency asset endpoint; fall back to full assets list.
-        payload = _contract_request(
-            credentials, "GET", f"/api/v1/private/account/asset/{DEFAULT_QUOTE}"
-        )
-        asset: Optional[Mapping[str, Any]] = None
-        if _contract_ok(payload) and isinstance(payload.get("data"), Mapping):
-            asset = payload["data"]
-        else:
-            payload = _contract_request(credentials, "GET", "/api/v1/private/account/assets")
-            if not _contract_ok(payload):
-                return make_failure(
-                    operation="balance",
-                    exchange=name,
-                    account=credentials["account"],
-                    code="MEXC_ERROR",
-                    message=_redact(
-                        sanitize_error_message(
-                            str(payload.get("message") or payload.get("msg") or payload.get("code") or "assets failed")
-                        ),
-                        credentials,
-                    ),
-                )
-            asset = _pick_usdt_asset(payload.get("data"))
-
-        if not isinstance(asset, Mapping):
+        # Full assets list so USDC + USDT (and other stables) are all counted.
+        payload = _contract_request(credentials, "GET", "/api/v1/private/account/assets")
+        if not _contract_ok(payload):
             return make_failure(
                 operation="balance",
                 exchange=name,
                 account=credentials["account"],
                 code="MEXC_ERROR",
-                message="No USDT contract asset row returned.",
+                message=_redact(
+                    sanitize_error_message(
+                        str(
+                            payload.get("message")
+                            or payload.get("msg")
+                            or payload.get("code")
+                            or "assets failed"
+                        )
+                    ),
+                    credentials,
+                ),
+            )
+        rows = payload.get("data") or []
+        if not isinstance(rows, list):
+            rows = [rows] if isinstance(rows, Mapping) else []
+
+        by_ccy: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            ccy = str(row.get("currency") or row.get("displayCurrency") or "").upper().strip()
+            if not ccy:
+                continue
+            m = _asset_metrics(row)
+            # Keep any non-dust row for breakdown; rollup uses stables.
+            if m["account_value"] == 0 and m["available"] == 0 and m["position_margin"] == 0:
+                continue
+            by_ccy[ccy] = {
+                "currency": ccy,
+                "equity": _format_decimal(m["equity"]),
+                "available": _format_decimal(m["available"]),
+                "frozen": _format_decimal(m["frozen"]),
+                "position_margin": _format_decimal(m["position_margin"]),
+                "unrealized": _format_decimal(m["unrealized"]),
+                "bonus": _format_decimal(m["bonus"]),
+                "_metrics": m,
+            }
+
+        stable_rows = {c: v for c, v in by_ccy.items() if c in _STABLE_CURRENCIES}
+        if not stable_rows and not by_ccy:
+            return make_failure(
+                operation="balance",
+                exchange=name,
+                account=credentials["account"],
+                code="MEXC_ERROR",
+                message="No contract asset balances returned.",
             )
 
-        equity = _to_decimal(asset.get("equity") if asset.get("equity") is not None else asset.get("cashBalance"))
-        available = _to_decimal(
-            asset.get("availableBalance")
-            if asset.get("availableBalance") is not None
-            else asset.get("availableCash")
+        # Roll up stablecoin collaterals (1:1). Prefer dominant unit label.
+        roll_src = stable_rows if stable_rows else by_ccy
+        account_value = sum((v["_metrics"]["account_value"] for v in roll_src.values()), Decimal("0"))
+        available = sum((v["_metrics"]["available"] for v in roll_src.values()), Decimal("0"))
+        position_margin = sum(
+            (v["_metrics"]["position_margin"] for v in roll_src.values()), Decimal("0")
         )
-        frozen = _to_decimal(asset.get("frozenBalance"))
-        position_margin = _to_decimal(asset.get("positionMargin"))
-        unrealized = _to_decimal(asset.get("unrealized"))
-        bonus = _to_decimal(asset.get("bonus"))
+        frozen = sum((v["_metrics"]["frozen"] for v in roll_src.values()), Decimal("0"))
+        unrealized = sum((v["_metrics"]["unrealized"] for v in roll_src.values()), Decimal("0"))
 
-        # account_value = equity (includes unrealized); withdrawable ≈ available
-        account_value = equity if equity != 0 else (available + frozen + position_margin)
+        # Unit: largest equity stable, else USDT.
+        dominant = "USDT"
+        best = Decimal("-1")
+        for ccy, v in roll_src.items():
+            eq = v["_metrics"]["account_value"]
+            if eq > best:
+                best = eq
+                dominant = ccy
+        unit = dominant if dominant in _STABLE_CURRENCIES else DEFAULT_QUOTE
+
         margin_used = position_margin if position_margin > 0 else frozen
         withdrawable = available if available > 0 else max(account_value - margin_used, Decimal("0"))
 
-        unit = DEFAULT_QUOTE
         balance = normalize_balance(account_value, unit)
         portfolio = CanonicalPortfolioSummary(
             account_value=normalize_balance(account_value, unit).value,
@@ -434,7 +473,11 @@ def _balance(account: str) -> CanonicalResponse:
             unit=unit,
         )
 
-        # Best-effort spot dust (non-blocking)
+        # Strip internal metrics from public breakdown
+        breakdown = []
+        for ccy, v in sorted(by_ccy.items(), key=lambda kv: kv[1]["_metrics"]["account_value"], reverse=True):
+            breakdown.append({k: val for k, val in v.items() if k != "_metrics"})
+
         spot_nonzero: List[Dict[str, str]] = []
         try:
             spot = _spot_request(credentials, "GET", "/api/v3/account")
@@ -462,14 +505,14 @@ def _balance(account: str) -> CanonicalResponse:
             balance=balance,
             portfolio_summary=portfolio,
             data={
-                "source": "contract",
-                "currency": str(asset.get("currency") or unit),
-                "equity": _format_decimal(equity),
-                "available": _format_decimal(available),
-                "frozen": _format_decimal(frozen),
-                "position_margin": _format_decimal(position_margin),
-                "unrealized": _format_decimal(unrealized),
-                "bonus": _format_decimal(bonus),
+                "source": "contract_assets_rollup",
+                "unit": unit,
+                "stable_currencies": sorted(stable_rows.keys()),
+                "equity_total": _format_decimal(account_value),
+                "available_total": _format_decimal(available),
+                "position_margin_total": _format_decimal(position_margin),
+                "unrealized_total": _format_decimal(unrealized),
+                "by_currency": breakdown[:30],
                 "spot_nonzero": spot_nonzero[:20],
             },
         )

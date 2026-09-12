@@ -32,19 +32,30 @@ class MexcAgentTests(unittest.TestCase):
         os.environ["MEXC_AMIROO_SECRETKEY"] = "secret_test"
 
         def fake_contract(_creds, method, path, params=None):
-            if path.endswith("/USDT"):
+            if path.endswith("/assets"):
                 return {
                     "success": True,
                     "code": 0,
-                    "data": {
-                        "currency": "USDT",
-                        "equity": "100.5",
-                        "availableBalance": "80.25",
-                        "frozenBalance": "0",
-                        "positionMargin": "20.25",
-                        "unrealized": "1.5",
-                        "bonus": "0",
-                    },
+                    "data": [
+                        {
+                            "currency": "USDT",
+                            "equity": "8.08",
+                            "availableBalance": "8.08",
+                            "frozenBalance": "0",
+                            "positionMargin": "0",
+                            "unrealized": "0",
+                            "bonus": "0",
+                        },
+                        {
+                            "currency": "USDC",
+                            "equity": "31548.10",
+                            "availableBalance": "29830.72",
+                            "frozenBalance": "1087.42",
+                            "positionMargin": "702.59",
+                            "unrealized": "-72.63",
+                            "bonus": "0",
+                        },
+                    ],
                 }
             return {"success": True, "code": 0, "data": []}
 
@@ -61,10 +72,12 @@ class MexcAgentTests(unittest.TestCase):
         self.assertTrue(resp.success, resp)
         assert resp.balance is not None
         assert resp.portfolio_summary is not None
-        self.assertEqual(resp.balance.unit, "USDT")
-        self.assertEqual(resp.balance.value, "100.50")
-        self.assertEqual(resp.portfolio_summary.withdrawable, "80.25")
-        self.assertEqual(resp.portfolio_summary.margin_used, "20.25")
+        self.assertEqual(resp.balance.unit, "USDC")
+        # 8.08 + 31548.10
+        self.assertEqual(resp.balance.value, "31556.18")
+        self.assertEqual(resp.portfolio_summary.margin_used, "702.59")
+        self.assertIn("USDC", (resp.data or {}).get("stable_currencies") or [])
+        self.assertIn("USDT", (resp.data or {}).get("stable_currencies") or [])
 
     def test_not_implemented(self) -> None:
         os.environ["MEXC_AMIROO_ACCESSKEY"] = "mx_test_key"
