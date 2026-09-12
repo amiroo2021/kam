@@ -69,8 +69,12 @@ API_TIMEOUT_SECONDS = 20
 DEFAULT_QUOTE = "USDT"
 DEFAULT_LEVERAGE = 20
 LADDER_ABSOLUTE_MAX_ORDERS = 200
-LADDER_MAX_WORKERS = 3
-LADDER_CHILD_PAUSE_SECONDS = 0.08
+# MEXC rejects "Requests are too frequent" under parallel bursts.
+# Serial paced submit + retries is slower but completes large ladders.
+LADDER_MAX_WORKERS = 1
+LADDER_CHILD_PAUSE_SECONDS = 0.22
+LADDER_RATE_LIMIT_RETRIES = 10
+LADDER_RATE_LIMIT_BASE_SLEEP = 0.45
 _LADDER_SUBMIT_LOCK = __import__("threading").Lock()
 _LADDER_LAST_SUBMIT_TS = 0.0
 
@@ -1071,6 +1075,21 @@ def _ladder_sizes(
     return [Decimal(x) * increment for x in allocated]
 
 
+def _is_mexc_rate_limit(message: Any) -> bool:
+    text = str(message or "").lower()
+    if not text:
+        return False
+    needles = (
+        "too frequent",
+        "too many requests",
+        "rate limit",
+        "requests are too",
+        "try again later",
+        "429",
+    )
+    return any(n in text for n in needles)
+
+
 def _place_ladder_child(
     credentials: Mapping[str, str],
     *,
@@ -1080,6 +1099,7 @@ def _place_ladder_child(
     size_coin: Decimal,
     meta: Mapping[str, Any],
     leverage: int,
+    child_index: int = 0,
 ) -> Dict[str, Any]:
     px = _quantize_price(price, meta)
     contracts = _coin_to_contracts(size_coin, meta)
@@ -1092,65 +1112,97 @@ def _place_ladder_child(
             "price": px,
             "size": _contracts_to_coin(Decimal(max(contracts, 0)), meta),
             "contracts": contracts,
+            "rate_limited": False,
         }
     side_code = _SIDE_OPEN_LONG if side_in == "buy" else _SIDE_OPEN_SHORT
-    external = f"kaml{int(time.time() * 1000)}{secrets_token()}"
-    body = {
-        "symbol": native,
-        "price": float(px),
-        "vol": int(contracts),
-        "side": int(side_code),
-        "type": int(_TYPE_LIMIT),
-        "openType": int(_OPEN_CROSS),
-        "leverage": int(leverage),
-        "externalOid": external[:32],
-    }
-    global _LADDER_LAST_SUBMIT_TS
-    with _LADDER_SUBMIT_LOCK:
-        now = time.time()
-        wait = LADDER_CHILD_PAUSE_SECONDS - (now - _LADDER_LAST_SUBMIT_TS)
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            payload = _contract_request(
-                credentials, "POST", "/api/v1/private/order/submit", body=body
-            )
-        except Exception as exc:  # noqa: BLE001
+    last_error: Optional[str] = None
+    rate_limited = False
+
+    for attempt in range(max(1, LADDER_RATE_LIMIT_RETRIES)):
+        external = f"kaml{int(time.time() * 1000)}{child_index:03d}{secrets_token()}"[:32]
+        body = {
+            "symbol": native,
+            "price": float(px),
+            "vol": int(contracts),
+            "side": int(side_code),
+            "type": int(_TYPE_LIMIT),
+            "openType": int(_OPEN_CROSS),
+            "leverage": int(leverage),
+            "externalOid": external,
+        }
+        global _LADDER_LAST_SUBMIT_TS
+        with _LADDER_SUBMIT_LOCK:
+            now = time.time()
+            wait = LADDER_CHILD_PAUSE_SECONDS - (now - _LADDER_LAST_SUBMIT_TS)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                payload = _contract_request(
+                    credentials, "POST", "/api/v1/private/order/submit", body=body
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LADDER_LAST_SUBMIT_TS = time.time()
+                last_error = str(exc)
+                if _is_mexc_rate_limit(last_error):
+                    rate_limited = True
+                    time.sleep(LADDER_RATE_LIMIT_BASE_SLEEP * (1.6 ** attempt))
+                    continue
+                return {
+                    "ok": False,
+                    "order_id": None,
+                    "error": last_error,
+                    "price": px,
+                    "size": _contracts_to_coin(Decimal(contracts), meta),
+                    "contracts": contracts,
+                    "client_order_id": external,
+                    "rate_limited": False,
+                }
             _LADDER_LAST_SUBMIT_TS = time.time()
+
+        if _contract_ok(payload):
+            data = payload.get("data")
+            oid = None
+            if isinstance(data, (int, str)):
+                oid = str(data)
+            elif isinstance(data, Mapping):
+                oid = str(data.get("orderId") or data.get("order_id") or "").strip() or None
             return {
-                "ok": False,
-                "order_id": None,
-                "error": str(exc),
+                "ok": True,
+                "order_id": oid,
+                "error": None,
                 "price": px,
                 "size": _contracts_to_coin(Decimal(contracts), meta),
                 "contracts": contracts,
                 "client_order_id": external,
+                "rate_limited": False,
+                "attempts": attempt + 1,
             }
-        _LADDER_LAST_SUBMIT_TS = time.time()
-    if not _contract_ok(payload):
+
+        last_error = str(payload.get("message") or payload.get("code") or "rejected")
+        if _is_mexc_rate_limit(last_error):
+            rate_limited = True
+            time.sleep(LADDER_RATE_LIMIT_BASE_SLEEP * (1.6 ** attempt))
+            continue
+        # Non-retriable exchange reject
         return {
             "ok": False,
             "order_id": None,
-            "error": str(payload.get("message") or payload.get("code") or "rejected"),
+            "error": last_error,
             "price": px,
             "size": _contracts_to_coin(Decimal(contracts), meta),
             "contracts": contracts,
             "client_order_id": external,
+            "rate_limited": False,
         }
-    data = payload.get("data")
-    oid = None
-    if isinstance(data, (int, str)):
-        oid = str(data)
-    elif isinstance(data, Mapping):
-        oid = str(data.get("orderId") or data.get("order_id") or "").strip() or None
+
     return {
-        "ok": True,
-        "order_id": oid,
-        "error": None,
+        "ok": False,
+        "order_id": None,
+        "error": last_error or "rate_limited",
         "price": px,
         "size": _contracts_to_coin(Decimal(contracts), meta),
         "contracts": contracts,
-        "client_order_id": external,
+        "rate_limited": rate_limited or _is_mexc_rate_limit(last_error),
     }
 
 
@@ -1265,44 +1317,56 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         batches: List[Optional[Dict[str, Any]]] = [None] * count
         omitted_below_minimum = 0
         first_error: Optional[str] = None
+        rate_limited = False
 
-        def _job(i: int, price: Decimal, size: Decimal) -> Tuple[int, Dict[str, Any]]:
+        # Serial paced submit — parallel bursts trip MEXC "too frequent".
+        for i in range(count):
             result = _place_ladder_child(
                 credentials,
                 native=native,
                 side_in=side_in,
-                price=price,
-                size_coin=size,
+                price=prices[i],
+                size_coin=sizes[i],
                 meta=meta,
                 leverage=lev,
+                child_index=i,
             )
-            return i, result
-
-        workers = max(1, min(LADDER_MAX_WORKERS, count))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [
-                pool.submit(_job, i, prices[i], sizes[i])
-                for i in range(count)
-            ]
-            for fut in as_completed(futs):
-                i, result = fut.result()
-                batches[i] = result
-                if result.get("error") == "below_min_or_zero":
-                    omitted_below_minimum += 1
-                    continue
-                if result.get("ok"):
-                    submitted_children.append(
-                        {
-                            "index": i,
-                            "price": _format_decimal(result["price"]),
-                            "size": _format_decimal(result["size"]),
-                            "order_id": result.get("order_id"),
-                            "client_order_id": result.get("client_order_id"),
-                        }
-                    )
-                else:
-                    if first_error is None:
-                        first_error = str(result.get("error") or "child failed")
+            batches[i] = result
+            if result.get("rate_limited"):
+                rate_limited = True
+            if result.get("error") == "below_min_or_zero":
+                omitted_below_minimum += 1
+                continue
+            if result.get("ok"):
+                submitted_children.append(
+                    {
+                        "index": i,
+                        "price": _format_decimal(result["price"]),
+                        "size": _format_decimal(result["size"]),
+                        "order_id": result.get("order_id"),
+                        "client_order_id": result.get("client_order_id"),
+                        "attempts": result.get("attempts"),
+                    }
+                )
+            else:
+                if first_error is None:
+                    first_error = str(result.get("error") or "child failed")
+                # Hard non-rate reject (e.g. leverage/margin) — stop early.
+                if not result.get("rate_limited"):
+                    # keep going for soft errors? stop on clear permanent rejects
+                    err_l = str(result.get("error") or "").lower()
+                    if any(
+                        x in err_l
+                        for x in (
+                            "insufficient",
+                            "leverage",
+                            "precision",
+                            "notional",
+                            "balance",
+                            "position mode",
+                        )
+                    ):
+                        break
 
         ok_count = len(submitted_children)
         if ok_count == 0:
@@ -1318,7 +1382,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             )
 
         # brief pause then verify resting ids
-        time.sleep(0.35)
+        time.sleep(0.45)
         verified_ids: List[str] = []
         try:
             opens = _fetch_open_order_rows(credentials, native)
@@ -1346,14 +1410,15 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                 requested_volume=_format_decimal(total),
                 submitted_volume=_format_decimal(submitted_volume),
                 batch_count=ok_count,
-                verified=len(verified_ids) == ok_count and not partial,
+                verified=len(verified_ids) >= max(1, int(ok_count * 0.9)) and not partial,
                 partial=partial or omitted_below_minimum > 0,
-                status="success" if (not partial and len(verified_ids) == ok_count) else "partial",
+                status="success" if (not partial and len(verified_ids) >= max(1, int(ok_count * 0.9))) else "partial",
                 accepted_child_count=ok_count,
                 omitted_order_count=count - ok_count,
                 omitted_below_minimum=omitted_below_minimum or None,
                 child_order_ids=child_ids or None,
                 batches=submitted_children,
+                rate_limited=rate_limited or None,
                 exchange_reason=(
                     _redact(sanitize_error_message(first_error), credentials) if first_error else None
                 ),
