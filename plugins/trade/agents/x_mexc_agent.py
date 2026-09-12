@@ -726,18 +726,42 @@ def _normalize_positions(
 def _fetch_open_order_rows(
     credentials: Mapping[str, str], symbol: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {}
-    if symbol:
-        params["symbol"] = symbol
-    payload = _contract_request(
-        credentials, "GET", "/api/v1/private/order/list/open_orders", params=params or None
-    )
-    if not _contract_ok(payload):
-        raise RuntimeError(str(payload.get("message") or payload.get("code") or "open orders failed"))
-    rows = payload.get("data") or []
-    if not isinstance(rows, list):
-        return []
-    return [dict(r) for r in rows if isinstance(r, Mapping)]
+    """Fetch all open orders, paging past MEXC's default 20-row page."""
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    page_size = 100  # API caps around 100; default without params is 20
+    for page in range(1, 51):  # hard ceiling 5000 orders
+        params: Dict[str, Any] = {
+            "page_num": page,
+            "page_size": page_size,
+        }
+        if symbol:
+            params["symbol"] = symbol
+        payload = _contract_request(
+            credentials, "GET", "/api/v1/private/order/list/open_orders", params=params
+        )
+        if not _contract_ok(payload):
+            # If first page fails, surface; later pages stop.
+            if page == 1:
+                raise RuntimeError(
+                    str(payload.get("message") or payload.get("code") or "open orders failed")
+                )
+            break
+        rows = payload.get("data") or []
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            if not isinstance(r, Mapping):
+                continue
+            oid = str(r.get("orderId") or "").strip()
+            if oid and oid in seen:
+                continue
+            if oid:
+                seen.add(oid)
+            out.append(dict(r))
+        if len(rows) < page_size:
+            break
+    return out
 
 
 def _side_label_from_mexc(side_code: int) -> str:
