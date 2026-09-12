@@ -38,6 +38,9 @@ class MexcAgentTests(unittest.TestCase):
             "positions_orders",
             "new_order",
             "cancel_order_group",
+            "set_tp",
+            "set_sl",
+            "close_position",
         ):
             self.assertIn(op, mexc.capabilities())
 

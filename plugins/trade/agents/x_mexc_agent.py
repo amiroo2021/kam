@@ -48,6 +48,7 @@ from ..canonical import (
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -71,8 +72,9 @@ _SIDE_CLOSE_SHORT = 2
 _SIDE_OPEN_SHORT = 3
 _SIDE_CLOSE_LONG = 4
 
-# order type: 1 limit
+# order type: 1 limit, 5 market
 _TYPE_LIMIT = 1
+_TYPE_MARKET = 5
 # openType: 1 isolated, 2 cross
 _OPEN_CROSS = 2
 # positionType: 1 long, 2 short
@@ -217,6 +219,9 @@ def capabilities() -> List[str]:
         "positions_management",
         "new_order",
         "cancel_order_group",
+        "set_tp",
+        "set_sl",
+        "close_position",
         "resolve_instrument",
         "list_instruments",
         "market_price",
@@ -805,6 +810,7 @@ def _positions_orders(account: str) -> CanonicalResponse:
         if not isinstance(pos_rows, list):
             pos_rows = []
         positions = _normalize_positions(credentials, pos_rows)
+        positions = _enrich_positions_with_stops(credentials, positions, pos_rows)
         order_rows = _fetch_open_order_rows(credentials)
         open_count, groups = _group_open_orders(credentials, order_rows)
         return make_success(
@@ -1296,6 +1302,467 @@ def _market_price(account: str, request: Mapping[str, Any]) -> CanonicalResponse
 
 
 # ---------------------------------------------------------------------------
+# Positions management (TP / SL / close)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_open_stop_rows(credentials: Mapping[str, str]) -> List[Dict[str, Any]]:
+    payload = _contract_request(credentials, "GET", "/api/v1/private/stoporder/open_orders")
+    if not _contract_ok(payload):
+        raise RuntimeError(str(payload.get("message") or payload.get("code") or "stop orders failed"))
+    rows = payload.get("data") or []
+    if not isinstance(rows, list):
+        return []
+    return [dict(r) for r in rows if isinstance(r, Mapping)]
+
+
+def _cancel_stop_ids(credentials: Mapping[str, str], stop_ids: Sequence[Any]) -> int:
+    cancelled = 0
+    for sid in stop_ids:
+        if sid is None or str(sid).strip() in {"", "0"}:
+            continue
+        try:
+            payload = _contract_request(
+                credentials,
+                "POST",
+                "/api/v1/private/stoporder/cancel_all",
+                body={"stopPlanOrderId": int(sid) if str(sid).isdigit() else sid},
+            )
+            if _contract_ok(payload):
+                cancelled += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mexc stop cancel failed id=%s: %s", sid, exc)
+    return cancelled
+
+
+def _stops_for_position(stops: Sequence[Mapping[str, Any]], position_id: str) -> List[Dict[str, Any]]:
+    pid = str(position_id)
+    out: List[Dict[str, Any]] = []
+    for row in stops:
+        if str(row.get("positionId") or "") == pid:
+            out.append(dict(row))
+    return out
+
+
+def _aggregate_tp_sl(stops: Sequence[Mapping[str, Any]]) -> Tuple[Optional[str], Optional[str], int, int]:
+    tps: List[Decimal] = []
+    sls: List[Decimal] = []
+    for row in stops:
+        tp = _to_decimal(row.get("takeProfitPrice"))
+        sl = _to_decimal(row.get("stopLossPrice"))
+        if tp > 0:
+            tps.append(tp)
+        if sl > 0:
+            sls.append(sl)
+    tp_s = _format_decimal(tps[0]) if len(tps) == 1 else (_format_decimal(min(tps)) if tps else None)
+    # multiple TPs: show min for long-ish display; wizard shows one value
+    if len(tps) > 1:
+        tp_s = _format_decimal(min(tps))
+    sl_s = _format_decimal(sls[0]) if len(sls) == 1 else (_format_decimal(max(sls)) if sls else None)
+    if len(sls) > 1:
+        sl_s = _format_decimal(max(sls))
+    return tp_s, sl_s, len(tps), len(sls)
+
+
+def _enrich_positions_with_stops(
+    credentials: Mapping[str, str],
+    positions: List[CanonicalPosition],
+    pos_rows: Sequence[Mapping[str, Any]],
+) -> List[CanonicalPosition]:
+    try:
+        stops = _fetch_open_stop_rows(credentials)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("mexc stop enrich skipped: %s", exc)
+        return positions
+    # map exchange_instrument+side -> positionId
+    id_by_key: Dict[Tuple[str, str], str] = {}
+    for row in pos_rows:
+        if not isinstance(row, Mapping):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        side = "long" if int(row.get("positionType") or 0) == _POS_LONG else "short"
+        pid = str(row.get("positionId") or "")
+        if sym and pid:
+            id_by_key[(sym, side)] = pid
+    out: List[CanonicalPosition] = []
+    for pos in positions:
+        native = str(pos.exchange_instrument or "").upper()
+        pid = id_by_key.get((native, pos.side))
+        if not pid:
+            out.append(pos)
+            continue
+        matched = _stops_for_position(stops, pid)
+        tp_s, sl_s, tp_n, sl_n = _aggregate_tp_sl(matched)
+        out.append(
+            CanonicalPosition(
+                symbol=pos.symbol,
+                side=pos.side,
+                size=pos.size,
+                entry_price=pos.entry_price,
+                pnl=pos.pnl,
+                tp=tp_s,
+                sl=sl_s,
+                tp_count=tp_n or None,
+                sl_count=sl_n or None,
+                exchange_instrument=pos.exchange_instrument,
+            )
+        )
+    return out
+
+
+def _find_open_position_row(
+    credentials: Mapping[str, str],
+    requested_symbol: str,
+    side_hint: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    meta = _resolve_meta(credentials, requested_symbol)
+    native = str(meta["symbol"]).upper()
+    payload = _contract_request(credentials, "GET", "/api/v1/private/position/open_positions")
+    if not _contract_ok(payload):
+        raise RuntimeError(str(payload.get("message") or "positions failed"))
+    rows = payload.get("data") or []
+    if not isinstance(rows, list):
+        rows = []
+    matches: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("symbol") or "").upper() != native:
+            continue
+        if _to_decimal(row.get("holdVol")) <= 0:
+            continue
+        matches.append(dict(row))
+    if not matches:
+        raise ValueError("POSITION_NOT_FOUND")
+    if side_hint:
+        want =  _POS_LONG if side_hint.lower() == "long" else _POS_SHORT
+        sided = [m for m in matches if int(m.get("positionType") or 0) == want]
+        if sided:
+            matches = sided
+    if len(matches) > 1 and not side_hint:
+        # Prefer long if both (unusual on MEXC one-way)
+        matches = sorted(matches, key=lambda r: int(r.get("positionType") or 0))
+    return matches[0], meta
+
+
+def _set_protection(account: str, request: Mapping[str, Any], kind: str) -> CanonicalResponse:
+    """kind is 'tp' or 'sl'."""
+    op = "set_tp" if kind == "tp" else "set_sl"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation=op,
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set MEXC_<ACCOUNT>_ACCESSKEY and MEXC_<ACCOUNT>_SECRETKEY.",
+        )
+    try:
+        price_raw = request.get("price")
+        if price_raw is None or str(price_raw).strip() == "":
+            return make_failure(
+                operation=op,
+                exchange=name,
+                account=credentials["account"],
+                code="INVALID_REQUEST",
+                message="price is required (0 removes protection).",
+            )
+        price = _to_decimal(price_raw)
+        side_hint = str(request.get("side") or request.get("position_side") or "").strip().lower() or None
+        if side_hint in {"buy", "long"}:
+            side_hint = "long"
+        elif side_hint in {"sell", "short"}:
+            side_hint = "short"
+        else:
+            side_hint = None
+
+        row, meta = _find_open_position_row(
+            credentials, str(request.get("symbol") or ""), side_hint=side_hint
+        )
+        native = str(meta["symbol"])
+        pid = str(row.get("positionId") or "")
+        hold = int(_to_decimal(row.get("holdVol")))
+        if hold <= 0 or not pid:
+            return make_failure(
+                operation=op,
+                exchange=name,
+                account=credentials["account"],
+                code="POSITION_NOT_FOUND",
+                message="No open position for symbol.",
+            )
+        pos_type = int(row.get("positionType") or _POS_LONG)
+        close_side = _SIDE_CLOSE_LONG if pos_type == _POS_LONG else _SIDE_CLOSE_SHORT
+        leverage = int(row.get("leverage") or credentials.get("default_leverage") or DEFAULT_LEVERAGE)
+        open_type = int(row.get("openType") or _OPEN_CROSS)
+        disp = _display_symbol(meta)
+        side_label = "long" if pos_type == _POS_LONG else "short"
+        size_coin = _contracts_to_coin(Decimal(hold), meta)
+
+        stops = _stops_for_position(_fetch_open_stop_rows(credentials), pid)
+        existing_tp, existing_sl, _, _ = _aggregate_tp_sl(stops)
+
+        # Cancel existing stop plans for this position so we can replace cleanly.
+        if stops:
+            _cancel_stop_ids(credentials, [s.get("id") for s in stops])
+            time.sleep(0.2)
+
+        if price <= 0:
+            # Removal only — do not re-place the other leg unless it existed.
+            other_price = existing_sl if kind == "tp" else existing_tp
+            if other_price and _to_decimal(other_price) > 0:
+                body: Dict[str, Any] = {
+                    "symbol": native,
+                    "vol": hold,
+                    "side": close_side,
+                    "openType": open_type,
+                    "leverage": leverage,
+                    "positionId": int(pid) if pid.isdigit() else pid,
+                }
+                if kind == "tp":
+                    body["stopLossPrice"] = float(_quantize_price(_to_decimal(other_price), meta))
+                else:
+                    body["takeProfitPrice"] = float(_quantize_price(_to_decimal(other_price), meta))
+                place = _contract_request(
+                    credentials, "POST", "/api/v1/private/stoporder/place", body=body
+                )
+                if not _contract_ok(place):
+                    return make_failure(
+                        operation=op,
+                        exchange=name,
+                        account=credentials["account"],
+                        code="PROTECTION_FAILED",
+                        message=_redact(
+                            sanitize_error_message(str(place.get("message") or place.get("code") or "place failed")),
+                            credentials,
+                        ),
+                    )
+            time.sleep(0.35)
+            left = _stops_for_position(_fetch_open_stop_rows(credentials), pid)
+            tp_s, sl_s, _, _ = _aggregate_tp_sl(left)
+            removed_ok = (tp_s is None) if kind == "tp" else (sl_s is None)
+            return make_success(
+                operation=op,
+                exchange=name,
+                account=credentials["account"],
+                position_action=CanonicalPositionActionResult(
+                    operation=op,
+                    symbol=disp,
+                    verified=removed_ok,
+                    price="0",
+                    removed=True,
+                    status="success" if removed_ok else "partial",
+                    current_side=side_label,
+                    current_size=_format_decimal(size_coin),
+                    message="protection removed",
+                ),
+            )
+
+        px = _quantize_price(price, meta)
+        body = {
+            "symbol": native,
+            "vol": hold,
+            "side": close_side,
+            "openType": open_type,
+            "leverage": leverage,
+            "positionId": int(pid) if pid.isdigit() else pid,
+        }
+        if kind == "tp":
+            body["takeProfitPrice"] = float(px)
+            if existing_sl and _to_decimal(existing_sl) > 0:
+                body["stopLossPrice"] = float(_quantize_price(_to_decimal(existing_sl), meta))
+        else:
+            body["stopLossPrice"] = float(px)
+            if existing_tp and _to_decimal(existing_tp) > 0:
+                body["takeProfitPrice"] = float(_quantize_price(_to_decimal(existing_tp), meta))
+
+        place = _contract_request(
+            credentials, "POST", "/api/v1/private/stoporder/place", body=body
+        )
+        if not _contract_ok(place):
+            return make_failure(
+                operation=op,
+                exchange=name,
+                account=credentials["account"],
+                code="PROTECTION_FAILED",
+                message=_redact(
+                    sanitize_error_message(str(place.get("message") or place.get("code") or "place failed")),
+                    credentials,
+                ),
+            )
+        oid = place.get("data")
+        time.sleep(0.4)
+        left = _stops_for_position(_fetch_open_stop_rows(credentials), pid)
+        tp_s, sl_s, _, _ = _aggregate_tp_sl(left)
+        got = tp_s if kind == "tp" else sl_s
+        verified = got is not None and abs(_to_decimal(got) - px) / px < Decimal("0.002")
+        return make_success(
+            operation=op,
+            exchange=name,
+            account=credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation=op,
+                symbol=disp,
+                verified=bool(verified or got),
+                price=_format_decimal(px),
+                removed=False,
+                status="success" if (verified or got) else "submitted",
+                exchange_order_id=oid,
+                current_side=side_label,
+                current_size=_format_decimal(size_coin),
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation=op,
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"POSITION_NOT_FOUND", "INSTRUMENT_NOT_FOUND"} else "INVALID_REQUEST",
+            message=(
+                "No open position for symbol."
+                if code == "POSITION_NOT_FOUND"
+                else ("Instrument not found." if code == "INSTRUMENT_NOT_FOUND" else sanitize_error_message(str(exc)))
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation=op,
+            exchange=name,
+            account=credentials["account"],
+            code="MEXC_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+def _close_position(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set MEXC_<ACCOUNT>_ACCESSKEY and MEXC_<ACCOUNT>_SECRETKEY.",
+        )
+    try:
+        side_hint = str(request.get("side") or request.get("position_side") or "").strip().lower() or None
+        if side_hint in {"buy", "long"}:
+            side_hint = "long"
+        elif side_hint in {"sell", "short"}:
+            side_hint = "short"
+        else:
+            side_hint = None
+        row, meta = _find_open_position_row(
+            credentials, str(request.get("symbol") or ""), side_hint=side_hint
+        )
+        native = str(meta["symbol"])
+        hold = int(_to_decimal(row.get("holdVol")))
+        if hold <= 0:
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=credentials["account"],
+                code="POSITION_NOT_FOUND",
+                message="No open position for symbol.",
+            )
+        # Optional partial size in coin units
+        size_req = request.get("size") or request.get("volume")
+        if size_req is not None and str(size_req).strip() not in {"", "0"}:
+            contracts = _coin_to_contracts(_to_decimal(size_req), meta)
+            if contracts <= 0:
+                return make_failure(
+                    operation="close_position",
+                    exchange=name,
+                    account=credentials["account"],
+                    code="SIZE_TOO_SMALL",
+                    message="Close size rounds to zero contracts.",
+                )
+            hold = min(hold, contracts)
+        pos_type = int(row.get("positionType") or _POS_LONG)
+        close_side = _SIDE_CLOSE_LONG if pos_type == _POS_LONG else _SIDE_CLOSE_SHORT
+        leverage = int(row.get("leverage") or DEFAULT_LEVERAGE)
+        open_type = int(row.get("openType") or _OPEN_CROSS)
+        disp = _display_symbol(meta)
+        side_label = "long" if pos_type == _POS_LONG else "short"
+        # Cancel stops first so they don't fight the close
+        pid = str(row.get("positionId") or "")
+        if pid:
+            stops = _stops_for_position(_fetch_open_stop_rows(credentials), pid)
+            if stops:
+                _cancel_stop_ids(credentials, [s.get("id") for s in stops])
+
+        body = {
+            "symbol": native,
+            "vol": hold,
+            "side": close_side,
+            "type": _TYPE_MARKET,
+            "openType": open_type,
+            "leverage": leverage,
+            "externalOid": f"kamc{int(time.time() * 1000)}",
+        }
+        payload = _contract_request(
+            credentials, "POST", "/api/v1/private/order/submit", body=body
+        )
+        if not _contract_ok(payload):
+            return make_failure(
+                operation="close_position",
+                exchange=name,
+                account=credentials["account"],
+                code="CLOSE_FAILED",
+                message=_redact(
+                    sanitize_error_message(str(payload.get("message") or payload.get("code") or "close failed")),
+                    credentials,
+                ),
+            )
+        oid = payload.get("data")
+        time.sleep(0.5)
+        # verify remaining
+        left_row = None
+        try:
+            left_row, _ = _find_open_position_row(credentials, native, side_hint=side_label)
+        except ValueError:
+            left_row = None
+        remaining = int(_to_decimal(left_row.get("holdVol"))) if left_row else 0
+        closed = remaining == 0
+        return make_success(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation="close_position",
+                symbol=disp,
+                verified=closed,
+                status="success" if closed else "partial",
+                exchange_order_id=oid,
+                current_side=side_label if remaining > 0 else None,
+                current_size=_format_decimal(_contracts_to_coin(Decimal(remaining), meta)) if remaining > 0 else "0",
+                message="closed" if closed else f"remaining_contracts={remaining}",
+            ),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code=code if code in {"POSITION_NOT_FOUND", "INSTRUMENT_NOT_FOUND"} else "INVALID_REQUEST",
+            message=(
+                "No open position for symbol."
+                if code == "POSITION_NOT_FOUND"
+                else ("Instrument not found." if code == "INSTRUMENT_NOT_FOUND" else sanitize_error_message(str(exc)))
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code="MEXC_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+
+# ---------------------------------------------------------------------------
 # execute
 # ---------------------------------------------------------------------------
 
@@ -1336,6 +1803,12 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _new_order(account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(account, request)
+        if operation == "set_tp":
+            return _set_protection(account, request, "tp")
+        if operation == "set_sl":
+            return _set_protection(account, request, "sl")
+        if operation == "close_position":
+            return _close_position(account, request)
         if operation == "resolve_instrument":
             return _resolve_instrument(account, request)
         if operation == "list_instruments":
