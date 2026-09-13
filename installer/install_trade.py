@@ -37,6 +37,23 @@ SUSPICIOUS_UNIT_PATH_TOKENS = (
     "kam-ik-itest",
 )
 
+# Packages Hermes commonly owns that must never be downgraded by KAM deps.
+# Fresh Hermes venvs may have eth-account 0.14.x; unconstrained
+# ``pip install -r requirements.txt`` / SDK runtime deps can resolve 0.13.x
+# and trip the preservation check, aborting install before agents are copied.
+HERMES_PROTECTED_PACKAGES: tuple[str, ...] = (
+    "eth-account",
+    "eth-keyfile",
+    "eth-utils",
+    "eth-abi",
+    "eth-hash",
+    "eth-rlp",
+    "eth-typing",
+    "eth-keys",
+    "urllib3",
+    "web3",
+)
+
 
 def _normalize_dist_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
@@ -181,28 +198,92 @@ def _sdk_requirement_string(spec: Dict[str, Any]) -> str:
     return f"{spec['package']}=={spec['version']}"
 
 
-def _sdk_install_command(python_exe: Path, spec: Dict[str, Any]) -> List[str]:
-    return [
+def _sdk_install_command(
+    python_exe: Path,
+    spec: Dict[str, Any],
+    constraints_file: Path | None = None,
+) -> List[str]:
+    cmd = [
         str(python_exe),
         "-m",
         "pip",
         "install",
         "--no-input",
         *[str(arg) for arg in spec.get("install_args") or []],
-        _sdk_requirement_string(spec),
     ]
+    if constraints_file is not None:
+        cmd.extend(["-c", str(constraints_file)])
+    cmd.append(_sdk_requirement_string(spec))
+    return cmd
 
 
-def _runtime_dependency_install_command(python_exe: Path, dep: Dict[str, Any]) -> List[str]:
-    return [
+def _runtime_dependency_install_command(
+    python_exe: Path,
+    dep: Dict[str, Any],
+    constraints_file: Path | None = None,
+) -> List[str]:
+    cmd = [
         str(python_exe),
         "-m",
         "pip",
         "install",
         "--no-input",
         *[str(arg) for arg in dep.get("install_args") or []],
-        _dependency_requirement_string(dep),
     ]
+    if constraints_file is not None:
+        cmd.extend(["-c", str(constraints_file)])
+    cmd.append(_dependency_requirement_string(dep))
+    return cmd
+
+
+def _write_protected_constraints(
+    versions: Dict[str, str],
+    destination: Path,
+    extra_packages: List[str] | None = None,
+) -> List[str]:
+    """Pin already-installed Hermes-sensitive packages so pip cannot downgrade them."""
+    packages = list(HERMES_PROTECTED_PACKAGES)
+    if extra_packages:
+        packages.extend(extra_packages)
+    lines: List[str] = []
+    seen: set[str] = set()
+    for raw in packages:
+        name = _normalize_dist_name(raw)
+        if name in seen:
+            continue
+        seen.add(name)
+        ver = versions.get(name)
+        if not ver:
+            continue
+        # pip constraint file uses the distribution name as installed.
+        lines.append(f"{raw}=={ver}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return lines
+
+
+def _default_preservation_policy(policy: Dict[str, Any] | None) -> Dict[str, Any]:
+    merged = {
+        "preserve_existing_versions": True,
+        "protected_packages": list(HERMES_PROTECTED_PACKAGES),
+    }
+    if policy:
+        merged.update(dict(policy))
+        # Always union protected packages with Hermes defaults.
+        protected = [
+            _normalize_dist_name(p)
+            for p in list(merged.get("protected_packages") or []) + list(HERMES_PROTECTED_PACKAGES)
+            if str(p).strip()
+        ]
+        # preserve original order unique
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for p in protected:
+            if p not in seen:
+                seen.add(p)
+                ordered.append(p)
+        merged["protected_packages"] = ordered
+    return merged
 
 
 def _installed_version_satisfies(installed_version: str | None, dep: Dict[str, Any]) -> bool:
@@ -301,11 +382,14 @@ def _plan_runtime_dependency_actions(
 def _bind_runtime_dependency_commands(
     python_exe: Path,
     runtime_dependency_actions: List[Dict[str, Any]],
+    constraints_file: Path | None = None,
 ) -> List[Dict[str, Any]]:
     bound: List[Dict[str, Any]] = []
     for action in runtime_dependency_actions:
         item = dict(action)
-        item["install_command"] = _runtime_dependency_install_command(python_exe, item)
+        item["install_command"] = _runtime_dependency_install_command(
+            python_exe, item, constraints_file=constraints_file
+        )
         bound.append(item)
     return bound
 
@@ -344,7 +428,7 @@ def _assert_dependency_state_preserved(
     policy: Dict[str, Any] | None,
     allowed_changed_packages: set[str] | None = None,
 ) -> Dict[str, Any]:
-    policy = dict(policy or {})
+    policy = _default_preservation_policy(policy)
     preserve_existing_versions = bool(policy.get("preserve_existing_versions", True))
     protected_packages = [
         _normalize_dist_name(name)
@@ -771,9 +855,27 @@ def install_dependencies(
 ) -> Dict[str, Any]:
     step("Dependencies")
     req = REPO_ROOT / "installer" / "requirements.txt"
-    req_command = [str(python_exe), "-m", "pip", "install", "--no-input", "-r", str(req)]
     manifest = load_dependency_manifest(manifest_path)
     sdk_specs = iter_sdk_dependencies(manifest)
+
+    # Snapshot + pin Hermes-sensitive packages before any resolver run.
+    before = {} if dry_run else _pip_list_versions(python_exe)
+    constraints_path = REPO_ROOT / "installer" / ".hermes_protected_constraints.txt"
+    constraint_lines: List[str] = []
+    if not dry_run:
+        constraint_lines = _write_protected_constraints(before, constraints_path)
+        if constraint_lines:
+            ok(
+                "Protected constraints: "
+                + ", ".join(constraint_lines[:8])
+                + ("…" if len(constraint_lines) > 8 else "")
+            )
+        else:
+            skip("No Hermes-protected packages present yet; installing without constraints")
+
+    req_command = [str(python_exe), "-m", "pip", "install", "--no-input", "-r", str(req)]
+    if constraint_lines:
+        req_command.extend(["-c", str(constraints_path)])
 
     if dry_run:
         if req.is_file():
@@ -782,7 +884,7 @@ def install_dependencies(
             skip("No requirements.txt; skipping base dependency install")
         sdk_reports = []
         for spec in sdk_specs:
-            command = _sdk_install_command(python_exe, spec)
+            command = _sdk_install_command(python_exe, spec, constraints_file=constraints_path)
             ok(
                 f"Would run SDK install [{spec['exchange']}:{spec.get('id') or spec['package']}] "
                 f"{' '.join(command)}"
@@ -790,6 +892,7 @@ def install_dependencies(
             runtime_dependency_actions = _bind_runtime_dependency_commands(
                 python_exe,
                 _plan_runtime_dependency_actions({}, spec),
+                constraints_file=constraints_path,
             )
             for dep_action in runtime_dependency_actions:
                 ok(
@@ -806,18 +909,17 @@ def install_dependencies(
                 "runtime_dependencies": runtime_dependency_actions,
                 "import_probe": spec["import_probe"],
                 "import_verification": "pending",
-                "preservation": dict(spec.get("preservation_policy") or {}),
+                "preservation": _default_preservation_policy(spec.get("preservation_policy")),
                 "action": "would-install",
             })
         return {
             "manifest": str(manifest_path or DEPENDENCY_MANIFEST_PATH),
             "requirements": str(req) if req.is_file() else None,
             "requirements_command": req_command,
+            "constraints": str(constraints_path),
             "sdks": sdk_reports,
             "action": "would-install",
         }
-
-    before = _pip_list_versions(python_exe)
 
     if req.is_file():
         proc = subprocess.run(req_command, capture_output=True, text=True)
@@ -825,13 +927,30 @@ def install_dependencies(
             raise K.InstallError(
                 f"Dependency install failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
             )
+        after_req = _pip_list_versions(python_exe)
+        # requirements may install new packages; protected ones must stay put.
+        _assert_dependency_state_preserved(
+            before,
+            after_req,
+            {"preserve_existing_versions": True, "protected_packages": list(HERMES_PROTECTED_PACKAGES)},
+            # allow anything NOT protected to change freely from requirements.txt
+            allowed_changed_packages={
+                name for name in after_req.keys() | before.keys()
+                if name not in {_normalize_dist_name(p) for p in HERMES_PROTECTED_PACKAGES}
+            },
+        )
+        current_versions = after_req
+        # Refresh constraints in case new protected packages appeared (unlikely).
+        constraint_lines = _write_protected_constraints(current_versions, constraints_path)
     else:
         skip("No requirements.txt; skipping base dependency install")
+        current_versions = before
 
     sdk_reports = []
-    current_versions = before
     for spec in sdk_specs:
-        command = _sdk_install_command(python_exe, spec)
+        command = _sdk_install_command(
+            python_exe, spec, constraints_file=constraints_path if constraint_lines else None
+        )
         proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode != 0:
             raise K.InstallError(
@@ -847,6 +966,7 @@ def install_dependencies(
         runtime_dependency_actions = _bind_runtime_dependency_commands(
             python_exe,
             _plan_runtime_dependency_actions(after_sdk, spec),
+            constraints_file=constraints_path if constraint_lines else None,
         )
         runtime_dependency_reports = []
         runtime_versions = after_sdk
@@ -907,6 +1027,8 @@ def install_dependencies(
         "manifest": str(manifest_path or DEPENDENCY_MANIFEST_PATH),
         "requirements": str(req) if req.is_file() else None,
         "requirements_command": req_command,
+        "constraints": str(constraints_path) if constraint_lines else None,
+        "constraint_pins": constraint_lines,
         "sdks": sdk_reports,
         "versions_before": before,
         "versions_after": current_versions,
