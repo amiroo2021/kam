@@ -59,7 +59,65 @@ def _normalize_dist_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
 
 
+def _ensure_pip(python_exe: Path) -> None:
+    """Make sure ``python -m pip`` works in the Hermes venv.
+
+    Some Hermes installs ship a venv without pip. Without this, dependency
+    install fails at the first ``pip list`` with ``No module named pip`` and
+    aborts before agents/plugin.yaml are copied.
+    """
+    probe = subprocess.run(
+        [str(python_exe), "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return
+
+    say(f"    [!!] pip missing in {python_exe}; bootstrapping via ensurepip")
+    boot = subprocess.run(
+        [str(python_exe), "-m", "ensurepip", "--upgrade"],
+        capture_output=True,
+        text=True,
+    )
+    if boot.returncode != 0:
+        raise K.InstallError(
+            "Hermes venv has no pip and ensurepip failed.\n"
+            f"python={python_exe}\n"
+            f"ensurepip stdout:\n{(boot.stdout or '')[-1500:]}\n"
+            f"ensurepip stderr:\n{(boot.stderr or '')[-1500:]}\n"
+            "Fix on the host, then re-run install:\n"
+            f"  {python_exe} -m ensurepip --upgrade\n"
+            f"  {python_exe} -m pip install --upgrade pip\n"
+            "Or install files only (no SDK deps):\n"
+            "  ./install.sh --trade --hermes-root <root> --skip-deps"
+        )
+
+    upgrade = subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "--no-input", "--upgrade", "pip"],
+        capture_output=True,
+        text=True,
+    )
+    # pip upgrade is best-effort; presence of pip is what matters.
+    probe2 = subprocess.run(
+        [str(python_exe), "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    if probe2.returncode != 0:
+        raise K.InstallError(
+            "pip still unavailable after ensurepip.\n"
+            f"python={python_exe}\n"
+            f"pip --version stderr:\n{(probe2.stderr or '')[-1500:]}\n"
+            f"pip upgrade stderr:\n{(upgrade.stderr or '')[-1500:]}\n"
+            f"  {python_exe} -m ensurepip --upgrade\n"
+            f"  {python_exe} -m pip install --upgrade pip"
+        )
+    ok(f"pip ready: {(probe2.stdout or '').strip()}")
+
+
 def _pip_list_versions(python_exe: Path) -> Dict[str, str]:
+    _ensure_pip(python_exe)
     proc = subprocess.run(
         [str(python_exe), "-m", "pip", "list", "--format=json"],
         capture_output=True, text=True,

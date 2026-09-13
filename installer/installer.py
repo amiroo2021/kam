@@ -233,6 +233,15 @@ def cmd_install(args: argparse.Namespace) -> int:
             print(f"dependencies: {deps_record.get('action')}")
         except Exception as exc:
             print(f"ERROR: dependency install failed: {exc}", file=sys.stderr)
+            print(
+                "Hint: if the Hermes venv has no pip, run:\n"
+                f"  {hermes_root}/venv/bin/python -m ensurepip --upgrade\n"
+                f"  {hermes_root}/venv/bin/python -m pip install --upgrade pip\n"
+                "Then re-run install. To install agent files/wiring without SDKs:\n"
+                "  ./install.sh --trade --hermes-root "
+                f"{hermes_root} --skip-deps",
+                file=sys.stderr,
+            )
             if not dry_run:
                 return 1
             deps_record = {"action": "error", "error": str(exc)}
