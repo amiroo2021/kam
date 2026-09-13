@@ -316,6 +316,38 @@ def cmd_install(args: argparse.Namespace) -> int:
     save_manifest(hermes_home, manifest)
     print(f"manifest: {install_state_path(hermes_home)}")
     print(f"OK -- installed: {', '.join(caps)}")
+
+    # Reload gateway so /trade seams + plugins.enabled take effect.
+    restart_record: dict = {"action": "skipped", "reason": "not-attempted"}
+    if not args.no_restart:
+        try:
+            from install_trade import restart_gateway as _restart_gateway
+        except Exception:
+            from install_trade import restart_gateway as _restart_gateway  # type: ignore
+        try:
+            restart_record = _restart_gateway(
+                dry_run=False,
+                no_restart=False,
+                hermes_root=hermes_root,
+            )
+            print(f"gateway restart: {restart_record.get('action')} method={restart_record.get('method')}")
+        except Exception as exc:
+            print(f"ERROR: gateway restart failed: {exc}", file=sys.stderr)
+            print("Run manually: hermes gateway restart", file=sys.stderr)
+            # Install itself succeeded; still surface restart failure as non-zero
+            # so operators notice /trade won't load until restart.
+            return 2
+    else:
+        print("gateway restart: skipped (--no-restart)")
+        restart_record = {"action": "skipped", "reason": "no-restart-flag"}
+
+    # Persist restart outcome on the manifest for audit.
+    try:
+        manifest = load_manifest(hermes_home)
+        manifest["restart"] = restart_record
+        save_manifest(hermes_home, manifest)
+    except Exception:
+        pass
     return 0
 
 

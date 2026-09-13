@@ -1094,28 +1094,111 @@ def install_dependencies(
     }
 
 
-def restart_gateway(dry_run: bool, no_restart: bool) -> Dict[str, Any]:
+def restart_gateway(
+    dry_run: bool,
+    no_restart: bool,
+    hermes_root: Path | None = None,
+) -> Dict[str, Any]:
+    """Restart the messaging gateway after install.
+
+    Preferred command (user/host standard):
+      ``hermes gateway restart``
+
+    Falls back to ``systemctl restart <unit>`` only if the hermes CLI is
+    unavailable.
+    """
     step("Gateway restart")
-    unit = K.find_service_unit()
-    if unit is None:
-        skip("No hermes-gateway.service found; restart manually if needed")
-        return {"action": "skipped", "reason": "unit-not-found"}
     if no_restart:
         skip("--no-restart supplied; not restarting")
         return {"action": "skipped", "reason": "no-restart-flag"}
-    if dry_run:
-        ok("Would run: systemctl restart hermes-gateway")
-        return {"action": "would-restart"}
 
-    subprocess.run(["systemctl", "restart", "hermes-gateway"], check=True)
+    hermes_cli = _resolve_hermes_cli(hermes_root)
+    if dry_run:
+        if hermes_cli is not None:
+            ok(f"Would run: {hermes_cli} gateway restart")
+            return {"action": "would-restart", "command": [str(hermes_cli), "gateway", "restart"]}
+        unit = K.find_service_unit()
+        if unit is None:
+            skip("No hermes CLI or hermes-gateway.service found; restart manually if needed")
+            return {"action": "skipped", "reason": "unit-not-found"}
+        ok(f"Would run: systemctl restart {unit.name}")
+        return {"action": "would-restart", "command": ["systemctl", "restart", unit.stem]}
+
+    if hermes_cli is not None:
+        cmd = [str(hermes_cli), "gateway", "restart"]
+        ok(f"Running: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if proc.returncode != 0:
+            raise K.InstallError(
+                f"hermes gateway restart failed (exit {proc.returncode}):\n{out[-3000:]}"
+            )
+        if out:
+            for line in out.splitlines()[-12:]:
+                say(f"    {line}")
+        # Best-effort status
+        status = subprocess.run(
+            [str(hermes_cli), "gateway", "status"],
+            capture_output=True,
+            text=True,
+        )
+        status_text = ((status.stdout or "") + (status.stderr or "")).strip()
+        ok("Gateway restart requested via hermes CLI")
+        return {
+            "action": "restarted",
+            "method": "hermes-cli",
+            "command": cmd,
+            "status_exit": status.returncode,
+            "status_tail": status_text[-1500:] if status_text else "",
+        }
+
+    unit = K.find_service_unit()
+    if unit is None:
+        skip(
+            "No hermes CLI or hermes-gateway.service found; "
+            "run manually: hermes gateway restart"
+        )
+        return {"action": "skipped", "reason": "cli-and-unit-not-found"}
+
+    service = unit.name
+    subprocess.run(["systemctl", "restart", service], check=True)
     proc = subprocess.run(
-        ["systemctl", "is-active", "hermes-gateway"], capture_output=True, text=True
+        ["systemctl", "is-active", service], capture_output=True, text=True
     )
     state = proc.stdout.strip()
     if state != "active":
         raise K.InstallError(f"Gateway did not return to active (state={state})")
-    ok("Gateway active")
-    return {"action": "restarted", "state": state}
+    ok(f"Gateway active ({service})")
+    return {"action": "restarted", "method": "systemctl", "service": service, "state": state}
+
+
+def _resolve_hermes_cli(hermes_root: Path | None) -> Path | None:
+    """Locate the hermes CLI binary."""
+    candidates: List[Path] = []
+    if hermes_root is not None:
+        candidates.append(Path(hermes_root) / "venv" / "bin" / "hermes")
+        candidates.append(Path(hermes_root) / "bin" / "hermes")
+    which = shutil.which("hermes")
+    if which:
+        candidates.append(Path(which))
+    candidates.extend(
+        [
+            Path("/usr/local/bin/hermes"),
+            Path("/usr/bin/hermes"),
+        ]
+    )
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return cand
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1218,7 +1301,7 @@ def main(argv: List[str]) -> int:
             raise K.InstallError("Verification failed; not restarting the gateway")
         say()
 
-        restart = restart_gateway(args.dry_run, args.no_restart)
+        restart = restart_gateway(args.dry_run, args.no_restart, hermes_root=hermes_root)
         manifest["restart"] = restart
         if not args.dry_run:
             K.write_manifest(K.manifest_path(REPO_ROOT), manifest)
