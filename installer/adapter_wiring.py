@@ -211,9 +211,9 @@ def remove_adapter_wiring(
 
     specs: List = []
     if "trade" in removing:
-        specs.extend(trade_adapter_specs())
+        specs.extend(trade_adapter_specs(hermes_root))
     if "fibo" in removing:
-        specs.extend(fibo_adapter_specs())
+        specs.extend(fibo_adapter_specs(hermes_root))
     if not (remaining & {"trade", "fibo"}):
         # Last capability gone — drop helper too.
         specs.extend(helper_specs(hermes_root))

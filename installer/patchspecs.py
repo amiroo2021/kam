@@ -485,14 +485,129 @@ def helper_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     ]
 
 
-def trade_adapter_specs() -> List[PatchSpec]:
+def _count(text: str, needle: str) -> int:
+    return text.count(needle) if needle else 0
+
+
+def _choose_unique_anchor_pair(
+    text: str,
+    before_candidates: List[str],
+    after_candidates: List[str],
+    *,
+    seam: str,
+) -> tuple[str, str]:
+    """Pick the first (before, after) pair that each occurs exactly once and in order."""
+    errors: List[str] = []
+    for before in before_candidates:
+        bc = _count(text, before)
+        if bc != 1:
+            errors.append(f"before={before!r} count={bc}")
+            continue
+        bi = text.index(before)
+        for after in after_candidates:
+            ac = _count(text, after)
+            if ac != 1:
+                errors.append(f"after={after!r} count={ac}")
+                continue
+            ai = text.index(after)
+            if bi < ai:
+                return before, after
+            errors.append(f"order fail before@{bi} after@{ai}")
+    detail = "; ".join(errors[:12])
+    raise InstallError(
+        f"[{seam}] could not resolve unique anchors for this Hermes adapter build. "
+        f"Tried {len(before_candidates)}×{len(after_candidates)} candidates. {detail}"
+    )
+
+
+def _read_adapter_text(hermes_root: Optional[Path]) -> str:
+    if hermes_root is None:
+        return ""
+    path = Path(hermes_root) / TELEGRAM_ADAPTER
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _callback_anchor_pair(adapter_text: str) -> tuple[str, str]:
+    before_candidates = [
+        'query_user_name = getattr(query.from_user, "first_name", None)',
+        "query_user_name = getattr(query.from_user, 'first_name', None)",
+        "query_user_name = getattr(query.from_user, \"full_name\", None)",
+        "query_thread_id = getattr(query_message, \"message_thread_id\", None)",
+        "query_chat_type = getattr(query_chat, \"type\", None)",
+        "data = query.data",
+        "query = update.callback_query",
+    ]
+    after_candidates = [
+        "# --- Model picker callbacks ---",
+        '# --- Model picker callbacks ---',
+        'if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):',
+        'if data.startswith(("mp:",',
+        'if data.startswith("mp:")',
+        "# --- Generic choice picker callbacks",
+        'if data.startswith("cp:"):',
+    ]
+    if not adapter_text:
+        # Fallback to classic Hermes layout (dopower / known-good).
+        return before_candidates[0], after_candidates[0]
+    return _choose_unique_anchor_pair(
+        adapter_text, before_candidates, after_candidates, seam="callback dispatch"
+    )
+
+
+def _text_anchor_pair(adapter_text: str) -> tuple[str, str]:
+    before_candidates = [
+        "await self._ensure_forum_commands(update.message)",
+        "await self._ensure_forum_commands(msg)",
+        "if not self._should_process_message(msg):",
+        "if not self._is_user_authorized_from_message(msg):",
+    ]
+    after_candidates = [
+        "event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)",
+        "event = self._build_message_event(msg, MessageType.TEXT,",
+        "self._enqueue_text_event(event)",
+    ]
+    if not adapter_text:
+        return before_candidates[0], after_candidates[0]
+    return _choose_unique_anchor_pair(
+        adapter_text, before_candidates, after_candidates, seam="wizard text interception"
+    )
+
+
+def _command_anchor_pair(adapter_text: str) -> tuple[str, str]:
+    before_candidates = [
+        "await self._ensure_forum_commands(msg)",
+        "await self._ensure_forum_commands(update.message)",
+        "if not self._is_user_authorized_from_message(msg):",
+        "if not self._should_process_message(msg, is_command=True):",
+    ]
+    after_candidates = [
+        "event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)",
+        "event = self._build_message_event(msg, MessageType.COMMAND,",
+    ]
+    if not adapter_text:
+        return before_candidates[0], after_candidates[0]
+    return _choose_unique_anchor_pair(
+        adapter_text, before_candidates, after_candidates, seam="slash command dispatch"
+    )
+
+
+def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     """Telegram adapter seams for /trade only (command + callback + text)."""
+    adapter_text = _read_adapter_text(hermes_root)
+    cb_before, cb_after = _callback_anchor_pair(adapter_text)
+    text_before, text_after = _text_anchor_pair(adapter_text)
+    cmd_before, cmd_after = _command_anchor_pair(adapter_text)
     return [
         PatchSpec(
             seam="callback dispatch",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
-            anchor_after="# --- Model picker callbacks ---",
+            anchor_before=cb_before,
+            anchor_after=cb_after,
             block=_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_callback",
@@ -500,11 +615,8 @@ def trade_adapter_specs() -> List[PatchSpec]:
         PatchSpec(
             seam="wizard text interception",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(update.message)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.TEXT, "
-                "update_id=update.update_id)"
-            ),
+            anchor_before=text_before,
+            anchor_after=text_after,
             block=_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
@@ -512,11 +624,8 @@ def trade_adapter_specs() -> List[PatchSpec]:
         PatchSpec(
             seam="slash command dispatch",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(msg)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.COMMAND, "
-                "update_id=update.update_id)"
-            ),
+            anchor_before=cmd_before,
+            anchor_after=cmd_after,
             block=_COMMAND_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_command",
@@ -524,14 +633,18 @@ def trade_adapter_specs() -> List[PatchSpec]:
     ]
 
 
-def fibo_adapter_specs() -> List[PatchSpec]:
+def fibo_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     """Telegram adapter seams for /fibo only (command + callback + text)."""
+    adapter_text = _read_adapter_text(hermes_root)
+    cb_before, cb_after = _callback_anchor_pair(adapter_text)
+    text_before, text_after = _text_anchor_pair(adapter_text)
+    cmd_before, cmd_after = _command_anchor_pair(adapter_text)
     return [
         PatchSpec(
             seam="fibo callback dispatch",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before='query_user_name = getattr(query.from_user, "first_name", None)',
-            anchor_after="# --- Model picker callbacks ---",
+            anchor_before=cb_before,
+            anchor_after=cb_after,
             block=_FIBO_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_callback",
@@ -539,11 +652,8 @@ def fibo_adapter_specs() -> List[PatchSpec]:
         PatchSpec(
             seam="fibo text interception",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(update.message)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.TEXT, "
-                "update_id=update.update_id)"
-            ),
+            anchor_before=text_before,
+            anchor_after=text_after,
             block=_FIBO_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_text",
@@ -551,11 +661,8 @@ def fibo_adapter_specs() -> List[PatchSpec]:
         PatchSpec(
             seam="fibo slash command dispatch",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before="await self._ensure_forum_commands(msg)",
-            anchor_after=(
-                "event = self._build_message_event(msg, MessageType.COMMAND, "
-                "update_id=update.update_id)"
-            ),
+            anchor_before=cmd_before,
+            anchor_after=cmd_after,
             block=_FIBO_COMMAND_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_command",
@@ -563,7 +670,7 @@ def fibo_adapter_specs() -> List[PatchSpec]:
     ]
 
 
-def adapter_specs() -> List[PatchSpec]:
+def adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     """Telegram adapter seams for /trade and /fibo, in file order.
 
     Fibo blocks are listed before trade blocks so both can share the same
@@ -571,7 +678,7 @@ def adapter_specs() -> List[PatchSpec]:
     first keeps trade inserts closer to the anchor and both stay between
     the anchors.
     """
-    return fibo_adapter_specs() + trade_adapter_specs()
+    return fibo_adapter_specs(hermes_root) + trade_adapter_specs(hermes_root)
 
 
 def specs_for_capabilities(
@@ -586,9 +693,9 @@ def specs_for_capabilities(
     caps = {str(c).strip().lower() for c in capabilities if str(c).strip()}
     specs: List[PatchSpec] = []
     if "fibo" in caps:
-        specs.extend(fibo_adapter_specs())
+        specs.extend(fibo_adapter_specs(hermes_root))
     if "trade" in caps:
-        specs.extend(trade_adapter_specs())
+        specs.extend(trade_adapter_specs(hermes_root))
     if caps & {"trade", "fibo"}:
         specs.extend(helper_specs(hermes_root))
     return specs
