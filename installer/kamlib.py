@@ -277,6 +277,12 @@ class PatchSpec:
     # Used to recognize structurally compatible helpers whose textual
     # sentinel may differ between Hermes builds.
     native_presence_check: Optional[Callable[[str, "PatchSpec"], Tuple[bool, str]]] = None
+    # Optional AST method-body insertion (Hermes builds where textual anchors
+    # are missing or non-unique). When set, apply_patch inserts inside this
+    # method after a preferred in-method line, ignoring global anchor_after.
+    method_name: Optional[str] = None
+    method_name_candidates: Optional[List[str]] = None
+    method_after_substrings: Optional[List[str]] = None
 
     def marker_begin(self) -> str:
         return f"{MARKER_BEGIN} ({self.seam})"
@@ -308,6 +314,128 @@ def _ast_validate_python(text: str, spec: PatchSpec) -> None:
         spec.ast_validator(text, spec)
 
 
+def _find_ast_methods(tree: ast.AST, names: List[str]) -> List[ast.AST]:
+    want = {n for n in names if n}
+    found: List[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in want:
+            found.append(node)
+    return found
+
+
+def _apply_method_body_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
+    """Insert marked block inside a target method body (AST-guided)."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise InstallError(
+            f"[{spec.seam}] cannot parse adapter for method insert: {exc}"
+        ) from exc
+
+    names: List[str] = []
+    if spec.method_name:
+        names.append(spec.method_name)
+    if spec.method_name_candidates:
+        names.extend(list(spec.method_name_candidates))
+    # de-dupe preserve order
+    seen: set[str] = set()
+    ordered_names = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            ordered_names.append(n)
+    if not ordered_names:
+        raise InstallError(f"[{spec.seam}] method insert requested but no method_name set")
+
+    methods = _find_ast_methods(tree, ordered_names)
+    if not methods:
+        raise InstallError(
+            f"[{spec.seam}] method insert: none of {ordered_names} found in {spec.relative_path}"
+        )
+    if len(methods) > 1:
+        # Prefer exact method_name match if unique among that name
+        if spec.method_name:
+            exact = [m for m in methods if getattr(m, "name", None) == spec.method_name]
+            if len(exact) == 1:
+                methods = exact
+            else:
+                raise InstallError(
+                    f"[{spec.seam}] method insert: ambiguous methods {[(getattr(m,'name',None), getattr(m,'lineno',None)) for m in methods]}"
+                )
+        else:
+            raise InstallError(
+                f"[{spec.seam}] method insert: ambiguous methods {[getattr(m,'name',None) for m in methods]}"
+            )
+    method = methods[0]
+    if not hasattr(method, "lineno") or not hasattr(method, "end_lineno"):
+        raise InstallError(f"[{spec.seam}] method node missing line numbers")
+    start = int(method.lineno) - 1
+    end = int(method.end_lineno) - 1
+    lines = text.splitlines(keepends=True)
+    if start < 0 or end >= len(lines) or start > end:
+        raise InstallError(f"[{spec.seam}] method line range invalid ({start}:{end})")
+
+    # Prefer insert after an in-method line matching substrings.
+    patterns = list(spec.method_after_substrings or [])
+    insert_at: Optional[int] = None
+    for pat in patterns:
+        for i in range(start, end + 1):
+            if pat in lines[i]:
+                insert_at = i
+                # keep first match of this pattern (early in method)
+                break
+        if insert_at is not None:
+            break
+
+    if insert_at is None:
+        # After def line + optional docstring: first body stmt line if available
+        body = list(getattr(method, "body", []) or [])
+        if body:
+            first = body[0]
+            # skip docstring
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(getattr(first, "value", None), ast.Constant)
+                and isinstance(first.value.value, str)
+                and len(body) > 1
+            ):
+                first = body[1]
+            insert_at = int(first.lineno) - 1
+        else:
+            insert_at = start
+
+    # Indent from insertion_indent or detect from next non-empty body line
+    indent = spec.insertion_indent
+    if not indent.strip() and indent == "":
+        raise InstallError(f"[{spec.seam}] insertion_indent is empty; refusing to patch.")
+    # If indent looks wrong, try detect from method body lines
+    for i in range(start + 1, min(end, start + 30) + 1):
+        raw = lines[i]
+        if raw.strip():
+            leading = raw[: len(raw) - len(raw.lstrip(" \t"))]
+            if leading and (indent == "        " or not indent.strip()):
+                indent = leading
+            break
+
+    marker_open = f"{indent}# {spec.marker_begin()}\n"
+    marker_close = f"{indent}# {spec.marker_end()}\n"
+    code = ""
+    for raw in spec.block.strip("\n").splitlines():
+        code += (f"{indent}{raw}\n" if raw.strip() else "\n")
+    insertion = "\n" + marker_open + code + marker_close
+
+    new_text = (
+        "".join(lines[: insert_at + 1])
+        + insertion
+        + "".join(lines[insert_at + 1 :])
+    )
+    if spec.marker_begin() not in new_text:
+        raise InstallError(f"[{spec.seam}] method insert failed to place marker")
+    if spec.relative_path.suffix == ".py":
+        _ast_validate_python(new_text, spec)
+    return new_text, "patched", f"inserted in method {getattr(method,'name', '?')} after line {insert_at + 1}"
+
+
 def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
     """Return ``(new_text, action, detail)``.
 
@@ -335,59 +463,70 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
     if not spec.insertion_indent:
         raise InstallError(f"[{spec.seam}] insertion_indent is empty; refusing to patch.")
 
-    before_count = text.count(spec.anchor_before)
-    if before_count != 1:
-        raise InstallError(
-            f"[{spec.seam}] anchor_before matched {before_count} times "
-            f"(expected exactly 1) in {spec.relative_path}. Refusing to patch."
+    # Preferred path: classic unique anchors.
+    anchor_error: Optional[str] = None
+    before_count = text.count(spec.anchor_before) if spec.anchor_before else 0
+    after_count = text.count(spec.anchor_after) if spec.anchor_after else 0
+    can_anchor = (
+        bool(spec.anchor_before)
+        and bool(spec.anchor_after)
+        and before_count == 1
+        and after_count == 1
+        and text.index(spec.anchor_before) < text.index(spec.anchor_after)
+    )
+    if can_anchor:
+        idx_before = text.index(spec.anchor_before)
+        lines = text.splitlines(keepends=True)
+        target_line_index: Optional[int] = None
+        running = 0
+        for i, line in enumerate(lines):
+            if running <= idx_before < running + len(line):
+                target_line_index = i
+                break
+            running += len(line)
+        if target_line_index is None:
+            raise InstallError(f"[{spec.seam}] could not locate anchor line; refusing to patch.")
+
+        indent = spec.insertion_indent
+        marker_open = f"{indent}# {spec.marker_begin()}\n"
+        marker_close = f"{indent}# {spec.marker_end()}\n"
+        code = ""
+        for raw in spec.block.strip("\n").splitlines():
+            code += (f"{indent}{raw}\n" if raw.strip() else "\n")
+        insertion = "\n" + marker_open + code + marker_close
+
+        new_text = (
+            "".join(lines[: target_line_index + 1])
+            + insertion
+            + "".join(lines[target_line_index + 1 :])
         )
-    after_count = text.count(spec.anchor_after)
-    if after_count != 1:
-        raise InstallError(
-            f"[{spec.seam}] anchor_after matched {after_count} times "
-            f"(expected exactly 1) in {spec.relative_path}. Refusing to patch."
-        )
 
-    idx_before = text.index(spec.anchor_before)
-    idx_after = text.index(spec.anchor_after)
-    if idx_before >= idx_after:
-        raise InstallError(
-            f"[{spec.seam}] anchor ordering invalid in {spec.relative_path} "
-            f"({idx_before} >= {idx_after}). Refusing to patch."
-        )
+        if new_text.index(spec.marker_begin()) >= new_text.index(spec.anchor_after):
+            raise InstallError(
+                f"[{spec.seam}] post-insert ordering check failed; refusing to keep patch."
+            )
+        if spec.relative_path.suffix == ".py":
+            _ast_validate_python(new_text, spec)
+        return new_text, "patched", "inserted after anchor_before"
 
-    lines = text.splitlines(keepends=True)
-    target_line_index: Optional[int] = None
-    running = 0
-    for i, line in enumerate(lines):
-        if running <= idx_before < running + len(line):
-            target_line_index = i
-            break
-        running += len(line)
-    if target_line_index is None:
-        raise InstallError(f"[{spec.seam}] could not locate anchor line; refusing to patch.")
-
-    indent = spec.insertion_indent
-    marker_open = f"{indent}# {spec.marker_begin()}\n"
-    marker_close = f"{indent}# {spec.marker_end()}\n"
-    code = ""
-    for raw in spec.block.strip("\n").splitlines():
-        code += (f"{indent}{raw}\n" if raw.strip() else "\n")
-    insertion = "\n" + marker_open + code + marker_close
-
-    new_text = (
-        "".join(lines[: target_line_index + 1])
-        + insertion
-        + "".join(lines[target_line_index + 1 :])
+    anchor_error = (
+        f"anchor_before count={before_count}, anchor_after count={after_count}"
     )
 
-    if new_text.index(spec.marker_begin()) >= new_text.index(spec.anchor_after):
-        raise InstallError(
-            f"[{spec.seam}] post-insert ordering check failed; refusing to keep patch."
-        )
-    if spec.relative_path.suffix == ".py":
-        _ast_validate_python(new_text, spec)
-    return new_text, "patched", "inserted after anchor_before"
+    # Fallback: AST method-body insertion for divergent Hermes adapters.
+    if spec.method_name or spec.method_name_candidates:
+        try:
+            return _apply_method_body_patch(text, spec)
+        except InstallError as exc:
+            raise InstallError(
+                f"[{spec.seam}] anchor path failed ({anchor_error}); "
+                f"method-body fallback also failed: {exc}"
+            ) from exc
+
+    raise InstallError(
+        f"[{spec.seam}] anchor_before matched {before_count} times "
+        f"(expected exactly 1) in {spec.relative_path}. Refusing to patch."
+    )
 
 
 def remove_patch(text: str, spec: PatchSpec) -> Tuple[str, bool]:

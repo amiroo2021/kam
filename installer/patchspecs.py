@@ -536,15 +536,14 @@ def _callback_anchor_pair(adapter_text: str) -> tuple[str, str]:
     before_candidates = [
         'query_user_name = getattr(query.from_user, "first_name", None)',
         "query_user_name = getattr(query.from_user, 'first_name', None)",
-        "query_user_name = getattr(query.from_user, \"full_name\", None)",
-        "query_thread_id = getattr(query_message, \"message_thread_id\", None)",
-        "query_chat_type = getattr(query_chat, \"type\", None)",
+        'query_user_name = getattr(query.from_user, "full_name", None)',
+        'query_thread_id = getattr(query_message, "message_thread_id", None)',
+        'query_chat_type = getattr(query_chat, "type", None)',
         "data = query.data",
         "query = update.callback_query",
     ]
     after_candidates = [
         "# --- Model picker callbacks ---",
-        '# --- Model picker callbacks ---',
         'if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):',
         'if data.startswith(("mp:",',
         'if data.startswith("mp:")',
@@ -554,9 +553,13 @@ def _callback_anchor_pair(adapter_text: str) -> tuple[str, str]:
     if not adapter_text:
         # Fallback to classic Hermes layout (dopower / known-good).
         return before_candidates[0], after_candidates[0]
-    return _choose_unique_anchor_pair(
-        adapter_text, before_candidates, after_candidates, seam="callback dispatch"
-    )
+    try:
+        return _choose_unique_anchor_pair(
+            adapter_text, before_candidates, after_candidates, seam="callback dispatch"
+        )
+    except InstallError:
+        # Method-body fallback in apply_patch will handle divergent builds.
+        return "", ""
 
 
 def _text_anchor_pair(adapter_text: str) -> tuple[str, str]:
@@ -573,9 +576,12 @@ def _text_anchor_pair(adapter_text: str) -> tuple[str, str]:
     ]
     if not adapter_text:
         return before_candidates[0], after_candidates[0]
-    return _choose_unique_anchor_pair(
-        adapter_text, before_candidates, after_candidates, seam="wizard text interception"
-    )
+    try:
+        return _choose_unique_anchor_pair(
+            adapter_text, before_candidates, after_candidates, seam="wizard text interception"
+        )
+    except InstallError:
+        return "", ""
 
 
 def _command_anchor_pair(adapter_text: str) -> tuple[str, str]:
@@ -591,9 +597,12 @@ def _command_anchor_pair(adapter_text: str) -> tuple[str, str]:
     ]
     if not adapter_text:
         return before_candidates[0], after_candidates[0]
-    return _choose_unique_anchor_pair(
-        adapter_text, before_candidates, after_candidates, seam="slash command dispatch"
-    )
+    try:
+        return _choose_unique_anchor_pair(
+            adapter_text, before_candidates, after_candidates, seam="slash command dispatch"
+        )
+    except InstallError:
+        return "", ""
 
 
 def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
@@ -611,6 +620,17 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_callback",
+            method_name="_handle_callback_query",
+            method_name_candidates=[
+                "_handle_callback_query",
+                "handle_callback_query",
+                "_on_callback_query",
+            ],
+            method_after_substrings=[
+                "data = query.data",
+                "query.data",
+                "callback_query",
+            ],
         ),
         PatchSpec(
             seam="wizard text interception",
@@ -620,6 +640,19 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
+            method_name="_handle_text",
+            method_name_candidates=[
+                "_handle_text",
+                "_handle_text_message",
+                "_on_text",
+                "handle_text",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(update.message)",
+                "await self._ensure_forum_commands(msg)",
+                "_ensure_forum_commands",
+                "MessageType.TEXT",
+            ],
         ),
         PatchSpec(
             seam="slash command dispatch",
@@ -629,6 +662,18 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_COMMAND_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_command",
+            method_name="_handle_command",
+            method_name_candidates=[
+                "_handle_command",
+                "handle_command",
+                "_on_command",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(msg)",
+                "await self._ensure_forum_commands(update.message)",
+                "_ensure_forum_commands",
+                "is_command=True",
+            ],
         ),
     ]
 
@@ -648,6 +693,17 @@ def fibo_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_FIBO_CALLBACK_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_callback",
+            method_name="_handle_callback_query",
+            method_name_candidates=[
+                "_handle_callback_query",
+                "handle_callback_query",
+                "_on_callback_query",
+            ],
+            method_after_substrings=[
+                "data = query.data",
+                "query.data",
+                "callback_query",
+            ],
         ),
         PatchSpec(
             seam="fibo text interception",
@@ -657,6 +713,19 @@ def fibo_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_FIBO_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_text",
+            method_name="_handle_text",
+            method_name_candidates=[
+                "_handle_text",
+                "_handle_text_message",
+                "_on_text",
+                "handle_text",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(update.message)",
+                "await self._ensure_forum_commands(msg)",
+                "_ensure_forum_commands",
+                "MessageType.TEXT",
+            ],
         ),
         PatchSpec(
             seam="fibo slash command dispatch",
@@ -666,6 +735,18 @@ def fibo_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_FIBO_COMMAND_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.fibo_wizard import handle_fibo_command",
+            method_name="_handle_command",
+            method_name_candidates=[
+                "_handle_command",
+                "handle_command",
+                "_on_command",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(msg)",
+                "await self._ensure_forum_commands(update.message)",
+                "_ensure_forum_commands",
+                "is_command=True",
+            ],
         ),
     ]
 
