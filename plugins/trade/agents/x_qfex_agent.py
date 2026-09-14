@@ -648,14 +648,9 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             "client_order_id": client_order_id,
         },
     }
-    try:
-        payload = _ws_command(credentials, command, expect={"order_response"})
-        row = payload.get("order_response") if isinstance(payload, Mapping) else {}
-        if not isinstance(row, Mapping):
-            row = {}
+    def _result_from_row(row: Mapping[str, Any], *, accepted: bool) -> CanonicalOrderResult:
         status_native = str(row.get("status") or "").upper()
-        accepted = status_native in {"ACK", "MODIFIED", "IOC_PARTIALLY_FILLED"} or bool(row.get("order_id"))
-        result = CanonicalOrderResult(
+        return CanonicalOrderResult(
             symbol=_display_symbol(native),
             side="buy" if side_q == "BUY" else "sell",
             order_type="limit",
@@ -668,10 +663,27 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             exchange_order_id=row.get("order_id"),
             client_order_id=row.get("client_order_id") or client_order_id,
         )
+
+    try:
+        payload = _ws_command(credentials, command, expect={"order_response"})
+        row = payload.get("order_response") if isinstance(payload, Mapping) else {}
+        if not isinstance(row, Mapping):
+            row = {}
+        status_native = str(row.get("status") or "").upper()
+        accepted = status_native in {"ACK", "MODIFIED", "IOC_PARTIALLY_FILLED"} or bool(row.get("order_id"))
+        result = _result_from_row(row, accepted=accepted)
         if accepted:
             return make_success(operation="new_order", exchange=name, account=credentials["account"], order=result)
         return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="ORDER_FAILED", message=status_native or "QFEX order rejected.", order=result)
     except Exception as exc:  # noqa: BLE001
+        try:
+            orders_payload = _ws_command(credentials, {"type": "get_user_orders", "params": {"limit": 500, "offset": 0, "symbol": native}}, expect={"all_orders_response"})
+            for row in _extract_order_rows(orders_payload):
+                if str(row.get("client_order_id") or "") == client_order_id and _is_open_order(row):
+                    result = _result_from_row(row, accepted=True)
+                    return make_success(operation="new_order", exchange=name, account=credentials["account"], order=result)
+        except Exception:
+            pass
         return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
 
 

@@ -230,6 +230,54 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.order.exchange_order_id, "oid-1")
         self.assertEqual(resp.order.status, "success")
 
+
+    def test_new_order_verifies_by_client_order_id_after_timeout(self) -> None:
+        self._creds()
+        calls = []
+
+        def fake_ws(_creds, command, expect=None):
+            calls.append(command["type"])
+            if command["type"] == "add_order":
+                raise RuntimeError("Connection timed out")
+            if command["type"] == "get_user_orders":
+                return {
+                    "all_orders_response": {
+                        "orders": [
+                            {
+                                "order_id": "oid-late",
+                                "client_order_id": "fixed-client-id",
+                                "symbol": "MSTR-USD",
+                                "side": "SELL",
+                                "status": "ACK",
+                                "quantity": 1,
+                                "price": 150,
+                                "quantity_remaining": 1,
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(command)
+
+        with mock.patch.object(qfex.uuid, "uuid4", return_value=type("U", (), {"hex": "fixed-client-id"})()), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "new_order",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                    "volume": "1",
+                    "price": "150",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(calls, ["add_order", "get_user_orders"])
+        assert resp.order is not None
+        self.assertEqual(resp.order.exchange_order_id, "oid-late")
+        self.assertTrue(resp.order.verified)
+
     def test_cancel_order_group_cancels_matching_symbol_and_side(self) -> None:
         self._creds()
         commands = []
