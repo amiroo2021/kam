@@ -35,7 +35,7 @@ class QfexAgentTests(unittest.TestCase):
         self.assertIn("qfex", tradedesk.TradeDesk().list_exchanges())
 
     def test_capabilities_include_trade_operations(self) -> None:
-        for op in ("balance", "positions_orders", "new_order", "cancel_order_group", "resolve_instrument", "market_price"):
+        for op in ("balance", "positions_orders", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder"):
             self.assertIn(op, qfex.capabilities())
 
     def test_auth_headers_use_nonce_timestamp_hmac_signature(self) -> None:
@@ -278,6 +278,103 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.order.exchange_order_id, "oid-late")
         self.assertTrue(resp.order.verified)
 
+
+    def test_ladder_submits_multiple_qfex_limit_orders(self) -> None:
+        self._creds()
+        commands = []
+
+        def fake_ws(_creds, command, expect=None):
+            commands.append(command)
+            idx = len([c for c in commands if c["type"] == "add_order"])
+            return {
+                "order_response": {
+                    "order_id": f"ladder-{idx}",
+                    "client_order_id": command["params"]["client_order_id"],
+                    "symbol": command["params"]["symbol"],
+                    "side": command["params"]["side"],
+                    "status": "ACK",
+                    "quantity": command["params"]["quantity"],
+                    "price": command["params"]["price"],
+                    "quantity_remaining": command["params"]["quantity"],
+                }
+            }
+
+        with mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                    "distribution": "uniform",
+                    "order_count": "3",
+                    "total_volume": "6",
+                    "start_price": "140",
+                    "end_price": "160",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual([c["params"]["price"] for c in commands], [140.0, 150.0, 160.0])
+        self.assertEqual([c["params"]["quantity"] for c in commands], [2.0, 2.0, 2.0])
+        self.assertTrue(all(c["params"]["symbol"] == "MSTR-USD" for c in commands))
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.requested_order_count, 3)
+        self.assertEqual(resp.ladder.submitted_order_count, 3)
+        self.assertEqual(resp.ladder.submitted_volume, "6")
+        self.assertTrue(resp.ladder.verified)
+
+    def test_ladder_verifies_child_after_qfex_timeout(self) -> None:
+        self._creds()
+        calls = []
+
+        def fake_ws(_creds, command, expect=None):
+            calls.append(command["type"])
+            if command["type"] == "add_order":
+                raise RuntimeError("Connection timed out")
+            if command["type"] == "get_user_orders":
+                return {
+                    "all_orders_response": {
+                        "orders": [
+                            {
+                                "order_id": "late-child",
+                                "client_order_id": command["params"].get("client_order_id", "fixed-ladder-child"),
+                                "symbol": "MSTR-USD",
+                                "side": "SELL",
+                                "status": "ACK",
+                                "quantity": 1,
+                                "price": 140,
+                                "quantity_remaining": 1,
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(command)
+
+        with mock.patch.object(qfex.uuid, "uuid4", return_value=type("U", (), {"hex": "fixed-ladder-child"})()), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                    "distribution": "uniform",
+                    "order_count": "1",
+                    "total_volume": "1",
+                    "start_price": "140",
+                    "end_price": "140",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(calls, ["add_order", "get_user_orders"])
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.child_order_ids, ["late-child"])
+        self.assertTrue(resp.ladder.verified)
+
     def test_cancel_order_group_cancels_matching_symbol_and_side(self) -> None:
         self._creds()
         commands = []
@@ -314,7 +411,7 @@ class QfexAgentTests(unittest.TestCase):
 
     def test_unsupported_operation_returns_canonical_failure(self) -> None:
         self._creds()
-        resp = qfex.execute({"operation": "ladder", "exchange": "qfex", "account": "amiroo"})
+        resp = qfex.execute({"operation": "not_a_real_operation", "exchange": "qfex", "account": "amiroo"})
         self.assertFalse(resp.success)
         assert resp.error is not None
         self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")

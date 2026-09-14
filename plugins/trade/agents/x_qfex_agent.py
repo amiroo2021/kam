@@ -21,6 +21,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -36,6 +37,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalLadderResult,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -156,7 +158,7 @@ def list_accounts() -> list[str]:
 
 
 def capabilities() -> list[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price"]
+    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder"]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -687,6 +689,125 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
 
 
+def _ladder_prices(start: Decimal, end: Decimal, count: int) -> list[Decimal]:
+    if count <= 0:
+        return []
+    if count == 1:
+        return [start]
+    return [start + (end - start) * Decimal(i) / Decimal(count - 1) for i in range(count)]
+
+
+def _ladder_sizes(total: Decimal, count: int, distribution: str) -> list[Decimal]:
+    if count <= 0:
+        return []
+    key = str(distribution or "uniform").strip().lower().replace(" ", "_")
+    if key == "uniform" or count == 1:
+        weights = [Decimal("1")] * count
+    elif key == "half_gaussian":
+        span = Decimal(count - 1)
+        weights = [
+            Decimal(str(math.exp(-(float(Decimal("3") * (span - Decimal(i)) / span) ** 2) / 2)))
+            for i in range(count)
+        ]
+    else:
+        raise ValueError("distribution must be uniform or half_gaussian")
+    weight_sum = sum(weights)
+    return [total * weight / weight_sum for weight in weights]
+
+
+def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="ladder", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    side_in = str(request.get("side") or "").strip().lower()
+    distribution = str(request.get("distribution") or "uniform").strip().lower().replace(" ", "_")
+    try:
+        native = _native_symbol(requested_symbol)
+        side_q = _qfex_side(side_in)
+        count = int(str(request.get("order_count") or "0").strip())
+        total = Decimal(str(request.get("total_volume") or "0").strip())
+        start = Decimal(str(request.get("start_price") or "0").strip())
+        end = Decimal(str(request.get("end_price") or "0").strip())
+    except Exception:  # noqa: BLE001
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="symbol, side, order_count, total_volume, start_price and end_price are required.")
+    if not native or side_q not in {"BUY", "SELL"} or count <= 0 or total <= 0 or start <= 0 or end <= 0:
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="symbol, side, order_count, total_volume, start_price and end_price must be valid positive values.")
+    if count > 50:
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="order_count exceeds safety cap (50).")
+    if count > 1 and side_in == "buy" and not (end < start):
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="For a BUY ladder, end_price must be lower than start_price.")
+    if count > 1 and side_in == "sell" and not (end > start):
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="For a SELL ladder, end_price must be higher than start_price.")
+    if distribution not in {"uniform", "half_gaussian"}:
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="distribution must be uniform or half_gaussian.")
+
+    try:
+        prices = _ladder_prices(start, end, count)
+        sizes = _ladder_sizes(total, count, distribution)
+        batches: list[dict[str, Any]] = []
+        child_ids: list[str | int] = []
+        submitted_volume = Decimal("0")
+        first_error = ""
+        for idx, (price, size) in enumerate(zip(prices, sizes)):
+            child_client_id = uuid.uuid4().hex[:32]
+            resp = _new_order(
+                credentials["account"],
+                {
+                    "symbol": native,
+                    "side": side_in,
+                    "volume": _format_decimal(size),
+                    "price": _format_decimal(price),
+                    "client_order_id": child_client_id,
+                },
+            )
+            ok = bool(resp.success and resp.order is not None and resp.order.verified)
+            order_id = resp.order.exchange_order_id if resp.order is not None else None
+            if ok:
+                if order_id is not None:
+                    child_ids.append(order_id)
+                submitted_volume += size
+            elif not first_error:
+                first_error = resp.error.message if resp.error else "child order failed"
+            batches.append(
+                {
+                    "index": idx,
+                    "price": _format_decimal(price),
+                    "size": _format_decimal(size),
+                    "ok": ok,
+                    "order_id": order_id,
+                    "client_order_id": child_client_id,
+                    "error": None if ok else (resp.error.message if resp.error else "failed"),
+                }
+            )
+        submitted = sum(1 for b in batches if b.get("ok"))
+        verified = submitted == count
+        partial = submitted not in {0, count}
+        result = CanonicalLadderResult(
+            symbol=_display_symbol(native),
+            side=side_in,
+            distribution=distribution,
+            requested_order_count=count,
+            submitted_order_count=submitted,
+            requested_volume=_format_decimal(total),
+            submitted_volume=_format_decimal(submitted_volume),
+            batch_count=len(batches),
+            verified=verified,
+            partial=partial,
+            status="success" if verified else ("partial" if partial else "failed"),
+            accepted_child_count=submitted,
+            omitted_order_count=count - submitted,
+            child_order_ids=child_ids,
+            batches=batches,
+            exchange_reason=first_error or None,
+        )
+        if verified:
+            return make_success(operation="ladder", exchange=name, account=credentials["account"], ladder=result)
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="PARTIAL_LADDER" if partial else "LADDER_FAILED", message=first_error or f"Submitted {submitted}/{count} QFEX ladder orders.", ladder=result)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
+
+
 def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -774,6 +895,8 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _positions_orders(account)
     if operation == "new_order":
         return _new_order(account, request)
+    if operation == "ladder":
+        return _ladder(account, request)
     if operation == "cancel_order_group":
         return _cancel_order_group(account, request)
     credentials = _lookup_credentials(account)
