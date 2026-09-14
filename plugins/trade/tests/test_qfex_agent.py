@@ -286,6 +286,75 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.position_action.price, "150")
         self.assertTrue(resp.position_action.verified)
 
+
+    def test_positions_orders_merges_qfex_tp_sl_from_open_orders(self) -> None:
+        self._creds()
+
+        def fake_rest(_creds, method, path, query=""):
+            return {
+                "positions": [
+                    {
+                        "symbol": "MSTR-USD",
+                        "position": -0.21,
+                        "average_price": 136.2,
+                        "unrealised_pnl": "-0.1",
+                        "realised_pnl": "0",
+                    }
+                ]
+            }
+
+        def fake_ws(_creds, command, expect=None):
+            return {
+                "all_orders_response": {
+                    "orders": [
+                        {
+                            "order_id": "tp-1",
+                            "symbol": "MSTR-USD",
+                            "side": "BUY",
+                            "type": "TAKE_PROFIT",
+                            "status": "ACK",
+                            "quantity": 0.21,
+                            "quantity_remaining": 0.21,
+                            "price": 100,
+                        },
+                        {
+                            "order_id": "sl-1",
+                            "symbol": "MSTR-USD",
+                            "side": "BUY",
+                            "type": "STOP_LOSS",
+                            "status": "ACK",
+                            "quantity": 0.21,
+                            "quantity_remaining": 0.21,
+                            "price": 150,
+                        },
+                        {
+                            "order_id": "limit-1",
+                            "symbol": "MSTR-USD",
+                            "side": "SELL",
+                            "type": "LIMIT",
+                            "status": "ACK",
+                            "quantity_remaining": 0.1,
+                            "price": 160,
+                        },
+                    ]
+                }
+            }
+
+        with mock.patch.object(qfex, "_signed_request", side_effect=fake_rest), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute({"operation": "positions_management", "exchange": "qfex", "account": "AMIROO"})
+
+        self.assertTrue(resp.success, resp)
+        assert resp.positions is not None
+        self.assertEqual(len(resp.positions), 1)
+        pos = resp.positions[0]
+        self.assertEqual(pos.symbol, "MSTR")
+        self.assertEqual(pos.side, "short")
+        self.assertEqual(pos.tp, "100")
+        self.assertEqual(pos.tp_count, 1)
+        self.assertEqual(pos.sl, "150")
+        self.assertEqual(pos.sl_count, 1)
+
     def test_new_order_sends_limit_order_over_websocket(self) -> None:
         self._creds()
         sent = []

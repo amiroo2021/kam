@@ -30,9 +30,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ..canonical import (
     CanonicalCancelGroupResult,
@@ -345,6 +346,72 @@ def _normalize_positions(rows: Any) -> list[CanonicalPosition]:
     return out
 
 
+def _qfex_protection_kind(row: Mapping[str, Any]) -> Optional[str]:
+    raw_type = str(row.get("type") or row.get("order_type") or "").strip().upper()
+    raw_type = raw_type.replace("-", "_").replace(" ", "_")
+    if raw_type in {"TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TP"}:
+        return "tp"
+    if raw_type in {"STOP_LOSS", "STOP_LOSS_MARKET", "STOP", "SL"}:
+        return "sl"
+    if _decimal_or_zero(row.get("take_profit") or row.get("takeProfit")) > 0:
+        return "tp"
+    if _decimal_or_zero(row.get("stop_loss") or row.get("stopLoss")) > 0:
+        return "sl"
+    return None
+
+
+def _merge_position_protections(positions: list[CanonicalPosition], order_rows: Sequence[Mapping[str, Any]]) -> list[CanonicalPosition]:
+    if not positions or not order_rows:
+        return positions
+    enriched: list[CanonicalPosition] = []
+    for pos in positions:
+        native = str(pos.exchange_instrument or _native_symbol(pos.symbol)).strip().upper()
+        close_side = "sell" if pos.side == "long" else "buy"
+        tp: Optional[str] = None
+        sl: Optional[str] = None
+        tp_count = 0
+        sl_count = 0
+        for row in order_rows:
+            if not _is_open_order(row):
+                continue
+            if str(row.get("symbol") or "").strip().upper() != native:
+                continue
+            if _canonical_side(str(row.get("side") or "")) != close_side:
+                continue
+            kind = _qfex_protection_kind(row)
+            if kind is None:
+                continue
+            px = _decimal_or_zero(
+                row.get("price")
+                or row.get("trigger_price")
+                or row.get("triggerPrice")
+                or row.get("take_profit")
+                or row.get("takeProfit")
+                or row.get("stop_loss")
+                or row.get("stopLoss")
+            )
+            if px <= 0:
+                continue
+            if kind == "tp":
+                tp_count += 1
+                if tp is None:
+                    tp = _format_decimal(px)
+            else:
+                sl_count += 1
+                if sl is None:
+                    sl = _format_decimal(px)
+        enriched.append(
+            replace(
+                pos,
+                tp=tp or pos.tp,
+                sl=sl or pos.sl,
+                tp_count=tp_count or pos.tp_count,
+                sl_count=sl_count or pos.sl_count,
+            )
+        )
+    return enriched
+
+
 def _group_open_orders(rows: list[Mapping[str, Any]]) -> tuple[int, list[CanonicalOrderGroup]]:
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     total = 0
@@ -599,6 +666,7 @@ def _positions_orders(account: str) -> CanonicalResponse:
             expect={"all_orders_response"},
         )
         order_rows = _extract_order_rows(orders_payload)
+        positions = _merge_position_protections(positions, order_rows)
         open_count, order_groups = _group_open_orders(order_rows)
         return make_success(
             operation="positions_orders",
