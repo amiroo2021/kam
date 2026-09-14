@@ -7,6 +7,8 @@ Credentials (``.env`` / environment):
 
 Current scope:
   - balance via GET /user/subaccounts/balance
+  - positions_orders via GET /user/positions + Trade WebSocket get_user_orders
+  - new_order / cancel_order_group via Trade WebSocket
 
 QFEX HMAC auth per docs:
   signature = HMAC-SHA256(secret, f"{nonce}:{unix_ts}").hexdigest()
@@ -22,6 +24,7 @@ import logging
 import os
 import re
 import secrets
+import uuid
 import time
 import urllib.error
 import urllib.parse
@@ -31,7 +34,11 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..canonical import (
+    CanonicalCancelGroupResult,
+    CanonicalOrderGroup,
+    CanonicalOrderResult,
     CanonicalPortfolioSummary,
+    CanonicalPosition,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -47,6 +54,8 @@ API_TIMEOUT_SECONDS = 20
 DEFAULT_UNIT = "USDT"
 
 _PATH_SUBACCOUNT_BALANCE = "/user/subaccounts/balance"
+_PATH_USER_POSITIONS = "/user/positions"
+DEFAULT_WS_URL = "wss://trade.qfex.com/"
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PUBLIC_KEY_ALIASES = ("PUBLIC_KEY", "PUBLICKEY", "API_KEY", "APIKEY", "KEY")
@@ -145,7 +154,7 @@ def list_accounts() -> list[str]:
 
 
 def capabilities() -> list[str]:
-    return ["balance"]
+    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group"]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -231,6 +240,201 @@ def _decimal_or_zero(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def _format_decimal(value: Any) -> str:
+    dec = _decimal_or_zero(value)
+    if dec == dec.to_integral_value():
+        return str(dec.quantize(Decimal("1")))
+    return format(dec.normalize(), "f")
+
+
+def _native_symbol(symbol: str) -> str:
+    raw = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+    if not raw:
+        return ""
+    if "-" not in raw:
+        return f"{raw}-USD"
+    return raw
+
+
+def _display_symbol(symbol: str) -> str:
+    raw = str(symbol or "").strip().upper()
+    for suffix in ("-USD", "-USDC", "-USDT"):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            return raw[: -len(suffix)]
+    return raw
+
+
+def _qfex_side(side: str) -> str:
+    s = str(side or "").strip().lower()
+    if s in {"buy", "long", "bid"}:
+        return "BUY"
+    if s in {"sell", "short", "ask"}:
+        return "SELL"
+    raise ValueError("INVALID_SIDE")
+
+
+def _canonical_side(side: str) -> str:
+    s = str(side or "").strip().upper()
+    if s == "BUY":
+        return "buy"
+    if s == "SELL":
+        return "sell"
+    return str(side or "").strip().lower()
+
+
+def _is_open_order(row: Mapping[str, Any]) -> bool:
+    status = str(row.get("status") or row.get("terminal_status") or "").strip().upper()
+    if status in {"CANCELLED", "FILLED", "EXPIRED", "REJECTED", "NOT_FOUND", "NO_SUCH_ORDER", "IOC_CANCELLED"}:
+        return False
+    remaining = _decimal_or_zero(row.get("quantity_remaining") or row.get("remaining_qty") or row.get("quantity"))
+    return remaining > 0
+
+
+def _extract_order_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    container = payload.get("all_orders_response") if isinstance(payload, Mapping) else None
+    if isinstance(container, Mapping):
+        rows = container.get("orders") or []
+    else:
+        rows = payload.get("orders") if isinstance(payload, Mapping) else []
+    return [dict(r) for r in rows if isinstance(r, Mapping)]
+
+
+def _normalize_positions(rows: Any) -> list[CanonicalPosition]:
+    out: list[CanonicalPosition] = []
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        qty = _decimal_or_zero(row.get("position") or row.get("size") or row.get("quantity"))
+        if qty == 0:
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        side = "long" if qty > 0 else "short"
+        pnl = _decimal_or_zero(row.get("unrealised_pnl")) + _decimal_or_zero(row.get("realised_pnl"))
+        out.append(
+            CanonicalPosition(
+                symbol=_display_symbol(symbol),
+                side=side,
+                size=_format_decimal(abs(qty)),
+                entry_price=_format_decimal(row.get("average_price") or row.get("entry_price") or "0"),
+                pnl=_format_decimal(pnl),
+                exchange_instrument=symbol or None,
+            )
+        )
+    return out
+
+
+def _group_open_orders(rows: list[Mapping[str, Any]]) -> tuple[int, list[CanonicalOrderGroup]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    total = 0
+    for row in rows:
+        if not _is_open_order(row):
+            continue
+        native = str(row.get("symbol") or "").strip().upper()
+        symbol = _display_symbol(native)
+        side = _canonical_side(str(row.get("side") or ""))
+        if not symbol or side not in {"buy", "sell"}:
+            continue
+        size = abs(_decimal_or_zero(row.get("quantity_remaining") or row.get("quantity")))
+        price = _decimal_or_zero(row.get("price"))
+        if size <= 0:
+            continue
+        total += 1
+        key = (symbol, side)
+        slot = groups.setdefault(
+            key,
+            {"symbol": symbol, "side": side, "order_count": 0, "total_size": Decimal("0"), "notional": Decimal("0"), "min_price": None, "max_price": None},
+        )
+        slot["order_count"] += 1
+        slot["total_size"] += size
+        if price > 0:
+            slot["notional"] += size * price
+            slot["min_price"] = price if slot["min_price"] is None else min(slot["min_price"], price)
+            slot["max_price"] = price if slot["max_price"] is None else max(slot["max_price"], price)
+    out: list[CanonicalOrderGroup] = []
+    for slot in groups.values():
+        total_size = slot["total_size"]
+        vwap = _format_decimal(slot["notional"] / total_size) if total_size > 0 and slot["notional"] > 0 else ""
+        out.append(
+            CanonicalOrderGroup(
+                symbol=slot["symbol"],
+                side=slot["side"],
+                order_count=int(slot["order_count"]),
+                total_size=_format_decimal(total_size),
+                vwap=vwap,
+                min_price=_format_decimal(slot["min_price"]) if slot["min_price"] is not None else "",
+                max_price=_format_decimal(slot["max_price"]) if slot["max_price"] is not None else "",
+            )
+        )
+    out.sort(key=lambda g: (g.symbol, g.side))
+    return total, out
+
+
+def _ws_auth_payload(credentials: Mapping[str, str]) -> dict[str, Any]:
+    nonce = secrets.token_hex(16)
+    unix_ts = int(time.time())
+    signature = hmac.new(
+        str(credentials.get("secret_key") or "").encode("utf-8"),
+        f"{nonce}:{unix_ts}".encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+    params: dict[str, Any] = {
+        "hmac": {
+            "public_key": str(credentials.get("public_key") or ""),
+            "nonce": nonce,
+            "unix_ts": unix_ts,
+            "signature": signature,
+        }
+    }
+    account_id = str(credentials.get("account_id") or "").strip()
+    if account_id:
+        params["account_id"] = account_id
+    return {"type": "auth", "params": params}
+
+
+def _ws_command(credentials: Mapping[str, str], command: Mapping[str, Any], expect: Optional[set[str]] = None) -> Dict[str, Any]:
+    """Send one QFEX Trade WebSocket command after HMAC auth."""
+    import websocket  # type: ignore
+
+    expected = expect or {"order_response", "all_orders_response", "ack", "position_response", "balance_response"}
+    ws_url = str(credentials.get("ws_url") or DEFAULT_WS_URL)
+    public_key = str(credentials.get("public_key") or "")
+    if public_key and "api_key=" not in ws_url:
+        sep = "&" if "?" in ws_url else "?"
+        ws_url = f"{ws_url}{sep}{urllib.parse.urlencode({'api_key': public_key})}"
+    ws = websocket.create_connection(ws_url, timeout=API_TIMEOUT_SECONDS)
+    try:
+        try:
+            ws.settimeout(min(5, API_TIMEOUT_SECONDS))
+        except Exception:
+            pass
+        ws.send(json.dumps(_ws_auth_payload(credentials), separators=(",", ":")))
+        deadline = time.time() + API_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if "err" in msg:
+                err = msg.get("err") or {}
+                raise RuntimeError(str(err.get("message") or err.get("error_code") or err))
+            if "authenticated_response" in msg or "ack" in msg or msg.get("authenticated") is True:
+                break
+        ws.send(json.dumps(dict(command), separators=(",", ":")))
+        deadline = time.time() + API_TIMEOUT_SECONDS
+        last: Dict[str, Any] = {}
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if isinstance(msg, dict):
+                last = msg
+            if "err" in msg:
+                err = msg.get("err") or {}
+                raise RuntimeError(str(err.get("message") or err.get("error_code") or err))
+            if any(k in msg for k in expected):
+                return msg
+        raise RuntimeError(f"Timed out waiting for QFEX websocket response; last={last}")
+    finally:
+        ws.close()
+
+
 def _balance(account: str) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -276,11 +480,166 @@ def _balance(account: str) -> CanonicalResponse:
         )
 
 
+
+def _positions_orders(account: str) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="positions_orders",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.",
+        )
+    try:
+        pos_payload = _signed_request(credentials, "GET", _PATH_USER_POSITIONS)
+        positions = _normalize_positions(pos_payload.get("positions") if isinstance(pos_payload, Mapping) else [])
+        orders_payload = _ws_command(
+            credentials,
+            {"type": "get_user_orders", "params": {"limit": 500, "offset": 0}},
+            expect={"all_orders_response"},
+        )
+        order_rows = _extract_order_rows(orders_payload)
+        open_count, order_groups = _group_open_orders(order_rows)
+        return make_success(
+            operation="positions_orders",
+            exchange=name,
+            account=credentials["account"],
+            positions=positions,
+            open_order_count=open_count,
+            order_groups=order_groups,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="positions_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="QFEX_ERROR",
+            message=_redact(exc, credentials),
+        )
+
+
+def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="new_order", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    side_in = str(request.get("side") or "").strip().lower()
+    volume_text = str(request.get("volume") or request.get("size") or request.get("quantity") or "").strip()
+    price_text = str(request.get("price") or "").strip()
+    order_type = str(request.get("order_type") or request.get("type") or "limit").strip().lower()
+    try:
+        native = _native_symbol(requested_symbol)
+        side_q = _qfex_side(side_in)
+        volume = _decimal_or_zero(volume_text)
+        price = _decimal_or_zero(price_text)
+    except Exception:
+        return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="Symbol, buy/sell side, volume and price are required.")
+    if order_type not in {"limit", ""}:
+        return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="UNSUPPORTED_ORDER_TYPE", message="QFEX agent currently supports limit orders only.")
+    if not native or side_q not in {"BUY", "SELL"} or volume <= 0 or price <= 0:
+        return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="Symbol, side, volume and price must be valid positive values.")
+    client_order_id = str(request.get("client_order_id") or request.get("clientOrderId") or "").strip() or uuid.uuid4().hex[:32]
+    command = {
+        "type": "add_order",
+        "params": {
+            "symbol": native,
+            "side": side_q,
+            "order_type": "LIMIT",
+            "order_time_in_force": "GTC",
+            "quantity": float(volume),
+            "price": float(price),
+            "client_order_id": client_order_id,
+        },
+    }
+    try:
+        payload = _ws_command(credentials, command, expect={"order_response"})
+        row = payload.get("order_response") if isinstance(payload, Mapping) else {}
+        if not isinstance(row, Mapping):
+            row = {}
+        status_native = str(row.get("status") or "").upper()
+        accepted = status_native in {"ACK", "MODIFIED", "IOC_PARTIALLY_FILLED"} or bool(row.get("order_id"))
+        result = CanonicalOrderResult(
+            symbol=_display_symbol(native),
+            side="buy" if side_q == "BUY" else "sell",
+            order_type="limit",
+            requested_volume=_format_decimal(volume),
+            requested_price=_format_decimal(price),
+            submitted_volume=_format_decimal(row.get("quantity") or volume),
+            submitted_price=_format_decimal(row.get("price") or price),
+            verified=accepted,
+            status="success" if accepted else (status_native.lower() or "submitted"),
+            exchange_order_id=row.get("order_id"),
+            client_order_id=row.get("client_order_id") or client_order_id,
+        )
+        if accepted:
+            return make_success(operation="new_order", exchange=name, account=credentials["account"], order=result)
+        return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="ORDER_FAILED", message=status_native or "QFEX order rejected.", order=result)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
+
+
+def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="cancel_order_group", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.")
+    native = _native_symbol(str(request.get("symbol") or "").strip())
+    try:
+        side_q = _qfex_side(str(request.get("side") or "").strip())
+    except Exception:
+        return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="INVALID_SIDE", message="Side must be buy or sell.")
+    try:
+        orders_payload = _ws_command(credentials, {"type": "get_user_orders", "params": {"limit": 500, "offset": 0, "symbol": native}}, expect={"all_orders_response"})
+        targets = [r for r in _extract_order_rows(orders_payload) if str(r.get("symbol") or "").upper() == native and str(r.get("side") or "").upper() == side_q and _is_open_order(r)]
+        batches: list[dict[str, Any]] = []
+        cancelled = 0
+        for row in targets:
+            order_id = str(row.get("order_id") or "").strip()
+            if not order_id:
+                continue
+            command = {"type": "cancel_order", "params": {"symbol": native, "order_id": order_id, "cancel_order_id_type": "order_id"}}
+            response = _ws_command(credentials, command, expect={"order_response", "ack"})
+            status = ""
+            if isinstance(response.get("order_response"), Mapping):
+                status = str(response["order_response"].get("status") or "").upper()
+            ok = status in {"CANCELLED", "ACK", "NO_SUCH_ORDER", "NOT_FOUND"} or "ack" in response
+            if ok:
+                cancelled += 1
+            batches.append({"order_id": order_id, "ok": ok, "status": status or ("ACK" if "ack" in response else "")})
+        verified = cancelled == len(targets)
+        result = CanonicalCancelGroupResult(
+            symbol=_display_symbol(native),
+            side="buy" if side_q == "BUY" else "sell",
+            targeted_order_count=len(targets),
+            cancelled_order_count=cancelled,
+            confirmed_absent_count=cancelled,
+            remaining_target_count=max(len(targets) - cancelled, 0),
+            verified=verified,
+            partial=not verified,
+            status="success" if verified else "partial",
+            batch_count=len(batches),
+            batches=batches,
+            requested_cancel_count=len(targets),
+            verified_cancel_count=cancelled,
+        )
+        if verified:
+            return make_success(operation="cancel_order_group", exchange=name, account=credentials["account"], cancel_group=result)
+        return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="PARTIAL_CANCEL", message=f"Cancelled {cancelled}/{len(targets)} QFEX orders.", cancel_group=result)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="cancel_order_group", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
+
+
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     operation = str(request.get("operation") or "").strip().lower()
     account = str(request.get("account") or "").strip()
     if operation == "balance":
         return _balance(account)
+    if operation in {"positions_orders", "positions_management"}:
+        return _positions_orders(account)
+    if operation == "new_order":
+        return _new_order(account, request)
+    if operation == "cancel_order_group":
+        return _cancel_order_group(account, request)
     credentials = _lookup_credentials(account)
     canonical_account = credentials["account"] if credentials else account
     return make_failure(

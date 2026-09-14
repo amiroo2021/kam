@@ -34,9 +34,9 @@ class QfexAgentTests(unittest.TestCase):
     def test_tradedesk_discovers_qfex(self) -> None:
         self.assertIn("qfex", tradedesk.TradeDesk().list_exchanges())
 
-    def test_capabilities_balance_only(self) -> None:
-        self.assertIn("balance", qfex.capabilities())
-        self.assertNotIn("new_order", qfex.capabilities())
+    def test_capabilities_include_trade_operations(self) -> None:
+        for op in ("balance", "positions_orders", "new_order", "cancel_order_group"):
+            self.assertIn(op, qfex.capabilities())
 
     def test_auth_headers_use_nonce_timestamp_hmac_signature(self) -> None:
         self._creds()
@@ -73,9 +73,146 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.balance.value, "150.25")
         self.assertEqual(resp.portfolio_summary.withdrawable, "150.25")
 
+    def test_positions_orders_normalizes_positions_and_open_orders(self) -> None:
+        self._creds()
+
+        def fake_rest(_creds, method, path, query=""):
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/user/positions")
+            return {
+                "positions": [
+                    {
+                        "symbol": "ETH-USD",
+                        "position": -2.5,
+                        "average_price": 2400,
+                        "unrealised_pnl": "12.5",
+                        "realised_pnl": "1.5",
+                    },
+                    {"symbol": "BTC-USD", "position": 0, "average_price": 0},
+                ],
+                "balance": {"available_balance": 123},
+            }
+
+        def fake_ws(_creds, command, expect=None):
+            self.assertEqual(command["type"], "get_user_orders")
+            return {
+                "all_orders_response": {
+                    "orders": [
+                        {
+                            "order_id": "o1",
+                            "symbol": "ETH-USD",
+                            "side": "BUY",
+                            "status": "ACK",
+                            "quantity_remaining": 1.5,
+                            "quantity": 2,
+                            "price": 2300,
+                        },
+                        {
+                            "order_id": "o2",
+                            "symbol": "ETH-USD",
+                            "side": "SELL",
+                            "status": "ACK",
+                            "quantity_remaining": 0.5,
+                            "quantity": 0.5,
+                            "price": 2600,
+                        },
+                    ]
+                }
+            }
+
+        with mock.patch.object(qfex, "_signed_request", side_effect=fake_rest), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute({"operation": "positions_orders", "exchange": "qfex", "account": "AMIROO"})
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(resp.open_order_count, 2)
+        assert resp.positions is not None
+        self.assertEqual(len(resp.positions), 1)
+        self.assertEqual(resp.positions[0].symbol, "ETH")
+        self.assertEqual(resp.positions[0].side, "short")
+        self.assertEqual(resp.positions[0].size, "2.5")
+        assert resp.order_groups is not None
+        self.assertEqual([(g.symbol, g.side, g.order_count) for g in resp.order_groups], [("ETH", "buy", 1), ("ETH", "sell", 1)])
+
+    def test_new_order_sends_limit_order_over_websocket(self) -> None:
+        self._creds()
+        sent = []
+
+        def fake_ws(_creds, command, expect=None):
+            sent.append(command)
+            return {
+                "order_response": {
+                    "order_id": "oid-1",
+                    "client_order_id": command["params"]["client_order_id"],
+                    "symbol": "ETH-USD",
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "status": "ACK",
+                    "quantity": 1.25,
+                    "price": 2500,
+                    "quantity_remaining": 1.25,
+                }
+            }
+
+        with mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "new_order",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "ETH",
+                    "side": "buy",
+                    "volume": "1.25",
+                    "price": "2500",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(sent[0]["type"], "add_order")
+        self.assertEqual(sent[0]["params"]["symbol"], "ETH-USD")
+        self.assertEqual(sent[0]["params"]["side"], "BUY")
+        self.assertEqual(sent[0]["params"]["order_type"], "LIMIT")
+        assert resp.order is not None
+        self.assertEqual(resp.order.exchange_order_id, "oid-1")
+        self.assertEqual(resp.order.status, "success")
+
+    def test_cancel_order_group_cancels_matching_symbol_and_side(self) -> None:
+        self._creds()
+        commands = []
+
+        def fake_ws(_creds, command, expect=None):
+            commands.append(command)
+            if command["type"] == "get_user_orders":
+                return {
+                    "all_orders_response": {
+                        "orders": [
+                            {"order_id": "buy-1", "symbol": "ETH-USD", "side": "BUY", "status": "ACK", "quantity_remaining": 1, "price": 2400},
+                            {"order_id": "sell-1", "symbol": "ETH-USD", "side": "SELL", "status": "ACK", "quantity_remaining": 1, "price": 2600},
+                            {"order_id": "btc-1", "symbol": "BTC-USD", "side": "BUY", "status": "ACK", "quantity_remaining": 1, "price": 90000},
+                        ]
+                    }
+                }
+            if command["type"] == "cancel_order":
+                return {"order_response": {"order_id": command["params"]["order_id"], "symbol": command["params"]["symbol"], "status": "CANCELLED"}}
+            raise AssertionError(command)
+
+        with mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {"operation": "cancel_order_group", "exchange": "qfex", "account": "AMIROO", "symbol": "ETH", "side": "buy"}
+            )
+
+        self.assertTrue(resp.success, resp)
+        cancel_commands = [c for c in commands if c["type"] == "cancel_order"]
+        self.assertEqual(len(cancel_commands), 1)
+        self.assertEqual(cancel_commands[0]["params"]["order_id"], "buy-1")
+        assert resp.cancel_group is not None
+        self.assertEqual(resp.cancel_group.targeted_order_count, 1)
+        self.assertEqual(resp.cancel_group.cancelled_order_count, 1)
+        self.assertTrue(resp.cancel_group.verified)
+
     def test_unsupported_operation_returns_canonical_failure(self) -> None:
         self._creds()
-        resp = qfex.execute({"operation": "new_order", "exchange": "qfex", "account": "amiroo"})
+        resp = qfex.execute({"operation": "ladder", "exchange": "qfex", "account": "amiroo"})
         self.assertFalse(resp.success)
         assert resp.error is not None
         self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
