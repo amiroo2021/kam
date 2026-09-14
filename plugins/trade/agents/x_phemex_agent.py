@@ -74,6 +74,7 @@ DEFAULT_API_BASE = "https://api.phemex.com"
 API_TIMEOUT_SECONDS = 20
 MAX_RETRIES = 2
 DEFAULT_CURRENCY = "USDT"
+DEFAULT_OPEN_ORDER_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _ID_ALIASES = ("ID", "APIKEY", "ACCESS_TOKEN", "API_KEY")
@@ -773,6 +774,8 @@ def _candidate_symbols_for_open_orders(
                 symbols.append(native)
             except Exception:  # noqa: BLE001
                 pass
+    for sym in DEFAULT_OPEN_ORDER_SYMBOLS:
+        symbols.append(sym)
     # Recent order history symbols (may include open + cancelled)
     try:
         currency = urllib.parse.quote(str(credentials.get("currency") or DEFAULT_CURRENCY))

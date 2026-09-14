@@ -193,6 +193,49 @@ class PhemexAgentTests(unittest.TestCase):
         self.assertTrue(resp.cancel_group.verified)
         self.assertTrue(any(c[0] == "DELETE" and "posSide=Long" in c[2] for c in calls))
 
+    def test_positions_orders_includes_eth_orders_without_position_or_history(self) -> None:
+        self._creds_env()
+        calls = []
+
+        def fake_fetch(_creds):
+            return {"account": {"currency": "USDT"}, "positions": []}
+
+        def fake_signed(_creds, method, path, query="", body="", auth=True):
+            calls.append((method, path, query))
+            if path == "/api-data/g-futures/orders":
+                return {"code": 0, "data": {"rows": []}}
+            if path == "/g-orders/activeList" and query == "symbol=ETHUSDT":
+                return {
+                    "code": 0,
+                    "data": {
+                        "rows": [
+                            {
+                                "symbol": "ETHUSDT",
+                                "side": "Buy",
+                                "ordStatus": "Created",
+                                "leavesQtyRq": "0.5",
+                                "priceRp": "2500",
+                            }
+                        ]
+                    },
+                }
+            if path == "/g-orders/activeList":
+                return {"code": 10002, "msg": "OM_ORDER_NOT_FOUND"}
+            return {"code": 0, "data": {}}
+
+        with mock.patch.object(phemex, "_fetch_account_positions", side_effect=fake_fetch), \
+             mock.patch.object(phemex, "_signed_request", side_effect=fake_signed):
+            resp = phemex.execute(
+                {"operation": "positions_orders", "exchange": "phemex", "account": "dramiroo"}
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(resp.open_order_count, 1)
+        self.assertEqual(len(resp.order_groups), 1)
+        self.assertEqual(resp.order_groups[0].symbol, "ETH")
+        self.assertEqual(resp.order_groups[0].side, "buy")
+        self.assertIn(("GET", "/g-orders/activeList", "symbol=ETHUSDT"), calls)
+
     def test_ladder_prices_and_sizes_uniform(self) -> None:
         prices = phemex._ladder_prices(Decimal("100"), Decimal("90"), 3, Decimal("0.1"))
         self.assertEqual(prices, [Decimal("100.0"), Decimal("95.0"), Decimal("90.0")])
