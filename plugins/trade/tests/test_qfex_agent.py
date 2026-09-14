@@ -35,7 +35,7 @@ class QfexAgentTests(unittest.TestCase):
         self.assertIn("qfex", tradedesk.TradeDesk().list_exchanges())
 
     def test_capabilities_include_trade_operations(self) -> None:
-        for op in ("balance", "positions_orders", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder"):
+        for op in ("balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder", "close_position", "set_tp", "set_sl"):
             self.assertIn(op, qfex.capabilities())
 
     def test_auth_headers_use_nonce_timestamp_hmac_signature(self) -> None:
@@ -187,6 +187,49 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.positions[0].size, "2.5")
         assert resp.order_groups is not None
         self.assertEqual([(g.symbol, g.side, g.order_count) for g in resp.order_groups], [("ETH", "buy", 1), ("ETH", "sell", 1)])
+
+
+    def test_close_position_uses_qfex_close_position_command_and_verifies_flat(self) -> None:
+        self._creds()
+        rest_calls = []
+        ws_calls = []
+
+        def fake_rest(_creds, method, path, query=""):
+            rest_calls.append(path)
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/user/positions")
+            if len(rest_calls) == 1:
+                return {"positions": [{"symbol": "MSTR-USD", "position": 2, "average_price": 120, "unrealised_pnl": "5", "realised_pnl": "0"}]}
+            return {"positions": []}
+
+        def fake_ws(_creds, command, expect=None):
+            ws_calls.append(command)
+            self.assertEqual(command["type"], "close_position")
+            self.assertEqual(command["params"]["symbol"], "MSTR-USD")
+            self.assertIn("client_order_id", command["params"])
+            return {"position_response": {"symbol": "MSTR-USD", "position": 0}}
+
+        with mock.patch.object(qfex, "_signed_request", side_effect=fake_rest), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute({"operation": "close_position", "exchange": "qfex", "account": "AMIROO", "symbol": "MSTR"})
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(len(ws_calls), 1)
+        assert resp.position_action is not None
+        self.assertEqual(resp.position_action.operation, "close_position")
+        self.assertEqual(resp.position_action.symbol, "MSTR")
+        self.assertTrue(resp.position_action.verified)
+        self.assertEqual(resp.position_action.current_size, "0")
+
+    def test_qfex_set_tp_sl_return_explicit_unsupported(self) -> None:
+        self._creds()
+        for op in ("set_tp", "set_sl"):
+            resp = qfex.execute({"operation": op, "exchange": "qfex", "account": "AMIROO", "symbol": "MSTR", "price": "150"})
+            self.assertFalse(resp.success)
+            assert resp.error is not None
+            self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+            assert resp.position_action is not None
+            self.assertEqual(resp.position_action.operation, op)
 
     def test_new_order_sends_limit_order_over_websocket(self) -> None:
         self._creds()

@@ -43,6 +43,7 @@ from ..canonical import (
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -158,7 +159,7 @@ def list_accounts() -> list[str]:
 
 
 def capabilities() -> list[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder"]
+    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder", "close_position", "set_tp", "set_sl"]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -696,6 +697,83 @@ def _quantize_to_step(value: Decimal, step: Decimal, rounding=ROUND_HALF_UP) -> 
     return units * step
 
 
+def _find_position_row(credentials: Mapping[str, str], requested_symbol: str) -> Optional[dict[str, Any]]:
+    native = _native_symbol(requested_symbol)
+    payload = _signed_request(credentials, "GET", _PATH_USER_POSITIONS)
+    rows = payload.get("positions") if isinstance(payload, Mapping) else []
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        qty = _decimal_or_zero(row.get("position") or row.get("size") or row.get("quantity"))
+        if symbol == native and qty != 0:
+            return dict(row)
+    return None
+
+
+def _position_action_unsupported(account: str, request: Mapping[str, Any], operation: str) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    canonical_account = credentials["account"] if credentials else account
+    symbol = _display_symbol(_native_symbol(str(request.get("symbol") or "")))
+    action = CanonicalPositionActionResult(
+        operation=operation,
+        symbol=symbol,
+        verified=False,
+        status="unsupported",
+        message="QFEX TP/SL position-management writes are not enabled until QFEX stop-order creation semantics are confirmed.",
+    )
+    return make_failure(
+        operation=operation,
+        exchange=name,
+        account=canonical_account,
+        code="NOT_IMPLEMENTED",
+        message=action.message or "QFEX operation is not implemented.",
+        position_action=action,
+    )
+
+
+def _close_position(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation="close_position", exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    native = _native_symbol(requested_symbol)
+    display = _display_symbol(native)
+    try:
+        before = _find_position_row(credentials, native)
+        if before is None:
+            action = CanonicalPositionActionResult(operation="close_position", symbol=display, verified=True, status="noop", current_size="0", message="No open position for symbol.")
+            return make_success(operation="close_position", exchange=name, account=credentials["account"], position_action=action)
+        before_qty = _decimal_or_zero(before.get("position") or before.get("size") or before.get("quantity"))
+        side = "long" if before_qty > 0 else "short"
+        client_order_id = str(request.get("client_order_id") or request.get("clientOrderId") or "").strip() or uuid.uuid4().hex[:32]
+        command = {"type": "close_position", "params": {"symbol": native, "client_order_id": client_order_id}}
+        try:
+            _ws_command(credentials, command, expect={"position_response", "order_response", "ack"})
+        except Exception:
+            # QFEX write responses can time out after execution; verify below.
+            pass
+        after = _find_position_row(credentials, native)
+        remaining = Decimal("0") if after is None else abs(_decimal_or_zero(after.get("position") or after.get("size") or after.get("quantity")))
+        verified = remaining == 0
+        action = CanonicalPositionActionResult(
+            operation="close_position",
+            symbol=display,
+            verified=verified,
+            status="success" if verified else "submitted",
+            current_side=None if verified else side,
+            current_size=_format_decimal(remaining),
+            message=("QFEX position is flat." if verified else "QFEX close_position submitted.") + f" Client order id: {client_order_id}",
+        )
+        if verified:
+            return make_success(operation="close_position", exchange=name, account=credentials["account"], position_action=action)
+        return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="CLOSE_UNVERIFIED", message="QFEX close_position submitted but position is not yet flat.", position_action=action)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
+
+
 def _ladder_prices(start: Decimal, end: Decimal, count: int, tick: Decimal = Decimal("0")) -> list[Decimal]:
     if count <= 0:
         return []
@@ -928,6 +1006,10 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _ladder(account, request)
     if operation == "cancel_order_group":
         return _cancel_order_group(account, request)
+    if operation == "close_position":
+        return _close_position(account, request)
+    if operation in {"set_tp", "set_sl"}:
+        return _position_action_unsupported(account, request, operation)
     credentials = _lookup_credentials(account)
     canonical_account = credentials["account"] if credentials else account
     return make_failure(
