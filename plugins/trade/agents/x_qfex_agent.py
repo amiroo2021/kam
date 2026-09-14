@@ -774,6 +774,85 @@ def _close_position(account: str, request: Mapping[str, Any]) -> CanonicalRespon
         return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
 
 
+def _set_protection(account: str, request: Mapping[str, Any], *, kind: str) -> CanonicalResponse:
+    operation = "set_tp" if kind == "tp" else "set_sl"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation=operation, exchange=name, account=account, code="ACCOUNT_NOT_FOUND", message="Set QFEX_<ACCOUNT>_PUBLIC_KEY and QFEX_<ACCOUNT>_SECRET_KEY.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    native = _native_symbol(requested_symbol)
+    display = _display_symbol(native)
+    price_in = _decimal_or_zero(request.get("price"))
+    if price_in <= 0:
+        action = CanonicalPositionActionResult(operation=operation, symbol=display, verified=False, removed=True, status="unsupported", message="QFEX TP/SL removal is not enabled yet.")
+        return make_failure(operation=operation, exchange=name, account=credentials["account"], code="NOT_IMPLEMENTED", message=action.message or "QFEX TP/SL removal is not enabled yet.", position_action=action)
+    try:
+        pos = _find_position_row(credentials, native)
+        if pos is None:
+            action = CanonicalPositionActionResult(operation=operation, symbol=display, verified=False, status="failed", current_size="0", message="No open position for symbol.")
+            return make_failure(operation=operation, exchange=name, account=credentials["account"], code="NO_OPEN_POSITION", message="No open position for symbol.", position_action=action)
+        qty_signed = _decimal_or_zero(pos.get("position") or pos.get("size") or pos.get("quantity"))
+        qty_abs = abs(qty_signed)
+        if qty_abs <= 0:
+            raise ValueError("NO_OPEN_POSITION")
+        side_q = "SELL" if qty_signed > 0 else "BUY"
+        side_label = "long" if qty_signed > 0 else "short"
+        row = _find_refdata_symbol(native) or {}
+        tick = _decimal_or_zero(row.get("tick_size"))
+        step = _decimal_or_zero(row.get("lot_size"))
+        price = _quantize_to_step(price_in, tick, ROUND_HALF_UP)
+        qty = _quantize_to_step(qty_abs, step, ROUND_DOWN)
+        if qty <= 0 or price <= 0:
+            return make_failure(operation=operation, exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="QFEX TP/SL quantity and price must be positive after quantization.")
+        client_order_id = str(request.get("client_order_id") or request.get("clientOrderId") or "").strip() or uuid.uuid4().hex[:32]
+        order_type = "TAKE_PROFIT" if kind == "tp" else "STOP_LOSS"
+        params: dict[str, Any] = {
+            "symbol": native,
+            "side": side_q,
+            "order_type": order_type,
+            "order_time_in_force": "GTC",
+            "quantity": float(qty),
+            "price": float(price),
+            "client_order_id": client_order_id,
+        }
+        if kind == "tp":
+            params["take_profit"] = float(price)
+        else:
+            params["stop_loss"] = float(price)
+        command = {"type": "add_order", "params": params}
+        row_resp: Mapping[str, Any] = {}
+        try:
+            payload = _ws_command(credentials, command, expect={"order_response", "stop_order_response"})
+            raw = payload.get("order_response") or payload.get("stop_order_response") if isinstance(payload, Mapping) else {}
+            row_resp = raw if isinstance(raw, Mapping) else {}
+        except Exception:
+            orders_payload = _ws_command(credentials, {"type": "get_user_orders", "params": {"limit": 500, "offset": 0, "symbol": native}}, expect={"all_orders_response"})
+            for order_row in _extract_order_rows(orders_payload):
+                if str(order_row.get("client_order_id") or "") == client_order_id and _is_open_order(order_row):
+                    row_resp = order_row
+                    break
+            if not row_resp:
+                raise
+        status_native = str(row_resp.get("status") or "").upper()
+        accepted = status_native in {"ACK", "MODIFIED", "IOC_PARTIALLY_FILLED"} or bool(row_resp.get("order_id") or row_resp.get("stop_order_id"))
+        action = CanonicalPositionActionResult(
+            operation=operation,
+            symbol=display,
+            verified=accepted,
+            price=_format_decimal(price),
+            status="success" if accepted else (status_native.lower() or "submitted"),
+            exchange_order_id=row_resp.get("order_id") or row_resp.get("stop_order_id"),
+            current_side=side_label,
+            current_size=_format_decimal(qty_abs),
+            message=f"QFEX {order_type} submitted for {_format_decimal(qty)} @ {_format_decimal(price)}.",
+        )
+        if accepted:
+            return make_success(operation=operation, exchange=name, account=credentials["account"], position_action=action)
+        return make_failure(operation=operation, exchange=name, account=credentials["account"], code="ORDER_FAILED", message=status_native or "QFEX TP/SL order rejected.", position_action=action)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation=operation, exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
+
+
 def _ladder_prices(start: Decimal, end: Decimal, count: int, tick: Decimal = Decimal("0")) -> list[Decimal]:
     if count <= 0:
         return []
@@ -1008,8 +1087,10 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _cancel_order_group(account, request)
     if operation == "close_position":
         return _close_position(account, request)
-    if operation in {"set_tp", "set_sl"}:
-        return _position_action_unsupported(account, request, operation)
+    if operation == "set_tp":
+        return _set_protection(account, request, kind="tp")
+    if operation == "set_sl":
+        return _set_protection(account, request, kind="sl")
     credentials = _lookup_credentials(account)
     canonical_account = credentials["account"] if credentials else account
     return make_failure(

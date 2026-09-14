@@ -221,15 +221,70 @@ class QfexAgentTests(unittest.TestCase):
         self.assertTrue(resp.position_action.verified)
         self.assertEqual(resp.position_action.current_size, "0")
 
-    def test_qfex_set_tp_sl_return_explicit_unsupported(self) -> None:
+
+    def test_set_tp_submits_qfex_take_profit_reduce_order(self) -> None:
         self._creds()
-        for op in ("set_tp", "set_sl"):
-            resp = qfex.execute({"operation": op, "exchange": "qfex", "account": "AMIROO", "symbol": "MSTR", "price": "150"})
-            self.assertFalse(resp.success)
-            assert resp.error is not None
-            self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
-            assert resp.position_action is not None
-            self.assertEqual(resp.position_action.operation, op)
+        rest_calls = []
+        ws_calls = []
+
+        def fake_rest(_creds, method, path, query=""):
+            rest_calls.append(path)
+            return {"positions": [{"symbol": "MSTR-USD", "position": -0.1, "average_price": 135.5, "unrealised_pnl": "0", "realised_pnl": "0"}]}
+
+        def fake_refdata(symbol):
+            return {"symbol": "MSTR-USD", "tick_size": "0.01", "lot_size": "0.01", "min_quantity": "0.01"}
+
+        def fake_ws(_creds, command, expect=None):
+            ws_calls.append(command)
+            self.assertEqual(command["type"], "add_order")
+            self.assertEqual(command["params"]["symbol"], "MSTR-USD")
+            self.assertEqual(command["params"]["side"], "BUY")
+            self.assertEqual(command["params"]["order_type"], "TAKE_PROFIT")
+            self.assertEqual(command["params"]["quantity"], 0.1)
+            self.assertEqual(command["params"]["price"], 120.0)
+            self.assertEqual(command["params"]["take_profit"], 120.0)
+            return {"order_response": {"order_id": "tp-1", "symbol": "MSTR-USD", "side": "BUY", "type": "TAKE_PROFIT", "status": "ACK", "quantity": 0.1, "price": 120, "client_order_id": command["params"]["client_order_id"]}}
+
+        with mock.patch.object(qfex, "_signed_request", side_effect=fake_rest), \
+             mock.patch.object(qfex, "_find_refdata_symbol", side_effect=fake_refdata), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute({"operation": "set_tp", "exchange": "qfex", "account": "AMIROO", "symbol": "MSTR", "price": "120.001"})
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(len(ws_calls), 1)
+        assert resp.position_action is not None
+        self.assertEqual(resp.position_action.operation, "set_tp")
+        self.assertEqual(resp.position_action.price, "120")
+        self.assertTrue(resp.position_action.verified)
+
+    def test_set_sl_submits_qfex_stop_loss_reduce_order(self) -> None:
+        self._creds()
+        ws_calls = []
+
+        def fake_rest(_creds, method, path, query=""):
+            return {"positions": [{"symbol": "MSTR-USD", "position": -0.1, "average_price": 135.5, "unrealised_pnl": "0", "realised_pnl": "0"}]}
+
+        def fake_refdata(symbol):
+            return {"symbol": "MSTR-USD", "tick_size": "0.01", "lot_size": "0.01", "min_quantity": "0.01"}
+
+        def fake_ws(_creds, command, expect=None):
+            ws_calls.append(command)
+            self.assertEqual(command["params"]["side"], "BUY")
+            self.assertEqual(command["params"]["order_type"], "STOP_LOSS")
+            self.assertEqual(command["params"]["stop_loss"], 150.0)
+            return {"order_response": {"order_id": "sl-1", "symbol": "MSTR-USD", "side": "BUY", "type": "STOP_LOSS", "status": "ACK", "quantity": 0.1, "price": 150, "client_order_id": command["params"]["client_order_id"]}}
+
+        with mock.patch.object(qfex, "_signed_request", side_effect=fake_rest), \
+             mock.patch.object(qfex, "_find_refdata_symbol", side_effect=fake_refdata), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute({"operation": "set_sl", "exchange": "qfex", "account": "AMIROO", "symbol": "MSTR", "price": "150"})
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(len(ws_calls), 1)
+        assert resp.position_action is not None
+        self.assertEqual(resp.position_action.operation, "set_sl")
+        self.assertEqual(resp.position_action.price, "150")
+        self.assertTrue(resp.position_action.verified)
 
     def test_new_order_sends_limit_order_over_websocket(self) -> None:
         self._creds()
