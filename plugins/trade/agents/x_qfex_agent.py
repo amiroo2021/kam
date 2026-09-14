@@ -758,8 +758,8 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="symbol, side, order_count, total_volume, start_price and end_price are required.")
     if not native or side_q not in {"BUY", "SELL"} or count <= 0 or total <= 0 or start <= 0 or end <= 0:
         return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="symbol, side, order_count, total_volume, start_price and end_price must be valid positive values.")
-    if count > 50:
-        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="order_count exceeds safety cap (50).")
+    if count > 100:
+        return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="order_count exceeds safety cap (100).")
     if count > 1 and side_in == "buy" and not (end < start):
         return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="For a BUY ladder, end_price must be lower than start_price.")
     if count > 1 and side_in == "sell" and not (end > start):

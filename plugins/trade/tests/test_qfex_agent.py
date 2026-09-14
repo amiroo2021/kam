@@ -326,6 +326,73 @@ class QfexAgentTests(unittest.TestCase):
         self.assertTrue(resp.ladder.verified)
 
 
+
+    def test_ladder_allows_up_to_100_orders(self) -> None:
+        self._creds()
+        commands = []
+
+        def fake_refdata(symbol):
+            return {"symbol": "MSTR-USD", "tick_size": "0.01", "lot_size": "0.01", "min_quantity": "0.01"}
+
+        def fake_ws(_creds, command, expect=None):
+            commands.append(command)
+            return {
+                "order_response": {
+                    "order_id": f"ladder-{len(commands)}",
+                    "client_order_id": command["params"]["client_order_id"],
+                    "symbol": command["params"]["symbol"],
+                    "side": command["params"]["side"],
+                    "status": "ACK",
+                    "quantity": command["params"]["quantity"],
+                    "price": command["params"]["price"],
+                    "quantity_remaining": command["params"]["quantity"],
+                }
+            }
+
+        with mock.patch.object(qfex, "_find_refdata_symbol", side_effect=fake_refdata), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                    "distribution": "uniform",
+                    "order_count": "100",
+                    "total_volume": "1",
+                    "start_price": "140",
+                    "end_price": "150",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(len(commands), 100)
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.requested_order_count, 100)
+        self.assertEqual(resp.ladder.submitted_order_count, 100)
+
+    def test_ladder_rejects_more_than_100_orders(self) -> None:
+        self._creds()
+        resp = qfex.execute(
+            {
+                "operation": "ladder",
+                "exchange": "qfex",
+                "account": "AMIROO",
+                "symbol": "MSTR-USD",
+                "side": "sell",
+                "distribution": "uniform",
+                "order_count": "101",
+                "total_volume": "1",
+                "start_price": "140",
+                "end_price": "150",
+            }
+        )
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "INVALID_REQUEST")
+        self.assertIn("100", resp.error.message)
+
     def test_ladder_quantizes_prices_and_sizes_to_qfex_increments(self) -> None:
         self._creds()
         commands = []
