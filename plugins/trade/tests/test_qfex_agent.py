@@ -35,7 +35,7 @@ class QfexAgentTests(unittest.TestCase):
         self.assertIn("qfex", tradedesk.TradeDesk().list_exchanges())
 
     def test_capabilities_include_trade_operations(self) -> None:
-        for op in ("balance", "positions_orders", "new_order", "cancel_order_group"):
+        for op in ("balance", "positions_orders", "new_order", "cancel_order_group", "resolve_instrument", "market_price"):
             self.assertIn(op, qfex.capabilities())
 
     def test_auth_headers_use_nonce_timestamp_hmac_signature(self) -> None:
@@ -50,6 +50,60 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(headers["x-qfex-nonce"], "abc123")
         self.assertEqual(headers["x-qfex-timestamp"], "1700000000")
         self.assertEqual(headers["x-qfex-hmac-signature"], expected)
+
+
+    def test_resolve_instrument_returns_qfex_symbol_for_confirmation(self) -> None:
+        self._creds()
+
+        def fake_public(path, query=""):
+            self.assertEqual(path, "/refdata")
+            return {
+                "data": [
+                    {
+                        "symbol": "ETH-USD",
+                        "base_asset": "ETH",
+                        "quote_asset": "USD",
+                        "tick_size": "0.01",
+                        "lot_size": "0.001",
+                        "min_quantity": "0.01",
+                    }
+                ]
+            }
+
+        with mock.patch.object(qfex, "_public_request", side_effect=fake_public):
+            resp = qfex.execute({"operation": "resolve_instrument", "exchange": "qfex", "account": "AMIROO", "symbol": "eth"})
+
+        self.assertTrue(resp.success, resp)
+        assert resp.instrument is not None
+        self.assertEqual(resp.instrument.requested_symbol, "eth")
+        self.assertEqual(resp.instrument.symbol, "ETH-USD")
+        self.assertEqual(resp.instrument.display_name, "ETH-USD")
+        self.assertEqual(resp.instrument.price_increment, "0.01")
+        self.assertEqual(resp.instrument.size_increment, "0.001")
+
+    def test_market_price_returns_last_price_for_confirmation(self) -> None:
+        self._creds()
+
+        def fake_public(path, query=""):
+            self.assertEqual(path, "/md/contracts")
+            return {
+                "data": [
+                    {
+                        "ticker_id": "ETH-USD",
+                        "last_price": "2510.5",
+                        "index_price": "2509.9",
+                    }
+                ]
+            }
+
+        with mock.patch.object(qfex, "_public_request", side_effect=fake_public):
+            resp = qfex.execute({"operation": "market_price", "exchange": "qfex", "account": "AMIROO", "symbol": "ETH"})
+
+        self.assertTrue(resp.success, resp)
+        assert resp.market_price is not None
+        self.assertEqual(resp.market_price.market, "ETH-USD")
+        self.assertEqual(resp.market_price.price, "2510.5")
+        self.assertEqual(resp.market_price.mark_price, "2509.9")
 
     def test_balance_rolls_up_available_balances(self) -> None:
         self._creds()

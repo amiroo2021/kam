@@ -35,6 +35,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..canonical import (
     CanonicalCancelGroupResult,
+    CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -154,7 +156,7 @@ def list_accounts() -> list[str]:
 
 
 def capabilities() -> list[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group"]
+    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price"]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -206,6 +208,21 @@ def _auth_headers(credentials: Mapping[str, str]) -> Dict[str, str]:
         headers["x-qfex-requested-account-id"] = account_id
     return headers
 
+
+
+def _public_request(path: str, query: str = "") -> Dict[str, Any]:
+    query = query.lstrip("?")
+    url = f"{DEFAULT_API_BASE}{path}" + (f"?{query}" if query else "")
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Hermes-KAM-QFEXAgent/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:  # noqa: S310 HTTPS API
+            raw = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise RuntimeError(f"HTTP {exc.code}: {raw or exc}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(str(exc.reason or exc)) from exc
 
 def _signed_request(
     credentials: Mapping[str, str], method: str, path: str, query: str = ""
@@ -435,6 +452,85 @@ def _ws_command(credentials: Mapping[str, str], command: Mapping[str, Any], expe
         ws.close()
 
 
+
+def _data_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("data") if isinstance(payload, Mapping) else []
+    return [dict(r) for r in rows if isinstance(r, Mapping)]
+
+
+def _find_refdata_symbol(requested_symbol: str) -> Optional[dict[str, Any]]:
+    native = _native_symbol(requested_symbol)
+    base = _display_symbol(native)
+    # Prefer full refdata for increments/limits. QFEX's ticker filter can return
+    # no rows for symbols that are present in /md/contracts, so fall back below.
+    payload = _public_request("/refdata")
+    rows = _data_rows(payload)
+    for row in rows:
+        sym = str(row.get("symbol") or "").upper()
+        if sym == native or str(row.get("base_asset") or "").upper() == base:
+            return row
+    contracts = _data_rows(_public_request("/md/contracts"))
+    for row in contracts:
+        ticker = str(row.get("ticker_id") or "").upper()
+        if ticker == native or str(row.get("base_currency") or "").upper() == base:
+            return {
+                "symbol": ticker,
+                "base_asset": row.get("base_currency"),
+                "quote_asset": row.get("target_currency") or row.get("quote_currency"),
+                "tick_size": row.get("tick_size") or "",
+                "lot_size": row.get("lot_size") or "",
+                "min_quantity": row.get("min_quantity") or "",
+            }
+    return None
+
+
+def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or request.get("query") or "").strip()
+    try:
+        row = _find_refdata_symbol(requested)
+        if not row:
+            return make_failure(operation="resolve_instrument", exchange=name, account=account, code="INSTRUMENT_NOT_FOUND", message=f"QFEX instrument not found: {requested}")
+        native = str(row.get("symbol") or _native_symbol(requested)).upper()
+        instrument = CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=native,
+            display_name=native,
+            price_increment=str(row.get("tick_size") or ""),
+            size_increment=str(row.get("lot_size") or ""),
+            minimum_size=str(row.get("min_quantity") or ""),
+        )
+        return make_success(operation="resolve_instrument", exchange=name, account=str(account or ""), instrument=instrument)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="resolve_instrument", exchange=name, account=str(account or ""), code="QFEX_ERROR", message=sanitize_error_message(str(exc)))
+
+
+def _market_price(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    requested = str(request.get("symbol") or request.get("market") or "").strip()
+    native = _native_symbol(requested)
+    try:
+        payload = _public_request("/md/contracts")
+        rows = _data_rows(payload)
+        match = None
+        for row in rows:
+            ticker = str(row.get("ticker_id") or "").upper()
+            if ticker == native or str(row.get("base_currency") or "").upper() == _display_symbol(native):
+                match = row
+                break
+        if not match:
+            return make_failure(operation="market_price", exchange=name, account=account, code="INSTRUMENT_NOT_FOUND", message=f"QFEX price not found: {requested}")
+        market = str(match.get("ticker_id") or native).upper()
+        price = str(match.get("last_price") or match.get("index_price") or "")
+        mp = CanonicalMarketPrice(
+            requested_symbol=requested,
+            market=market,
+            mark_price=str(match.get("index_price") or "") or None,
+            price=price or None,
+        )
+        return make_success(operation="market_price", exchange=name, account=str(account or ""), market_price=mp)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation="market_price", exchange=name, account=str(account or ""), code="QFEX_ERROR", message=sanitize_error_message(str(exc)))
+
+
 def _balance(account: str) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -632,6 +728,10 @@ def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalRe
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     operation = str(request.get("operation") or "").strip().lower()
     account = str(request.get("account") or "").strip()
+    if operation == "resolve_instrument":
+        return _resolve_instrument(account, request)
+    if operation == "market_price":
+        return _market_price(account, request)
     if operation == "balance":
         return _balance(account)
     if operation in {"positions_orders", "positions_management"}:
