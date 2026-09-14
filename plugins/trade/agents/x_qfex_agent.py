@@ -700,20 +700,44 @@ def _cancel_order_group(account: str, request: Mapping[str, Any]) -> CanonicalRe
         orders_payload = _ws_command(credentials, {"type": "get_user_orders", "params": {"limit": 500, "offset": 0, "symbol": native}}, expect={"all_orders_response"})
         targets = [r for r in _extract_order_rows(orders_payload) if str(r.get("symbol") or "").upper() == native and str(r.get("side") or "").upper() == side_q and _is_open_order(r)]
         batches: list[dict[str, Any]] = []
-        cancelled = 0
+        cancelled_ids: set[str] = set()
+        uncertain_ids: set[str] = set()
         for row in targets:
             order_id = str(row.get("order_id") or "").strip()
             if not order_id:
                 continue
             command = {"type": "cancel_order", "params": {"symbol": native, "order_id": order_id, "cancel_order_id_type": "order_id"}}
-            response = _ws_command(credentials, command, expect={"order_response", "ack"})
             status = ""
-            if isinstance(response.get("order_response"), Mapping):
-                status = str(response["order_response"].get("status") or "").upper()
-            ok = status in {"CANCELLED", "ACK", "NO_SUCH_ORDER", "NOT_FOUND"} or "ack" in response
+            ok = False
+            try:
+                response = _ws_command(credentials, command, expect={"order_response", "ack"})
+                if isinstance(response.get("order_response"), Mapping):
+                    status = str(response["order_response"].get("status") or "").upper()
+                ok = status in {"CANCELLED", "ACK", "NO_SUCH_ORDER", "NOT_FOUND"} or "ack" in response
+            except Exception as exc:  # noqa: BLE001
+                status = f"VERIFY_AFTER_ERROR: {_redact(exc, credentials)}"
+                uncertain_ids.add(order_id)
             if ok:
-                cancelled += 1
-            batches.append({"order_id": order_id, "ok": ok, "status": status or ("ACK" if "ack" in response else "")})
+                cancelled_ids.add(order_id)
+            batches.append({"order_id": order_id, "ok": ok, "status": status or ("ACK" if ok else "")})
+
+        if uncertain_ids:
+            verify_payload = _ws_command(credentials, {"type": "get_user_orders", "params": {"limit": 500, "offset": 0, "symbol": native}}, expect={"all_orders_response"})
+            still_open = {
+                str(r.get("order_id") or "").strip()
+                for r in _extract_order_rows(verify_payload)
+                if str(r.get("symbol") or "").upper() == native
+                and str(r.get("side") or "").upper() == side_q
+                and _is_open_order(r)
+            }
+            for batch in batches:
+                order_id = str(batch.get("order_id") or "")
+                if order_id in uncertain_ids and order_id not in still_open:
+                    batch["ok"] = True
+                    batch["status"] = "CONFIRMED_ABSENT"
+                    cancelled_ids.add(order_id)
+
+        cancelled = len(cancelled_ids)
         verified = cancelled == len(targets)
         result = CanonicalCancelGroupResult(
             symbol=_display_symbol(native),

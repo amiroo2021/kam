@@ -320,5 +320,52 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
 
 
+
+    def test_cancel_order_group_verifies_absent_after_timeout(self) -> None:
+        self._creds()
+        calls = []
+
+        def fake_ws(_creds, command, expect=None):
+            calls.append(command["type"])
+            if command["type"] == "get_user_orders" and calls.count("get_user_orders") == 1:
+                return {
+                    "all_orders_response": {
+                        "orders": [
+                            {
+                                "order_id": "mstr-140",
+                                "symbol": "MSTR-USD",
+                                "side": "SELL",
+                                "status": "ACK",
+                                "quantity_remaining": 1,
+                                "price": 140,
+                            }
+                        ]
+                    }
+                }
+            if command["type"] == "cancel_order":
+                raise RuntimeError("Connection timed out")
+            if command["type"] == "get_user_orders" and calls.count("get_user_orders") == 2:
+                return {"all_orders_response": {"orders": []}}
+            raise AssertionError(command)
+
+        with mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "cancel_order_group",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual(calls, ["get_user_orders", "cancel_order", "get_user_orders"])
+        assert resp.cancel_group is not None
+        self.assertEqual(resp.cancel_group.cancelled_order_count, 1)
+        self.assertEqual(resp.cancel_group.confirmed_absent_count, 1)
+        self.assertTrue(resp.cancel_group.verified)
+
+
 if __name__ == "__main__":
     unittest.main()
