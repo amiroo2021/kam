@@ -325,6 +325,53 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.ladder.submitted_volume, "6")
         self.assertTrue(resp.ladder.verified)
 
+
+    def test_ladder_quantizes_prices_and_sizes_to_qfex_increments(self) -> None:
+        self._creds()
+        commands = []
+
+        def fake_refdata(symbol):
+            self.assertEqual(symbol, "MSTR-USD")
+            return {"symbol": "MSTR-USD", "tick_size": "0.01", "lot_size": "0.01", "min_quantity": "0.1"}
+
+        def fake_ws(_creds, command, expect=None):
+            commands.append(command)
+            return {
+                "order_response": {
+                    "order_id": f"ladder-{len(commands)}",
+                    "client_order_id": command["params"]["client_order_id"],
+                    "symbol": command["params"]["symbol"],
+                    "side": command["params"]["side"],
+                    "status": "ACK",
+                    "quantity": command["params"]["quantity"],
+                    "price": command["params"]["price"],
+                    "quantity_remaining": command["params"]["quantity"],
+                }
+            }
+
+        with mock.patch.object(qfex, "_find_refdata_symbol", side_effect=fake_refdata), \
+             mock.patch.object(qfex, "_ws_command", side_effect=fake_ws):
+            resp = qfex.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "qfex",
+                    "account": "AMIROO",
+                    "symbol": "MSTR-USD",
+                    "side": "sell",
+                    "distribution": "uniform",
+                    "order_count": "3",
+                    "total_volume": "1",
+                    "start_price": "140.001",
+                    "end_price": "140.029",
+                }
+            )
+
+        self.assertTrue(resp.success, resp)
+        self.assertEqual([c["params"]["price"] for c in commands], [140.0, 140.02, 140.03])
+        self.assertEqual([c["params"]["quantity"] for c in commands], [0.34, 0.33, 0.33])
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.submitted_volume, "1")
+
     def test_ladder_verifies_child_after_qfex_timeout(self) -> None:
         self._creds()
         calls = []

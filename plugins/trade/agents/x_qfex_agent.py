@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -689,15 +689,24 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         return make_failure(operation="new_order", exchange=name, account=credentials["account"], code="QFEX_ERROR", message=_redact(exc, credentials))
 
 
-def _ladder_prices(start: Decimal, end: Decimal, count: int) -> list[Decimal]:
+def _quantize_to_step(value: Decimal, step: Decimal, rounding=ROUND_HALF_UP) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=rounding)
+    return units * step
+
+
+def _ladder_prices(start: Decimal, end: Decimal, count: int, tick: Decimal = Decimal("0")) -> list[Decimal]:
     if count <= 0:
         return []
     if count == 1:
-        return [start]
-    return [start + (end - start) * Decimal(i) / Decimal(count - 1) for i in range(count)]
+        raw = [start]
+    else:
+        raw = [start + (end - start) * Decimal(i) / Decimal(count - 1) for i in range(count)]
+    return [_quantize_to_step(price, tick, ROUND_HALF_UP) for price in raw]
 
 
-def _ladder_sizes(total: Decimal, count: int, distribution: str) -> list[Decimal]:
+def _ladder_sizes(total: Decimal, count: int, distribution: str, step: Decimal = Decimal("0"), min_size: Decimal = Decimal("0")) -> list[Decimal]:
     if count <= 0:
         return []
     key = str(distribution or "uniform").strip().lower().replace(" ", "_")
@@ -712,7 +721,23 @@ def _ladder_sizes(total: Decimal, count: int, distribution: str) -> list[Decimal
     else:
         raise ValueError("distribution must be uniform or half_gaussian")
     weight_sum = sum(weights)
-    return [total * weight / weight_sum for weight in weights]
+    raw = [total * weight / weight_sum for weight in weights]
+    if step <= 0:
+        return raw
+    total_units = int((total / step).to_integral_value(rounding=ROUND_DOWN))
+    min_units = int((min_size / step).to_integral_value(rounding=ROUND_HALF_UP)) if min_size > 0 else 0
+    if total_units <= 0 or total_units < min_units * count:
+        raise ValueError("Total volume is too small for QFEX ladder size increment/minimum.")
+    allocation = [max(min_units, int((item / step).to_integral_value(rounding=ROUND_DOWN))) for item in raw]
+    # If minimum sizing pushed the sum over total, fail instead of oversizing.
+    if sum(allocation) > total_units:
+        raise ValueError("Total volume is too small for QFEX ladder minimum size.")
+    residual = total_units - sum(allocation)
+    remainders = [(raw[i] / step) - int((raw[i] / step).to_integral_value(rounding=ROUND_DOWN)) for i in range(count)]
+    order = sorted(range(count), key=lambda i: (remainders[i], -i), reverse=True)
+    for idx in order[:residual]:
+        allocation[idx] += 1
+    return [Decimal(units) * step for units in allocation]
 
 
 def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
@@ -743,8 +768,12 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         return make_failure(operation="ladder", exchange=name, account=credentials["account"], code="INVALID_REQUEST", message="distribution must be uniform or half_gaussian.")
 
     try:
-        prices = _ladder_prices(start, end, count)
-        sizes = _ladder_sizes(total, count, distribution)
+        row = _find_refdata_symbol(native) or {}
+        tick = _decimal_or_zero(row.get("tick_size"))
+        step = _decimal_or_zero(row.get("lot_size"))
+        min_size = _decimal_or_zero(row.get("min_quantity"))
+        prices = _ladder_prices(start, end, count, tick)
+        sizes = _ladder_sizes(total, count, distribution, step, min_size)
         batches: list[dict[str, Any]] = []
         child_ids: list[str | int] = []
         submitted_volume = Decimal("0")
