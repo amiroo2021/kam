@@ -174,7 +174,39 @@
   function latestTime(msg) {
     const t = Number(msg.last_candle_time || msg.metric_windows?.latest_candle_time);
     if (Number.isFinite(t)) return t;
+    if (lastCandleBounds && Number.isFinite(lastCandleBounds.last)) return lastCandleBounds.last;
     return Math.floor(Date.now() / 1000);
+  }
+
+  /** Last applied candle window (seconds). Used to clip ladder segments. */
+  let lastCandleBounds = null; // { first, last, count }
+  let lastCandles = [];
+
+  function chartTimeBounds(msg) {
+    const candles = Array.isArray(msg.candles) && msg.candles.length ? msg.candles : lastCandles;
+    if (!candles || !candles.length) return lastCandleBounds;
+    const first = Number(candles[0].time);
+    const last = Number(candles[candles.length - 1].time);
+    if (!Number.isFinite(first) || !Number.isFinite(last)) return lastCandleBounds;
+    return { first, last, count: candles.length };
+  }
+
+  function clipVisualStart(activationSec, bounds) {
+    if (!Number.isFinite(activationSec)) return null;
+    if (!bounds || !Number.isFinite(bounds.first)) return activationSec;
+    // Visual clip only — backend activation_ts unchanged
+    return Math.max(activationSec, bounds.first);
+  }
+
+  /** Ladder/metric series must not expand price OR time autoscale away from candles. */
+  function overlaySeriesOpts(extra) {
+    return Object.assign({
+      lastValueVisible: true,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
+      // Exclude from autoscale so huge P0..P(n+2) span does not squash candles
+      autoscaleInfoProvider: () => null,
+    }, extra || {});
   }
 
   /**
@@ -187,12 +219,19 @@
     const levels = msg.levels;
     if (!Array.isArray(levels) || !levels.length) return;
     const colors = sideColors(msg.side);
-    const tRight = rightEdgeTime(msg);
+    const bounds = chartTimeBounds(msg);
+    const tRight = bounds && Number.isFinite(bounds.last)
+      ? Math.max(bounds.last + 60, rightEdgeTime(msg))
+      : rightEdgeTime(msg);
 
     levels.forEach((lv) => {
       const price = Number(lv.price);
-      const t0 = Number(lv.activation_time);
-      if (!Number.isFinite(price) || !Number.isFinite(t0)) return;
+      const tAct = Number(lv.activation_time);
+      if (!Number.isFinite(price) || !Number.isFinite(tAct)) return;
+      // Clip visual start into retained candle window (do not rewrite backend activation)
+      const t0 = clipVisualStart(tAct, bounds);
+      if (!Number.isFinite(t0)) return;
+      const t1 = Math.max(t0 + 1, tRight);
       const kind = lv.kind || "activated";
       let color = colors.activated;
       let width = 2;
@@ -205,20 +244,19 @@
         width = 2;
         style = 2; // dashed
       }
-      const series = chart.addLineSeries({
+      const series = chart.addLineSeries(overlaySeriesOpts({
         color,
         lineWidth: width,
         lineStyle: style,
-        lastValueVisible: true,
-        priceLineVisible: false,
-        crosshairMarkerVisible: false,
         title: lv.label || lv.id || "",
-      });
+      }));
       series.setData([
         { time: t0, value: price },
-        { time: Math.max(t0 + 1, tRight), value: price },
+        { time: t1, value: price },
       ]);
-      ladderSeries[lv.id || lv.label] = series;
+      // stash debug meta
+      series.__gf = { label: lv.label, price, kind, tAct, t0, t1, clipped: t0 !== tAct };
+      ladderSeries[lv.id || lv.label || String(lv.step)] = series;
     });
   }
 
@@ -259,18 +297,18 @@
       if (skip.has(s.key)) return;
       const price = Number(msg[s.key]);
       if (!Number.isFinite(price)) return;
-      const series = chart.addLineSeries({
+      const bounds = chartTimeBounds(msg);
+      const tStart = bounds && Number.isFinite(bounds.last) ? bounds.last : t0;
+      const tEnd = Math.max(tStart + 1, bounds && Number.isFinite(bounds.last) ? bounds.last + 60 : tRight);
+      const series = chart.addLineSeries(overlaySeriesOpts({
         color: s.color,
         lineWidth: 1,
         lineStyle: s.dashed ? 2 : 0,
-        lastValueVisible: true,
-        priceLineVisible: false,
-        crosshairMarkerVisible: false,
         title: s.title,
-      });
+      }));
       series.setData([
-        { time: t0, value: price },
-        { time: Math.max(t0 + 1, tRight), value: price },
+        { time: tStart, value: price },
+        { time: tEnd, value: price },
       ]);
       metricSeries[s.key] = series;
     });
@@ -338,7 +376,15 @@
       progressFill.style.width = Math.min(100, pct) + "%";
       const from = p.from_t || "";
       const to = p.to_t || "";
-      progressText.textContent = `Replaying ${from} → ${to} · ${pct.toFixed(0)}% · bars ${p.bars_done || p.events_done || "?"} / ${p.bars_total || p.events_total || "?"}`;
+      const stage = p.stage || "";
+      const cache = p.cache || {};
+      let extra = "";
+      if (stage === "loading_cache" || stage === "cache_ready") {
+        extra = ` · cache ${cache.bars_from_cache != null ? cache.bars_from_cache : "…"} reused`;
+      } else if (stage === "downloading_gaps") {
+        extra = ` · dl ${cache.bars_downloaded != null ? cache.bars_downloaded : p.bars_done || "…"} · pages ${cache.rest_pages || p.pages || "?"}`;
+      }
+      progressText.textContent = `${stage || "working"} ${from} → ${to} · ${pct.toFixed(0)}% · bars ${p.bars_done || p.events_done || "?"} / ${p.bars_total || p.events_total || "?"}${extra}`;
     } else if (progressBar && (msg.phase === "live" || msg.phase === "backtest_done")) {
       if (msg.phase === "backtest_done") {
         progressBar.hidden = false;
@@ -353,8 +399,19 @@
 
   function applySnapshot(msg) {
     if (Array.isArray(msg.candles) && msg.candles.length) {
+      lastCandles = msg.candles;
+      lastCandleBounds = {
+        first: Number(msg.candles[0].time),
+        last: Number(msg.candles[msg.candles.length - 1].time),
+        count: msg.candles.length,
+      };
       candleSeries.setData(msg.candles);
-      chart.timeScale().fitContent();
+      // Fit ONLY the retained candle window (not ancient ladder activations)
+      try {
+        chart.timeScale().setVisibleLogicalRange({ from: 0, to: Math.max(1, msg.candles.length - 1) });
+      } catch (_) {
+        try { chart.timeScale().fitContent(); } catch (__) {}
+      }
     }
     applyOverlayState(msg);
     if (msg.side) document.getElementById("side").value = msg.side;

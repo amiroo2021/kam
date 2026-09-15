@@ -16,7 +16,8 @@ from ..engine.engine import GoldenFiboEngine
 from ..engine.events import DomainEvent, MarketEvent, MarketEventKind
 from ..live.price_path import apply_price_to_engine
 from ..marketdata import binance_public as bn
-from ..marketdata.binance_klines_range import BinancePublicKlineSource, inclusive_open_range_fetch_end
+from ..marketdata.binance_klines_range import inclusive_open_range_fetch_end
+from ..marketdata.kline_cache import CachePolicy, CachedBinanceKlineSource, KlineCache, fetch_range_cached
 from ..marketdata.timeframes import (
     interval_ms,
     ms_to_iso,
@@ -73,7 +74,10 @@ class SessionController:
         self._buffering = False
         self._live_enabled = False
         self.feed_status = "idle"
-        self.kline_source = BinancePublicKlineSource()
+        self.kline_cache = KlineCache()
+        self.cache_policy = CachePolicy.AUTO
+        self.kline_source = CachedBinanceKlineSource(cache=self.kline_cache, policy=self.cache_policy)
+        self.cache_stats: Dict[str, Any] = {}
         self.history_limit_live = 300
 
     def register_client(self, ws: Any) -> None:
@@ -144,6 +148,7 @@ class SessionController:
                 "bars_processed": self.bars_processed,
                 "event_summary": self.event_log.summary_counts(),
                 "ohlc_resolver": self.ohlc_mode.value,
+                "cache": dict(self.cache_stats),
                 "start_ms": self.start_ms,
                 "end_ms": self.end_ms,
                 "fence_ms": self.fence_ms,
@@ -291,13 +296,15 @@ class SessionController:
         end_ms: int,
         closed_only_before_ms: int | None,
     ) -> tuple[int, int, int | None]:
-        """Page fetch → apply to engine → progress. Returns (bars, ambiguity, last_open_ms)."""
+        """Cache-first range fetch, then chunked apply to one engine.
+
+        Returns (bars, ambiguity, last_open_ms).
+        """
         step = interval_ms(self.timeframe)
         est = max(1, (int(end_ms) - int(start_ms)) // step)
-        pages = 0
-        bars_done = 0
         amb_total = 0
         last_open: int | None = None
+        bars_done = 0
 
         await self._set_phase(
             SessionPhase.DOWNLOADING,
@@ -308,132 +315,148 @@ class SessionController:
             bars_total=est,
             pages=0,
             pct=0.0,
-            stage="download_replay",
+            stage="loading_cache",
         )
 
-        # Materialize page iterator in a worker-friendly loop: one page per to_thread
-        cursor = start_ms
-        seen: set[int] = set()
-        from ..marketdata.binance_klines_range import iter_klines_pages
+        progress_box: dict = {"last": {}}
 
-        def next_page_state() -> dict:
-            return {"cursor": cursor, "seen": seen}
+        def on_progress(info: dict) -> None:
+            progress_box["last"] = dict(info)
 
-        # Use source.iter_pages fully in thread would block progress; pull one page at a time.
-        from ..marketdata.binance_public import BINANCE_SPOT_REST
-        import urllib.parse, json, urllib.request
+        def do_fetch():
+            return fetch_range_cached(
+                self.symbol,
+                self.timeframe,
+                start_ms,
+                end_ms,
+                cache=self.kline_cache,
+                policy=self.cache_policy,
+                closed_only_before_ms=closed_only_before_ms,
+                fetch=getattr(self.kline_source, "fetch", None),
+                base_url=getattr(self.kline_source, "base_url", None) or "https://api.binance.com",
+                on_progress=on_progress,
+            )
 
-        base_url = getattr(self.kline_source, "base_url", BINANCE_SPOT_REST)
-        custom_fetch = getattr(self.kline_source, "fetch", None)
-
-        while cursor < end_ms and not self._stopped():
-            pages += 1
-            cur = cursor
-            end_bound = end_ms
-            cof = closed_only_before_ms
-            lim = 1000
-            sym = self.symbol
-            tf = self.timeframe
-
-            def fetch_one() -> list:
-                from ..marketdata.binance_klines_range import _default_fetch
-                fetch = custom_fetch or _default_fetch
-                qs = urllib.parse.urlencode(
-                    {
-                        "symbol": sym,
-                        "interval": tf,
-                        "startTime": int(cur),
-                        "endTime": int(end_bound - 1),
-                        "limit": lim,
-                    }
-                )
-                url = f"{base_url}/api/v3/klines?{qs}"
-                return fetch(url)
-
-            batch = await asyncio.to_thread(fetch_one)
+        fetch_fut = asyncio.get_event_loop().run_in_executor(None, do_fetch)
+        while not fetch_fut.done():
             if self._stopped():
+                # cannot cancel executor easily; wait briefly
+                await asyncio.sleep(0.1)
+                if not fetch_fut.done():
+                    pass
                 break
-            if not batch:
-                break
-
-            page_rows: list = []
-            page_last = None
-            for row in batch:
-                ot = int(row[0])
-                if ot < start_ms or ot >= end_ms:
-                    continue
-                if ot in seen:
-                    continue
-                if cof is not None and ot + step > cof:
-                    continue
-                seen.add(ot)
-                page_rows.append(row)
-                page_last = ot
-            page_rows.sort(key=lambda r: int(r[0]))
-
-            if page_rows:
-                # Apply page through same engine
-                def apply_page() -> tuple:
-                    r = apply_ohlc_page(
-                        self.engine,
-                        page_rows,
-                        mode=self.ohlc_mode,
-                        event_log=self.event_log,
-                    )
-                    return r.ambiguity_count, r.domain, r.bars_processed
-
-                a_count, domain, nbar = await asyncio.to_thread(apply_page)
-                amb_total += a_count
-                bars_done += nbar
-                last_open = page_last
-
-                async with self._lock:
-                    for k in page_rows:
-                        self.klines.append(k)
-                        self.bars.append(bar_from_binance_kline(k))
-                    # chart candles
-                    from ..marketdata import binance_public as bn_mod
-                    new_cc = bn_mod.bars_to_chart_candles(page_rows)
-                    self.chart_candles.extend(new_cc)
-                    self._trim_chart()
-                    self._trim_metric_bars()
-                    self.ambiguity_count = amb_total
-                    self.bars_processed = bars_done
-                    self.recent_domain.extend(domain[-50:])
-                    self._p0_seeded = self.engine.state.active
-                    if page_rows:
-                        self.last_price = str(page_rows[-1][4])
-
-            pct = min(99.0, 100.0 * bars_done / est)
+            info = progress_box.get("last") or {}
+            stg = info.get("stage") or "loading_cache"
+            st = info.get("stats") or {}
+            done_hint = int(st.get("bars_from_cache", 0) or 0) + int(st.get("bars_downloaded", 0) or 0)
             await self._set_phase(
                 SessionPhase.DOWNLOADING,
                 from_t=ms_to_iso(start_ms),
                 to_t=ms_to_iso(end_ms),
-                bars_done=bars_done,
+                bars_done=done_hint,
                 bars_est=est,
                 bars_total=est,
-                pages=pages,
+                pages=int(st.get("rest_pages", 0) or 0),
+                pct=min(40.0, 40.0 * done_hint / max(1, est)),
+                stage=stg,
+                cache=st,
+            )
+            await asyncio.sleep(0.25)
+
+        if self._stopped() and not fetch_fut.done():
+            # still running — wait for completion to avoid thread leak, discard
+            try:
+                await asyncio.wait_for(asyncio.shield(fetch_fut), timeout=600)
+            except Exception:
+                pass
+            return bars_done, amb_total, last_open
+
+        result = await fetch_fut
+        klines = result.klines
+        self.cache_stats = result.stats.as_dict()
+        if self._stopped():
+            return 0, 0, None
+
+        await self._set_phase(
+            SessionPhase.DOWNLOADING,
+            from_t=ms_to_iso(start_ms),
+            to_t=ms_to_iso(end_ms),
+            bars_done=len(klines),
+            bars_est=est,
+            bars_total=len(klines),
+            pages=self.cache_stats.get("rest_pages", 0),
+            pct=40.0,
+            stage="cache_ready",
+            cache=self.cache_stats,
+        )
+
+        await self._set_phase(
+            SessionPhase.REPLAYING,
+            from_t=ms_to_iso(start_ms),
+            to_t=ms_to_iso(end_ms),
+            bars_done=0,
+            bars_est=len(klines),
+            bars_total=len(klines),
+            pct=40.0,
+            stage="replaying",
+            cache=self.cache_stats,
+        )
+
+        chunk = 1000
+        total = len(klines)
+        for i in range(0, total, chunk):
+            if self._stopped():
+                break
+            page_rows = klines[i : i + chunk]
+
+            def apply_page(rows=page_rows):
+                r = apply_ohlc_page(
+                    self.engine,
+                    rows,
+                    mode=self.ohlc_mode,
+                    event_log=self.event_log,
+                )
+                return r.ambiguity_count, r.domain, r.bars_processed
+
+            a_count, domain, nbar = await asyncio.to_thread(apply_page)
+            amb_total += a_count
+            bars_done += nbar
+            if page_rows:
+                last_open = int(page_rows[-1][0])
+
+            async with self._lock:
+                for k in page_rows:
+                    self.klines.append(k)
+                    self.bars.append(bar_from_binance_kline(k))
+                new_cc = bn.bars_to_chart_candles(page_rows)
+                self.chart_candles.extend(new_cc)
+                self._trim_chart()
+                self._trim_metric_bars()
+                self.ambiguity_count = amb_total
+                self.bars_processed = bars_done
+                self.recent_domain.extend(domain[-50:])
+                self._p0_seeded = self.engine.state.active
+                if page_rows:
+                    self.last_price = str(page_rows[-1][4])
+
+            frac = bars_done / max(1, total)
+            pct = 40.0 + 59.0 * frac
+            await self._set_phase(
+                SessionPhase.REPLAYING,
+                from_t=ms_to_iso(start_ms),
+                to_t=ms_to_iso(end_ms),
+                bars_done=bars_done,
+                bars_est=total,
+                bars_total=total,
+                pages=self.cache_stats.get("rest_pages", 0),
                 pct=round(pct, 2),
-                stage="download_replay",
+                stage="replaying",
+                cache=self.cache_stats,
                 last_open_ms=last_open,
             )
-            # occasional snapshot so chart fills during long runs
-            if pages == 1 or pages % 5 == 0 or bars_done >= est:
+            if i == 0 or (i // chunk) % 5 == 0 or bars_done >= total:
                 await self.broadcast_snapshot()
-
-            if page_last is None:
-                break
-            nxt = page_last + step
-            if nxt <= cursor:
-                break
-            cursor = nxt
-            if len(batch) < lim and (page_last + step >= end_ms or not page_rows):
-                break
-            # polite yield to event loop (health + WS)
             await asyncio.sleep(0)
-            # small pause like original rate limit when full page
-            if len(batch) >= lim:
-                await asyncio.sleep(0.05)
 
         if self._stopped():
             return bars_done, amb_total, last_open
@@ -443,11 +466,12 @@ class SessionController:
             from_t=ms_to_iso(start_ms),
             to_t=ms_to_iso(end_ms),
             bars_done=bars_done,
-            bars_est=est,
+            bars_est=bars_done,
             bars_total=bars_done,
-            pages=pages,
+            pages=self.cache_stats.get("rest_pages", 0),
             pct=99.5,
             stage="replay_complete",
+            cache=self.cache_stats,
         )
         return bars_done, amb_total, last_open
 

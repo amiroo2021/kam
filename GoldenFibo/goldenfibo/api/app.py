@@ -72,7 +72,15 @@ async def api_session_start(body: Optional[dict] = Body(None)) -> JSONResponse:
     side = b.get("side")
     pct = b.get("percentage")
     try:
-        snap = await get_session().start_run(
+        sess = get_session()
+        if b.get("cache_policy"):
+            from ..marketdata.kline_cache import CachePolicy
+            try:
+                sess.cache_policy = CachePolicy(str(b.get("cache_policy")).upper())
+                sess.kline_source.policy = sess.cache_policy
+            except Exception:
+                pass
+        snap = await sess.start_run(
             mode=mode,
             symbol=b.get("symbol"),
             timeframe=b.get("timeframe"),
@@ -90,6 +98,38 @@ async def api_session_start(body: Optional[dict] = Body(None)) -> JSONResponse:
 async def api_session_stop() -> JSONResponse:
     await get_session().stop()
     return JSONResponse(get_session().snapshot_dict())
+
+
+
+@app.get("/api/cache/stats")
+async def api_cache_stats(symbol: str = "BTCUSDT", timeframe: str = "1m") -> JSONResponse:
+    s = get_session()
+    return JSONResponse(s.kline_cache.stats_for(symbol, timeframe))
+
+
+@app.post("/api/cache/clear")
+async def api_cache_clear(body: Optional[dict] = Body(None)) -> JSONResponse:
+    b = body or {}
+    s = get_session()
+    n = s.kline_cache.clear(str(b.get("symbol") or s.symbol), str(b.get("timeframe") or s.timeframe))
+    return JSONResponse({"cleared": n, "symbol": b.get("symbol") or s.symbol, "timeframe": b.get("timeframe") or s.timeframe})
+
+
+@app.post("/api/cache/validate")
+async def api_cache_validate(body: Optional[dict] = Body(None)) -> JSONResponse:
+    from ..marketdata.kline_cache import validate_klines_sequence
+    b = body or {}
+    s = get_session()
+    symbol = str(b.get("symbol") or s.symbol)
+    tf = str(b.get("timeframe") or s.timeframe)
+    start_ms = b.get("start_ms")
+    end_ms = b.get("end_ms")
+    if start_ms is None or end_ms is None:
+        st = s.kline_cache.stats_for(symbol, tf)
+        start_ms = st.get("first_open_time") or 0
+        end_ms = (st.get("last_open_time") or 0) + 1
+    rows = s.kline_cache.read_range(symbol, tf, int(start_ms), int(end_ms))
+    return JSONResponse({"stats": s.kline_cache.stats_for(symbol, tf), "validation": validate_klines_sequence(rows, timeframe=tf)})
 
 
 @app.post("/api/session")
