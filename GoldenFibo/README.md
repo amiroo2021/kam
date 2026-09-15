@@ -1,51 +1,70 @@
 # GoldenFibo
 
-Isolated research / backtesting foundation for the Golden Fibonacci ladder strategy.
+Isolated Golden Fibonacci research / live visualization platform.
 
-**Phase 0–1 only:** one deterministic `GoldenFiboEngine` driven by ordered `MarketEvent`s,
-legacy OHLC feeder compatibility, strict ambiguity detection, and dual sizing policies.
-No chart UI, FastAPI, live WebSocket trading, or production Hermes integration yet.
+**Canonical rule:** one `GoldenFiboEngine`. Historical, replay, and live only differ by
+`MarketEvent` feeders. The browser **never** computes ladder levels.
+
+## Phases
+
+| Phase | Status |
+|---|---|
+| 0–1 Engine + parity | done |
+| 2 Live chart MVP | done (this tree) |
+| 3 Replay / backtest UI | not started |
+| Live exchange execution | **out of scope** |
 
 ## Layout
 
 ```text
 GoldenFibo/
-  goldenfibo/           # canonical runtime package
-    engine/             # pure strategy: events, levels, state, engine
-    feeders/            # MarketEvent producers (historical OHLC, …)
-    simulation/         # sizing policies (not path logic)
-  reference/
-    legacy_research/    # frozen recovered golden-fibo 0.1.0 snapshot (oracle only)
+  goldenfibo/
+    engine/          # pure strategy
+    feeders/         # OHLC historical
+    live/            # ordered price → MarketEvents
+    marketdata/      # Binance public REST/WS adapters
+    metrics/         # VWAP/POC (wizard semantics)
+    api/             # FastAPI + session + WS
+    static/          # Lightweight Charts UI
+  reference/legacy_research/   # frozen 0.1.0 oracle
   tests/
 ```
 
-## Canonical rule
+## Run live visualization (Ubuntu)
 
-There is **one** calculation engine. Historical, replay, and future live paths only differ
-by how they produce `MarketEvent`s. UI must never compute ladder levels.
-
-## Geometry (verified vs legacy)
-
-```text
-PHI = 1.618
-TP0(BUY)  = P0 * (1 + percentage)
-TP0(SELL) = P0 * (1 - percentage)
-P[n+1]    = P[n] + PHI * (P[n] - TP[n])
-TP[n]     = P[n-1]   for n >= 1
+```bash
+cd /home/parallels/kam/GoldenFibo
+uv venv .venv
+uv pip install -e ".[dev]"
+uv run goldenfibo-web
+# or:
+uv run uvicorn goldenfibo.api.app:app --host 0.0.0.0 --port 8000
 ```
 
-## Run tests
+On the MacBook browser (Parallels shared network):
+
+```bash
+# on Ubuntu, discover IP:
+hostname -I
+# then open e.g.:
+http://10.211.55.6:8000
+```
+
+Local-only development. No public exposure, no API keys, no orders.
+
+## Live P0 rule
+
+At session start, after public REST kline seed:
+
+**P0 = open of the latest 1m kline returned by Binance** (current forming bar open).
+
+Historical candles fill the chart only; the engine does **not** replay the full history
+into the ladder. Reconnect reuses backend state and does **not** reseed P0 while the
+process is alive. Backend restart resets the in-memory paper session.
+
+## Tests
 
 ```bash
 cd GoldenFibo
-python -m pytest
+uv run pytest
 ```
-
-## Sizing
-
-Configurable policies — **not** baked into geometry:
-
-- `linear_research` — `Lot[n] = base + n * step` (default for legacy parity)
-- `exponential_live` — `V0=V1=step0`, `Vn=step0*2^(n-1)` for `n>=2`
-
-Default product sizing is undecided; choose explicitly per run.

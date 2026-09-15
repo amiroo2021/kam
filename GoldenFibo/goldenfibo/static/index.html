@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GoldenFibo Live</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">GoldenFibo</div>
+    <div class="modes">
+      <button class="mode active" data-mode="LIVE">LIVE</button>
+      <button class="mode disabled" disabled title="Phase 3">REPLAY</button>
+      <button class="mode disabled" disabled title="Phase 3">BACKTEST</button>
+    </div>
+    <div class="status" id="connStatus">connecting…</div>
+  </header>
+
+  <section class="controls">
+    <label>Symbol <input id="symbol" value="BTCUSDT" /></label>
+    <label>TF
+      <select id="timeframe">
+        <option value="1m" selected>1m</option>
+      </select>
+    </label>
+    <label>Side
+      <select id="side">
+        <option value="BUY" selected>BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+    </label>
+    <label>Percentage <input id="percentage" value="0.001" /></label>
+    <button id="applyBtn">Apply session</button>
+    <div class="hud">
+      <span>Price <strong id="hudPrice">—</strong></span>
+      <span>Cycle <strong id="hudCycle">—</strong></span>
+      <span>Step <strong id="hudStep">—</strong></span>
+      <span>P0 <strong id="hudP0">—</strong></span>
+      <span>TP <strong id="hudTp">—</strong></span>
+    </div>
+  </section>
+
+  <main id="chart" aria-label="GoldenFibo chart"></main>
+  <footer class="footer">
+    Backend owns session state · JS only renders snapshots · public Binance data · no orders
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
