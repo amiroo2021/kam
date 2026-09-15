@@ -45,7 +45,7 @@ def test_snapshot_schema_v1_fields():
     )
     assert payload["v"] == 1
     assert payload["type"] == "state_snapshot"
-    assert payload["p0"] == "2500"
+    assert payload["p0"] == "2500.00"
     assert payload["n"] == 0
     assert Decimal(payload["shared_tp"]) == Decimal("2502.5")
     assert isinstance(payload["levels"], list)
@@ -68,7 +68,7 @@ def test_reconnect_snapshot_same_p0():
         mode="LIVE", symbol="BTCUSDT", timeframe="1m", side="SELL", percentage="0.001",
         price="100", engine=eng, candles=candles, bars=bars,
     )
-    assert a["p0"] == b["p0"] == "100"
+    assert a["p0"] == b["p0"] == "100.00"
     assert a["cycle_id"] == b["cycle_id"] == 1
 
 

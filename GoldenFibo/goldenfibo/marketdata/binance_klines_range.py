@@ -12,6 +12,12 @@ from typing import Callable, List, Optional, Sequence
 from .binance_public import BINANCE_SPOT_REST
 from .timeframes import interval_ms, validate_interval
 
+
+def inclusive_open_range_fetch_end(end_open_ms: int, interval: str) -> int:
+    """User End is inclusive by candle open → half-open fetch end = End + timeframe."""
+    return int(end_open_ms) + interval_ms(interval)
+
+
 FetchFn = Callable[[str], list]  # full URL → parsed JSON list
 
 
@@ -42,7 +48,10 @@ def fetch_klines_range(
     fetch: Optional[FetchFn] = None,
     closed_only_before_ms: Optional[int] = None,
 ) -> List[list]:
-    """Download klines covering [start_ms, end_ms) with pagination (limit≤1000).
+    """Download klines covering half-open [start_ms, end_ms) with pagination (limit≤1000).
+
+    For user-facing BACKTEST inclusive open range [start_open, end_open], pass
+    end_ms = inclusive_open_range_fetch_end(end_open, interval).
 
     - Dedupes by open_time.
     - Advances cursor by last_open + interval_ms.

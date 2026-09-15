@@ -69,7 +69,7 @@ def test_state_endpoint(client):
     assert r.status_code == 200
     body = r.json()
     assert body["v"] == 1
-    assert body["p0"] == "2500"
+    assert body["p0"] == "2500.00"
     assert body["type"] == "state_snapshot"
 
 
@@ -85,7 +85,7 @@ def test_ws_snapshot_on_connect(client):
         msg = ws.receive_json()
         assert msg["v"] == 1
         assert msg["type"] == "state_snapshot"
-        assert msg["p0"] == "2500"
+        assert msg["p0"] == "2500.00"
         # second snapshot request without reseed
         ws.send_json({"op": "snapshot"})
         msg2 = ws.receive_json()

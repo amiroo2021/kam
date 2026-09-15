@@ -26,6 +26,17 @@ applies its path rule.
 Must be **UTC** and **aligned to the selected timeframe** (e.g. 1m → whole minutes).
 P0 for BACKTEST/REPLAY = open of the first closed bar at/after Start.
 
+**BACKTEST End is inclusive by candle open.**  
+`Start=00:01`, `End=20:15`, `1m` → candles `00:01 … 20:15` (internal fetch `[start, end+tf)`).  
+REPLAY→LIVE has no user End and keeps its closed-history / live fence (unchanged).
+
+### Metrics
+
+- **VWAP** = quote_vol / base_vol (wizard semantics)
+- **POC** = max-volume bin center (160-bin OHLC range histogram, base vol spread H–L)
+- **Value Area** = 70% volume expansion around POC bin → VAL/VAH edges  
+  Display prices/metrics rounded to **2 decimals**.
+
 ## Run
 
 ```bash

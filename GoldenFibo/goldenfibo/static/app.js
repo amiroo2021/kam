@@ -84,7 +84,7 @@
   }
 
   function clearMetricLines() {
-    ["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc"].forEach((k) => {
+    ["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc", "ladder_val", "ladder_vah"].forEach((k) => {
       if (priceLines[k]) {
         try {
           candleSeries.removePriceLine(priceLines[k]);
@@ -219,6 +219,19 @@
           title: p.bTitle,
         });
       }
+    });
+    // Ladder Value Area edges (backend-computed)
+    [["ladder_val", msg.ladder_val, "#7e57c2", "VAL"], ["ladder_vah", msg.ladder_vah, "#7e57c2", "VAH"]].forEach(([key, val, color, title]) => {
+      const price = Number(val);
+      if (!Number.isFinite(price)) return;
+      priceLines[key] = candleSeries.createPriceLine({
+        price,
+        color,
+        lineWidth: 1,
+        lineStyle: 1,
+        axisLabelVisible: true,
+        title,
+      });
     });
   }
 

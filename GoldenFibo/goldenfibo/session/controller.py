@@ -16,7 +16,7 @@ from ..engine.engine import GoldenFiboEngine
 from ..engine.events import DomainEvent, MarketEvent, MarketEventKind
 from ..live.price_path import apply_price_to_engine
 from ..marketdata import binance_public as bn
-from ..marketdata.binance_klines_range import BinancePublicKlineSource
+from ..marketdata.binance_klines_range import BinancePublicKlineSource, inclusive_open_range_fetch_end
 from ..marketdata.timeframes import (
     interval_ms,
     ms_to_iso,
@@ -307,14 +307,16 @@ class SessionController:
                 to_t=ms_to_iso(self.end_ms),
                 pct=0.0,
             )
-            start_ms, end_ms = self.start_ms, self.end_ms
+            start_ms, end_open_ms = self.start_ms, self.end_ms
+            # BACKTEST user End is inclusive by candle open → fetch [start, end+tf)
+            fetch_end_ms = inclusive_open_range_fetch_end(end_open_ms, self.timeframe)
             klines = await asyncio.to_thread(
                 lambda: self.kline_source.fetch_range(
                     symbol=self.symbol,
                     interval=self.timeframe,
                     start_ms=start_ms,
-                    end_ms=end_ms,
-                    closed_only_before_ms=end_ms,
+                    end_ms=fetch_end_ms,
+                    closed_only_before_ms=fetch_end_ms,
                 )
             )
             self.progress["bars_total"] = len(klines)
@@ -554,7 +556,7 @@ class SessionController:
                 from ..metrics import fmt_metric, metrics_for_legs
 
                 st = self.engine.state
-                lv, sv, lp, sp = metrics_for_legs(
+                lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
                     self.bars,
                     ladder_start_ts_ms=st.legs[0].ts_ms if st.legs else None,
                     step_start_ts_ms=st.legs[-1].ts_ms if st.legs else None,
@@ -563,6 +565,8 @@ class SessionController:
                 frag["active_step_vwap"] = fmt_metric(sv)
                 frag["ladder_poc"] = fmt_metric(lp)
                 frag["active_step_poc"] = fmt_metric(sp)
+                frag["ladder_val"] = fmt_metric(l_val)
+                frag["ladder_vah"] = fmt_metric(l_vah)
                 msg: Dict[str, Any] = schemas.engine_event_msg(domain, frag)
             else:
                 msg = schemas.price_update_msg(str(price), ts_ms)

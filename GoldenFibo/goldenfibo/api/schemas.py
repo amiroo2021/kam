@@ -9,14 +9,15 @@ from ..engine.engine import GoldenFiboEngine
 from ..engine.events import DomainEvent
 from ..engine.levels import ladder_step
 from ..engine.state import EngineState, StateSnapshot
-from ..metrics import OhlcvBar, fmt_metric, metrics_for_legs
+from ..metrics import OhlcvBar, fmt_metric, fmt_price, metrics_for_legs
 
 
 PROTOCOL_VERSION = 1
 
 
 def _s(x: Optional[Decimal]) -> Optional[str]:
-    return None if x is None else str(x)
+    """Round engine prices to 2 decimal places for display/parity."""
+    return fmt_price(x)
 
 
 def levels_for_render(state: EngineState, extra: int = 2) -> List[Dict[str, Any]]:
@@ -41,15 +42,15 @@ def levels_for_render(state: EngineState, extra: int = 2) -> List[Dict[str, Any]
             role = "current"
         elif i == 0:
             role = "P0"
-        out.append({"id": f"P{i}", "step": i, "price": str(p), "tp_at_step": str(tp), "role": role})
+        out.append({"id": f"P{i}", "step": i, "price": fmt_price(p), "tp_at_step": fmt_price(tp), "role": role})
     # explicit shared TP line
     if state.shared_tp is not None:
         out.append(
             {
                 "id": "TP",
                 "step": None,
-                "price": str(state.shared_tp),
-                "tp_at_step": str(state.shared_tp),
+                "price": fmt_price(state.shared_tp),
+                "tp_at_step": fmt_price(state.shared_tp),
                 "role": "tp",
             }
         )
@@ -111,9 +112,10 @@ def build_state_payload(
     snap = StateSnapshot.from_state(st)
     ladder_ts = st.legs[0].ts_ms if st.legs else None
     step_ts = st.legs[-1].ts_ms if st.legs else None
-    lv, sv, lp, sp = metrics_for_legs(bars, ladder_start_ts_ms=ladder_ts, step_start_ts_ms=step_ts)
+    lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
+        bars, ladder_start_ts_ms=ladder_ts, step_start_ts_ms=step_ts
+    )
 
-    # Attach metrics onto snapshot fields for clients
     payload = {
         "v": PROTOCOL_VERSION,
         "type": "state_snapshot",
@@ -144,6 +146,8 @@ def build_state_payload(
         "active_step_vwap": fmt_metric(sv),
         "ladder_poc": fmt_metric(lp),
         "active_step_poc": fmt_metric(sp),
+        "ladder_val": fmt_metric(l_val),
+        "ladder_vah": fmt_metric(l_vah),
         "markers": markers_from_domain(recent_domain or []),
         "snapshot": {
             "symbol": snap.symbol,
