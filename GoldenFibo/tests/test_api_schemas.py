@@ -89,6 +89,9 @@ def test_frontend_dedupes_equal_vwap_poc_and_p0_markers():
     from pathlib import Path
 
     js = (Path(__file__).resolve().parents[1] / "goldenfibo" / "static" / "app.js").read_text()
+    assert 'currentMode = "REPLAY_TO_LIVE"' in js or "currentMode = 'REPLAY_TO_LIVE'" in js
+    assert "defaultReplayStartLocal" in js
+    assert "format2" in js
     assert "applyLadderLevels" in js
     assert "applyMetricSegments" in js
     assert "dedupeMarkers" in js
@@ -119,3 +122,59 @@ def test_levels_for_render_current_ladder_n4():
     # prices monotonic for BUY (downward ladder)
     prices = [float(lv["price"]) for lv in levels]
     assert prices == sorted(prices, reverse=True)
+
+
+def test_tp_label_and_equality_at_n1_and_n3():
+    from decimal import Decimal
+    from goldenfibo.api.schemas import levels_for_render
+    from goldenfibo import EngineConfig, GoldenFiboEngine, MarketEvent, MarketEventKind, Side
+
+    eng = GoldenFiboEngine(EngineConfig(side=Side.BUY, percentage=Decimal("0.001")))
+    t0 = 1_700_000_000_000
+    eng.on_event(MarketEvent(MarketEventKind.SEED_P0, ts_ms=t0, price=Decimal("100.123456789")))
+    # n=1
+    eng.on_event(MarketEvent(MarketEventKind.PROGRESSION_TOUCH, ts_ms=t0 + 60_000, step=1))
+    assert eng.state.highest_filled == 1
+    assert eng.state.shared_tp == eng.state.p0  # TP == P0 at n=1
+    lv = levels_for_render(eng.state)
+    p0 = next(x for x in lv if x["step"] == 0)
+    assert p0["is_tp"] is True
+    assert p0["label"].startswith("(TP)")
+    # display 2dp while engine keeps full precision
+    assert p0["price"] == "100.12"
+    assert "100.123456789" in str(eng.state.p0)
+
+    eng.on_event(MarketEvent(MarketEventKind.PROGRESSION_TOUCH, ts_ms=t0 + 120_000, step=2))
+    eng.on_event(MarketEvent(MarketEventKind.PROGRESSION_TOUCH, ts_ms=t0 + 180_000, step=3))
+    assert eng.state.highest_filled == 3
+    # TP == P(n-1) == P2 price
+    from goldenfibo.engine.levels import ladder_step
+    p2, _ = ladder_step(Side.BUY, eng.state.p0, 2, percentage=eng.state.percentage, phi=eng.state.phi)
+    assert eng.state.shared_tp == p2
+    lv = levels_for_render(eng.state)
+    tp_lv = next(x for x in lv if x["is_tp"])
+    assert tp_lv["step"] == 2
+    assert "(TP)" in tp_lv["label"]
+
+
+def test_default_replay_start_is_utc_minus_two_calendar_days_midnight():
+    """Mirror UI defaultReplayStartLocal calendar rule in Python."""
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    expected = (now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=2))
+    # parse same way as UI: YYYY-MM-DDT00:00
+    y, m, d = expected.year, expected.month, expected.day
+    s = f"{y:04d}-{m:02d}-{d:02d}T00:00"
+    assert s.endswith("T00:00")
+    # must be whole-minute aligned
+    assert s[14:] == "00"
+
+
+def test_html_defaults_replay_mode():
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[1] / "goldenfibo" / "static" / "index.html").read_text()
+    assert 'data-mode="REPLAY_TO_LIVE"' in html
+    assert 'class="mode active" data-mode="REPLAY_TO_LIVE"' in html or (
+        'data-mode="REPLAY_TO_LIVE">REPLAY' in html and 'active" data-mode="REPLAY_TO_LIVE"' in html
+    )

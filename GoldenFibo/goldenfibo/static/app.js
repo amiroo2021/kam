@@ -13,7 +13,8 @@
   const progressFill = document.getElementById("progressFill");
   const progressText = document.getElementById("progressText");
   const histNote = document.getElementById("histNote");
-  let currentMode = "LIVE";
+  let currentMode = "REPLAY_TO_LIVE"; // form default; server may run LIVE separately
+  let serverMode = "LIVE";
   let lastPhase = "";
   let wsConnected = false;
   const showEventsEl = document.getElementById("showEvents");
@@ -47,6 +48,32 @@
   let ws = null;
   let reconnectTimer = null;
 
+  /** Display-only 2dp; never used for GoldenFibo math. */
+  function format2(v) {
+    if (v == null || v === "") return "—";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    return n.toFixed(2);
+  }
+
+  function defaultReplayStartLocal() {
+    // UTC today minus 2 calendar days at 00:00 → datetime-local value
+    const now = new Date();
+    const y = now.getUTCFullYear();
+    const m = now.getUTCMonth();
+    const d = now.getUTCDate();
+    const start = new Date(Date.UTC(y, m, d - 2, 0, 0, 0));
+    const pad = (x) => String(x).padStart(2, "0");
+    return (
+      start.getUTCFullYear() +
+      "-" +
+      pad(start.getUTCMonth() + 1) +
+      "-" +
+      pad(start.getUTCDate()) +
+      "T00:00"
+    );
+  }
+
   function setStatus(text, ok) {
     statusEl.textContent = text;
     statusEl.className = "status " + (ok === true ? "ok" : ok === false ? "bad" : "");
@@ -55,7 +82,7 @@
   /** Mode/phase-aware status — do not imply BACKTEST is "live". */
   function refreshConnectionStatus() {
     if (!wsConnected) return;
-    const mode = (currentMode || "LIVE").toUpperCase();
+    const mode = (serverMode || currentMode || "LIVE").toUpperCase();
     const phase = (lastPhase || "").toLowerCase();
     let text = "connected";
     let ok = true;
@@ -262,11 +289,11 @@
   }
 
   function applyHud(msg) {
-    if (msg.price != null) hudPrice.textContent = msg.price;
+    if (msg.price != null) hudPrice.textContent = format2(msg.price);
     if (msg.cycle_id != null) hudCycle.textContent = String(msg.cycle_id);
     if (msg.n != null) hudStep.textContent = "P" + msg.n;
-    if (msg.p0 != null) hudP0.textContent = msg.p0;
-    if (msg.shared_tp != null) hudTp.textContent = msg.shared_tp;
+    if (msg.p0 != null) hudP0.textContent = format2(msg.p0);
+    if (msg.shared_tp != null) hudTp.textContent = format2(msg.shared_tp);
     if (msg.phase != null && hudPhase) hudPhase.textContent = msg.phase;
     if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
     if (msg.note_historical && histNote) histNote.textContent = msg.note_historical;
@@ -334,8 +361,9 @@
       switch (msg.type) {
         case "state_snapshot":
           applySnapshot(msg);
-          if (msg.mode) { currentMode = msg.mode; }
+          if (msg.mode) { serverMode = msg.mode; }
           applyPhase(msg);
+          // Keep form mode (default REPLAY→LIVE); do not force form to server LIVE
           syncModeUi();
           refreshConnectionStatus();
           break;
@@ -353,7 +381,7 @@
           }
           break;
         case "price_update":
-          if (msg.price != null) hudPrice.textContent = msg.price;
+          if (msg.price != null) hudPrice.textContent = format2(msg.price);
           break;
         case "phase":
           applyPhase(msg);
@@ -418,6 +446,11 @@
     });
   });
   syncModeUi();
+  // Prefill Start for REPLAY→LIVE: UTC calendar today-2 @ 00:00
+  (function initDefaultStart() {
+    const el = document.getElementById("startTime");
+    if (el && !el.value) el.value = defaultReplayStartLocal();
+  })();
 
   document.getElementById("applyBtn").addEventListener("click", () => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
