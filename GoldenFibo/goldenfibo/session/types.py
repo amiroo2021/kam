@@ -14,6 +14,7 @@ class SessionMode(str, Enum):
 class SessionPhase(str, Enum):
     IDLE = "idle"
     LOADING = "loading_history"
+    DOWNLOADING = "downloading_history"
     REPLAYING = "replaying"
     CATCHING_UP = "catching_up"
     LIVE = "live"

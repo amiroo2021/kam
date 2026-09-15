@@ -9,7 +9,7 @@ from typing import Callable, List, Optional, Sequence
 from ..engine.config import EngineConfig, OhlcResolveMode, Side
 from ..engine.engine import EngineResult, GoldenFiboEngine
 from ..engine.events import DomainEvent, MarketEvent
-from ..feeders.historical_ohlc import collect_ohlc_events, count_ambiguous
+from ..feeders.historical_ohlc import apply_ohlc_to_engine, collect_ohlc_events, count_ambiguous
 from ..marketdata.timeframes import interval_ms, require_aligned, validate_interval
 from .event_log import EventLog
 
@@ -88,4 +88,29 @@ def new_engine_for_run(
     validate_interval(timeframe)
     return GoldenFiboEngine(
         EngineConfig(side=side, percentage=percentage, symbol=symbol.upper())
+    )
+
+
+
+def apply_ohlc_page(
+    engine: GoldenFiboEngine,
+    candles: Sequence[Sequence],
+    *,
+    mode: OhlcResolveMode = OhlcResolveMode.LEGACY,
+    event_log: Optional[EventLog] = None,
+) -> HistRunResult:
+    """Stream one OHLC page into an existing engine (no shadow re-seed)."""
+    market, domain, amb = apply_ohlc_to_engine(engine, candles, mode=mode)
+    if event_log is not None:
+        event_log.extend(domain)
+    return HistRunResult(
+        engine=engine,
+        events=market,
+        domain=domain,
+        klines=list(candles),
+        ambiguity_count=amb,
+        bars_processed=len(candles),
+        start_ms=int(candles[0][0]) if candles else 0,
+        end_ms=int(candles[-1][0]) + 1 if candles else 0,
+        event_log=event_log or EventLog(),
     )

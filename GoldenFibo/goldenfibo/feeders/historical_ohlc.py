@@ -47,6 +47,11 @@ class HistoricalOhlcFeeder:
         self.config = config
         self.mode = mode
 
+    def _apply(self, shadow: GoldenFiboEngine, ev: MarketEvent, domain_out: List[Any] | None) -> None:
+        result = shadow.on_event(ev)
+        if domain_out is not None:
+            domain_out.extend(result.events)
+
     def iter_events(self) -> Iterator[MarketEvent]:
         shadow = GoldenFiboEngine(self.config)
         for candle in self.candles:
@@ -55,7 +60,7 @@ class HistoricalOhlcFeeder:
     def collect(self) -> List[MarketEvent]:
         return list(self.iter_events())
 
-    def _events_for_candle(self, candle: Sequence[Any], shadow: GoldenFiboEngine) -> Iterator[MarketEvent]:
+    def _events_for_candle(self, candle: Sequence[Any], shadow: GoldenFiboEngine, domain_out: List[Any] | None = None) -> Iterator[MarketEvent]:
         ts, o, h, l, c = _parse_candle(candle)
         cfg = self.config
         side = cfg.side
@@ -63,7 +68,7 @@ class HistoricalOhlcFeeder:
 
         if not st.active or st.p0 is None:
             ev = MarketEvent(kind=MarketEventKind.SEED_P0, ts_ms=ts, price=o)
-            shadow.on_event(ev)
+            self._apply(shadow, ev, domain_out)
             yield ev
             st = shadow.state
 
@@ -100,7 +105,7 @@ class HistoricalOhlcFeeder:
                 )
             )
             amb = MarketEvent(kind=MarketEventKind.AMBIGUOUS_BAR, ts_ms=ts, meta=meta)
-            shadow.on_event(amb)
+            self._apply(shadow, amb, domain_out)
             yield amb
             if self.mode is OhlcResolveMode.STRICT:
                 return
@@ -118,14 +123,14 @@ class HistoricalOhlcFeeder:
                         price=npx,
                         step=st.highest_filled + 1,
                     )
-                    shadow.on_event(ev)
+                    self._apply(shadow, ev, domain_out)
                     yield ev
                     st = shadow.state
                 else:
                     break
             if st.shared_tp is not None and l <= st.shared_tp:
                 ev = MarketEvent(kind=MarketEventKind.TP_TOUCH, ts_ms=ts, price=st.shared_tp)
-                shadow.on_event(ev)
+                self._apply(shadow, ev, domain_out)
                 yield ev
                 return
         else:
@@ -140,14 +145,14 @@ class HistoricalOhlcFeeder:
                         price=npx,
                         step=st.highest_filled + 1,
                     )
-                    shadow.on_event(ev)
+                    self._apply(shadow, ev, domain_out)
                     yield ev
                     st = shadow.state
                 else:
                     break
             if st.shared_tp is not None and h >= st.shared_tp:
                 ev = MarketEvent(kind=MarketEventKind.TP_TOUCH, ts_ms=ts, price=st.shared_tp)
-                shadow.on_event(ev)
+                self._apply(shadow, ev, domain_out)
                 yield ev
                 return
 
@@ -181,3 +186,25 @@ def replay_ohlc_legacy(
     )
     events = collect_ohlc_events(candles, cfg, mode=OhlcResolveMode.LEGACY)
     return GoldenFiboEngine(cfg).run(events).state
+
+
+
+def apply_ohlc_to_engine(
+    engine: GoldenFiboEngine,
+    candles: Sequence[Sequence[Any]],
+    *,
+    mode: OhlcResolveMode = OhlcResolveMode.LEGACY,
+) -> tuple[List[MarketEvent], List[Any], int]:
+    """Apply OHLC candles directly onto *engine* (engine is the live state machine).
+
+    Unlike collect_ohlc_events + re-play, this does not create a separate shadow engine,
+    so multi-page historical streams can continue the same GoldenFiboEngine object.
+    Returns (market_events, domain_events, ambiguity_count).
+    """
+    feeder = HistoricalOhlcFeeder(candles, engine.config, mode=mode)
+    market: List[MarketEvent] = []
+    domain: List[Any] = []
+    for candle in candles:
+        for ev in feeder._events_for_candle(candle, engine, domain_out=domain):
+            market.append(ev)
+    return market, domain, count_ambiguous(market)

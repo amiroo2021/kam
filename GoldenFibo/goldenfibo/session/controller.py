@@ -26,8 +26,10 @@ from ..marketdata.timeframes import (
 )
 from ..metrics import OhlcvBar, bar_from_binance_kline
 from .event_log import EventLog
-from .runner import run_ohlc_on_engine
+from .runner import apply_ohlc_page, new_engine_for_run, run_ohlc_on_engine
 from .types import SessionMode, SessionPhase
+
+CHART_CANDLE_LIMIT = 2500  # browser chart window; engine reconstructs full history
 
 logger = logging.getLogger("goldenfibo.controller")
 
@@ -127,6 +129,8 @@ class SessionController:
                 SessionPhase.LIVE,
                 SessionPhase.BACKTEST_DONE,
                 SessionPhase.REPLAYING,
+                SessionPhase.DOWNLOADING,
+                SessionPhase.LOADING,
                 SessionPhase.CATCHING_UP,
             )
             or self.feed_status in ("live", "seeded", "buffering"),
@@ -259,6 +263,194 @@ class SessionController:
         )
         await self.broadcast_snapshot()
 
+
+    def _stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def _trim_chart(self) -> None:
+        if len(self.chart_candles) > CHART_CANDLE_LIMIT:
+            self.chart_candles = self.chart_candles[-CHART_CANDLE_LIMIT:]
+        if len(self.klines) > CHART_CANDLE_LIMIT:
+            self.klines = self.klines[-CHART_CANDLE_LIMIT:]
+
+    def _trim_metric_bars(self) -> None:
+        """Keep bars needed for current-cycle ladder/step metrics only."""
+        st = self.engine.state
+        if not st.legs:
+            # keep a modest tail while seeding
+            if len(self.bars) > CHART_CANDLE_LIMIT:
+                self.bars = self.bars[-CHART_CANDLE_LIMIT:]
+            return
+        start_ms = int(st.legs[0].ts_ms)
+        self.bars = [b for b in self.bars if int(getattr(b, "ts_ms", 0) or 0) >= start_ms]
+
+    async def _hist_download_and_replay(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        closed_only_before_ms: int | None,
+    ) -> tuple[int, int, int | None]:
+        """Page fetch → apply to engine → progress. Returns (bars, ambiguity, last_open_ms)."""
+        step = interval_ms(self.timeframe)
+        est = max(1, (int(end_ms) - int(start_ms)) // step)
+        pages = 0
+        bars_done = 0
+        amb_total = 0
+        last_open: int | None = None
+
+        await self._set_phase(
+            SessionPhase.DOWNLOADING,
+            from_t=ms_to_iso(start_ms),
+            to_t=ms_to_iso(end_ms),
+            bars_done=0,
+            bars_est=est,
+            bars_total=est,
+            pages=0,
+            pct=0.0,
+            stage="download_replay",
+        )
+
+        # Materialize page iterator in a worker-friendly loop: one page per to_thread
+        cursor = start_ms
+        seen: set[int] = set()
+        from ..marketdata.binance_klines_range import iter_klines_pages
+
+        def next_page_state() -> dict:
+            return {"cursor": cursor, "seen": seen}
+
+        # Use source.iter_pages fully in thread would block progress; pull one page at a time.
+        from ..marketdata.binance_public import BINANCE_SPOT_REST
+        import urllib.parse, json, urllib.request
+
+        base_url = getattr(self.kline_source, "base_url", BINANCE_SPOT_REST)
+        custom_fetch = getattr(self.kline_source, "fetch", None)
+
+        while cursor < end_ms and not self._stopped():
+            pages += 1
+            cur = cursor
+            end_bound = end_ms
+            cof = closed_only_before_ms
+            lim = 1000
+            sym = self.symbol
+            tf = self.timeframe
+
+            def fetch_one() -> list:
+                from ..marketdata.binance_klines_range import _default_fetch
+                fetch = custom_fetch or _default_fetch
+                qs = urllib.parse.urlencode(
+                    {
+                        "symbol": sym,
+                        "interval": tf,
+                        "startTime": int(cur),
+                        "endTime": int(end_bound - 1),
+                        "limit": lim,
+                    }
+                )
+                url = f"{base_url}/api/v3/klines?{qs}"
+                return fetch(url)
+
+            batch = await asyncio.to_thread(fetch_one)
+            if self._stopped():
+                break
+            if not batch:
+                break
+
+            page_rows: list = []
+            page_last = None
+            for row in batch:
+                ot = int(row[0])
+                if ot < start_ms or ot >= end_ms:
+                    continue
+                if ot in seen:
+                    continue
+                if cof is not None and ot + step > cof:
+                    continue
+                seen.add(ot)
+                page_rows.append(row)
+                page_last = ot
+            page_rows.sort(key=lambda r: int(r[0]))
+
+            if page_rows:
+                # Apply page through same engine
+                def apply_page() -> tuple:
+                    r = apply_ohlc_page(
+                        self.engine,
+                        page_rows,
+                        mode=self.ohlc_mode,
+                        event_log=self.event_log,
+                    )
+                    return r.ambiguity_count, r.domain, r.bars_processed
+
+                a_count, domain, nbar = await asyncio.to_thread(apply_page)
+                amb_total += a_count
+                bars_done += nbar
+                last_open = page_last
+
+                async with self._lock:
+                    for k in page_rows:
+                        self.klines.append(k)
+                        self.bars.append(bar_from_binance_kline(k))
+                    # chart candles
+                    from ..marketdata import binance_public as bn_mod
+                    new_cc = bn_mod.bars_to_chart_candles(page_rows)
+                    self.chart_candles.extend(new_cc)
+                    self._trim_chart()
+                    self._trim_metric_bars()
+                    self.ambiguity_count = amb_total
+                    self.bars_processed = bars_done
+                    self.recent_domain.extend(domain[-50:])
+                    self._p0_seeded = self.engine.state.active
+                    if page_rows:
+                        self.last_price = str(page_rows[-1][4])
+
+            pct = min(99.0, 100.0 * bars_done / est)
+            await self._set_phase(
+                SessionPhase.DOWNLOADING,
+                from_t=ms_to_iso(start_ms),
+                to_t=ms_to_iso(end_ms),
+                bars_done=bars_done,
+                bars_est=est,
+                bars_total=est,
+                pages=pages,
+                pct=round(pct, 2),
+                stage="download_replay",
+                last_open_ms=last_open,
+            )
+            # occasional snapshot so chart fills during long runs
+            if pages == 1 or pages % 5 == 0 or bars_done >= est:
+                await self.broadcast_snapshot()
+
+            if page_last is None:
+                break
+            nxt = page_last + step
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < lim and (page_last + step >= end_ms or not page_rows):
+                break
+            # polite yield to event loop (health + WS)
+            await asyncio.sleep(0)
+            # small pause like original rate limit when full page
+            if len(batch) >= lim:
+                await asyncio.sleep(0.05)
+
+        if self._stopped():
+            return bars_done, amb_total, last_open
+
+        await self._set_phase(
+            SessionPhase.REPLAYING,
+            from_t=ms_to_iso(start_ms),
+            to_t=ms_to_iso(end_ms),
+            bars_done=bars_done,
+            bars_est=est,
+            bars_total=bars_done,
+            pages=pages,
+            pct=99.5,
+            stage="replay_complete",
+        )
+        return bars_done, amb_total, last_open
+
     async def _run_live_now(self) -> None:
         try:
             await self._set_phase(SessionPhase.LOADING)
@@ -301,50 +493,19 @@ class SessionController:
     async def _run_backtest(self) -> None:
         assert self.start_ms is not None and self.end_ms is not None
         try:
-            await self._set_phase(
-                SessionPhase.LOADING,
-                from_t=ms_to_iso(self.start_ms),
-                to_t=ms_to_iso(self.end_ms),
-                pct=0.0,
-            )
             start_ms, end_open_ms = self.start_ms, self.end_ms
             # BACKTEST user End is inclusive by candle open → fetch [start, end+tf)
             fetch_end_ms = inclusive_open_range_fetch_end(end_open_ms, self.timeframe)
-            klines = await asyncio.to_thread(
-                lambda: self.kline_source.fetch_range(
-                    symbol=self.symbol,
-                    interval=self.timeframe,
-                    start_ms=start_ms,
-                    end_ms=fetch_end_ms,
-                    closed_only_before_ms=fetch_end_ms,
-                )
+            bars_done, amb, _last = await self._hist_download_and_replay(
+                start_ms=start_ms,
+                end_ms=fetch_end_ms,
+                closed_only_before_ms=fetch_end_ms,
             )
-            self.progress["bars_total"] = len(klines)
-            await self._set_phase(SessionPhase.REPLAYING, bars_total=len(klines), pct=0.0)
-
-            def on_prog(p: dict) -> None:
-                self.progress.update(p)
-
-            result = await asyncio.to_thread(
-                lambda: run_ohlc_on_engine(
-                    self.engine,
-                    klines,
-                    mode=self.ohlc_mode,
-                    event_log=self.event_log,
-                    progress_every=max(1, len(klines) // 50) if klines else 0,
-                    on_progress=on_prog,
-                )
-            )
-            async with self._lock:
-                self.klines = list(klines)
-                self.bars = [bar_from_binance_kline(k) for k in klines]
-                self.chart_candles = bn.bars_to_chart_candles(klines)
-                self.ambiguity_count = result.ambiguity_count
-                self.bars_processed = result.bars_processed
-                self.recent_domain.extend(result.domain[-200:])
-                self._p0_seeded = self.engine.state.active
-                if klines:
-                    self.last_price = str(klines[-1][4])
+            if self._stopped():
+                await self._set_phase(SessionPhase.STOPPED)
+                return
+            self.ambiguity_count = amb
+            self.bars_processed = bars_done
             await self.broadcast_snapshot()
             await self._set_phase(
                 SessionPhase.BACKTEST_DONE,
@@ -377,62 +538,27 @@ class SessionController:
             now = int(time.time() * 1000)
             hist_end = (now // step) * step
             start_ms = self.start_ms
-            await self._set_phase(
-                SessionPhase.LOADING,
-                from_t=ms_to_iso(start_ms),
-                to_t=ms_to_iso(hist_end),
-                pct=0.0,
-            )
             self._buffering = True
             self._live_enabled = False
             await self._ensure_ws()
 
-            klines = await asyncio.to_thread(
-                lambda: self.kline_source.fetch_range(
-                    symbol=self.symbol,
-                    interval=self.timeframe,
-                    start_ms=start_ms,
-                    end_ms=hist_end,
-                    closed_only_before_ms=hist_end,
-                )
+            bars_done, amb, last_open = await self._hist_download_and_replay(
+                start_ms=start_ms,
+                end_ms=hist_end,
+                closed_only_before_ms=hist_end,
             )
-            await self._set_phase(
-                SessionPhase.REPLAYING,
-                bars_total=len(klines),
-                from_t=ms_to_iso(start_ms),
-                to_t=ms_to_iso(hist_end),
-                pct=0.0,
-            )
+            if self._stopped():
+                self._buffering = False
+                await self._set_phase(SessionPhase.STOPPED)
+                return
 
-            def on_prog(p: dict) -> None:
-                self.progress.update(p)
-
-            result = await asyncio.to_thread(
-                lambda: run_ohlc_on_engine(
-                    self.engine,
-                    klines,
-                    mode=self.ohlc_mode,
-                    event_log=self.event_log,
-                    progress_every=max(1, len(klines) // 50) if klines else 0,
-                    on_progress=on_prog,
-                )
-            )
-            if klines:
-                self.last_hist_open_ms = int(klines[-1][0])
-                self.fence_ms = self.last_hist_open_ms + step
+            self.ambiguity_count = amb
+            self.bars_processed = bars_done
+            if last_open is not None:
+                self.last_hist_open_ms = last_open
+                self.fence_ms = last_open + step
             else:
                 self.fence_ms = hist_end
-
-            async with self._lock:
-                self.klines = list(klines)
-                self.bars = [bar_from_binance_kline(k) for k in klines]
-                self.chart_candles = bn.bars_to_chart_candles(klines)
-                self.ambiguity_count = result.ambiguity_count
-                self.bars_processed = result.bars_processed
-                self.recent_domain.extend(result.domain[-200:])
-                self._p0_seeded = self.engine.state.active
-                if klines:
-                    self.last_price = str(klines[-1][4])
 
             if id(self.engine) != engine_id:
                 raise RuntimeError("engine object must survive handoff")

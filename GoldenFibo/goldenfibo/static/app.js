@@ -16,6 +16,7 @@
   let currentMode = "REPLAY_TO_LIVE"; // form default; server may run LIVE separately
   let serverMode = "LIVE";
   let lastPhase = "";
+  let lastProgress = {};
   let wsConnected = false;
   const showEventsEl = document.getElementById("showEvents");
   let showEvents = !!(showEventsEl && showEventsEl.checked);
@@ -80,21 +81,45 @@
   }
 
   /** Mode/phase-aware status — do not imply BACKTEST is "live". */
+  function progressLabel() {
+    const p = lastProgress || {};
+    const done = p.bars_done != null ? p.bars_done : (p.bars_processed != null ? p.bars_processed : null);
+    const est = p.bars_est != null ? p.bars_est : p.bars_total;
+    const pct = p.pct != null ? Number(p.pct).toFixed(1) : null;
+    const pages = p.pages != null ? p.pages : null;
+    if (done != null && est != null) {
+      let s = done.toLocaleString() + " / ~" + Number(est).toLocaleString() + " bars";
+      if (pct != null) s += " · " + pct + "%";
+      if (pages != null) s += " · page " + pages;
+      return s;
+    }
+    if (done != null) {
+      let s = done.toLocaleString() + " bars";
+      if (pages != null) s += " · page " + pages;
+      return s;
+    }
+    if (pages != null) return "page " + pages;
+    return "";
+  }
+
   function refreshConnectionStatus() {
     if (!wsConnected) return;
     const mode = (serverMode || currentMode || "LIVE").toUpperCase();
     const phase = (lastPhase || "").toLowerCase();
+    const prog = progressLabel();
     let text = "connected";
     let ok = true;
     if (mode === "BACKTEST") {
       if (phase === "backtest_done") text = "backtest · done";
-      else if (phase === "replaying" || phase === "loading_history") text = "backtest · replaying";
+      else if (phase === "downloading_history") text = "backtest · downloading" + (prog ? " · " + prog : "");
+      else if (phase === "replaying" || phase === "loading_history") text = "backtest · replaying" + (prog ? " · " + prog : "");
       else if (phase === "error") { text = "backtest · error"; ok = false; }
       else text = "backtest · connected";
     } else if (mode === "REPLAY_TO_LIVE") {
       if (phase === "live") text = "live · connected";
+      else if (phase === "downloading_history") text = "replay · downloading" + (prog ? " · " + prog : "");
       else if (phase === "replaying" || phase === "loading_history" || phase === "catching_up")
-        text = "replay · catching up";
+        text = "replay · catching up" + (prog ? " · " + prog : "");
       else if (phase === "error") { text = "replay · error"; ok = false; }
       else text = "replay · connected";
     } else {
