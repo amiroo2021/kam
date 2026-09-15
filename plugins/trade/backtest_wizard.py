@@ -290,6 +290,19 @@ def _vwap(candles, ts):
     return quote/base if base else float("nan")
 
 
+def _active_ladder_start_ts(state) -> int:
+    """Return the timestamp of the currently open cycle's P0 leg.
+
+    Closed cycles/ladders must not contribute to ladder VWAP/POC or the
+    ladder volume area. ``replay_ohlc`` replaces ``state.legs`` whenever a TP
+    closes a cycle and chains a new P0, so the first current leg is the active
+    P0 open time.
+    """
+    if not getattr(state, "legs", None):
+        raise ValueError("active ladder has no open P0 leg")
+    return int(state.legs[0].ts)
+
+
 def _poc(candles, ts, bins: int = 160):
     """Approximate volume-profile point of control from OHLCV candles.
 
@@ -334,10 +347,12 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     pn1,_=ladder_step(side,state.p0,min(n+1,20), percentage=percentage)
     pn2,_=ladder_step(side,state.p0,min(n+2,20), percentage=percentage)
     pnm1,_=ladder_step(side,state.p0,n-1, percentage=percentage) if n>=1 else (state.shared_tp,None)
-    ladder_vwap=_vwap(candles,state.legs[0].ts)
-    step_vwap=_vwap(candles,state.legs[-1].ts)
-    ladder_poc=_poc(candles,state.legs[0].ts)
-    step_poc=_poc(candles,state.legs[-1].ts)
+    active_ladder_start_ts=_active_ladder_start_ts(state)
+    active_step_start_ts=int(state.legs[-1].ts)
+    ladder_vwap=_vwap(candles,active_ladder_start_ts)
+    step_vwap=_vwap(candles,active_step_start_ts)
+    ladder_poc=_poc(candles,active_ladder_start_ts)
+    step_poc=_poc(candles,active_step_start_ts)
     last=float(candles[-1][4])
     levels=levels_p0_to_pn(state,min(n+2,20), percentage=percentage)
     jpg=_draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last)
@@ -365,11 +380,12 @@ def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_po
     img=Image.new('RGB',(W,H),'#fbfbf8'); d=ImageDraw.Draw(img)
     label='BUY' if side is Side.BUY else 'SELL'
     d.text((60,35),f'{symbol} {market.upper()} {label} GoldenFibo Backtest',fill='#111',font=fb)
-    d.text((60,72),'Visual summary: P0 at bottom, ladder volume area, active P(n), VWAPs, POCs, and current price',fill='#555',font=fs)
+    d.text((60,72),'Visual summary: P0 at bottom, active ladder volume area, active P(n), VWAPs, POCs, and current price',fill='#555',font=fs)
     d.rectangle([left,top,right,bottom],fill='white',outline='#ddd')
-    # Ladder volume area: shade the full displayed ladder price zone from P0
-    # through P(n+2). This is drawn before grid/levels so all price lines,
-    # VWAPs, and POCs remain readable on top.
+    # Active ladder volume area: shade the displayed price zone for the open
+    # ladder only, from the latest cycle's P0 through P(n+2). Closed cycles do
+    # not contribute to the metrics; VWAP/POC start at _active_ladder_start_ts.
+    # Draw this before grid/levels so all price lines remain readable on top.
     ladder_prices=[float(x['price']) for x in levels]
     ladder_low=min(ladder_prices); ladder_high=max(ladder_prices)
     area_top=min(y(ladder_low), y(ladder_high)); area_bottom=max(y(ladder_low), y(ladder_high))
