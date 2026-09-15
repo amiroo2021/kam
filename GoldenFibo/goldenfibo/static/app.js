@@ -32,6 +32,9 @@
 
   /** @type {Record<string, any>} */
   const priceLines = {};
+  /** @type {any[]} */
+  let lastMarkers = [];
+  let lastMetricMsg = null;
   let ws = null;
   let reconnectTimer = null;
 
@@ -47,14 +50,22 @@
   resize();
 
   const ROLE_STYLE = {
-    P0: { color: "#f0b90b", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P0" },
-    filled: { color: "#5b8def", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "" },
-    current: { color: "#ffffff", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P(n)" },
-    tp: { color: "#0ecb81", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "TP" },
-    tp_prev: { color: "#0ecb81", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "P(n-1)" },
-    next: { color: "#f6465d", lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: "P(n+1)" },
-    further: { color: "#f6465d", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "P(n+2)" },
+    P0: { color: "#f0b90b", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P0", priority: 100 },
+    filled: { color: "#5b8def", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "", priority: 10 },
+    current: { color: "#ffffff", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P(n)", priority: 90 },
+    tp: { color: "#0ecb81", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "TP", priority: 95 },
+    tp_prev: { color: "#0ecb81", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "P(n-1)", priority: 50 },
+    next: { color: "#f6465d", lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: "P(n+1)", priority: 80 },
+    further: { color: "#f6465d", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "P(n+2)", priority: 70 },
   };
+
+  function nearlyEqual(a, b, eps) {
+    const x = Number(a);
+    const y = Number(b);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const tol = eps != null ? eps : Math.max(1e-8, Math.abs(x) * 1e-10);
+    return Math.abs(x - y) <= tol;
+  }
 
   function clearPriceLines() {
     Object.keys(priceLines).forEach((k) => {
@@ -65,54 +76,170 @@
     });
   }
 
+  function clearMetricLines() {
+    ["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc"].forEach((k) => {
+      if (priceLines[k]) {
+        try {
+          candleSeries.removePriceLine(priceLines[k]);
+        } catch (_) {}
+        delete priceLines[k];
+      }
+    });
+  }
+
+  /**
+   * One horizontal line per distinct price. Prefer higher-priority roles
+   * (P0 / TP / current) so we never stack duplicate P0 labels.
+   */
   function applyLevels(levels) {
     if (!Array.isArray(levels)) return;
-    clearPriceLines();
+    // Keep metric lines; only rebuild ladder lines.
+    const metricKeys = new Set(["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc"]);
+    Object.keys(priceLines).forEach((k) => {
+      if (metricKeys.has(k)) return;
+      try {
+        candleSeries.removePriceLine(priceLines[k]);
+      } catch (_) {}
+      delete priceLines[k];
+    });
+
+    const chosen = [];
     levels.forEach((lv) => {
       const price = Number(lv.price);
       if (!Number.isFinite(price)) return;
       const role = lv.role || "filled";
-      // Prefer explicit TP line; skip duplicate tp_prev price if TP present
       if (role === "tp_prev" && levels.some((x) => x.role === "tp")) return;
       const style = ROLE_STYLE[role] || ROLE_STYLE.filled;
-      const title = style.title || lv.id || "";
+      const pri = style.priority || 0;
+      const existing = chosen.find((c) => nearlyEqual(c.price, price));
+      if (existing) {
+        if (pri > existing.pri) {
+          existing.lv = lv;
+          existing.role = role;
+          existing.style = style;
+          existing.pri = pri;
+        }
+        return;
+      }
+      chosen.push({ price, lv, role, style, pri });
+    });
+
+    chosen.forEach((c) => {
+      const title = c.style.title || (c.role === "P0" ? "P0" : c.lv.id || "");
+      // Single clean label: role only on axis (price shown by scale); avoid "P0 P0 price"
+      const label = title || "";
       const line = candleSeries.createPriceLine({
-        price,
-        color: style.color,
-        lineWidth: style.lineWidth,
-        lineStyle: style.lineStyle,
-        axisLabelVisible: style.axisLabelVisible,
-        title: title ? `${title} ${price}` : String(price),
+        price: c.price,
+        color: c.style.color,
+        lineWidth: c.style.lineWidth,
+        lineStyle: c.style.lineStyle,
+        axisLabelVisible: c.style.axisLabelVisible || !!title,
+        title: label,
       });
-      priceLines[lv.id || `${role}-${price}`] = line;
+      priceLines[c.lv.id || `${c.role}-${c.price}`] = line;
     });
   }
 
+  /**
+   * Merge Step/Ladder VWAP and POC when values match (step 0 / same window).
+   * When they diverge, draw separate lines again.
+   */
   function applyMetrics(msg) {
-    const extras = [
-      ["ladder_vwap", msg.ladder_vwap, "#f2c500", "L-VWAP"],
-      ["active_step_vwap", msg.active_step_vwap, "#c9a227", "S-VWAP"],
-      ["ladder_poc", msg.ladder_poc, "#26a69a", "L-POC"],
-      ["active_step_poc", msg.active_step_poc, "#66bb6a", "S-POC"],
+    if (!msg) return;
+    lastMetricMsg = msg;
+    clearMetricLines();
+
+    const pairs = [
+      {
+        aKey: "ladder_vwap",
+        bKey: "active_step_vwap",
+        aVal: msg.ladder_vwap,
+        bVal: msg.active_step_vwap,
+        color: "#f2c500",
+        mergedTitle: "VWAP",
+        aTitle: "L-VWAP",
+        bTitle: "S-VWAP",
+        bColor: "#c9a227",
+        mergeKey: "vwap",
+      },
+      {
+        aKey: "ladder_poc",
+        bKey: "active_step_poc",
+        aVal: msg.ladder_poc,
+        bVal: msg.active_step_poc,
+        color: "#26a69a",
+        mergedTitle: "POC",
+        aTitle: "L-POC",
+        bTitle: "S-POC",
+        bColor: "#66bb6a",
+        mergeKey: "poc",
+      },
     ];
-    extras.forEach(([key, val, color, title]) => {
-      if (priceLines[key]) {
-        try {
-          candleSeries.removePriceLine(priceLines[key]);
-        } catch (_) {}
-        delete priceLines[key];
+
+    pairs.forEach((p) => {
+      const a = Number(p.aVal);
+      const b = Number(p.bVal);
+      const aOk = Number.isFinite(a);
+      const bOk = Number.isFinite(b);
+      if (aOk && bOk && nearlyEqual(a, b)) {
+        priceLines[p.mergeKey] = candleSeries.createPriceLine({
+          price: a,
+          color: p.color,
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: p.mergedTitle,
+        });
+        return;
       }
-      const price = Number(val);
-      if (!Number.isFinite(price)) return;
-      priceLines[key] = candleSeries.createPriceLine({
-        price,
-        color,
-        lineWidth: 1,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title: `${title} ${price}`,
-      });
+      if (aOk) {
+        priceLines[p.aKey] = candleSeries.createPriceLine({
+          price: a,
+          color: p.color,
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: p.aTitle,
+        });
+      }
+      if (bOk) {
+        priceLines[p.bKey] = candleSeries.createPriceLine({
+          price: b,
+          color: p.bColor,
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: p.bTitle,
+        });
+      }
     });
+  }
+
+  /** Keep one P0 seed marker per timestamp; drop duplicate P0 texts. */
+  function dedupeMarkers(markers) {
+    if (!Array.isArray(markers)) return [];
+    const out = [];
+    const p0Times = new Set();
+    markers.forEach((m) => {
+      const text = String(m.text || "");
+      const isP0 = text === "P0" || /^P0\b/.test(text);
+      if (isP0) {
+        const t = m.time;
+        if (p0Times.has(t)) return;
+        p0Times.add(t);
+        out.push(Object.assign({}, m, { text: "P0" }));
+        return;
+      }
+      out.push(m);
+    });
+    return out;
+  }
+
+  function applyMarkers(markers) {
+    lastMarkers = dedupeMarkers(markers || []);
+    try {
+      candleSeries.setMarkers(lastMarkers);
+    } catch (_) {}
   }
 
   function applyHud(msg) {
@@ -123,36 +250,31 @@
     if (msg.shared_tp != null) hudTp.textContent = msg.shared_tp;
   }
 
+  function applyOverlayState(msg) {
+    if (msg.levels) applyLevels(msg.levels);
+    if (
+      msg.ladder_vwap !== undefined ||
+      msg.active_step_vwap !== undefined ||
+      msg.ladder_poc !== undefined ||
+      msg.active_step_poc !== undefined
+    ) {
+      applyMetrics(msg);
+    } else if (lastMetricMsg) {
+      applyMetrics(lastMetricMsg);
+    }
+    applyHud(msg);
+    if (Array.isArray(msg.markers)) applyMarkers(msg.markers);
+  }
+
   function applySnapshot(msg) {
     if (Array.isArray(msg.candles) && msg.candles.length) {
       candleSeries.setData(msg.candles);
       chart.timeScale().fitContent();
     }
-    applyLevels(msg.levels);
-    applyMetrics(msg);
-    applyHud(msg);
-    if (Array.isArray(msg.markers) && msg.markers.length) {
-      try {
-        candleSeries.setMarkers(msg.markers);
-      } catch (_) {}
-    }
+    applyOverlayState(msg);
     if (msg.side) document.getElementById("side").value = msg.side;
     if (msg.percentage) document.getElementById("percentage").value = msg.percentage;
     if (msg.symbol) document.getElementById("symbol").value = msg.symbol;
-  }
-
-  function applyEngineEvent(msg) {
-    if (msg.state) {
-      if (msg.state.levels) applyLevels(msg.state.levels);
-      applyHud(Object.assign({}, msg.state, { price: undefined }));
-      if (msg.state.ladder_vwap !== undefined) applyMetrics(msg.state);
-      if (Array.isArray(msg.state.markers) && msg.state.markers.length) {
-        // append-style: backend sends only new markers; keep simple full replace from last snapshot ideally
-        try {
-          const existing = candleSeries.markers ? candleSeries.markers() : [];
-        } catch (_) {}
-      }
-    }
   }
 
   function connect() {
@@ -186,16 +308,15 @@
           if (msg.price != null) hudPrice.textContent = msg.price;
           break;
         case "engine_event":
-          applyEngineEvent(msg);
-          // refresh full lines from embedded state
-          if (msg.state && msg.state.levels) applyLevels(msg.state.levels);
           if (msg.state) {
-            applyHud({
-              cycle_id: msg.state.cycle_id,
-              n: msg.state.n,
-              p0: msg.state.p0,
-              shared_tp: msg.state.shared_tp,
-            });
+            // Merge fragment onto last metric context so VWAP/POC survive level redraws
+            const merged = Object.assign({}, lastMetricMsg || {}, msg.state);
+            if (Array.isArray(msg.state.markers) && msg.state.markers.length) {
+              merged.markers = dedupeMarkers(lastMarkers.concat(msg.state.markers));
+            } else {
+              merged.markers = lastMarkers;
+            }
+            applyOverlayState(merged);
           }
           break;
         default:

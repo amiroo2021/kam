@@ -81,3 +81,14 @@ def test_frontend_has_no_ladder_math_literals():
     assert "PHI" not in js
     assert "ladder_step" not in js
     assert "P[n+1]" not in js
+
+
+def test_frontend_dedupes_equal_vwap_poc_and_p0_markers():
+    """Chart-cleanup: merged metric labels + single P0 marker path exist in JS."""
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "goldenfibo" / "static" / "app.js").read_text()
+    assert "mergedTitle: \"VWAP\"" in js or 'mergedTitle: "VWAP"' in js
+    assert "mergedTitle: \"POC\"" in js or 'mergedTitle: "POC"' in js
+    assert "dedupeMarkers" in js
+    assert "nearlyEqual" in js
