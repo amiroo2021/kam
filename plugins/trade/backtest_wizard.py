@@ -365,8 +365,17 @@ def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_po
     img=Image.new('RGB',(W,H),'#fbfbf8'); d=ImageDraw.Draw(img)
     label='BUY' if side is Side.BUY else 'SELL'
     d.text((60,35),f'{symbol} {market.upper()} {label} GoldenFibo Backtest',fill='#111',font=fb)
-    d.text((60,72),'Visual summary: P0 at bottom, active P(n), VWAPs, and current price',fill='#555',font=fs)
+    d.text((60,72),'Visual summary: P0 at bottom, ladder volume area, active P(n), VWAPs, POCs, and current price',fill='#555',font=fs)
     d.rectangle([left,top,right,bottom],fill='white',outline='#ddd')
+    # Ladder volume area: shade the full displayed ladder price zone from P0
+    # through P(n+2). This is drawn before grid/levels so all price lines,
+    # VWAPs, and POCs remain readable on top.
+    ladder_prices=[float(x['price']) for x in levels]
+    ladder_low=min(ladder_prices); ladder_high=max(ladder_prices)
+    area_top=min(y(ladder_low), y(ladder_high)); area_bottom=max(y(ladder_low), y(ladder_high))
+    d.rectangle([left,area_top,right,area_bottom],fill='#ffe6ef')
+    d.rounded_rectangle([left+12,area_top+8,left+315,area_top+34],radius=6,fill='white')
+    d.text((left+22,area_top+10),'Ladder volume area',fill='#c24b75',font=fmb)
     for j in range(8):
         price=pmin+(pmax-pmin)*j/7; yy=y(price)
         d.line([left,yy,right,yy],fill='#eee',width=1)
