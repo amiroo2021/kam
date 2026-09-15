@@ -303,20 +303,20 @@ def _active_ladder_start_ts(state) -> int:
     return int(state.legs[0].ts)
 
 
-def _poc(candles, ts, bins: int = 160):
-    """Approximate volume-profile point of control from OHLCV candles.
+def _volume_profile(candles, ts, bins: int = 160):
+    """Approximate volume profile bins from OHLCV candles.
 
-    Binance 1m candles do not expose tick-level volume-at-price, so this
-    distributes each candle's base volume uniformly over its high-low range
-    into fixed bins for the requested window and returns the max-volume bin
-    center.
+    Binance 1m candles do not expose tick-level volume-at-price, so each
+    candle's base volume is distributed across price bins by high-low overlap
+    for the requested active window.
     """
     rel=[k for k in candles if int(k[0])>=ts]
     if not rel:
-        return float("nan")
+        return None
     lo=min(float(k[3]) for k in rel); hi=max(float(k[2]) for k in rel)
     if hi <= lo:
-        return float(rel[-1][4])
+        close=float(rel[-1][4])
+        return {"lo":close, "hi":close, "width":1.0, "vols":[sum(float(k[5]) for k in rel)]}
     bins=max(20, int(bins))
     width=(hi-lo)/bins
     vols=[0.0 for _ in range(bins)]
@@ -329,11 +329,61 @@ def _poc(candles, ts, bins: int = 160):
             vols[idx]+=v
             continue
         a=max(0,int((l-lo)/width)); b=min(bins-1,int((h-lo)/width))
-        count=max(1,b-a+1); share=v/count
+        span=h-l
         for idx in range(a,b+1):
-            vols[idx]+=share
-    idx=max(range(bins), key=lambda i: vols[i])
-    return lo + (idx + 0.5) * width
+            bin_lo=lo+idx*width; bin_hi=bin_lo+width
+            overlap=max(0.0, min(h,bin_hi)-max(l,bin_lo))
+            if overlap > 0:
+                vols[idx]+=v*(overlap/span)
+    return {"lo":lo, "hi":hi, "width":width, "vols":vols}
+
+
+def _poc(candles, ts, bins: int = 160):
+    """Approximate volume-profile point of control from active-window OHLCV."""
+    profile=_volume_profile(candles, ts, bins=bins)
+    if not profile:
+        return float("nan")
+    vols=profile["vols"]
+    if not vols:
+        return float("nan")
+    idx=max(range(len(vols)), key=lambda i: vols[i])
+    return float(profile["lo"]) + (idx + 0.5) * float(profile["width"])
+
+
+def _value_area(candles, ts, bins: int = 160, ratio: float = 0.70):
+    """Approximate active-window Value Area around POC.
+
+    Returns VAL/POC/VAH using the standard profile expansion: start at POC,
+    then add the higher-volume adjacent side until ``ratio`` of total profile
+    volume is covered.
+    """
+    profile=_volume_profile(candles, ts, bins=bins)
+    if not profile:
+        return {"val":float("nan"), "poc":float("nan"), "vah":float("nan"), "covered_volume":0.0, "total_volume":0.0}
+    vols=list(profile["vols"])
+    total=sum(vols)
+    if total <= 0:
+        p=float(profile["lo"])
+        return {"val":p, "poc":p, "vah":p, "covered_volume":0.0, "total_volume":0.0}
+    poc_idx=max(range(len(vols)), key=lambda i: vols[i])
+    left=right=poc_idx
+    covered=vols[poc_idx]
+    target=total*max(0.0,min(1.0,float(ratio)))
+    while covered < target and (left > 0 or right < len(vols)-1):
+        left_vol=vols[left-1] if left > 0 else -1.0
+        right_vol=vols[right+1] if right < len(vols)-1 else -1.0
+        if right_vol > left_vol:
+            right += 1; covered += vols[right]
+        else:
+            left -= 1; covered += vols[left]
+    lo=float(profile["lo"]); width=float(profile["width"])
+    return {
+        "val": lo + left * width,
+        "poc": lo + (poc_idx + 0.5) * width,
+        "vah": lo + (right + 1) * width,
+        "covered_volume": covered,
+        "total_volume": total,
+    }
 
 
 def _fmt(x: float) -> str:
@@ -353,20 +403,25 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     step_vwap=_vwap(candles,active_step_start_ts)
     ladder_poc=_poc(candles,active_ladder_start_ts)
     step_poc=_poc(candles,active_step_start_ts)
+    ladder_value_area=_value_area(candles,active_ladder_start_ts)
     last=float(candles[-1][4])
     levels=levels_p0_to_pn(state,min(n+2,20), percentage=percentage)
-    jpg=_draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last)
+    jpg=_draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last, ladder_value_area=ladder_value_area)
     label="BUY" if side is Side.BUY else "SELL"
-    lines=[f"{label} ladder", f"Cycle: {state.cycle}  Completed: {len(state.closed)}", f"P0: {_fmt(state.p0)}", f"Current step: P{n} = {_fmt(pn)}", f"TP/P(n-1): {_fmt(pnm1)}", f"Next P{n+1}: {_fmt(pn1)}", f"P{n+2}: {_fmt(pn2)}", f"Ladder VWAP: {_fmt(ladder_vwap)}", f"Step VWAP: {_fmt(step_vwap)}", f"Ladder POC: {_fmt(ladder_poc)}", f"Step POC: {_fmt(step_poc)}", f"Last close: {_fmt(last)}"]
+    lines=[f"{label} ladder", f"Cycle: {state.cycle}  Completed: {len(state.closed)}", f"P0: {_fmt(state.p0)}", f"Current step: P{n} = {_fmt(pn)}", f"TP/P(n-1): {_fmt(pnm1)}", f"Next P{n+1}: {_fmt(pn1)}", f"P{n+2}: {_fmt(pn2)}", f"Ladder VWAP: {_fmt(ladder_vwap)}", f"Step VWAP: {_fmt(step_vwap)}", f"Ladder POC: {_fmt(ladder_poc)}", f"Ladder Value Area: {_fmt(ladder_value_area['val'])} → {_fmt(ladder_value_area['vah'])}", f"Step POC: {_fmt(step_poc)}", f"Last close: {_fmt(last)}"]
     return {"text":"\n".join(lines), "svg":jpg}
 
 
-def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, current):
+def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, current, *, ladder_value_area=None):
     """Draw visual ladder summary directly to JPEG for Telegram photo delivery."""
     from PIL import Image, ImageDraw, ImageFont
 
     W,H=1200,1600; left,right=170,1100; top,bottom=110,1440
-    prices=[float(x['price']) for x in levels]+[ladder_vwap,step_vwap,ladder_poc,step_poc,current]
+    va_prices=[]
+    if ladder_value_area:
+        va_prices=[float(ladder_value_area.get('val', float('nan'))), float(ladder_value_area.get('vah', float('nan')))]
+        va_prices=[p for p in va_prices if p == p]
+    prices=[float(x['price']) for x in levels]+[ladder_vwap,step_vwap,ladder_poc,step_poc,current]+va_prices
     pmin=min(prices); pmax=max(prices); pad=(pmax-pmin)*0.07 or 1; pmin-=pad; pmax+=pad
     def y(p): return bottom-(float(p)-pmin)/(pmax-pmin)*(bottom-top)
     def font(path, size):
@@ -380,18 +435,20 @@ def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_po
     img=Image.new('RGB',(W,H),'#fbfbf8'); d=ImageDraw.Draw(img)
     label='BUY' if side is Side.BUY else 'SELL'
     d.text((60,35),f'{symbol} {market.upper()} {label} GoldenFibo Backtest',fill='#111',font=fb)
-    d.text((60,72),'Visual summary: P0 at bottom, active ladder volume area, active P(n), VWAPs, POCs, and current price',fill='#555',font=fs)
+    d.text((60,72),'Visual summary: P0 at bottom, active ladder value area, active P(n), VWAPs, POCs, and current price',fill='#555',font=fs)
     d.rectangle([left,top,right,bottom],fill='white',outline='#ddd')
-    # Active ladder volume area: shade the displayed price zone for the open
-    # ladder only, from the latest cycle's P0 through P(n+2). Closed cycles do
-    # not contribute to the metrics; VWAP/POC start at _active_ladder_start_ts.
-    # Draw this before grid/levels so all price lines remain readable on top.
-    ladder_prices=[float(x['price']) for x in levels]
-    ladder_low=min(ladder_prices); ladder_high=max(ladder_prices)
-    area_top=min(y(ladder_low), y(ladder_high)); area_bottom=max(y(ladder_low), y(ladder_high))
-    d.rectangle([left,area_top,right,area_bottom],fill='#ffe6ef')
-    d.rounded_rectangle([left+12,area_top+8,left+315,area_top+34],radius=6,fill='white')
-    d.text((left+22,area_top+10),'Ladder volume area',fill='#c24b75',font=fmb)
+    # Active ladder Value Area: shade VAL→VAH for the current open ladder's
+    # active-window volume profile. This is not the full displayed ladder range
+    # and does not include future P(n+1)/P(n+2) levels unless their prices fall
+    # inside the computed value area.
+    if ladder_value_area:
+        val=float(ladder_value_area.get('val', float('nan')))
+        vah=float(ladder_value_area.get('vah', float('nan')))
+        if val == val and vah == vah:
+            area_top=min(y(val), y(vah)); area_bottom=max(y(val), y(vah))
+            d.rectangle([left,area_top,right,area_bottom],fill='#ffe6ef')
+            d.rounded_rectangle([left+12,area_top+8,left+330,area_top+34],radius=6,fill='white')
+            d.text((left+22,area_top+10),f'Value Area 70%: {_fmt(val)}–{_fmt(vah)}',fill='#c24b75',font=fmb)
     for j in range(8):
         price=pmin+(pmax-pmin)*j/7; yy=y(price)
         d.line([left,yy,right,yy],fill='#eee',width=1)
