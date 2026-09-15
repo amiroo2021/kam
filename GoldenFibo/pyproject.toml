@@ -1,0 +1,14 @@
+[project]
+name = "goldenfibo"
+version = "0.1.0"
+description = "Unified deterministic GoldenFibo engine (backtest / replay / live feeders)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

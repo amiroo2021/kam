@@ -1,0 +1,13 @@
+[project]
+name = "golden-fibo"
+version = "0.1.0"
+description = "Golden Fibo virtual paper trade BUY/SELL Fibonacci ladder bots"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+hl-paper = "golden_fibo.hl_paper:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
