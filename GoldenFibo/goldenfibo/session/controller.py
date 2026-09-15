@@ -527,6 +527,8 @@ class SessionController:
             await self._on_kline(data)
 
     async def _apply_live_price(self, price: Decimal, ts_ms: int, *, broadcast: bool) -> None:
+        from ..metrics import fmt_metric, fmt_price, metrics_for_legs
+
         async with self._lock:
             self.last_price = str(price)
             domain = apply_price_to_engine(self.engine, price, ts_ms)
@@ -550,11 +552,24 @@ class SessionController:
                     if self.engine.state.further_p()
                     else None,
                     "levels": schemas.levels_for_render(self.engine.state),
+                    "legs": [
+                        {
+                            "step": leg.step,
+                            "entry": fmt_price(leg.entry),
+                            "ts_ms": leg.ts_ms,
+                            "time": leg.ts_ms // 1000,
+                        }
+                        for leg in self.engine.state.legs
+                    ],
+                    "last_candle_time": self.chart_candles[-1]["time"] if self.chart_candles else None,
+                    "metric_windows": {
+                        "ladder_start_ts_ms": self.engine.state.legs[0].ts_ms if self.engine.state.legs else None,
+                        "step_start_ts_ms": self.engine.state.legs[-1].ts_ms if self.engine.state.legs else None,
+                        "latest_candle_time": self.chart_candles[-1]["time"] if self.chart_candles else None,
+                    },
                     "markers": schemas.markers_from_domain(domain),
                     "ambiguity_count": self.ambiguity_count,
                 }
-                from ..metrics import fmt_metric, metrics_for_legs
-
                 st = self.engine.state
                 lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
                     self.bars,

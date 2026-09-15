@@ -20,38 +20,58 @@ def _s(x: Optional[Decimal]) -> Optional[str]:
     return fmt_price(x)
 
 
+def _leg_ts_by_step(state: EngineState) -> Dict[int, int]:
+    return {int(leg.step): int(leg.ts_ms) for leg in state.legs}
+
+
 def levels_for_render(state: EngineState, extra: int = 2) -> List[Dict[str, Any]]:
-    """Backend-computed level list for chart lines/labels (JS must not compute)."""
+    """Current-cycle ladder only: one entry per P0..P(n+2) with activation times.
+
+    - Activated P0..P(n) use leg activation timestamps from the engine.
+    - Projected P(n+1), P(n+2) start at current P(n) activation time.
+    - TP is NOT a separate level: step n-1 is labeled (TP) when n >= 1.
+    - Prices always from ladder_step (backend geometry only).
+    """
     if state.p0 is None or state.highest_filled < 0:
         return []
     n = state.highest_filled
-    max_n = min(state.max_step, max(n + extra, n))
+    leg_ts = _leg_ts_by_step(state)
+    pn_ts = leg_ts.get(n)
     out: List[Dict[str, Any]] = []
-    for i in range(0, max_n + 1):
-        p, tp = ladder_step(state.side, state.p0, i, phi=state.phi, percentage=state.percentage)
-        role = "filled"
-        if i == n + 1:
-            role = "next"
-        elif i == n + 2:
-            role = "further"
-        elif i == n - 1 and n >= 1:
-            role = "tp_prev"
-        elif i == 0 and n == 0:
-            role = "P0"  # current step is also P0
+
+    max_i = min(state.max_step, n + extra)
+    for i in range(0, max_i + 1):
+        p, _tp_at = ladder_step(state.side, state.p0, i, phi=state.phi, percentage=state.percentage)
+        is_tp = n >= 1 and i == n - 1
+        if i < n:
+            kind = "activated"
+            label = f"(TP) P{i}" if is_tp else f"P{i}"
+            act_ms = leg_ts.get(i)
         elif i == n:
-            role = "current"
-        elif i == 0:
-            role = "P0"
-        out.append({"id": f"P{i}", "step": i, "price": fmt_price(p), "tp_at_step": fmt_price(tp), "role": role})
-    # explicit shared TP line
-    if state.shared_tp is not None:
+            kind = "current"
+            label = f"P{i} [P(n)]" if n > 0 else f"P{i} [P(n)]"
+            if n == 0:
+                label = "P0 [P(n)]"
+            act_ms = leg_ts.get(i)
+        elif i == n + 1:
+            kind = "projected_next"
+            label = f"P{i} [P(n+1)]"
+            act_ms = pn_ts
+        else:
+            kind = "projected_further"
+            label = f"P{i} [P(n+2)]"
+            act_ms = pn_ts
+
         out.append(
             {
-                "id": "TP",
-                "step": None,
-                "price": fmt_price(state.shared_tp),
-                "tp_at_step": fmt_price(state.shared_tp),
-                "role": "tp",
+                "id": f"P{i}",
+                "step": i,
+                "price": fmt_price(p),
+                "kind": kind,
+                "label": label,
+                "is_tp": is_tp,
+                "activation_ts_ms": act_ms,
+                "activation_time": (act_ms // 1000) if act_ms is not None else None,
             }
         )
     return out
@@ -116,6 +136,10 @@ def build_state_payload(
         bars, ladder_start_ts_ms=ladder_ts, step_start_ts_ms=step_ts
     )
 
+    last_candle_time = None
+    if candles:
+        last_candle_time = candles[-1].get("time")
+
     payload = {
         "v": PROTOCOL_VERSION,
         "type": "state_snapshot",
@@ -124,7 +148,7 @@ def build_state_payload(
         "timeframe": timeframe,
         "side": side,
         "percentage": percentage,
-        "price": price,
+        "price": fmt_price(price) if price is not None else None,
         "connected": connected,
         "cycle_id": st.cycle_id,
         "active": st.active,
@@ -136,12 +160,28 @@ def build_state_payload(
         "next_p": _s(st.next_p()),
         "further_p": _s(st.further_p()),
         "legs": [
-            {"step": leg.step, "entry": str(leg.entry), "ts_ms": leg.ts_ms, "qty": str(leg.qty)}
+            {
+                "step": leg.step,
+                "entry": fmt_price(leg.entry),
+                "ts_ms": leg.ts_ms,
+                "time": leg.ts_ms // 1000,
+                "qty": str(leg.qty),
+            }
             for leg in st.legs
         ],
         "closed_count": len(st.closed),
+        # Current ladder geometry for chart (no separate TP line)
         "levels": levels_for_render(st),
         "candles": candles,
+        "last_candle_time": last_candle_time,
+        # Metric windows (authoritative starts from legs)
+        "metric_windows": {
+            "ladder_start_ts_ms": ladder_ts,
+            "ladder_start_time": (ladder_ts // 1000) if ladder_ts is not None else None,
+            "step_start_ts_ms": step_ts,
+            "step_start_time": (step_ts // 1000) if step_ts is not None else None,
+            "latest_candle_time": last_candle_time,
+        },
         "ladder_vwap": fmt_metric(lv),
         "active_step_vwap": fmt_metric(sv),
         "ladder_poc": fmt_metric(lp),
@@ -168,7 +208,7 @@ def candle_update_msg(candle: Dict[str, Any], *, final: bool = False) -> Dict[st
 
 
 def price_update_msg(price: str, ts_ms: int) -> Dict[str, Any]:
-    return {"v": PROTOCOL_VERSION, "type": "price_update", "price": price, "ts_ms": ts_ms}
+    return {"v": PROTOCOL_VERSION, "type": "price_update", "price": fmt_price(price) or price, "ts_ms": ts_ms}
 
 
 def engine_event_msg(events: List[DomainEvent], state_fragment: Dict[str, Any]) -> Dict[str, Any]:

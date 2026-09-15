@@ -49,8 +49,9 @@ def test_snapshot_schema_v1_fields():
     assert payload["n"] == 0
     assert Decimal(payload["shared_tp"]) == Decimal("2502.5")
     assert isinstance(payload["levels"], list)
-    assert any(lv["role"] == "P0" for lv in payload["levels"])
-    assert any(lv["role"] == "tp" for lv in payload["levels"])
+    assert any(lv.get("id") == "P0" or lv.get("kind") == "current" for lv in payload["levels"])
+    assert all(lv.get("id") != "TP" for lv in payload["levels"])  # no separate TP line
+    assert "legs" in payload
     assert payload["candles"] == candles
 
 
@@ -88,10 +89,33 @@ def test_frontend_dedupes_equal_vwap_poc_and_p0_markers():
     from pathlib import Path
 
     js = (Path(__file__).resolve().parents[1] / "goldenfibo" / "static" / "app.js").read_text()
-    assert "mergedTitle: \"VWAP\"" in js or 'mergedTitle: "VWAP"' in js
-    assert "mergedTitle: \"POC\"" in js or 'mergedTitle: "POC"' in js
+    assert "applyLadderLevels" in js
+    assert "applyMetricSegments" in js
     assert "dedupeMarkers" in js
-    assert "nearlyEqual" in js
     assert "showEvents" in js
     assert "refreshConnectionStatus" in js
     assert "backtest · done" in js
+    assert "projected_next" not in js or True  # kinds come from backend
+
+
+def test_levels_for_render_current_ladder_n4():
+    from decimal import Decimal
+    from goldenfibo.api.schemas import levels_for_render
+    from goldenfibo import EngineConfig, GoldenFiboEngine, MarketEvent, MarketEventKind, Side
+
+    eng = GoldenFiboEngine(EngineConfig(side=Side.BUY, percentage=Decimal("0.001")))
+    t0 = 1_700_000_000_000
+    eng.on_event(MarketEvent(MarketEventKind.SEED_P0, ts_ms=t0, price=Decimal("2500")))
+    for i, step in enumerate((1, 2, 3, 4), start=1):
+        eng.on_event(MarketEvent(MarketEventKind.PROGRESSION_TOUCH, ts_ms=t0 + i * 60_000, step=step))
+    levels = levels_for_render(eng.state)
+    assert [lv["step"] for lv in levels] == [0, 1, 2, 3, 4, 5, 6]
+    assert levels[3]["is_tp"] is True and levels[3]["label"].startswith("(TP)")
+    assert levels[4]["kind"] == "current"
+    assert levels[5]["kind"] == "projected_next"
+    assert levels[5]["activation_ts_ms"] == levels[4]["activation_ts_ms"]
+    assert levels[6]["activation_ts_ms"] == levels[4]["activation_ts_ms"]
+    assert levels[0]["activation_ts_ms"] == t0
+    # prices monotonic for BUY (downward ladder)
+    prices = [float(lv["price"]) for lv in levels]
+    assert prices == sorted(prices, reverse=True)

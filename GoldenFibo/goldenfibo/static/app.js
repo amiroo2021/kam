@@ -41,11 +41,9 @@
     wickDownColor: "#f6465d",
   });
 
-  /** @type {Record<string, any>} */
-  const priceLines = {};
   /** @type {any[]} */
   let lastMarkers = [];
-  let lastMetricMsg = null;
+  let lastOverlayMsg = null;
   let ws = null;
   let reconnectTimer = null;
 
@@ -85,186 +83,148 @@
   window.addEventListener("resize", resize);
   resize();
 
-  const ROLE_STYLE = {
-    P0: { color: "#f0b90b", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P0", priority: 100 },
-    filled: { color: "#5b8def", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "", priority: 10 },
-    current: { color: "#ffffff", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "P(n)", priority: 90 },
-    tp: { color: "#0ecb81", lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: "TP", priority: 95 },
-    tp_prev: { color: "#0ecb81", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "P(n-1)", priority: 50 },
-    next: { color: "#f6465d", lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: "P(n+1)", priority: 80 },
-    further: { color: "#f6465d", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "P(n+2)", priority: 70 },
-  };
 
-  function nearlyEqual(a, b, eps) {
-    const x = Number(a);
-    const y = Number(b);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-    const tol = eps != null ? eps : Math.max(1e-8, Math.abs(x) * 1e-10);
-    return Math.abs(x - y) <= tol;
-  }
+  /** Line series for current-ladder segments + metrics (not full-width price lines). */
+  const ladderSeries = {};
+  const metricSeries = {};
 
-  function clearPriceLines() {
-    Object.keys(priceLines).forEach((k) => {
+  function clearSeriesMap(map) {
+    Object.keys(map).forEach((k) => {
       try {
-        candleSeries.removePriceLine(priceLines[k]);
+        chart.removeSeries(map[k]);
       } catch (_) {}
-      delete priceLines[k];
+      delete map[k];
     });
   }
 
-  function clearMetricLines() {
-    ["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc", "ladder_val", "ladder_vah"].forEach((k) => {
-      if (priceLines[k]) {
-        try {
-          candleSeries.removePriceLine(priceLines[k]);
-        } catch (_) {}
-        delete priceLines[k];
-      }
-    });
+  function sideColors(side) {
+    const s = String(side || "BUY").toUpperCase();
+    if (s === "SELL") {
+      return {
+        activated: "#ff8a80", // light red/pink
+        current: "#f44336", // strong red
+        projected: "#ef5350",
+      };
+    }
+    return {
+      activated: "#90caf9", // light blue
+      current: "#1e88e5", // strong blue
+      projected: "#42a5f5",
+    };
+  }
+
+  function rightEdgeTime(msg) {
+    const t = Number(msg.last_candle_time || msg.metric_windows?.latest_candle_time);
+    if (Number.isFinite(t)) return t + 3600 * 6; // extend visually to the right
+    return Math.floor(Date.now() / 1000) + 3600;
+  }
+
+  function latestTime(msg) {
+    const t = Number(msg.last_candle_time || msg.metric_windows?.latest_candle_time);
+    if (Number.isFinite(t)) return t;
+    return Math.floor(Date.now() / 1000);
   }
 
   /**
-   * One horizontal line per distinct price. Prefer higher-priority roles
-   * (P0 / TP / current) so we never stack duplicate P0 labels.
+   * Current ladder only: one horizontal segment per backend level.
+   * Y = backend price; X from activation_time → right edge.
+   * No separate TP series — TP is the (TP) label on P(n-1).
    */
-  function applyLevels(levels) {
-    if (!Array.isArray(levels)) return;
-    // Keep metric lines; only rebuild ladder lines.
-    const metricKeys = new Set(["ladder_vwap", "active_step_vwap", "vwap", "ladder_poc", "active_step_poc", "poc"]);
-    Object.keys(priceLines).forEach((k) => {
-      if (metricKeys.has(k)) return;
-      try {
-        candleSeries.removePriceLine(priceLines[k]);
-      } catch (_) {}
-      delete priceLines[k];
-    });
+  function applyLadderLevels(msg) {
+    clearSeriesMap(ladderSeries);
+    const levels = msg.levels;
+    if (!Array.isArray(levels) || !levels.length) return;
+    const colors = sideColors(msg.side);
+    const tRight = rightEdgeTime(msg);
 
-    const chosen = [];
     levels.forEach((lv) => {
       const price = Number(lv.price);
-      if (!Number.isFinite(price)) return;
-      const role = lv.role || "filled";
-      if (role === "tp_prev" && levels.some((x) => x.role === "tp")) return;
-      const style = ROLE_STYLE[role] || ROLE_STYLE.filled;
-      const pri = style.priority || 0;
-      const existing = chosen.find((c) => nearlyEqual(c.price, price));
-      if (existing) {
-        if (pri > existing.pri) {
-          existing.lv = lv;
-          existing.role = role;
-          existing.style = style;
-          existing.pri = pri;
-        }
-        return;
+      const t0 = Number(lv.activation_time);
+      if (!Number.isFinite(price) || !Number.isFinite(t0)) return;
+      const kind = lv.kind || "activated";
+      let color = colors.activated;
+      let width = 2;
+      let style = 0; // solid
+      if (kind === "current") {
+        color = colors.current;
+        width = 3;
+      } else if (kind === "projected_next" || kind === "projected_further") {
+        color = colors.projected;
+        width = 2;
+        style = 2; // dashed
       }
-      chosen.push({ price, lv, role, style, pri });
-    });
-
-    chosen.forEach((c) => {
-      const title = c.style.title || (c.role === "P0" ? "P0" : c.lv.id || "");
-      // Single clean label: role only on axis (price shown by scale); avoid "P0 P0 price"
-      const label = title || "";
-      const line = candleSeries.createPriceLine({
-        price: c.price,
-        color: c.style.color,
-        lineWidth: c.style.lineWidth,
-        lineStyle: c.style.lineStyle,
-        axisLabelVisible: c.style.axisLabelVisible || !!title,
-        title: label,
+      const series = chart.addLineSeries({
+        color,
+        lineWidth: width,
+        lineStyle: style,
+        lastValueVisible: true,
+        priceLineVisible: false,
+        crosshairMarkerVisible: false,
+        title: lv.label || lv.id || "",
       });
-      priceLines[c.lv.id || `${c.role}-${c.price}`] = line;
+      series.setData([
+        { time: t0, value: price },
+        { time: Math.max(t0 + 1, tRight), value: price },
+      ]);
+      ladderSeries[lv.id || lv.label] = series;
     });
   }
 
   /**
-   * Merge Step/Ladder VWAP and POC when values match (step 0 / same window).
-   * When they diverge, draw separate lines again.
+   * Metrics: segments from latest candle → right edge only (not drawn backward).
+   * Values & windows come from backend; JS does not recompute VWAP/POC.
    */
-  function applyMetrics(msg) {
-    if (!msg) return;
-    lastMetricMsg = msg;
-    clearMetricLines();
+  function applyMetricSegments(msg) {
+    clearSeriesMap(metricSeries);
+    const t0 = latestTime(msg);
+    const tRight = rightEdgeTime(msg);
+    if (!Number.isFinite(t0)) return;
 
-    const pairs = [
-      {
-        aKey: "ladder_vwap",
-        bKey: "active_step_vwap",
-        aVal: msg.ladder_vwap,
-        bVal: msg.active_step_vwap,
-        color: "#f2c500",
-        mergedTitle: "VWAP",
-        aTitle: "L-VWAP",
-        bTitle: "S-VWAP",
-        bColor: "#c9a227",
-        mergeKey: "vwap",
-      },
-      {
-        aKey: "ladder_poc",
-        bKey: "active_step_poc",
-        aVal: msg.ladder_poc,
-        bVal: msg.active_step_poc,
-        color: "#26a69a",
-        mergedTitle: "POC",
-        aTitle: "L-POC",
-        bTitle: "S-POC",
-        bColor: "#66bb6a",
-        mergeKey: "poc",
-      },
+    const specs = [
+      { key: "ladder_vwap", title: "L-VWAP", color: "#f2c500", dashed: false },
+      { key: "active_step_vwap", title: "S-VWAP", color: "#f2c500", dashed: true },
+      { key: "ladder_poc", title: "L-POC", color: "#eceff1", dashed: false },
+      { key: "active_step_poc", title: "S-POC", color: "#eceff1", dashed: true },
+      { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true },
+      { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true },
     ];
+    // Dedupe equal L/S VWAP and L/S POC for readability
+    const lv = Number(msg.ladder_vwap);
+    const sv = Number(msg.active_step_vwap);
+    const lp = Number(msg.ladder_poc);
+    const sp = Number(msg.active_step_poc);
+    const skip = new Set();
+    if (Number.isFinite(lv) && Number.isFinite(sv) && Math.abs(lv - sv) < 1e-6) {
+      skip.add("active_step_vwap");
+      specs[0].title = "VWAP";
+    }
+    if (Number.isFinite(lp) && Number.isFinite(sp) && Math.abs(lp - sp) < 1e-6) {
+      skip.add("active_step_poc");
+      specs[2].title = "POC";
+    }
 
-    pairs.forEach((p) => {
-      const a = Number(p.aVal);
-      const b = Number(p.bVal);
-      const aOk = Number.isFinite(a);
-      const bOk = Number.isFinite(b);
-      if (aOk && bOk && nearlyEqual(a, b)) {
-        priceLines[p.mergeKey] = candleSeries.createPriceLine({
-          price: a,
-          color: p.color,
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: p.mergedTitle,
-        });
-        return;
-      }
-      if (aOk) {
-        priceLines[p.aKey] = candleSeries.createPriceLine({
-          price: a,
-          color: p.color,
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: p.aTitle,
-        });
-      }
-      if (bOk) {
-        priceLines[p.bKey] = candleSeries.createPriceLine({
-          price: b,
-          color: p.bColor,
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: p.bTitle,
-        });
-      }
-    });
-    // Ladder Value Area edges (backend-computed)
-    [["ladder_val", msg.ladder_val, "#7e57c2", "VAL"], ["ladder_vah", msg.ladder_vah, "#7e57c2", "VAH"]].forEach(([key, val, color, title]) => {
-      const price = Number(val);
+    specs.forEach((s) => {
+      if (skip.has(s.key)) return;
+      const price = Number(msg[s.key]);
       if (!Number.isFinite(price)) return;
-      priceLines[key] = candleSeries.createPriceLine({
-        price,
-        color,
+      const series = chart.addLineSeries({
+        color: s.color,
         lineWidth: 1,
-        lineStyle: 1,
-        axisLabelVisible: true,
-        title,
+        lineStyle: s.dashed ? 2 : 0,
+        lastValueVisible: true,
+        priceLineVisible: false,
+        crosshairMarkerVisible: false,
+        title: s.title,
       });
+      series.setData([
+        { time: t0, value: price },
+        { time: Math.max(t0 + 1, tRight), value: price },
+      ]);
+      metricSeries[s.key] = series;
     });
   }
 
-  /** Keep one P0 seed marker per timestamp; drop duplicate P0 texts. */
+
   function dedupeMarkers(markers) {
     if (!Array.isArray(markers)) return [];
     const out = [];
@@ -289,9 +249,16 @@
       lastMarkers = dedupeMarkers(markers || []);
     }
     try {
-      // Historical event markers only — current horizontal levels stay via price lines.
       candleSeries.setMarkers(showEvents ? lastMarkers : []);
     } catch (_) {}
+  }
+
+  function applyOverlayState(msg) {
+    lastOverlayMsg = msg;
+    applyLadderLevels(msg);
+    applyMetricSegments(msg);
+    applyHud(msg);
+    if (Array.isArray(msg.markers)) applyMarkers(msg.markers);
   }
 
   function applyHud(msg) {
@@ -331,21 +298,6 @@
     }
   }
 
-  function applyOverlayState(msg) {
-    if (msg.levels) applyLevels(msg.levels);
-    if (
-      msg.ladder_vwap !== undefined ||
-      msg.active_step_vwap !== undefined ||
-      msg.ladder_poc !== undefined ||
-      msg.active_step_poc !== undefined
-    ) {
-      applyMetrics(msg);
-    } else if (lastMetricMsg) {
-      applyMetrics(lastMetricMsg);
-    }
-    applyHud(msg);
-    if (Array.isArray(msg.markers)) applyMarkers(msg.markers);
-  }
 
   function applySnapshot(msg) {
     if (Array.isArray(msg.candles) && msg.candles.length) {
@@ -388,7 +340,17 @@
           refreshConnectionStatus();
           break;
         case "candle_update":
-          if (msg.candle) candleSeries.update(msg.candle);
+          if (msg.candle) {
+            candleSeries.update(msg.candle);
+            if (lastOverlayMsg) {
+              lastOverlayMsg.last_candle_time = msg.candle.time;
+              if (lastOverlayMsg.metric_windows)
+                lastOverlayMsg.metric_windows.latest_candle_time = msg.candle.time;
+              applyMetricSegments(lastOverlayMsg);
+              // extend ladder segments right edge
+              applyLadderLevels(lastOverlayMsg);
+            }
+          }
           break;
         case "price_update":
           if (msg.price != null) hudPrice.textContent = msg.price;
@@ -407,13 +369,16 @@
           break;
         case "engine_event":
           if (msg.state) {
-            // Merge fragment onto last metric context so VWAP/POC survive level redraws
-            const merged = Object.assign({}, lastMetricMsg || {}, msg.state);
+            const merged = Object.assign({}, lastOverlayMsg || {}, msg.state);
+            if (msg.state.levels) merged.levels = msg.state.levels;
             if (Array.isArray(msg.state.markers) && msg.state.markers.length) {
               merged.markers = dedupeMarkers(lastMarkers.concat(msg.state.markers));
             } else {
               merged.markers = lastMarkers;
             }
+            // keep candle tail time if fragment omits it
+            if (merged.last_candle_time == null && lastOverlayMsg)
+              merged.last_candle_time = lastOverlayMsg.last_candle_time;
             applyOverlayState(merged);
           }
           break;
