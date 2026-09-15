@@ -1,70 +1,58 @@
 # GoldenFibo
 
-Isolated Golden Fibonacci research / live visualization platform.
+Isolated Golden Fibonacci research / visualization platform.
 
 **Canonical rule:** one `GoldenFiboEngine`. Historical, replay, and live only differ by
-`MarketEvent` feeders. The browser **never** computes ladder levels.
+how they produce `MarketEvent`s. The browser never computes ladder levels.
 
-## Phases
+## Modes (Phase 3)
 
-| Phase | Status |
+| Mode | Behavior |
 |---|---|
-| 0–1 Engine + parity | done |
-| 2 Live chart MVP | done (this tree) |
-| 3 Replay / backtest UI | not started |
-| Live exchange execution | **out of scope** |
+| **LIVE** | Seed P0 at current forming bar open → live Binance public streams |
+| **BACKTEST** | Start→End historical OHLC (LEGACY) → **stop** (no live) |
+| **REPLAY→LIVE** | Start→now historical OHLC → **same engine** → live streams |
 
-## Layout
+### Historical OHLC vs live aggTrade
 
-```text
-GoldenFibo/
-  goldenfibo/
-    engine/          # pure strategy
-    feeders/         # OHLC historical
-    live/            # ordered price → MarketEvents
-    marketdata/      # Binance public REST/WS adapters
-    metrics/         # VWAP/POC (wizard semantics)
-    api/             # FastAPI + session + WS
-    static/          # Lightweight Charts UI
-  reference/legacy_research/   # frozen 0.1.0 oracle
-  tests/
-```
+Default historical resolver is **LEGACY OHLC** (deterministic intrabar assumptions:
+adverse progression first, then TP). This is **not** tick-perfect and is **not** claimed
+to equal continuous aggTrade over the same period. Dual-touch bars are counted as
+`ambiguity_count` and marked with `AMBIGUOUS_BAR` domain events while LEGACY still
+applies its path rule.
 
-## Run live visualization (Ubuntu)
+### Start/End time
+
+Must be **UTC** and **aligned to the selected timeframe** (e.g. 1m → whole minutes).
+P0 for BACKTEST/REPLAY = open of the first closed bar at/after Start.
+
+## Run
 
 ```bash
 cd /home/parallels/kam/GoldenFibo
 uv venv .venv
 uv pip install -e ".[dev]"
 uv run goldenfibo-web
-# or:
-uv run uvicorn goldenfibo.api.app:app --host 0.0.0.0 --port 8000
+# open http://$(hostname -I | awk '{print $1}'):8000
 ```
-
-On the MacBook browser (Parallels shared network):
-
-```bash
-# on Ubuntu, discover IP:
-hostname -I
-# then open e.g.:
-http://10.211.55.6:8000
-```
-
-Local-only development. No public exposure, no API keys, no orders.
-
-## Live P0 rule
-
-At session start, after public REST kline seed:
-
-**P0 = open of the latest 1m kline returned by Binance** (current forming bar open).
-
-Historical candles fill the chart only; the engine does **not** replay the full history
-into the ladder. Reconnect reuses backend state and does **not** reseed P0 while the
-process is alive. Backend restart resets the in-memory paper session.
 
 ## Tests
 
 ```bash
-cd GoldenFibo
 uv run pytest
+```
+
+## Layout
+
+```text
+goldenfibo/
+  engine/           # pure strategy (do not fork per mode)
+  feeders/          # OHLC → MarketEvents
+  live/             # aggTrade price → MarketEvents
+  marketdata/       # Binance public + pagination + source protocols
+  session/          # SessionController LIVE/BACKTEST/REPLAY_TO_LIVE
+  api/              # FastAPI + WS
+  static/           # chart UI (renderer only)
+  metrics/          # VWAP/POC (wizard semantics)
+reference/legacy_research/  # frozen oracle
 ```

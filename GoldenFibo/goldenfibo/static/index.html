@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GoldenFibo Live</title>
+  <title>GoldenFibo</title>
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -11,18 +11,20 @@
   <header class="topbar">
     <div class="brand">GoldenFibo</div>
     <div class="modes">
-      <button class="mode active" data-mode="LIVE">LIVE</button>
-      <button class="mode disabled" disabled title="Phase 3">REPLAY</button>
-      <button class="mode disabled" disabled title="Phase 3">BACKTEST</button>
+      <button type="button" class="mode active" data-mode="LIVE">LIVE</button>
+      <button type="button" class="mode" data-mode="REPLAY_TO_LIVE">REPLAY→LIVE</button>
+      <button type="button" class="mode" data-mode="BACKTEST">BACKTEST</button>
     </div>
     <div class="status" id="connStatus">connecting…</div>
   </header>
-
   <section class="controls">
     <label>Symbol <input id="symbol" value="BTCUSDT" /></label>
     <label>TF
       <select id="timeframe">
         <option value="1m" selected>1m</option>
+        <option value="5m">5m</option>
+        <option value="15m">15m</option>
+        <option value="1h">1h</option>
       </select>
     </label>
     <label>Side
@@ -32,19 +34,32 @@
       </select>
     </label>
     <label>Percentage <input id="percentage" value="0.001" /></label>
-    <button id="applyBtn">Apply session</button>
+    <label class="dt" id="startWrap">Start (UTC)
+      <input id="startTime" type="datetime-local" step="60" />
+    </label>
+    <label class="dt" id="endWrap" hidden>End (UTC)
+      <input id="endTime" type="datetime-local" step="60" />
+    </label>
+    <button type="button" id="applyBtn">Start</button>
     <div class="hud">
+      <span>Phase <strong id="hudPhase">—</strong></span>
       <span>Price <strong id="hudPrice">—</strong></span>
       <span>Cycle <strong id="hudCycle">—</strong></span>
       <span>Step <strong id="hudStep">—</strong></span>
       <span>P0 <strong id="hudP0">—</strong></span>
       <span>TP <strong id="hudTp">—</strong></span>
+      <span>Ambiguous <strong id="hudAmb">—</strong></span>
     </div>
   </section>
-
+  <div class="progress" id="progressBar" hidden>
+    <div class="progress-fill" id="progressFill"></div>
+    <span id="progressText"></span>
+  </div>
+  <p class="hint" id="histNote"></p>
   <main id="chart" aria-label="GoldenFibo chart"></main>
   <footer class="footer">
-    Backend owns session state · JS only renders snapshots · public Binance data · no orders
+    Backend owns GoldenFibo state · JS renders only · public Binance · no orders ·
+    LEGACY OHLC hist ≠ tick-perfect aggTrade
   </footer>
   <script src="/static/app.js"></script>
 </body>

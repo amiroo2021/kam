@@ -7,6 +7,13 @@
   const hudStep = document.getElementById("hudStep");
   const hudP0 = document.getElementById("hudP0");
   const hudTp = document.getElementById("hudTp");
+  const hudPhase = document.getElementById("hudPhase");
+  const hudAmb = document.getElementById("hudAmb");
+  const progressBar = document.getElementById("progressBar");
+  const progressFill = document.getElementById("progressFill");
+  const progressText = document.getElementById("progressText");
+  const histNote = document.getElementById("histNote");
+  let currentMode = "LIVE";
 
   const chart = LightweightCharts.createChart(el, {
     layout: {
@@ -248,6 +255,31 @@
     if (msg.n != null) hudStep.textContent = "P" + msg.n;
     if (msg.p0 != null) hudP0.textContent = msg.p0;
     if (msg.shared_tp != null) hudTp.textContent = msg.shared_tp;
+    if (msg.phase != null && hudPhase) hudPhase.textContent = msg.phase;
+    if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
+    if (msg.note_historical && histNote) histNote.textContent = msg.note_historical;
+  }
+
+  function applyPhase(msg) {
+    if (msg.phase && hudPhase) hudPhase.textContent = msg.phase;
+    if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
+    const p = msg.progress || {};
+    const pct = p.pct != null ? Number(p.pct) : null;
+    if (progressBar && pct != null && msg.phase && msg.phase !== "live" && msg.phase !== "backtest_done") {
+      progressBar.hidden = false;
+      progressFill.style.width = Math.min(100, pct) + "%";
+      const from = p.from_t || "";
+      const to = p.to_t || "";
+      progressText.textContent = `Replaying ${from} → ${to} · ${pct.toFixed(0)}% · bars ${p.bars_done || p.events_done || "?"} / ${p.bars_total || p.events_total || "?"}`;
+    } else if (progressBar && (msg.phase === "live" || msg.phase === "backtest_done")) {
+      if (msg.phase === "backtest_done") {
+        progressBar.hidden = false;
+        progressFill.style.width = "100%";
+        progressText.textContent = `Backtest done · ${msg.bars_processed || 0} bars · ${msg.ambiguity_count || 0} ambiguous intrabar events`;
+      } else {
+        progressBar.hidden = true;
+      }
+    }
   }
 
   function applyOverlayState(msg) {
@@ -300,12 +332,26 @@
       switch (msg.type) {
         case "state_snapshot":
           applySnapshot(msg);
+          applyPhase(msg);
+          if (msg.mode) { currentMode = msg.mode; syncModeUi(); }
           break;
         case "candle_update":
           if (msg.candle) candleSeries.update(msg.candle);
           break;
         case "price_update":
           if (msg.price != null) hudPrice.textContent = msg.price;
+          break;
+        case "phase":
+          applyPhase(msg);
+          break;
+        case "run_complete":
+          applyPhase(Object.assign({ phase: "backtest_done" }, msg));
+          break;
+        case "handoff":
+          if (hudPhase) hudPhase.textContent = "live (handoff)";
+          break;
+        case "error":
+          setStatus(msg.error || "error", false);
           break;
         case "engine_event":
           if (msg.state) {
@@ -325,18 +371,55 @@
     };
   }
 
+  
+  function toIsoLocalInput(val) {
+    if (!val) return null;
+    // datetime-local has no Z; treat as UTC wall clock by appending Z
+    const s = val.length === 16 ? val + ":00" : val;
+    return s.replace(" ", "T") + "Z";
+  }
+
+  function syncModeUi() {
+    document.querySelectorAll(".mode").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === currentMode);
+    });
+    const needStart = currentMode !== "LIVE";
+    const needEnd = currentMode === "BACKTEST";
+    document.getElementById("startWrap").hidden = !needStart;
+    document.getElementById("endWrap").hidden = !needEnd;
+    document.getElementById("applyBtn").textContent =
+      currentMode === "LIVE" ? "Start LIVE" : currentMode === "BACKTEST" ? "Run BACKTEST" : "Start REPLAY→LIVE";
+  }
+
+  document.querySelectorAll(".mode").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      currentMode = btn.dataset.mode;
+      syncModeUi();
+    });
+  });
+  syncModeUi();
+
   document.getElementById("applyBtn").addEventListener("click", () => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(
-      JSON.stringify({
-        op: "reconfigure",
-        symbol: document.getElementById("symbol").value.trim(),
-        timeframe: document.getElementById("timeframe").value,
-        side: document.getElementById("side").value,
-        percentage: document.getElementById("percentage").value,
-      })
-    );
+    const payload = {
+      op: "start",
+      mode: currentMode,
+      symbol: document.getElementById("symbol").value.trim(),
+      timeframe: document.getElementById("timeframe").value,
+      side: document.getElementById("side").value,
+      percentage: document.getElementById("percentage").value,
+    };
+    if (currentMode !== "LIVE") {
+      payload.start_time = toIsoLocalInput(document.getElementById("startTime").value);
+    }
+    if (currentMode === "BACKTEST") {
+      payload.end_time = toIsoLocalInput(document.getElementById("endTime").value);
+    }
+    ws.send(JSON.stringify(payload));
   });
+
+  // patch message handler additions via replace of switch cases
 
   connect();
 })();

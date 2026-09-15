@@ -1,4 +1,16 @@
-"""Historical OHLC → ordered MarketEvents (legacy + strict ambiguity)."""
+"""Historical OHLC → ordered MarketEvents (legacy + strict ambiguity).
+
+LEGACY (default historical resolver for Phase 3):
+  Deterministic intrabar assumption: adverse progression touches first, then TP.
+  When a bar's range touches BOTH shared TP and next progression, the true
+  chronology is unknowable from OHLC alone. LEGACY still applies the assumption
+  AND emits AMBIGUOUS_BAR so runs can report ambiguity_count.
+  This is NOT tick-perfect reconstruction and is NOT equivalent to continuous
+  aggTrade live processing over the same wall-clock period.
+
+STRICT:
+  Dual-touch bars emit AMBIGUOUS_BAR only (no path mutation).
+"""
 
 from __future__ import annotations
 
@@ -24,15 +36,6 @@ def _parse_candle(candle: Sequence[Any]) -> tuple[int, Decimal, Decimal, Decimal
 
 
 class HistoricalOhlcFeeder:
-    """Convert OHLC candles into MarketEvents.
-
-    LEGACY: adverse progression touches first, then TP (recovered historical_replay).
-    After TP, engine chains P0=TP; feeder ignores the rest of that candle.
-
-    STRICT: if bar touches both TP and next progression, emit AMBIGUOUS_BAR only
-    (no path mutation for that bar).
-    """
-
     def __init__(
         self,
         candles: Sequence[Sequence[Any]],
@@ -67,38 +70,52 @@ class HistoricalOhlcFeeder:
         assert st.p0 is not None and st.shared_tp is not None
         p0: Decimal = st.p0
         shared_tp: Decimal = st.shared_tp
+        next_p = st.next_p()
+        is_ambiguous = (
+            next_p is not None
+            and dual_touch(side, high=h, low=l, shared_tp=shared_tp, next_p=next_p)
+        )
 
-        if self.mode is OhlcResolveMode.STRICT:
-            next_p = st.next_p()
-            if next_p is not None and dual_touch(side, high=h, low=l, shared_tp=shared_tp, next_p=next_p):
-                meta = ambiguity_payload(
-                    ts_ms=ts,
-                    o=o,
-                    h=h,
-                    l=l,
-                    c=c,
-                    shared_tp=shared_tp,
-                    next_p=next_p,
-                    cycle_id=st.cycle_id,
-                    highest_filled=st.highest_filled,
-                    p0=p0,
-                    side=side,
+        if is_ambiguous:
+            meta = ambiguity_payload(
+                ts_ms=ts,
+                o=o,
+                h=h,
+                l=l,
+                c=c,
+                shared_tp=shared_tp,
+                next_p=next_p,  # type: ignore[arg-type]
+                cycle_id=st.cycle_id,
+                highest_filled=st.highest_filled,
+                p0=p0,
+                side=side,
+            )
+            meta["resolver"] = self.mode.value
+            meta["note"] = (
+                "OHLC range touches TP and next progression; true order unknown. "
+                + (
+                    "LEGACY applies adverse-first then TP."
+                    if self.mode is OhlcResolveMode.LEGACY
+                    else "STRICT skips path mutation."
                 )
-                ev = MarketEvent(kind=MarketEventKind.AMBIGUOUS_BAR, ts_ms=ts, meta=meta)
-                shadow.on_event(ev)
-                yield ev
+            )
+            amb = MarketEvent(kind=MarketEventKind.AMBIGUOUS_BAR, ts_ms=ts, meta=meta)
+            shadow.on_event(amb)
+            yield amb
+            if self.mode is OhlcResolveMode.STRICT:
                 return
 
+        # LEGACY path (also after marking ambiguity)
         if side is Side.SELL:
             while st.highest_filled < cfg.max_step and st.p0 is not None:
-                next_p, _ = ladder_step(
+                npx, _ = ladder_step(
                     side, st.p0, st.highest_filled + 1, phi=cfg.phi, percentage=cfg.percentage
                 )
-                if h >= next_p:
+                if h >= npx:
                     ev = MarketEvent(
                         kind=MarketEventKind.PROGRESSION_TOUCH,
                         ts_ms=ts,
-                        price=next_p,
+                        price=npx,
                         step=st.highest_filled + 1,
                     )
                     shadow.on_event(ev)
@@ -113,14 +130,14 @@ class HistoricalOhlcFeeder:
                 return
         else:
             while st.highest_filled < cfg.max_step and st.p0 is not None:
-                next_p, _ = ladder_step(
+                npx, _ = ladder_step(
                     side, st.p0, st.highest_filled + 1, phi=cfg.phi, percentage=cfg.percentage
                 )
-                if l <= next_p:
+                if l <= npx:
                     ev = MarketEvent(
                         kind=MarketEventKind.PROGRESSION_TOUCH,
                         ts_ms=ts,
-                        price=next_p,
+                        price=npx,
                         step=st.highest_filled + 1,
                     )
                     shadow.on_event(ev)
@@ -144,6 +161,10 @@ def collect_ohlc_events(
     return HistoricalOhlcFeeder(candles, config, mode=mode).collect()
 
 
+def count_ambiguous(events: Sequence[MarketEvent]) -> int:
+    return sum(1 for e in events if e.kind is MarketEventKind.AMBIGUOUS_BAR)
+
+
 def replay_ohlc_legacy(
     candles: Sequence[Sequence[Any]],
     *,
@@ -152,7 +173,6 @@ def replay_ohlc_legacy(
     max_step: int = 20,
     symbol: str = "",
 ) -> EngineState:
-    """Legacy OHLC path via feeder events applied once to the canonical engine."""
     cfg = EngineConfig(
         side=Side(side),
         percentage=Decimal(str(percentage)),
