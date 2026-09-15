@@ -21,6 +21,13 @@
   const showEventsEl = document.getElementById("showEvents");
   let showEvents = !!(showEventsEl && showEventsEl.checked);
 
+  /** Right-side whitespace after latest candle (logical bar widths). */
+  const RIGHT_PAD_BARS = 40;
+  /** Vertical padding fraction around candle high/low for default viewport. */
+  const PRICE_PAD_FRAC = 0.12;
+  /** Prefer showing about this many recent candles horizontally (plus right pad). */
+  const DEFAULT_VISIBLE_BARS = 200;
+
   const chart = LightweightCharts.createChart(el, {
     layout: {
       background: { color: "#0b0e11" },
@@ -31,8 +38,19 @@
       horzLines: { color: "#1a2030" },
     },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#1e2630" },
-    timeScale: { borderColor: "#1e2630", timeVisible: true, secondsVisible: false },
+    rightPriceScale: {
+      borderColor: "#1e2630",
+      // Candles own the scale; we set visible range from candle OHLC after load.
+      autoScale: true,
+      scaleMargins: { top: 0.08, bottom: 0.12 },
+    },
+    timeScale: {
+      borderColor: "#1e2630",
+      timeVisible: true,
+      secondsVisible: false,
+      rightOffset: RIGHT_PAD_BARS,
+      lockVisibleTimeRangeOnResize: true,
+    },
   });
 
   const candleSeries = chart.addCandlestickSeries({
@@ -198,15 +216,65 @@
     return Math.max(activationSec, bounds.first);
   }
 
-  /** Ladder/metric series must not expand price OR time autoscale away from candles. */
+  /**
+   * LWC 4.x: returning null from autoscaleInfoProvider means "use DEFAULT"
+   * (series still participates). To EXCLUDE a series from price autoscale,
+   * return { priceRange: null }. Ladder/metric series stay on the right scale
+   * so prices align with candles, but they must not force P0→P(n+2) fit.
+   */
   function overlaySeriesOpts(extra) {
     return Object.assign({
       lastValueVisible: true,
       priceLineVisible: false,
       crosshairMarkerVisible: false,
-      // Exclude from autoscale so huge P0..P(n+2) span does not squash candles
-      autoscaleInfoProvider: () => null,
+      autoscaleInfoProvider: () => ({ priceRange: null }),
     }, extra || {});
+  }
+
+  /** Extend overlay segment end into right-side whitespace (seconds). */
+  function rightWhitespaceTime(bounds) {
+    if (!bounds || !Number.isFinite(bounds.last)) {
+      return Math.floor(Date.now() / 1000) + 60 * RIGHT_PAD_BARS;
+    }
+    // Assume ~1m bars for padding seconds when TF unknown; still whitespace-only.
+    const barSec = 60;
+    return bounds.last + barSec * RIGHT_PAD_BARS;
+  }
+
+  /**
+   * Default viewport after hist load / handoff:
+   * - horizontal: recent candles + RIGHT_PAD_BARS whitespace (no fake candles)
+   * - vertical: candle OHLC only (ladder may be offscreen — user can zoom)
+   */
+  function applyMarketViewport(candles) {
+    if (!Array.isArray(candles) || !candles.length) return;
+    const n = candles.length;
+    const visible = Math.min(n, DEFAULT_VISIBLE_BARS);
+    const from = n - visible;
+    const to = n - 1 + RIGHT_PAD_BARS;
+    try {
+      chart.timeScale().applyOptions({ rightOffset: RIGHT_PAD_BARS });
+      chart.timeScale().setVisibleLogicalRange({ from, to });
+    } catch (_) {}
+
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = from; i < n; i++) {
+      const c = candles[i];
+      const l = Number(c.low);
+      const h = Number(c.high);
+      if (Number.isFinite(l) && l < lo) lo = l;
+      if (Number.isFinite(h) && h > hi) hi = h;
+    }
+    if (!(Number.isFinite(lo) && Number.isFinite(hi) && hi >= lo)) return;
+    const span = hi - lo;
+    const pad = span > 0 ? span * PRICE_PAD_FRAC : Math.max(Math.abs(hi) * 0.001, 1);
+    try {
+      const ps = chart.priceScale("right");
+      // Lock to candle range so overlays cannot reopen full ladder span
+      ps.applyOptions({ autoScale: false });
+      ps.setVisibleRange({ from: lo - pad, to: hi + pad });
+    } catch (_) {}
   }
 
   /**
@@ -220,9 +288,7 @@
     if (!Array.isArray(levels) || !levels.length) return;
     const colors = sideColors(msg.side);
     const bounds = chartTimeBounds(msg);
-    const tRight = bounds && Number.isFinite(bounds.last)
-      ? Math.max(bounds.last + 60, rightEdgeTime(msg))
-      : rightEdgeTime(msg);
+    const tRight = rightWhitespaceTime(bounds);
 
     levels.forEach((lv) => {
       const price = Number(lv.price);
@@ -299,7 +365,7 @@
       if (!Number.isFinite(price)) return;
       const bounds = chartTimeBounds(msg);
       const tStart = bounds && Number.isFinite(bounds.last) ? bounds.last : t0;
-      const tEnd = Math.max(tStart + 1, bounds && Number.isFinite(bounds.last) ? bounds.last + 60 : tRight);
+      const tEnd = Math.max(tStart + 1, rightWhitespaceTime(bounds));
       const series = chart.addLineSeries(overlaySeriesOpts({
         color: s.color,
         lineWidth: 1,
@@ -393,12 +459,16 @@
       } else {
         progressBar.hidden = true;
       }
+      if (msg.phase === "live" && lastCandles && lastCandles.length) {
+        applyMarketViewport(lastCandles);
+      }
     }
   }
 
 
   function applySnapshot(msg) {
-    if (Array.isArray(msg.candles) && msg.candles.length) {
+    const hasCandles = Array.isArray(msg.candles) && msg.candles.length;
+    if (hasCandles) {
       lastCandles = msg.candles;
       lastCandleBounds = {
         first: Number(msg.candles[0].time),
@@ -406,14 +476,14 @@
         count: msg.candles.length,
       };
       candleSeries.setData(msg.candles);
-      // Fit ONLY the retained candle window (not ancient ladder activations)
-      try {
-        chart.timeScale().setVisibleLogicalRange({ from: 0, to: Math.max(1, msg.candles.length - 1) });
-      } catch (_) {
-        try { chart.timeScale().fitContent(); } catch (__) {}
-      }
     }
+    // Always keep all ladder/metric series (may be offscreen — user can zoom)
     applyOverlayState(msg);
+    if (hasCandles) {
+      // Default view: readable candles around market + right whitespace.
+      // Do NOT vertically fit P0→P(n+2).
+      applyMarketViewport(msg.candles);
+    }
     if (msg.side) document.getElementById("side").value = msg.side;
     if (msg.percentage) document.getElementById("percentage").value = msg.percentage;
     if (msg.symbol) document.getElementById("symbol").value = msg.symbol;
@@ -472,6 +542,8 @@
           applyPhase(Object.assign({ phase: "backtest_done" }, msg));
           break;
         case "handoff":
+          if (lastCandles && lastCandles.length) applyMarketViewport(lastCandles);
+
           if (hudPhase) hudPhase.textContent = "live (handoff)";
           break;
         case "error":

@@ -178,3 +178,14 @@ def test_html_defaults_replay_mode():
     assert 'class="mode active" data-mode="REPLAY_TO_LIVE"' in html or (
         'data-mode="REPLAY_TO_LIVE">REPLAY' in html and 'active" data-mode="REPLAY_TO_LIVE"' in html
     )
+
+
+def test_chart_viewport_autoscale_and_right_pad_contract():
+    """LWC4: exclude overlays via {priceRange:null}; right pad + candle viewport."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parents[1] / "goldenfibo" / "static" / "app.js").read_text()
+    assert "autoscaleInfoProvider: () => ({ priceRange: null })" in js
+    assert "autoscaleInfoProvider: () => null" not in js  # null alone = default include
+    assert "RIGHT_PAD_BARS" in js
+    assert "applyMarketViewport" in js
+    assert "autoScale: false" in js  # lock vertical to candles after load
