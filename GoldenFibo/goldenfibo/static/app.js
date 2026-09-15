@@ -14,6 +14,10 @@
   const progressText = document.getElementById("progressText");
   const histNote = document.getElementById("histNote");
   let currentMode = "LIVE";
+  let lastPhase = "";
+  let wsConnected = false;
+  const showEventsEl = document.getElementById("showEvents");
+  let showEvents = !!(showEventsEl && showEventsEl.checked);
 
   const chart = LightweightCharts.createChart(el, {
     layout: {
@@ -48,6 +52,31 @@
   function setStatus(text, ok) {
     statusEl.textContent = text;
     statusEl.className = "status " + (ok === true ? "ok" : ok === false ? "bad" : "");
+  }
+
+  /** Mode/phase-aware status — do not imply BACKTEST is "live". */
+  function refreshConnectionStatus() {
+    if (!wsConnected) return;
+    const mode = (currentMode || "LIVE").toUpperCase();
+    const phase = (lastPhase || "").toLowerCase();
+    let text = "connected";
+    let ok = true;
+    if (mode === "BACKTEST") {
+      if (phase === "backtest_done") text = "backtest · done";
+      else if (phase === "replaying" || phase === "loading_history") text = "backtest · replaying";
+      else if (phase === "error") { text = "backtest · error"; ok = false; }
+      else text = "backtest · connected";
+    } else if (mode === "REPLAY_TO_LIVE") {
+      if (phase === "live") text = "live · connected";
+      else if (phase === "replaying" || phase === "loading_history" || phase === "catching_up")
+        text = "replay · catching up";
+      else if (phase === "error") { text = "replay · error"; ok = false; }
+      else text = "replay · connected";
+    } else {
+      if (phase === "error") { text = "live · error"; ok = false; }
+      else text = "live · connected";
+    }
+    setStatus(text, ok);
   }
 
   function resize() {
@@ -256,9 +285,12 @@
   }
 
   function applyMarkers(markers) {
-    lastMarkers = dedupeMarkers(markers || []);
+    if (markers != null) {
+      lastMarkers = dedupeMarkers(markers || []);
+    }
     try {
-      candleSeries.setMarkers(lastMarkers);
+      // Historical event markers only — current horizontal levels stay via price lines.
+      candleSeries.setMarkers(showEvents ? lastMarkers : []);
     } catch (_) {}
   }
 
@@ -274,7 +306,11 @@
   }
 
   function applyPhase(msg) {
-    if (msg.phase && hudPhase) hudPhase.textContent = msg.phase;
+    if (msg.phase) {
+      lastPhase = msg.phase;
+      if (hudPhase) hudPhase.textContent = msg.phase;
+      refreshConnectionStatus();
+    }
     if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
     const p = msg.progress || {};
     const pct = p.pct != null ? Number(p.pct) : null;
@@ -327,8 +363,9 @@
     const url = `${proto}://${location.host}/ws`;
     setStatus("connecting…");
     ws = new WebSocket(url);
-    ws.onopen = () => setStatus("live · connected", true);
+    ws.onopen = () => { wsConnected = true; refreshConnectionStatus(); };
     ws.onclose = () => {
+      wsConnected = false;
       setStatus("disconnected — retrying", false);
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, 2000);
@@ -345,8 +382,10 @@
       switch (msg.type) {
         case "state_snapshot":
           applySnapshot(msg);
+          if (msg.mode) { currentMode = msg.mode; }
           applyPhase(msg);
-          if (msg.mode) { currentMode = msg.mode; syncModeUi(); }
+          syncModeUi();
+          refreshConnectionStatus();
           break;
         case "candle_update":
           if (msg.candle) candleSeries.update(msg.candle);
@@ -396,12 +435,14 @@
     document.querySelectorAll(".mode").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.mode === currentMode);
     });
-    const needStart = currentMode !== "LIVE";
+    // LIVE: no Start/End. REPLAY→LIVE: Start only. BACKTEST: Start + End.
+    const needStart = currentMode === "BACKTEST" || currentMode === "REPLAY_TO_LIVE";
     const needEnd = currentMode === "BACKTEST";
     document.getElementById("startWrap").hidden = !needStart;
     document.getElementById("endWrap").hidden = !needEnd;
     document.getElementById("applyBtn").textContent =
       currentMode === "LIVE" ? "Start LIVE" : currentMode === "BACKTEST" ? "Run BACKTEST" : "Start REPLAY→LIVE";
+    refreshConnectionStatus();
   }
 
   document.querySelectorAll(".mode").forEach((btn) => {
@@ -433,6 +474,13 @@
   });
 
   // patch message handler additions via replace of switch cases
+
+  if (showEventsEl) {
+    showEventsEl.addEventListener("change", () => {
+      showEvents = !!showEventsEl.checked;
+      applyMarkers(null); // re-render from lastMarkers
+    });
+  }
 
   connect();
 })();

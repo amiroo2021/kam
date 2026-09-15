@@ -68,3 +68,10 @@ html, body {
 }
 .hint { margin: 0 1rem 0.4rem; font-size: 0.75rem; color: var(--muted); }
 label.dt input { min-width: 11rem; }
+
+label.toggle {
+  display: flex; align-items: center; gap: 0.35rem;
+  font-size: 0.8rem; color: var(--muted); cursor: pointer;
+  user-select: none;
+}
+label.toggle input { accent-color: var(--accent); }

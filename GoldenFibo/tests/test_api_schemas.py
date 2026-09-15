@@ -92,3 +92,6 @@ def test_frontend_dedupes_equal_vwap_poc_and_p0_markers():
     assert "mergedTitle: \"POC\"" in js or 'mergedTitle: "POC"' in js
     assert "dedupeMarkers" in js
     assert "nearlyEqual" in js
+    assert "showEvents" in js
+    assert "refreshConnectionStatus" in js
+    assert "backtest · done" in js
