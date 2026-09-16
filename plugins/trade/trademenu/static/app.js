@@ -11,6 +11,7 @@
   const ordersBody = $("ordersBody");
   const suggestions = $("symbolSuggestions");
   const chartStatus = $("chartStatus");
+  const instrumentCandidatesEl = $("instrumentCandidates");
   const positionsStatus = $("positionsStatus");
   const ordersStatus = $("ordersStatus");
   const positionsUpdated = $("positionsUpdated");
@@ -693,12 +694,105 @@
     }
   }
 
+  function clearCandidatePicker() {
+    if (!instrumentCandidatesEl) return;
+    instrumentCandidatesEl.hidden = true;
+    instrumentCandidatesEl.innerHTML = "";
+  }
+
+  function fmtCandidatePrice(raw) {
+    if (raw == null || raw === "") return "—";
+    const n = Number(String(raw).replace(/,/g, ""));
+    if (!Number.isFinite(n)) return String(raw);
+    try {
+      return n.toLocaleString(undefined, { maximumFractionDigits: 8 });
+    } catch (_) {
+      return String(raw);
+    }
+  }
+
+  /**
+   * Ambiguous resolve UI — candidates come ONLY from TradeDesk/agent picker
+   * (same path as Telegram /trade). Click → activateInstrument(exact native).
+   */
+  function showCandidatePicker(query, candidates, { key } = {}) {
+    if (!instrumentCandidatesEl) return;
+    const list = Array.isArray(candidates) ? candidates.slice(0, 4) : [];
+    instrumentCandidatesEl.innerHTML = "";
+    if (!list.length) {
+      instrumentCandidatesEl.hidden = true;
+      return;
+    }
+    const label = document.createElement("div");
+    label.className = "cand-label";
+    const q = String(query || "").trim() || "symbol";
+    label.textContent = `Multiple instruments match “${q}”:`;
+    instrumentCandidatesEl.appendChild(label);
+
+    for (const c of list) {
+      if (!c || typeof c !== "object") continue;
+      const native = String(c.native_symbol || c.symbol || "").trim();
+      if (!native) continue;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "cand-chip";
+      btn.setAttribute("data-native", native);
+      const px = c.last_price != null ? c.last_price : c.price;
+      const name = document.createElement("span");
+      name.textContent = native;
+      btn.appendChild(name);
+      const priceEl = document.createElement("span");
+      priceEl.className = "cand-px";
+      priceEl.textContent = px != null && String(px).trim() !== "" ? fmtCandidatePrice(px) : "…";
+      btn.appendChild(priceEl);
+      btn.addEventListener("click", () => {
+        // Exact native only — same path as Positions/Orders click.
+        activateInstrument(native, native);
+      });
+      instrumentCandidatesEl.appendChild(btn);
+
+      // Independent best-effort quote fill if picker arrived without prices.
+      if ((px == null || String(px).trim() === "") && native) {
+        const snapKey = key || selectionKey();
+        const snapNative = native;
+        api(
+          `/api/quote?exchange=${encodeURIComponent(exchangeEl.value)}&account=${encodeURIComponent(accountEl.value)}&symbol=${encodeURIComponent(native)}`
+        )
+          .then(({ data }) => {
+            if (snapKey !== selectionKey()) return;
+            const p =
+              (data && (data.price || data.mark_price || (data.market_price && data.market_price.price))) ||
+              null;
+            if (p == null) {
+              priceEl.textContent = "—";
+              return;
+            }
+            // Ensure chip still targets same native.
+            if (btn.getAttribute("data-native") !== snapNative) return;
+            priceEl.textContent = fmtCandidatePrice(p);
+          })
+          .catch(() => {
+            if (snapKey !== selectionKey()) return;
+            if (btn.getAttribute("data-native") === snapNative) priceEl.textContent = "—";
+          });
+      }
+    }
+    instrumentCandidatesEl.hidden = false;
+    // Ambiguous = selection state, not a fatal chart error.
+    setLine(chartStatus, `Multiple instruments match “${q}” — select one`, "neutral");
+    nativeInstrument = null;
+    resolvedOk = false;
+    quoteFresh = false;
+    updateTradeEnablement("Select an instrument candidate");
+  }
+
   async function resolveSymbol() {
     const reqId = ++resolveReq;
     const key = selectionKey();
     const ex = exchangeEl.value;
     const acct = accountEl.value;
     const sym = (symbolEl.value || "BTCUSD").trim();
+    clearCandidatePicker();
     setLine(chartStatus, `Resolving ${sym}…`);
     const signal = abort("resolve");
     const { data } = await api(
@@ -711,12 +805,13 @@
     if (Array.isArray(data.candidates)) {
       for (const c of data.candidates) {
         const opt = document.createElement("option");
-        opt.value = c.symbol || c.display_name || "";
+        opt.value = c.native_symbol || c.symbol || c.display_name || "";
         suggestions.appendChild(opt);
       }
     }
 
     if (data.success && data.instrument && data.instrument.symbol) {
+      clearCandidatePicker();
       nativeInstrument = data.instrument.symbol;
       formatMeta = data.format_meta || null;
       resolvedOk = true;
@@ -727,12 +822,33 @@
       return nativeInstrument;
     }
 
+    // Ambiguous: same candidates Telegram /trade would show (priced via TradeDesk).
+    const status = String(data.status || "").toLowerCase();
+    const errCode = data.error && data.error.code;
+    const cands = Array.isArray(data.candidates) ? data.candidates : [];
+    if (
+      cands.length &&
+      (status === "ambiguous" ||
+        errCode === "INSTRUMENT_AMBIGUOUS" ||
+        /multiple instruments/i.test(String((data.error && data.error.message) || "")))
+    ) {
+      nativeInstrument = null;
+      formatMeta = null;
+      resolvedOk = false;
+      clearPositionLines();
+      nativeSym.textContent = data.display || `${sym} → multiple matches`;
+      showCandidatePicker(data.query || sym, cands, { key });
+      return null;
+    }
+
     nativeInstrument = null;
     formatMeta = null;
     resolvedOk = false;
     clearPositionLines();
+    clearCandidatePicker();
     nativeSym.textContent = data.display || `${sym} → unresolved`;
     setLine(chartStatus, (data.error && data.error.message) || "Instrument unresolved", "error");
+    updateTradeEnablement((data.error && data.error.message) || "Instrument unresolved");
     return null;
   }
 
@@ -745,12 +861,26 @@
     const tf = tfEl.value;
     // Invalidate previous instrument Last immediately so BTC cannot stick on ZEC.
     clearMarketState("Loading market data…");
+    clearCandidatePicker();
     try {
-      setLine(chartStatus, `Loading ${sym} ${tf} candles…`);
+      // Resolve first (shared TradeDesk path). Ambiguous → picker, no candle fetch.
+      setLine(chartStatus, `Resolving ${sym}…`);
+      const native = await resolveSymbol();
+      if (reqId !== chartReq || key !== selectionKey()) return;
+      if (!native) {
+        // Picker or hard failure already rendered by resolveSymbol.
+        candleCount.textContent = "0";
+        try {
+          candleSeries && candleSeries.setData([]);
+        } catch (_) {}
+        return;
+      }
+
+      setLine(chartStatus, `Loading ${native} ${tf} candles…`);
       const signal = abort("chart");
       const t0 = performance.now();
       const { data } = await api(
-        `/api/candles?exchange=${encodeURIComponent(ex)}&account=${encodeURIComponent(acct)}&symbol=${encodeURIComponent(sym)}&tf=${encodeURIComponent(tf)}`,
+        `/api/candles?exchange=${encodeURIComponent(ex)}&account=${encodeURIComponent(acct)}&symbol=${encodeURIComponent(native)}&tf=${encodeURIComponent(tf)}`,
         signal
       );
       if (reqId !== chartReq || key !== selectionKey()) return;
@@ -761,29 +891,25 @@
           applyPriceScaleAfterSetData([], { instrumentChanged: true });
         } catch (_) {}
         candleCount.textContent = "0";
-        // Do NOT wipe native identity just because candles failed — quote,
-        // overlays, and ticket still bind to the resolved instrument.
-        const failNative = data.native_symbol || null;
+        // Keep resolved native for quote/overlays/ticket even if candles fail.
+        const failNative = data.native_symbol || native || null;
         if (failNative) {
           nativeInstrument = failNative;
           resolvedOk = true;
           if (data.display) nativeSym.textContent = data.display;
           if (data.format_meta) formatMeta = data.format_meta;
-        } else {
-          // Resolve independently so overlays/quote can still attach.
-          const native = await resolveSymbol();
-          if (reqId !== chartReq || key !== selectionKey()) return;
-          if (!native) {
-            nativeSym.textContent = data.display || `${sym} → unresolved`;
-          }
         }
-        // Failed candle paint still advances rendered-native tracking when we
-        // know the target, so a later success treats it as same/new correctly.
         if (nativeInstrument) chartRenderedNative = nativeInstrument;
         const label = nativeInstrument || sym;
         const msg =
           (data.error && data.error.message) ||
           `Chart unavailable for ${label} on ${ex}`;
+        // Ambiguous should not reach here (resolve-first), but stay neutral if it does.
+        const code = data.error && data.error.code;
+        if (code === "INSTRUMENT_AMBIGUOUS" && Array.isArray(data.candidates) && data.candidates.length) {
+          showCandidatePicker(sym, data.candidates, { key });
+          return;
+        }
         setLine(chartStatus, `Chart unavailable for ${label} on ${ex}: ${msg}`, "error");
         updateTradeEnablement(msg);
         updateOverlay();
@@ -801,21 +927,18 @@
       }));
       formatMeta = data.format_meta || formatMeta;
       if (data.display) nativeSym.textContent = data.display;
-      nativeInstrument = data.native_symbol || nativeInstrument;
+      nativeInstrument = data.native_symbol || nativeInstrument || native;
       resolvedOk = true;
 
       const nextNative = nativeInstrument || data.native_symbol || "";
       const instrumentChanged = shouldResetPriceScale(chartRenderedNative, nextNative);
 
       try {
-        // REQUIRED order on instrument change:
-        //   clear overlays → (replace series) → setData(NEW) → autoscale → fit → new overlays
         clearPositionLines();
         clearLiveOrderLines();
         clearPreviewLines();
 
         if (instrumentChanged) {
-          // Fresh series drops any manually locked Y-axis from SP500/BTC/etc.
           replaceCandleSeries();
         }
 
@@ -835,7 +958,6 @@
         chartRenderedNative = nextNative || chartRenderedNative;
       } catch (_) {}
       candleCount.textContent = String(candles.length);
-      // Overlays ONLY after new data + scale reset (never leave SP500 lines on ETH).
       updateOverlay();
       updateTradeEnablement();
       const rMs = data.resolve_timing_ms && data.resolve_timing_ms.tradedesk_ms;
@@ -847,7 +969,6 @@
           "ok"
         );
       }
-      // Authoritative quote for Current button (may refine Last).
       loadQuote(true);
     } catch (e) {
       if (e.name === "AbortError") return;
@@ -1655,6 +1776,7 @@
     clearPositionLines();
     clearLiveOrderLines();
     clearPreviewLines();
+    clearCandidatePicker();
     invalidateTradePreview();
     // Drop previous instrument quote/chart immediately (BTC must not stick on ZEC).
     resolvedOk = false;

@@ -1067,49 +1067,21 @@ class TradeWizard:
         primary_native: Optional[str] = None,
         agent_candidates: Optional[List[Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Merge resolver primary + similar catalog hits, then attach prices."""
-        merged: List[Dict[str, Any]] = []
-        seen: set[str] = set()
+        """Delegate to shared picker (identical candidates for TradeMenu)."""
+        from plugins.trade.instrument_picker import (
+            INSTRUMENT_PICK_MAX_TELEGRAM,
+            build_priced_candidates,
+        )
 
-        def _push(sym: str, **extra: Any) -> None:
-            key = sym.upper()
-            if not sym or key in seen:
-                return
-            seen.add(key)
-            row = {"symbol": sym}
-            row.update({k: v for k, v in extra.items() if v is not None and v != ""})
-            merged.append(row)
-
-        if primary_native:
-            _push(str(primary_native).strip(), score=1000, primary=True)
-
-        for item in agent_candidates or []:
-            sym = self._candidate_symbol(item)
-            if not sym:
-                continue
-            extra: Dict[str, Any] = {}
-            if isinstance(item, dict):
-                if item.get("price") is not None:
-                    extra["price"] = item.get("price")
-                if item.get("display_name"):
-                    extra["display_name"] = item.get("display_name")
-            _push(sym, score=900, **extra)
-
-        if self._agent_supports_list_instruments(exchange):
-            catalog = self._call_list_instruments(exchange, account)
-            for ranked in self._rank_catalog_candidates(catalog, requested):
-                _push(
-                    str(ranked.get("symbol") or "").strip(),
-                    score=ranked.get("score"),
-                    display_name=ranked.get("display_name"),
-                    price=ranked.get("price"),
-                )
-
-        if not merged and primary_native:
-            _push(str(primary_native).strip(), score=1000, primary=True)
-
-        return self._enrich_candidate_prices(
-            exchange, account, merged, limit=_INSTRUMENT_PICK_MAX
+        return build_priced_candidates(
+            self._desk,
+            exchange,
+            account,
+            requested,
+            primary_native=primary_native,
+            agent_candidates=agent_candidates,
+            limit=INSTRUMENT_PICK_MAX_TELEGRAM,
+            capabilities=self._agent_capabilities(exchange),
         )
 
     def _instrument_button_label(self, entry: Dict[str, Any]) -> str:

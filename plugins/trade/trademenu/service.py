@@ -183,56 +183,47 @@ class TradeMenuService:
                 return cached
 
         t0 = time.perf_counter()
-        resp = self.desk.execute(
-            {
-                "operation": "resolve_instrument",
-                "exchange": exchange,
-                "account": account,
-                "symbol": requested,
-            }
+        # Shared picker path with Telegram /trade (same TradeDesk resolve +
+        # list_instruments rank + market_price enrichment).
+        from plugins.trade.instrument_picker import (
+            INSTRUMENT_PICK_MAX_TRADEMENU,
+            resolve_with_candidates,
+        )
+
+        picked = resolve_with_candidates(
+            self.desk,
+            exchange,
+            account,
+            requested,
+            limit=INSTRUMENT_PICK_MAX_TRADEMENU,
         )
         desk_ms = (time.perf_counter() - t0) * 1000.0
-        data: Dict[str, Any] = {
-            "success": bool(resp.success),
-            "exchange": exchange,
-            "account": account,
-            "requested_symbol": requested,
-            "cache_hit": False,
-            "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
-        }
-        if resp.instrument is not None:
-            inst = _to_plain(resp.instrument)
-            data["instrument"] = inst
-            payload_early = _to_plain(resp.data) if resp.data else None
-            native_from_data = None
-            if isinstance(payload_early, dict):
-                native_from_data = payload_early.get("native_symbol")
-            native = str(native_from_data or inst.get("symbol") or "").strip()
-            data["native_symbol"] = native or inst.get("symbol")
-            if native and inst.get("symbol") != native:
-                # Prefer full native id for candles/quotes when agent used a short display symbol.
-                inst = dict(inst)
+        data: Dict[str, Any] = dict(picked)
+        data["exchange"] = exchange
+        data["account"] = account
+        data["cache_hit"] = False
+        data["timing_ms"] = {"tradedesk_ms": round(desk_ms, 1)}
+
+        # Normalize unique success instrument + format_meta (legacy consumers).
+        if data.get("success") and data.get("native_symbol"):
+            inst = data.get("instrument") if isinstance(data.get("instrument"), dict) else {}
+            native = str(data.get("native_symbol") or inst.get("symbol") or "").strip()
+            if native:
+                inst = dict(inst or {})
                 inst["symbol"] = native
                 data["instrument"] = inst
-            data["display"] = f"{requested} → {inst.get('symbol')}"
-            meta = {
-                "price_increment": inst.get("price_increment") or inst.get("tick_size"),
-                "size_increment": inst.get("size_increment") or inst.get("lot_size"),
-                "price_decimals": inst.get("price_decimals"),
-                "size_decimals": inst.get("size_decimals") or inst.get("sz_decimals"),
-            }
-            data["format_meta"] = {k: v for k, v in meta.items() if v is not None}
-        payload = _to_plain(resp.data) if resp.data else None
-        if isinstance(payload, dict):
-            candidates = payload.get("candidates") or payload.get("instruments")
-            if candidates:
-                data["candidates"] = candidates
-            data["data"] = {k: v for k, v in payload.items() if k not in {"candidates", "instruments"}}
-        if resp.error is not None:
-            data["error"] = _to_plain(resp.error)
-            data["display"] = f"{requested} → unresolved"
-        if resp.success and data.get("native_symbol"):
+                data["display"] = data.get("display") or f"{requested} → {native}"
+                meta = data.get("format_meta") if isinstance(data.get("format_meta"), dict) else {}
+                if not meta:
+                    meta = {
+                        "price_increment": inst.get("price_increment") or inst.get("tick_size"),
+                        "size_increment": inst.get("size_increment") or inst.get("lot_size"),
+                        "price_decimals": inst.get("price_decimals"),
+                        "size_decimals": inst.get("size_decimals") or inst.get("sz_decimals"),
+                    }
+                    data["format_meta"] = {k: v for k, v in meta.items() if v is not None}
             with self._lock:
+                # Only cache unique resolved natives — never cache ambiguity.
                 self._resolve_cache[cache_key] = (now + self.resolve_cache_ttl, dict(data))
         return data
 
