@@ -101,33 +101,75 @@
   async function api(path, signal, opts) {
     const headers = Object.assign({}, (opts && opts.headers) || {});
     const method = (opts && opts.method) || "GET";
-    if (method !== "GET") {
-      headers["Content-Type"] = "application/json";
-      headers["X-CSRF-Token"] = csrfToken || cookie("trademenu_csrf") || "";
+    if (method !== "GET" && method !== "HEAD") {
+      headers["Content-Type"] = headers["Content-Type"] || "application/json";
+      if (!headers["X-CSRF-Token"]) {
+        headers["X-CSRF-Token"] = csrfToken || readCsrfCookie() || "";
+      }
     }
     const res = await fetch(path, {
       credentials: "same-origin",
       signal,
       method,
       headers,
-      body: opts && opts.body != null ? JSON.stringify(opts.body) : undefined,
+      body: opts && opts.body != null ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : undefined,
     });
     if (res.status === 401) {
       window.location.href = "/login";
       throw new Error("unauthorized");
     }
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     return { res, data };
   }
 
-  async function ensureCsrf() {
-    try {
-      const { data } = await api("/api/session");
-      if (data && data.csrf) csrfToken = data.csrf;
-      else csrfToken = cookie("trademenu_csrf") || csrfToken;
-    } catch (_) {
-      csrfToken = cookie("trademenu_csrf") || csrfToken;
+  function readCsrfCookie() {
+    const raw = cookie("trademenu_csrf");
+    if (!raw) return "";
+    return raw.replace(/^"|"$/g, "").trim();
+  }
+
+  async function ensureCsrf(force) {
+    if (!force && csrfToken) return csrfToken;
+    const { res, data } = await api("/api/session");
+    if (res.status === 401) throw new Error("unauthorized");
+    const token = (data && data.csrf) || readCsrfCookie() || "";
+    if (!token) {
+      throw new Error("CSRF token unavailable. Please reload or log in again.");
     }
+    csrfToken = token;
+    return csrfToken;
+  }
+
+  /**
+   * Single authenticated write helper for ALL TradeMenu POST mutations.
+   * Always refreshes CSRF from /api/session before the write (session binding).
+   * Does NOT auto-retry after a write may have reached the handler (no double trade).
+   */
+  async function apiPost(path, payload, signal) {
+    const token = await ensureCsrf(true);
+    const { res, data } = await api(path, signal, {
+      method: "POST",
+      headers: { "X-CSRF-Token": token },
+      body: payload || {},
+    });
+    // Stale CSRF cookie/session (not "maybe executed"): one safe refresh + single retry.
+    if (res.status === 403 && data && data.error && data.error.code === "CSRF_FAILED") {
+      csrfToken = "";
+      const token2 = await ensureCsrf(true);
+      if (token2 && token2 !== token) {
+        return api(path, signal, {
+          method: "POST",
+          headers: { "X-CSRF-Token": token2 },
+          body: payload || {},
+        });
+      }
+    }
+    if (res.status === 403 && data && data.error && data.error.code === "CSRF_SESSION_STALE") {
+      csrfToken = "";
+      await ensureCsrf(true);
+      throw new Error((data.error && data.error.message) || "Session expired. Please retry once.");
+    }
+    return { res, data };
   }
 
   function clearPositionLines() {
@@ -375,12 +417,15 @@
     modalConfirm.disabled = false;
     modalConfirm.textContent = cfg.confirmLabel || "Confirm";
     modalConfirm.className = cfg.danger ? "btn-danger" : "";
+    modalCancel.disabled = false;
     modalCancel.textContent = cfg.cancelLabel || "Cancel";
+    // Prefetch CSRF while the user fills the modal (avoids empty token on submit).
+    ensureCsrf(true).catch(() => {});
     if (cfg.input != null) {
       modalFields.hidden = false;
       $("modalFieldLabel").firstChild.textContent = cfg.inputLabel || "New value";
       modalInput.value = cfg.input === true ? "" : String(cfg.input);
-      modalInput.focus();
+      setTimeout(() => modalInput.focus(), 0);
     } else {
       modalFields.hidden = true;
       modalInput.value = "";
@@ -396,11 +441,12 @@
 
   async function runWrite(path, body, selSnapshot) {
     showToast("Processing…", "busy");
-    const { data } = await api(path, undefined, { method: "POST", body });
+    const { data, res } = await apiPost(path, body);
     if (selSnapshot && selSnapshot !== accountKey()) {
       showToast("Stale response ignored (selection changed).", "error");
       return null;
     }
+    if (res && res.status === 401) throw new Error("unauthorized");
     return data;
   }
 
@@ -540,15 +586,24 @@
   });
   modalConfirm.addEventListener("click", async () => {
     if (!modalState || !modalState.onConfirm) return;
+    if (modalConfirm.disabled) return;
     modalError.hidden = true;
+    modalError.textContent = "";
+    const prevLabel = modalState.confirmLabel || "Confirm";
+    modalConfirm.disabled = true;
+    modalConfirm.textContent = "Processing…";
     try {
       const price = modalFields.hidden ? undefined : (modalInput.value || "").trim();
       const result = await modalState.onConfirm(price);
-      if (result && result.aborted) return;
+      if (result && result.aborted) {
+        modalConfirm.disabled = false;
+        modalConfirm.textContent = prevLabel;
+        return;
+      }
       closeModal();
     } catch (e) {
       modalConfirm.disabled = false;
-      modalConfirm.textContent = modalState.confirmLabel || "Confirm";
+      modalConfirm.textContent = prevLabel;
       modalError.hidden = false;
       modalError.textContent = String(e.message || e);
       showToast(String(e.message || e), "error");

@@ -63,10 +63,35 @@ def create_app(
         return "unknown"
 
     def _session_token(request: Request) -> Optional[str]:
-        return request.cookies.get(cfg.cookie_name)
+        raw = request.cookies.get(cfg.cookie_name)
+        if not raw:
+            return None
+        # Browsers/jars may preserve optional quotes around cookie values.
+        return raw.strip().strip('"')
 
     def _authenticated(request: Request) -> bool:
         return sessions.verify(_session_token(request))
+
+    def _set_session_cookies(resp: Response, token: str, csrf: str) -> None:
+        resp.set_cookie(
+            key=cfg.cookie_name,
+            value=token,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            max_age=cfg.session_max_age_seconds,
+            path="/",
+        )
+        # Readable by JS for double-submit CSRF header (not HttpOnly).
+        resp.set_cookie(
+            key="trademenu_csrf",
+            value=csrf,
+            httponly=False,
+            samesite="lax",
+            secure=False,
+            max_age=cfg.session_max_age_seconds,
+            path="/",
+        )
 
     def _require_auth(request: Request) -> Optional[JSONResponse]:
         if _authenticated(request):
@@ -82,6 +107,18 @@ def create_app(
             return denied
         token = _session_token(request)
         provided = request.headers.get("x-csrf-token") or request.headers.get("X-CSRF-Token")
+        if not sessions.csrf_of(token):
+            # Pre-CSRF or rotated-out session: force re-login rather than silent fail.
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "CSRF_SESSION_STALE",
+                        "message": "Session is missing CSRF binding. Please log in again.",
+                    },
+                },
+                status_code=403,
+            )
         if not sessions.csrf_ok(token, provided):
             return JSONResponse(
                 {"success": False, "error": {"code": "CSRF_FAILED", "message": "Invalid or missing CSRF token."}},
@@ -116,7 +153,14 @@ def create_app(
     def _app_page() -> HTMLResponse:
         path = STATIC_DIR / "index.html"
         if path.is_file():
-            return HTMLResponse(path.read_text(encoding="utf-8"))
+            html_body = path.read_text(encoding="utf-8")
+            # Cache-bust static assets so CSRF/write JS cannot lag the backend.
+            ver = str(int((STATIC_DIR / "app.js").stat().st_mtime) if (STATIC_DIR / "app.js").is_file() else 1)
+            html_body = html_body.replace("/static/app.js", f"/static/app.js?v={ver}")
+            html_body = html_body.replace("/static/style.css", f"/static/style.css?v={ver}")
+            resp = HTMLResponse(html_body)
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            return resp
         return HTMLResponse("<h1>TradeMenu</h1><p>Static UI missing.</p>", status_code=500)
 
     @app.get("/", response_class=HTMLResponse)
@@ -144,25 +188,7 @@ def create_app(
         limiter.record_success(key)
         token, csrf = sessions.issue()
         resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie(
-            key=cfg.cookie_name,
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=cfg.session_max_age_seconds,
-            path="/",
-        )
-        # Readable by JS for double-submit CSRF header (not HttpOnly).
-        resp.set_cookie(
-            key="trademenu_csrf",
-            value=csrf,
-            httponly=False,
-            samesite="lax",
-            secure=False,
-            max_age=cfg.session_max_age_seconds,
-            path="/",
-        )
+        _set_session_cookies(resp, token, csrf)
         return resp
 
     @app.post("/logout")
@@ -177,12 +203,20 @@ def create_app(
         return {"ok": True, "service": "trademenu", "phase": 2}
 
     @app.get("/api/session")
-    async def api_session(request: Request) -> JSONResponse:
+    async def api_session(request: Request) -> Response:
         denied = _require_auth(request)
         if denied:
             return denied
-        csrf = sessions.csrf_of(_session_token(request))
-        return JSONResponse({"success": True, "authenticated": True, "csrf": csrf})
+        token = _session_token(request)
+        csrf = sessions.csrf_of(token)
+        # Upgrade legacy sessions (valid auth cookie but no csrf claim) in place.
+        if not csrf:
+            token, csrf = sessions.issue()
+            body = {"success": True, "authenticated": True, "csrf": csrf, "rotated": True}
+            resp = JSONResponse(body)
+            _set_session_cookies(resp, token, csrf)
+            return resp
+        return JSONResponse({"success": True, "authenticated": True, "csrf": csrf, "rotated": False})
 
     @app.get("/api/exchanges")
     async def api_exchanges(request: Request) -> JSONResponse:

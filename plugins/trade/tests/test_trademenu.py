@@ -372,7 +372,17 @@ class TradeMenuApiTests(unittest.TestCase):
     def _csrf(self) -> str:
         r = self.client.get("/api/session")
         self.assertEqual(r.status_code, 200)
-        return str(r.json().get("csrf") or "")
+        csrf = str(r.json().get("csrf") or "")
+        self.assertTrue(csrf)
+        return csrf
+
+    def test_write_unauthenticated_rejected(self) -> None:
+        self.client.cookies.clear()
+        r = self.client.post(
+            "/api/position/set_sl",
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "74000"},
+        )
+        self.assertEqual(r.status_code, 401)
 
     def test_write_requires_csrf(self) -> None:
         self._login()
@@ -381,11 +391,23 @@ class TradeMenuApiTests(unittest.TestCase):
             json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "76000"},
         )
         self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "CSRF_FAILED")
+
+    def test_write_wrong_csrf_rejected(self) -> None:
+        self._login()
+        r = self.client.post(
+            "/api/position/set_sl",
+            headers={"X-CSRF-Token": "definitely-not-the-real-token-value"},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "74000"},
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "CSRF_FAILED")
 
     def test_set_tp_via_tradedesk(self) -> None:
         self._login()
         csrf = self._csrf()
         desk = self.service.desk  # type: ignore[attr-defined]
+        before = len(desk.calls)
         r = self.client.post(
             "/api/position/set_tp",
             headers={"X-CSRF-Token": csrf},
@@ -393,11 +415,46 @@ class TradeMenuApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["success"])
-        self.assertTrue(any(c.get("operation") == "set_tp" and c.get("price") == "76000" for c in desk.calls))
+        tp_calls = [c for c in desk.calls[before:] if c.get("operation") == "set_tp"]
+        self.assertEqual(len(tp_calls), 1)
+        self.assertEqual(tp_calls[0].get("price"), "76000")
+
+    def test_set_sl_via_tradedesk(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        desk = self.service.desk  # type: ignore[attr-defined]
+        before = len(desk.calls)
+        r = self.client.post(
+            "/api/position/set_sl",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "74000"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["success"])
+        sl_calls = [c for c in desk.calls[before:] if c.get("operation") == "set_sl"]
+        self.assertEqual(len(sl_calls), 1)
+        self.assertEqual(sl_calls[0].get("symbol"), "BTC")
+        self.assertEqual(sl_calls[0].get("price"), "74000")
+
+    def test_close_position_via_tradedesk(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        desk = self.service.desk  # type: ignore[attr-defined]
+        before = len(desk.calls)
+        r = self.client.post(
+            "/api/position/close",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["success"])
+        self.assertEqual(sum(1 for c in desk.calls[before:] if c.get("operation") == "close_position"), 1)
 
     def test_cancel_group_partial_message(self) -> None:
         self._login()
         csrf = self._csrf()
+        desk = self.service.desk  # type: ignore[attr-defined]
+        before = len(desk.calls)
         r = self.client.post(
             "/api/orders/cancel_group",
             headers={"X-CSRF-Token": csrf},
@@ -408,6 +465,7 @@ class TradeMenuApiTests(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertTrue(body.get("partial"))
         self.assertIn("11/12", body.get("message") or "")
+        self.assertEqual(sum(1 for c in desk.calls[before:] if c.get("operation") == "cancel_order_group"), 1)
 
     def test_write_rejects_unknown_account(self) -> None:
         self._login()
@@ -419,6 +477,53 @@ class TradeMenuApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["code"], "UNKNOWN_ACCOUNT")
+
+    def test_logout_blocks_writes(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        self.client.post("/logout", follow_redirects=False)
+        self.client.cookies.clear()
+        r = self.client.post(
+            "/api/position/set_sl",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "74000"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_session_rotates_legacy_without_csrf_claim(self) -> None:
+        """Sessions issued before CSRF still authenticate; /api/session upgrades them."""
+        sm = SessionManager(self.cfg)
+        # Craft a valid session payload WITHOUT csrf (legacy).
+        import base64, hashlib, hmac, json, time
+
+        payload = {"sub": "operator", "iat": int(time.time()), "exp": int(time.time()) + 3600}
+        body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+        sig = hmac.new(self.cfg.session_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        legacy = f"{body}.{sig}"
+        self.assertTrue(sm.verify(legacy))
+        self.assertIsNone(sm.csrf_of(legacy))
+        self.client.cookies.set(self.cfg.cookie_name, legacy)
+        r = self.client.get("/api/session")
+        self.assertEqual(r.status_code, 200)
+        body_j = r.json()
+        self.assertTrue(body_j["success"])
+        self.assertTrue(body_j.get("csrf"))
+        self.assertTrue(body_j.get("rotated"))
+        # Follow-up write with rotated csrf must pass CSRF gate (FakeDesk).
+        csrf = body_j["csrf"]
+        r2 = self.client.post(
+            "/api/position/set_sl",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "74000"},
+        )
+        self.assertEqual(r2.status_code, 200, r2.text)
+
+    def test_app_page_cache_busts_static(self) -> None:
+        self._login()
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("/static/app.js?v=", r.text)
+        self.assertIn("no-store", r.headers.get("cache-control", "").lower())
 
     def test_format_price_helper(self) -> None:
         from plugins.trade.trademenu.formatting import format_price, format_size, format_pnl

@@ -117,7 +117,13 @@ class SessionManager:
         expected = self.csrf_of(token)
         if not expected or not provided:
             return False
-        return hmac.compare_digest(expected, str(provided))
+        got = str(provided).strip()
+        if not got:
+            return False
+        # compare_digest requires equal length; unequal ⇒ mismatch (never raise).
+        if len(got) != len(expected):
+            return False
+        return hmac.compare_digest(expected, got)
 
     def password_ok(self, candidate: str) -> bool:
         # Constant-time compare against configured password.
