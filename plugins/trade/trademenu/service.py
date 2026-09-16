@@ -186,7 +186,7 @@ class TradeMenuService:
         # Shared picker path with Telegram /trade (same TradeDesk resolve +
         # list_instruments rank + market_price enrichment).
         from plugins.trade.instrument_picker import (
-            INSTRUMENT_PICK_MAX_TRADEMENU,
+            INSTRUMENT_PICK_MAX,
             resolve_with_candidates,
         )
 
@@ -195,7 +195,7 @@ class TradeMenuService:
             exchange,
             account,
             requested,
-            limit=INSTRUMENT_PICK_MAX_TRADEMENU,
+            limit=INSTRUMENT_PICK_MAX,
         )
         desk_ms = (time.perf_counter() - t0) * 1000.0
         data: Dict[str, Any] = dict(picked)

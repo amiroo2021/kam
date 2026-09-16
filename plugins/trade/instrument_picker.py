@@ -15,9 +15,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Telegram uses 5; TradeMenu UI shows up to 4 compact chips.
-INSTRUMENT_PICK_MAX_TELEGRAM = 5
-INSTRUMENT_PICK_MAX_TRADEMENU = 4
+# Single shared safety cap for Telegram /trade and TradeMenu candidate chips.
+# Must stay identical so both surfaces show the same native list (e.g. silver → 5).
+INSTRUMENT_PICK_MAX = 5
+# Back-compat aliases (same value — never diverge).
+INSTRUMENT_PICK_MAX_TELEGRAM = INSTRUMENT_PICK_MAX
+INSTRUMENT_PICK_MAX_TRADEMENU = INSTRUMENT_PICK_MAX
 
 _CONCEPT_GROUPS: Tuple[frozenset, ...] = (
     frozenset({"GOLD", "XAU", "XAUUSD", "XAUUSDT", "XAUUST"}),
@@ -398,7 +401,7 @@ def resolve_with_candidates(
     account: str,
     symbol: str,
     *,
-    limit: int = INSTRUMENT_PICK_MAX_TRADEMENU,
+    limit: int = INSTRUMENT_PICK_MAX,
 ) -> Dict[str, Any]:
     """One-shot resolve for TradeMenu: unique | ambiguous (priced) | not found.
 

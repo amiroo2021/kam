@@ -717,7 +717,7 @@
    */
   function showCandidatePicker(query, candidates, { key } = {}) {
     if (!instrumentCandidatesEl) return;
-    const list = Array.isArray(candidates) ? candidates.slice(0, 4) : [];
+    const list = Array.isArray(candidates) ? candidates.slice() : [];
     instrumentCandidatesEl.innerHTML = "";
     if (!list.length) {
       instrumentCandidatesEl.hidden = true;

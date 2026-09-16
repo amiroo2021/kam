@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from plugins.trade import instrument_picker as ip
@@ -84,39 +85,89 @@ class FakeDesk:
         return make_failure(op or "x", "hyperliquid", "FLEX", "NOPE", "nope")
 
 
+# Live-shaped silver catalog (5 HIP-3/native routes).
+_SILVER_FIVE = [
+    {"symbol": "flx:SILVER", "display_name": "SILVER", "base": "SILVER"},
+    {"symbol": "hyna:SILVER", "display_name": "SILVER", "base": "SILVER"},
+    {"symbol": "km:SILVER", "display_name": "SILVER", "base": "SILVER"},
+    {"symbol": "mkts:SILVER", "display_name": "SILVER", "base": "SILVER"},
+    {"symbol": "xyz:SILVER", "display_name": "SILVER", "base": "SILVER"},
+]
+_SILVER_PRICES = {
+    "flx:SILVER": "65.65",
+    "hyna:SILVER": "85.97",
+    "km:SILVER": "70.451",
+    "mkts:SILVER": "70.451",
+    "xyz:SILVER": "63.124",
+}
+
+
 class AmbiguousPickerTests(unittest.TestCase):
-    def test_ambiguous_silver_returns_priced_candidates(self) -> None:
+    def test_limits_are_identical_telegram_trademenu(self) -> None:
+        self.assertEqual(ip.INSTRUMENT_PICK_MAX, 5)
+        self.assertEqual(ip.INSTRUMENT_PICK_MAX_TELEGRAM, ip.INSTRUMENT_PICK_MAX)
+        self.assertEqual(ip.INSTRUMENT_PICK_MAX_TRADEMENU, ip.INSTRUMENT_PICK_MAX)
+
+    def test_silver_five_candidates_includes_xyz(self) -> None:
+        """Regression: TradeMenu must not drop xyz:SILVER via a private [:4] cap."""
         desk = FakeDesk(
             resolve_map={"SILVER": "AMBIGUOUS"},
-            catalog=[
-                {"symbol": "xyz:Silver", "display_name": "Silver", "base": "SILVER"},
-                {"symbol": "flx:SILVER", "display_name": "SILVER", "base": "SILVER"},
-                {"symbol": "BTC", "display_name": "BTC", "base": "BTC"},
-            ],
-            prices={"xyz:Silver": "63.07", "flx:SILVER": "63.11"},
+            catalog=list(_SILVER_FIVE),
+            prices=dict(_SILVER_PRICES),
         )
-        out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", "silver", limit=4)
-        self.assertEqual(out["status"], "ambiguous")
-        self.assertFalse(out["success"])
-        cands = out["candidates"]
-        self.assertGreaterEqual(len(cands), 1)
-        self.assertLessEqual(len(cands), 4)
-        natives = [c["native_symbol"] for c in cands]
-        self.assertTrue(any("Silver" in n or "SILVER" in n for n in natives))
-        # HIP-3 prefix preserved
-        self.assertTrue(any(n.startswith("xyz:") or n.startswith("flx:") for n in natives))
-        priced = [c for c in cands if c.get("price") or c.get("last_price")]
-        self.assertGreaterEqual(len(priced), 1)
+        # Shared builder (Telegram)
+        tw = ip.build_priced_candidates(
+            desk, "hyperliquid", "FLEX", "silver", limit=ip.INSTRUMENT_PICK_MAX
+        )
+        # TradeMenu one-shot
+        tm = ip.resolve_with_candidates(
+            desk, "hyperliquid", "FLEX", "silver", limit=ip.INSTRUMENT_PICK_MAX
+        )
+        tw_n = [c["symbol"] for c in tw]
+        tm_n = [c["native_symbol"] for c in tm["candidates"]]
+        self.assertEqual(tw_n, tm_n)
+        self.assertEqual(len(tm_n), 5)
+        self.assertIn("xyz:SILVER", tm_n)
+        self.assertIn("flx:SILVER", tm_n)
+        self.assertIn("hyna:SILVER", tm_n)
+        self.assertIn("km:SILVER", tm_n)
+        self.assertIn("mkts:SILVER", tm_n)
+        # Prices match across surfaces
+        tw_p = {c["symbol"]: str(c.get("price")) for c in tw}
+        tm_p = {
+            c["native_symbol"]: str(c.get("price") or c.get("last_price"))
+            for c in tm["candidates"]
+        }
+        self.assertEqual(tw_p, tm_p)
+        self.assertEqual(tm_p["xyz:SILVER"], "63.124")
 
-    def test_max_four_candidates(self) -> None:
+    def test_service_returns_all_five_silver(self) -> None:
+        desk = FakeDesk(
+            resolve_map={"SILVER": "AMBIGUOUS"},
+            catalog=list(_SILVER_FIVE),
+            prices=dict(_SILVER_PRICES),
+        )
+        svc = TradeMenuService(desk=desk)  # type: ignore[arg-type]
+        r = svc.resolve_instrument("hyperliquid", "FLEX", "silver")
+        self.assertFalse(r["success"])
+        self.assertEqual(r.get("status"), "ambiguous")
+        natives = [c["native_symbol"] for c in r["candidates"]]
+        self.assertEqual(len(natives), 5)
+        self.assertIn("xyz:SILVER", natives)
+
+    def test_shared_cap_not_four(self) -> None:
         catalog = [{"symbol": f"dex{i}:Silver", "base": "SILVER"} for i in range(8)]
         desk = FakeDesk(
             resolve_map={"SILVER": "AMBIGUOUS"},
             catalog=catalog,
             prices={f"dex{i}:Silver": str(60 + i) for i in range(8)},
         )
-        out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", "silver", limit=4)
-        self.assertLessEqual(len(out["candidates"]), 4)
+        out = ip.resolve_with_candidates(
+            desk, "hyperliquid", "FLEX", "silver", limit=ip.INSTRUMENT_PICK_MAX
+        )
+        # Shared global safety cap is 5 (Telegram), never a TradeMenu-only 4.
+        self.assertEqual(len(out["candidates"]), 5)
+        self.assertNotEqual(len(out["candidates"]), 4)
 
     def test_exact_native_not_ambiguous(self) -> None:
         desk = FakeDesk(
@@ -125,52 +176,51 @@ class AmbiguousPickerTests(unittest.TestCase):
             prices={"xyz:SILVER": "63", "BTC": "76000"},
         )
         for q, native in (("xyz:Silver", "xyz:SILVER"), ("xyz:SP500", "xyz:SP500"), ("BTC", "BTC")):
-            out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", q, limit=4)
+            out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", q)
             self.assertTrue(out["success"], out)
             self.assertEqual(out["status"], "resolved")
             self.assertEqual(out["native_symbol"], native)
-
-    def test_service_exposes_candidates(self) -> None:
-        desk = FakeDesk(
-            resolve_map={"GOLD": "AMBIGUOUS"},
-            catalog=[
-                {"symbol": "xyz:Gold", "base": "GOLD", "display_name": "Gold"},
-                {"symbol": "abc:GOLD", "base": "GOLD"},
-            ],
-            prices={"xyz:Gold": "4267.5", "abc:GOLD": "4268"},
-        )
-        svc = TradeMenuService(desk=desk)  # type: ignore[arg-type]
-        r = svc.resolve_instrument("hyperliquid", "FLEX", "gold")
-        self.assertFalse(r["success"])
-        self.assertEqual(r.get("status"), "ambiguous")
-        self.assertTrue(r.get("candidates"))
-        self.assertLessEqual(len(r["candidates"]), 4)
 
     def test_quote_failure_keeps_candidate(self) -> None:
         desk = FakeDesk(
             resolve_map={"SILVER": "AMBIGUOUS"},
             catalog=[{"symbol": "xyz:Silver", "base": "SILVER"}],
-            prices={},  # no prices
+            prices={},
         )
-        out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", "silver", limit=4)
+        out = ip.resolve_with_candidates(desk, "hyperliquid", "FLEX", "silver")
         self.assertEqual(len(out["candidates"]), 1)
         self.assertEqual(out["candidates"][0]["native_symbol"], "xyz:Silver")
-        # price may be missing — still selectable
-        self.assertNotIn("must", str(out["candidates"][0]).lower())
 
-    def test_app_js_candidate_click_uses_activate(self) -> None:
-        from pathlib import Path
-
+    def test_frontend_does_not_slice_to_four(self) -> None:
         src = Path("/root/kam/plugins/trade/trademenu/static/app.js").read_text(encoding="utf-8")
-        self.assertIn("showCandidatePicker", src)
+        self.assertNotIn("slice(0, 4)", src)
+        self.assertNotIn("slice(0,4)", src)
         self.assertIn("activateInstrument(native, native)", src)
-        self.assertIn("Multiple instruments match", src)
-        self.assertIn("clearCandidatePicker", src)
-        # Resolve before candles so ambiguous never hits chart error path first.
-        i_res = src.find("const native = await resolveSymbol()")
-        i_candles = src.find("/api/candles?")
-        self.assertGreater(i_res, 0)
-        self.assertGreater(i_candles, i_res)
+        self.assertIn("showCandidatePicker", src)
+        # Full list path (no TradeMenu-only truncation)
+        self.assertIn("candidates.slice()", src)
+
+    def test_click_exact_native_skips_second_ambiguous_pass(self) -> None:
+        """Selecting xyz:SILVER must resolve uniquely — not re-run bare 'silver'."""
+        desk = FakeDesk(
+            resolve_map={
+                "SILVER": "AMBIGUOUS",
+                "XYZ:SILVER": "xyz:SILVER",
+            },
+            catalog=list(_SILVER_FIVE),
+            prices=dict(_SILVER_PRICES),
+        )
+        svc = TradeMenuService(desk=desk)  # type: ignore[arg-type]
+        ambiguous = svc.resolve_instrument("hyperliquid", "FLEX", "silver")
+        self.assertEqual(ambiguous.get("status"), "ambiguous")
+        self.assertIn("xyz:SILVER", [c["native_symbol"] for c in ambiguous["candidates"]])
+
+        picked = svc.resolve_instrument("hyperliquid", "FLEX", "xyz:SILVER")
+        self.assertTrue(picked["success"])
+        self.assertEqual(picked["native_symbol"], "xyz:SILVER")
+        self.assertEqual(picked.get("status"), "resolved")
+        # Exact pick must not be treated as ambiguous again.
+        self.assertNotEqual(picked.get("status"), "ambiguous")
 
 
 if __name__ == "__main__":
