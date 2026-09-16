@@ -9,12 +9,13 @@
 </head>
 <body>
   <div class="shell">
-    <header class="topbar">
+    <header class="topbar sticky-top">
       <div class="brand">TradeMenu</div>
+      <div id="actionToast" class="toast" hidden></div>
       <form method="post" action="/logout"><button type="submit">Logout</button></form>
     </header>
 
-    <section class="controls">
+    <section class="controls sticky-controls">
       <label>Exchange
         <select id="exchange"></select>
       </label>
@@ -36,10 +37,10 @@
           <option value="1D">1D</option>
         </select>
       </label>
-      <label>&nbsp;<button type="button" id="reloadBtn">Reload</button></label>
+      <label>&nbsp;<button type="button" id="reloadBtn">Reload all</button></label>
     </section>
 
-    <div>
+    <div class="main">
       <div class="meta">
         <span>Native <strong id="nativeSym">—</strong></span>
         <span>Last <strong id="lastPrice">—</strong></span>
@@ -51,53 +52,80 @@
       <div class="tabs" role="tablist">
         <button type="button" class="tab active" id="tabPositions" data-tab="positions" role="tab" aria-selected="true">Positions</button>
         <button type="button" class="tab" id="tabOrders" data-tab="orders" role="tab" aria-selected="false">Orders</button>
+        <button type="button" class="tab-refresh" id="refreshPanelBtn" title="Refresh panel">↻</button>
       </div>
 
       <section class="panel" id="panelPositions">
-        <div id="positionsStatus" class="status-line">Positions idle</div>
+        <div class="panel-meta">
+          <span id="positionsStatus" class="status-line">Positions idle</span>
+          <span id="positionsUpdated" class="updated">Last updated: —</span>
+        </div>
         <div class="positions">
           <table>
             <thead>
               <tr>
                 <th>Symbol</th>
                 <th>Side</th>
-                <th>Size</th>
-                <th>Entry</th>
-                <th>Mark</th>
-                <th>PnL</th>
-                <th>SL</th>
-                <th>TP</th>
+                <th class="num">Size</th>
+                <th class="num">Entry</th>
+                <th class="num">Mark</th>
+                <th class="num">PnL</th>
+                <th class="num">SL</th>
+                <th class="num">TP</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="positionsBody">
-              <tr><td colspan="8">—</td></tr>
+              <tr><td colspan="9">—</td></tr>
             </tbody>
           </table>
         </div>
       </section>
 
       <section class="panel" id="panelOrders" hidden>
-        <div id="ordersStatus" class="status-line">Orders idle</div>
+        <div class="panel-meta">
+          <span id="ordersStatus" class="status-line">Orders idle</span>
+          <span id="ordersUpdated" class="updated">Last updated: —</span>
+        </div>
         <div class="positions">
           <table>
             <thead>
               <tr>
                 <th>Symbol</th>
                 <th>Side / Type</th>
-                <th>Orders</th>
-                <th>Total Volume</th>
-                <th>Price Range</th>
-                <th>VWAP</th>
+                <th class="num">Orders</th>
+                <th class="num">Total Volume</th>
+                <th class="num">Price Range</th>
+                <th class="num">VWAP</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="ordersBody">
-              <tr><td colspan="6">—</td></tr>
+              <tr><td colspan="7">—</td></tr>
             </tbody>
           </table>
         </div>
       </section>
     </div>
   </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <h2 id="modalTitle">Action</h2>
+      <p id="modalBody" class="modal-body"></p>
+      <div id="modalFields" class="modal-fields" hidden>
+        <label id="modalFieldLabel">New value
+          <input id="modalInput" type="text" inputmode="decimal" autocomplete="off" />
+        </label>
+      </div>
+      <p id="modalError" class="error" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="modalCancel">Cancel</button>
+        <button type="button" class="btn-danger" id="modalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

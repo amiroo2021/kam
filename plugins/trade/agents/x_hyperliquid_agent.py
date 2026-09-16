@@ -89,6 +89,8 @@ _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # ``_build_exchange_client`` so order/close construction stays hermetic and
 # unit tests never require live connectivity.
 _perp_dex_names_cache: Optional[List[str]] = None
+_perp_market_candidates_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+_PERP_MARKET_CANDIDATES_TTL_SECONDS = 60.0
 
 # Preflight heuristic: a valid Hyperliquid wallet address is a 0x-prefixed
 # 40-char hex string. We don't strictly validate the checksum — the API
@@ -546,6 +548,12 @@ def _cached_perp_dex_names() -> List[str]:
 
 
 def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
+    global _perp_market_candidates_cache
+    now = time.time()
+    if _perp_market_candidates_cache is not None:
+        cached_at, cached = _perp_market_candidates_cache
+        if now - cached_at < _PERP_MARKET_CANDIDATES_TTL_SECONDS and cached:
+            return [dict(item) for item in cached]
     candidates: List[Dict[str, Any]] = []
     for dex_index, dex in enumerate(_fetch_perp_dex_names()):
         payload: Dict[str, Any] = {"type": "metaAndAssetCtxs"}
@@ -601,7 +609,8 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                     "mark_price": _decimal_text(mark) if mark is not None else None,
                 }
             )
-    return candidates
+    _perp_market_candidates_cache = (now, [dict(item) for item in candidates])
+    return [dict(item) for item in candidates]
 
 
 def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:

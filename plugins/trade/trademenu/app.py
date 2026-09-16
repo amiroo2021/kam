@@ -1,13 +1,13 @@
-"""TradeMenu FastAPI application — Phase 1 read-only."""
+"""TradeMenu FastAPI application — discovery + chart + positions/orders + writes."""
 
 from __future__ import annotations
 
 import html
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Form, Query, Request, Response
+from fastapi import Body, FastAPI, Form, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -28,7 +28,7 @@ def create_app(
         cfg = config or load_config()
     except TradeMenuConfigError:
         # Fail-closed app: only health-style error page, no data APIs.
-        app = FastAPI(title="TradeMenu", version="0.1.0")
+        app = FastAPI(title="TradeMenu", version="0.2.0")
 
         @app.get("/")
         async def locked_root() -> HTMLResponse:
@@ -50,7 +50,7 @@ def create_app(
     limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)
     svc = service or TradeMenuService()
 
-    app = FastAPI(title="TradeMenu", version="0.1.0")
+    app = FastAPI(title="TradeMenu", version="0.2.0")
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -62,14 +62,32 @@ def create_app(
             return request.client.host or "unknown"
         return "unknown"
 
+    def _session_token(request: Request) -> Optional[str]:
+        return request.cookies.get(cfg.cookie_name)
+
     def _authenticated(request: Request) -> bool:
-        token = request.cookies.get(cfg.cookie_name)
-        return sessions.verify(token)
+        return sessions.verify(_session_token(request))
 
     def _require_auth(request: Request) -> Optional[JSONResponse]:
         if _authenticated(request):
             return None
-        return JSONResponse({"success": False, "error": {"code": "UNAUTHORIZED", "message": "Login required."}}, status_code=401)
+        return JSONResponse(
+            {"success": False, "error": {"code": "UNAUTHORIZED", "message": "Login required."}},
+            status_code=401,
+        )
+
+    def _require_csrf(request: Request) -> Optional[JSONResponse]:
+        denied = _require_auth(request)
+        if denied:
+            return denied
+        token = _session_token(request)
+        provided = request.headers.get("x-csrf-token") or request.headers.get("X-CSRF-Token")
+        if not sessions.csrf_ok(token, provided):
+            return JSONResponse(
+                {"success": False, "error": {"code": "CSRF_FAILED", "message": "Invalid or missing CSRF token."}},
+                status_code=403,
+            )
+        return None
 
     def _login_page(error: str = "") -> HTMLResponse:
         err_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
@@ -121,16 +139,25 @@ def create_app(
             return _login_page(gate.message)
         if not sessions.password_ok(password):
             limiter.record_failure(key)
-            # Never log password.
             logger.info("TradeMenu login failure from %s", key)
             return _login_page("Invalid password.")
         limiter.record_success(key)
-        token = sessions.issue()
+        token, csrf = sessions.issue()
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             key=cfg.cookie_name,
             value=token,
             httponly=True,
+            samesite="lax",
+            secure=False,
+            max_age=cfg.session_max_age_seconds,
+            path="/",
+        )
+        # Readable by JS for double-submit CSRF header (not HttpOnly).
+        resp.set_cookie(
+            key="trademenu_csrf",
+            value=csrf,
+            httponly=False,
             samesite="lax",
             secure=False,
             max_age=cfg.session_max_age_seconds,
@@ -142,11 +169,20 @@ def create_app(
     async def logout() -> Response:
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie(cfg.cookie_name, path="/")
+        resp.delete_cookie("trademenu_csrf", path="/")
         return resp
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"ok": True, "service": "trademenu", "phase": 1}
+        return {"ok": True, "service": "trademenu", "phase": 2}
+
+    @app.get("/api/session")
+    async def api_session(request: Request) -> JSONResponse:
+        denied = _require_auth(request)
+        if denied:
+            return denied
+        csrf = sessions.csrf_of(_session_token(request))
+        return JSONResponse({"success": True, "authenticated": True, "csrf": csrf})
 
     @app.get("/api/exchanges")
     async def api_exchanges(request: Request) -> JSONResponse:
@@ -205,8 +241,6 @@ def create_app(
                 {"success": False, "error": {"code": err, "message": err.replace("_", " ").title()}, "candles": []},
                 status_code=400,
             )
-        # Require canonical resolve before market-data fetch — never pass an
-        # unresolved friendly symbol through as if it were native.
         resolved = svc.resolve_instrument(exchange, account, symbol)
         if not resolved.get("success") or not isinstance(resolved.get("instrument"), dict):
             return JSONResponse(
@@ -239,8 +273,10 @@ def create_app(
         payload["native_symbol"] = native
         payload["display"] = resolved.get("display") or f"{symbol} → {native}"
         payload["resolved"] = True
+        payload["format_meta"] = resolved.get("format_meta") or {}
         payload["timeframes"] = list(SUPPORTED_TFS)
         payload["resolve_timing_ms"] = resolved.get("timing_ms")
+        payload["resolve_cache_hit"] = bool(resolved.get("cache_hit"))
         status = 200 if payload.get("success") else 400
         return JSONResponse(payload, status_code=status)
 
@@ -265,6 +301,69 @@ def create_app(
         if denied:
             return denied
         return JSONResponse(svc.orders(exchange, account))
+
+    async def _read_json(request: Request) -> Dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @app.post("/api/position/set_tp")
+    async def api_set_tp(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.set_tp(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+            str(body.get("price") or ""),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/position/set_sl")
+    async def api_set_sl(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.set_sl(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+            str(body.get("price") or ""),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/position/close")
+    async def api_close(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.close_position(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/orders/cancel_group")
+    async def api_cancel_group(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.cancel_order_group(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+            str(body.get("side") or ""),
+            str(body.get("type") or body.get("order_type") or "limit"),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
 
     return app
 

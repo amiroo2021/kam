@@ -25,6 +25,7 @@ from plugins.trade.trademenu.service import TradeMenuService
 
 class FakeDesk:
     def __init__(self) -> None:
+        self.calls: List[Dict[str, Any]] = []
         self._exchanges = ["hyperliquid", "binance", "phemex"]
         self._accounts = {
             "hyperliquid": ["FIBO", "BITGET", "FLEX"],
@@ -117,6 +118,34 @@ class FakeDesk:
                     ],
                 )
             return make_success(op, ex, acct, positions=[], order_groups=[], open_order_count=0)
+        if op == "set_tp":
+            self.calls.append(dict(request))
+            return make_success(op, ex, acct)
+        if op == "set_sl":
+            self.calls.append(dict(request))
+            return make_success(op, ex, acct)
+        if op == "close_position":
+            self.calls.append(dict(request))
+            return make_success(op, ex, acct)
+        if op == "cancel_order_group":
+            self.calls.append(dict(request))
+            from plugins.trade.canonical import CanonicalCancelGroupResult
+
+            return make_success(
+                op,
+                ex,
+                acct,
+                cancel_group=CanonicalCancelGroupResult(
+                    symbol=str(request.get("symbol") or ""),
+                    side=str(request.get("side") or ""),
+                    targeted_order_count=12,
+                    cancelled_order_count=11,
+                    confirmed_absent_count=11,
+                    remaining_target_count=1,
+                    verified=False,
+                    partial=True,
+                ),
+            )
         return make_failure(op or "unknown", ex or "", acct or "", "NOT_IMPLEMENTED", "nope")
 
 
@@ -138,8 +167,10 @@ def _cfg() -> TradeMenuConfig:
 class TradeMenuAuthTests(unittest.TestCase):
     def test_session_roundtrip(self) -> None:
         sm = SessionManager(_cfg())
-        tok = sm.issue()
+        tok, csrf = sm.issue()
         self.assertTrue(sm.verify(tok))
+        self.assertTrue(sm.csrf_ok(tok, csrf))
+        self.assertFalse(sm.csrf_ok(tok, "bad"))
         self.assertFalse(sm.verify(tok + "x"))
         self.assertFalse(sm.verify(None))
 
@@ -337,6 +368,64 @@ class TradeMenuApiTests(unittest.TestCase):
                 r = client.get("/")
                 self.assertEqual(r.status_code, 503)
                 self.assertIn("unavailable", r.text.lower())
+
+    def _csrf(self) -> str:
+        r = self.client.get("/api/session")
+        self.assertEqual(r.status_code, 200)
+        return str(r.json().get("csrf") or "")
+
+    def test_write_requires_csrf(self) -> None:
+        self._login()
+        r = self.client.post(
+            "/api/position/set_tp",
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "76000"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_set_tp_via_tradedesk(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        desk = self.service.desk  # type: ignore[attr-defined]
+        r = self.client.post(
+            "/api/position/set_tp",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FIBO", "symbol": "BTC", "price": "76000"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["success"])
+        self.assertTrue(any(c.get("operation") == "set_tp" and c.get("price") == "76000" for c in desk.calls))
+
+    def test_cancel_group_partial_message(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        r = self.client.post(
+            "/api/orders/cancel_group",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "FLEX", "symbol": "BTC", "side": "buy"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertTrue(body.get("partial"))
+        self.assertIn("11/12", body.get("message") or "")
+
+    def test_write_rejects_unknown_account(self) -> None:
+        self._login()
+        csrf = self._csrf()
+        r = self.client.post(
+            "/api/position/close",
+            headers={"X-CSRF-Token": csrf},
+            json={"exchange": "hyperliquid", "account": "NOPE", "symbol": "BTC"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"]["code"], "UNKNOWN_ACCOUNT")
+
+    def test_format_price_helper(self) -> None:
+        from plugins.trade.trademenu.formatting import format_price, format_size, format_pnl
+
+        self.assertEqual(format_price("75623.997064734531", {"price_increment": "0.1"}), "75,624.0")
+        self.assertEqual(format_pnl("-1234.567"), "-1,234.57")
+        self.assertEqual(format_size("1.5000000", {"size_increment": "0.001"}), "1.5")
 
 
 if __name__ == "__main__":

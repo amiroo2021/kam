@@ -1,7 +1,8 @@
-"""TradeDesk-backed read-only service layer for TradeMenu."""
+"""TradeDesk-backed service layer for TradeMenu (read + write via TradeDesk)."""
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal, InvalidOperation
@@ -9,10 +10,14 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..tradedesk import TradeDesk, get_tradedesk
+from .formatting import format_pnl, format_price, format_size
+
+logger = logging.getLogger("trademenu")
 
 # Short in-process TTL so Positions + Orders share one agent fetch and
 # rapid UI polls do not re-hit multi-dex Hyperliquid open-order fanout.
 _POSITIONS_CACHE_TTL_SECONDS = 12.0
+_RESOLVE_CACHE_TTL_SECONDS = 60.0
 
 
 def _account_alias(entry: Any) -> str:
@@ -91,9 +96,19 @@ class TradeMenuService:
     def __init__(self, desk: Optional[TradeDesk] = None, cache_ttl: float = _POSITIONS_CACHE_TTL_SECONDS) -> None:
         self.desk = desk or get_tradedesk()
         self.cache_ttl = float(cache_ttl)
+        self.resolve_cache_ttl = _RESOLVE_CACHE_TTL_SECONDS
         self._lock = Lock()
         # key -> (expires_at, timing_ms, CanonicalResponse-like dict payload)
         self._po_cache: Dict[Tuple[str, str], Tuple[float, float, Dict[str, Any]]] = {}
+        # (exchange, account, symbol_key) -> (expires_at, payload)
+        self._resolve_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+
+    def invalidate_positions_cache(self, exchange: str = "", account: str = "") -> None:
+        with self._lock:
+            if exchange and account:
+                self._po_cache.pop((str(exchange), str(account)), None)
+            else:
+                self._po_cache.clear()
 
     def list_exchanges(self) -> List[str]:
         return list(self.desk.list_exchanges())
@@ -125,6 +140,18 @@ class TradeMenuService:
         if err:
             return {"success": False, "error": {"code": err, "message": err.replace("_", " ").title()}}
         requested = str(symbol or "").strip()
+        cache_key = (str(exchange), str(account), requested.casefold())
+        now = time.time()
+        with self._lock:
+            hit = self._resolve_cache.get(cache_key)
+            if hit and hit[0] > now:
+                cached = dict(hit[1])
+                cached["cache_hit"] = True
+                timing = dict(cached.get("timing_ms") or {})
+                timing["cached"] = True
+                cached["timing_ms"] = timing
+                return cached
+
         t0 = time.perf_counter()
         resp = self.desk.execute(
             {
@@ -140,6 +167,7 @@ class TradeMenuService:
             "exchange": exchange,
             "account": account,
             "requested_symbol": requested,
+            "cache_hit": False,
             "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
         }
         if resp.instrument is not None:
@@ -147,6 +175,13 @@ class TradeMenuService:
             data["instrument"] = inst
             data["native_symbol"] = inst.get("symbol")
             data["display"] = f"{requested} → {inst.get('symbol')}"
+            meta = {
+                "price_increment": inst.get("price_increment") or inst.get("tick_size"),
+                "size_increment": inst.get("size_increment") or inst.get("lot_size"),
+                "price_decimals": inst.get("price_decimals"),
+                "size_decimals": inst.get("size_decimals") or inst.get("sz_decimals"),
+            }
+            data["format_meta"] = {k: v for k, v in meta.items() if v is not None}
         payload = _to_plain(resp.data) if resp.data else None
         if isinstance(payload, dict):
             candidates = payload.get("candidates") or payload.get("instruments")
@@ -156,6 +191,9 @@ class TradeMenuService:
         if resp.error is not None:
             data["error"] = _to_plain(resp.error)
             data["display"] = f"{requested} → unresolved"
+        if resp.success and data.get("native_symbol"):
+            with self._lock:
+                self._resolve_cache[cache_key] = (now + self.resolve_cache_ttl, dict(data))
         return data
 
     def market_price(self, exchange: str, account: str, symbol: str) -> Dict[str, Any]:
@@ -228,6 +266,16 @@ class TradeMenuService:
             mark = row.get("mark")
             if mark in (None, "", "—"):
                 mark = _derive_mark(row.get("side"), row.get("entry_price"), row.get("size"), row.get("pnl"))
+            # Lightweight meta from exchange_instrument if present
+            meta: Dict[str, Any] = {}
+            ei = row.get("exchange_instrument")
+            if isinstance(ei, dict):
+                meta = {
+                    "price_increment": ei.get("price_increment") or ei.get("tick_size"),
+                    "size_increment": ei.get("size_increment") or ei.get("lot_size"),
+                    "price_decimals": ei.get("price_decimals"),
+                    "size_decimals": ei.get("size_decimals") or ei.get("sz_decimals"),
+                }
             positions.append(
                 {
                     "symbol": row.get("symbol"),
@@ -239,6 +287,15 @@ class TradeMenuService:
                     "sl": row.get("sl"),
                     "tp": row.get("tp"),
                     "exchange_instrument": row.get("exchange_instrument"),
+                    "format_meta": {k: v for k, v in meta.items() if v is not None},
+                    "display": {
+                        "size": format_size(row.get("size"), meta),
+                        "entry": format_price(row.get("entry_price"), meta),
+                        "mark": format_price(mark, meta),
+                        "pnl": format_pnl(row.get("pnl"), meta),
+                        "sl": format_price(row.get("sl"), meta),
+                        "tp": format_price(row.get("tp"), meta),
+                    },
                 }
             )
 
@@ -247,6 +304,7 @@ class TradeMenuService:
             plain = _to_plain(g)
             side = str(plain.get("side") or "").lower()
             # Telegram groups are side-based limit ladders; label as LIMIT.
+            meta = {}
             groups.append(
                 {
                     "symbol": plain.get("symbol"),
@@ -257,6 +315,16 @@ class TradeMenuService:
                     "min_price": plain.get("min_price"),
                     "max_price": plain.get("max_price"),
                     "vwap": plain.get("vwap"),
+                    "display": {
+                        "total_remaining_size": format_size(plain.get("total_size"), meta),
+                        "min_price": format_price(plain.get("min_price"), meta),
+                        "max_price": format_price(plain.get("max_price"), meta),
+                        "vwap": format_price(plain.get("vwap"), meta),
+                        "range": (
+                            f"{format_price(plain.get('min_price'), meta)}–"
+                            f"{format_price(plain.get('max_price'), meta)}"
+                        ),
+                    },
                 }
             )
 
@@ -322,3 +390,146 @@ class TradeMenuService:
             "cache_hit": payload.get("cache_hit"),
             "operation_used": payload.get("operation_used"),
         }
+
+    def _safe_error(self, resp: Any) -> Dict[str, Any]:
+        err = _to_plain(getattr(resp, "error", None)) or {}
+        if not isinstance(err, dict):
+            return {"code": "ERROR", "message": str(err)}
+        msg = str(err.get("message") or err.get("code") or "Operation failed.")
+        low = msg.lower()
+        for bad in ("api key", "private key", "secret", "password", "signature", "authorization"):
+            if bad in low:
+                msg = str(err.get("code") or "OPERATION_FAILED")
+                break
+        return {"code": str(err.get("code") or "ERROR"), "message": msg}
+
+    def _execute_write(
+        self,
+        operation: str,
+        exchange: str,
+        account: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        err = self.validate_exchange_account(exchange, account)
+        if err:
+            return {
+                "success": False,
+                "error": {"code": err, "message": err.replace("_", " ").title()},
+                "operation": operation,
+                "exchange": exchange,
+                "account": account,
+            }
+        req: Dict[str, Any] = {
+            "operation": operation,
+            "exchange": exchange,
+            "account": account,
+        }
+        if extra:
+            req.update(extra)
+        t0 = time.perf_counter()
+        resp = self.desk.execute(req)
+        desk_ms = (time.perf_counter() - t0) * 1000.0
+        self.invalidate_positions_cache(exchange, account)
+        out: Dict[str, Any] = {
+            "success": bool(resp.success),
+            "operation": operation,
+            "exchange": exchange,
+            "account": account,
+            "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
+        }
+        if extra:
+            for k in ("symbol", "side", "price", "order_type"):
+                if k in extra:
+                    out[k] = extra[k]
+        if resp.success:
+            if getattr(resp, "cancel_group", None) is not None:
+                cg = _to_plain(resp.cancel_group)
+                out["cancel_group"] = cg
+                cancelled = int(cg.get("cancelled_order_count") or cg.get("cancelled") or 0)
+                requested = int(
+                    cg.get("targeted_order_count")
+                    or cg.get("requested_order_count")
+                    or cg.get("requested_cancel_count")
+                    or cg.get("order_count")
+                    or cancelled
+                )
+                out["cancelled"] = cancelled
+                out["requested"] = requested
+                out["verified"] = bool(cg.get("verified"))
+                if requested and cancelled < requested:
+                    out["partial"] = True
+                    out["message"] = f"Cancelled {cancelled}/{requested} orders."
+                else:
+                    out["message"] = f"Cancelled {cancelled} orders."
+            else:
+                out["message"] = f"{operation} succeeded."
+            logger.info(
+                "TradeMenu write ok op=%s exchange=%s account=%s symbol=%s ms=%.1f",
+                operation,
+                exchange,
+                account,
+                (extra or {}).get("symbol") or "",
+                desk_ms,
+            )
+        else:
+            out["error"] = self._safe_error(resp)
+            logger.info(
+                "TradeMenu write fail op=%s exchange=%s account=%s symbol=%s code=%s",
+                operation,
+                exchange,
+                account,
+                (extra or {}).get("symbol") or "",
+                out["error"].get("code"),
+            )
+        return out
+
+    def set_tp(self, exchange: str, account: str, symbol: str, price: str) -> Dict[str, Any]:
+        return self._execute_write(
+            "set_tp",
+            exchange,
+            account,
+            {"symbol": str(symbol or "").strip(), "price": str(price or "").strip()},
+        )
+
+    def set_sl(self, exchange: str, account: str, symbol: str, price: str) -> Dict[str, Any]:
+        return self._execute_write(
+            "set_sl",
+            exchange,
+            account,
+            {"symbol": str(symbol or "").strip(), "price": str(price or "").strip()},
+        )
+
+    def close_position(self, exchange: str, account: str, symbol: str) -> Dict[str, Any]:
+        return self._execute_write(
+            "close_position",
+            exchange,
+            account,
+            {"symbol": str(symbol or "").strip()},
+        )
+
+    def cancel_order_group(
+        self,
+        exchange: str,
+        account: str,
+        symbol: str,
+        side: str,
+        order_type: str = "limit",
+    ) -> Dict[str, Any]:
+        side_n = str(side or "").strip().lower()
+        if side_n not in {"buy", "sell"}:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_SIDE", "message": "side must be buy or sell"},
+                "operation": "cancel_order_group",
+                "exchange": exchange,
+                "account": account,
+            }
+        return self._execute_write(
+            "cancel_order_group",
+            exchange,
+            account,
+            {
+                "symbol": str(symbol or "").strip(),
+                "side": side_n,
+            },
+        )

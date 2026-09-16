@@ -6,10 +6,11 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 from .config import TradeMenuConfig
 
@@ -70,32 +71,53 @@ class SessionManager:
         self.config = config
         self._secret = config.session_secret.encode("utf-8")
 
-    def issue(self, subject: str = "operator") -> str:
+    def issue(self, subject: str = "operator") -> Tuple[str, str]:
+        """Return (session_token, csrf_token). csrf is embedded in the signed payload."""
+        csrf = secrets.token_urlsafe(24)
         payload = {
             "sub": subject,
             "iat": int(time.time()),
             "exp": int(time.time()) + int(self.config.session_max_age_seconds),
+            "csrf": csrf,
         }
         body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
         sig = hmac.new(self._secret, body.encode("ascii"), hashlib.sha256).hexdigest()
-        return f"{body}.{sig}"
+        return f"{body}.{sig}", csrf
 
-    def verify(self, token: Optional[str]) -> bool:
+    def _decode(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
         if not token or "." not in token:
-            return False
+            return None
         body, _, sig = token.partition(".")
         if not body or not sig:
-            return False
+            return None
         expected = hmac.new(self._secret, body.encode("ascii"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, sig):
-            return False
+            return None
         try:
             raw = base64.urlsafe_b64decode(body.encode("ascii"))
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
-            return False
+            return None
         exp = int(payload.get("exp") or 0)
-        return exp >= int(time.time())
+        if exp < int(time.time()):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def verify(self, token: Optional[str]) -> bool:
+        return self._decode(token) is not None
+
+    def csrf_of(self, token: Optional[str]) -> Optional[str]:
+        payload = self._decode(token)
+        if not payload:
+            return None
+        csrf = str(payload.get("csrf") or "").strip()
+        return csrf or None
+
+    def csrf_ok(self, token: Optional[str], provided: Optional[str]) -> bool:
+        expected = self.csrf_of(token)
+        if not expected or not provided:
+            return False
+        return hmac.compare_digest(expected, str(provided))
 
     def password_ok(self, candidate: str) -> bool:
         # Constant-time compare against configured password.
