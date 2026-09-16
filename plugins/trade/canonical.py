@@ -152,6 +152,8 @@ class CanonicalOrderGroup:
     trigger_price: Optional[str] = None
     limit_price: Optional[str] = None
     order_ids: Optional[list] = None
+    # Full venue-native instrument id (e.g. PERP_ZEC_USDC, xyz:SP500).
+    exchange_instrument: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -167,6 +169,7 @@ class CanonicalOrderGroup:
             "reduce_only": self.reduce_only,
             "trigger_price": self.trigger_price,
             "limit_price": self.limit_price,
+            "exchange_instrument": self.exchange_instrument,
         }
         if self.order_ids is not None:
             data["order_ids"] = list(self.order_ids)

@@ -325,12 +325,20 @@ def _symbol_from_orderly(symbol: Any) -> str:
 
 
 def _orderly_symbol(symbol: Any) -> str:
-    text = str(symbol or "").strip().upper()
+    text = str(symbol or "").strip().upper().replace("-", "_").replace("/", "_")
+    if not text:
+        return text
     if text.startswith("PERP_"):
         return text
-    if text and not text.endswith("_USDC"):
-        return f"PERP_{text}_USDC"
-    return text
+    # Friendly forms: ZEC, ZECUSD, ZEC_USDC, ZECUSDT → PERP_ZEC_USDC
+    base = text
+    for q in ("_USDC", "_USDT", "_USD", "USDC", "USDT", "USD"):
+        if base.endswith(q) and len(base) > len(q):
+            candidate = base[: -len(q)].rstrip("_")
+            if candidate:
+                base = candidate
+                break
+    return f"PERP_{base}_USDC"
 
 
 def _tick_decimals(value: Any) -> int:
@@ -550,6 +558,7 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
             "size_precision": int(rule.get("size_precision") or 0),
             "order_ids": [],
             "reduce_only": reduce_only,
+            "exchange_instrument": orderly_symbol or None,
         })
         group["count"] += 1
         group["size"] += remaining
@@ -587,6 +596,7 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
             display_type=display_map.get(classification) or f"{side_u} LIMIT",
             reduce_only=bool(group.get("reduce_only")),
             order_ids=list(group["order_ids"]) or None,
+            exchange_instrument=group.get("exchange_instrument"),
         ))
     groups.sort(key=lambda item: (item.symbol, item.classification, item.side))
     return (open_count, groups)

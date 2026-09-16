@@ -493,6 +493,7 @@ class TradeMenuService:
                     "sl": row.get("sl"),
                     "tp": row.get("tp"),
                     "exchange_instrument": row.get("exchange_instrument"),
+                    "native_symbol": row.get("exchange_instrument") or row.get("native_symbol"),
                     "format_meta": {k: v for k, v in meta.items() if v is not None},
                     "display": {
                         "size": format_size(row.get("size"), meta),
@@ -511,9 +512,12 @@ class TradeMenuService:
             side = str(plain.get("side") or "").lower()
             # Telegram groups are side-based limit ladders; label as LIMIT.
             meta = {}
+            native = plain.get("exchange_instrument") or plain.get("native_symbol")
             groups.append(
                 {
                     "symbol": plain.get("symbol"),
+                    "native_symbol": native,
+                    "exchange_instrument": native,
                     "side": side,
                     "type": (
                         "limit"
@@ -626,13 +630,26 @@ class TradeMenuService:
         err = _to_plain(getattr(resp, "error", None)) or {}
         if not isinstance(err, dict):
             return {"code": "ERROR", "message": str(err)}
+        code = str(err.get("code") or "ERROR")
         msg = str(err.get("message") or err.get("code") or "Operation failed.")
         low = msg.lower()
         for bad in ("api key", "private key", "secret", "password", "signature", "authorization"):
             if bad in low:
-                msg = str(err.get("code") or "OPERATION_FAILED")
+                msg = code
                 break
-        return {"code": str(err.get("code") or "ERROR"), "message": msg}
+        # Never leak raw HTTP client traces / URLs to the browser.
+        if "http" in low and ("error" in low or "://" in low or "status" in low):
+            reason = str(err.get("exchange_reason") or "").strip()
+            if reason and "http" not in reason.lower() and "://" not in reason:
+                msg = reason
+            else:
+                msg = "Order rejected by exchange." if "order" in low else "Exchange request failed."
+        # Collapse urllib-style messages
+        for needle in (" for url:", "Client Error:", "Server Error:", "HTTPSConnectionPool"):
+            if needle.lower() in low:
+                msg = "Order rejected by exchange." if "order" in low else "Exchange request failed."
+                break
+        return {"code": code, "message": msg}
 
     def _execute_write(
         self,
@@ -1261,12 +1278,23 @@ class TradeMenuService:
                 )
             else:
                 out["error"] = self._safe_error(resp)
-                if ladder and (ladder.get("accepted_child_count") or 0):
+                if ladder and int(ladder.get("accepted_child_count") or 0) > 0:
+                    accepted = int(ladder.get("accepted_child_count") or 0)
+                    requested = int(ladder.get("requested_order_count") or plan.get("order_count") or 0)
                     out["partial"] = True
+                    out["accepted"] = accepted
+                    out["requested"] = requested
+                    # Surface partial success to the UI; do not auto-retry.
+                    out["success"] = True
                     out["message"] = (
-                        f"{ladder.get('accepted_child_count')} of "
-                        f"{ladder.get('requested_order_count')} orders accepted."
+                        f"Ladder partially placed: {accepted} / {requested} accepted. "
+                        f"No automatic retry."
                     )
+                    if out["error"].get("message"):
+                        # Keep a short reason without raw HTTP URL noise.
+                        reason = str(out["error"].get("message") or "")
+                        if reason and "http" not in reason.lower() and "://" not in reason:
+                            out["message"] = f"{out['message']} Last error: {reason}"
             return out
 
         return {"success": False, "error": {"code": "PREVIEW_INVALID", "message": "Unknown preview kind."}}

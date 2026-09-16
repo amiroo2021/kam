@@ -237,26 +237,32 @@
     positionLines = [];
   }
 
-  function symbolsMatch(posSym, native, requested) {
-    const a = String(posSym || "").trim();
-    const b = String(native || "").trim();
-    const c = String(requested || "").trim();
-    if (!a) return false;
-    const au = a.toUpperCase();
-    const bu = b.toUpperCase();
-    const cu = c.toUpperCase();
-    if (bu && au === bu) return true;
-    if (cu && au === cu) return true;
-    // HIP-3: native xyz:SP500 matches position xyz:SP500 or friendly SP500
-    const aTail = au.includes(":") ? au.split(":").pop() : au;
-    const bTail = bu.includes(":") ? bu.split(":").pop() : bu;
-    const cTail = cu.includes(":") ? cu.split(":").pop() : cu;
-    if (bTail && aTail === bTail) return true;
-    if (cTail && aTail === cTail) return true;
-    const peel = (s) => s.replace(/[-_/]/g, "").replace(/(USDT|USDC|USD)$/i, "");
-    const pa = peel(aTail || au);
-    if (bTail && pa === peel(bTail)) return true;
-    if (cTail && pa === peel(cTail)) return true;
+  function symbolsMatch(posSym, native, requested, rowNative) {
+    const candidates = [
+      String(posSym || "").trim(),
+      String(rowNative || "").trim(),
+    ].filter(Boolean);
+    const targets = [
+      String(native || "").trim(),
+      String(requested || "").trim(),
+    ].filter(Boolean);
+    if (!candidates.length || !targets.length) return false;
+    const peel = (s) => {
+      const u = s.toUpperCase();
+      const tail = u.includes(":") ? u.split(":").pop() : u;
+      // PERP_ZEC_USDC → ZEC
+      let t = tail;
+      if (t.startsWith("PERP_") && t.endsWith("_USDC")) t = t.slice(5, -5);
+      return t.replace(/[-_/]/g, "").replace(/(USDT|USDC|USD)$/i, "");
+    };
+    for (const c of candidates) {
+      const cu = c.toUpperCase();
+      for (const t of targets) {
+        const tu = t.toUpperCase();
+        if (cu === tu) return true;
+        if (peel(cu) && peel(cu) === peel(tu)) return true;
+      }
+    }
     return false;
   }
 
@@ -279,7 +285,9 @@
     clearLiveOrderLines();
     if (!resolvedOk || !nativeInstrument) return;
     const req = (symbolEl.value || "").trim();
-    const match = lastPositions.find((p) => symbolsMatch(p.symbol, nativeInstrument, req));
+    const match = lastPositions.find((p) =>
+      symbolsMatch(p.symbol, nativeInstrument, req, p.native_symbol || p.exchange_instrument)
+    );
     if (match) {
       const side = String(match.side || "").toUpperCase();
       const meta = match.format_meta || formatMeta || {};
@@ -304,7 +312,9 @@
     }
     // Live open ladder VWAP overlays for active symbol
     if ($("showOrdersOverlay") && $("showOrdersOverlay").checked) {
-      const groups = (lastOrderGroups || []).filter((g) => symbolsMatch(g.symbol, nativeInstrument, req));
+      const groups = (lastOrderGroups || []).filter((g) =>
+        symbolsMatch(g.symbol, nativeInstrument, req, g.native_symbol || g.exchange_instrument)
+      );
       for (const g of groups) {
         if (String(g.classification || "entry_limit") !== "entry_limit") continue;
         const vwap = Number(String(g.vwap || "").replace(/,/g, ""));
@@ -828,20 +838,28 @@
   function wireSymbolClicks(root) {
     root.querySelectorAll("button.link-sym[data-symbol]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const sym = btn.getAttribute("data-symbol") || "";
-        if (!sym) return;
-        // Exact native (incl. HIP-3 dex prefix xyz:SP500) must stay intact.
-        // Do NOT invent SP500USD from xyz:SP500.
-        if (sym.includes(":")) {
-          symbolEl.value = sym;
+        const display = btn.getAttribute("data-symbol") || "";
+        const native = btn.getAttribute("data-native") || "";
+        if (!display && !native) return;
+        // Prefer venue-native id when present (PERP_ZEC_USDC, xyz:SP500).
+        // Never invent ZECUSD by concatenating USD onto ZEC when native is known.
+        if (native) {
+          symbolEl.value = native;
+        } else if (display.includes(":")) {
+          symbolEl.value = display;
         } else {
-          const peeled = sym;
-          const friendly = /USD|USDT|USDC/i.test(peeled) ? peeled : `${peeled}USD`;
-          symbolEl.value = friendly;
+          // Leave display as-is; agent resolve handles ZEC / BTC / SP500.
+          symbolEl.value = display;
         }
         onSelectionChanged();
       });
     });
+  }
+
+  function activeTradeSymbol() {
+    // Prefer last resolved native so preview/execute share the chart identity.
+    if (resolvedOk && nativeInstrument) return nativeInstrument;
+    return (symbolEl.value || "").trim();
   }
 
   function wireOrderActions() {
@@ -985,8 +1003,9 @@
             const d = p.display || {};
             const sym = dash(p.symbol);
             const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+            const native = esc(p.native_symbol || p.exchange_instrument || "");
             return `<tr>
-              <td><button type="button" class="link-sym" data-symbol="${esc(p.symbol)}">${sym}</button></td>
+              <td><button type="button" class="link-sym" data-symbol="${esc(p.symbol)}" data-native="${native}">${sym}</button></td>
               <td class="${sideClass}">${dash(p.side)}</td>
               <td class="num">${dash(d.size || p.size)}</td>
               <td class="num">${dash(d.entry || p.entry)}</td>
@@ -995,9 +1014,9 @@
               <td class="num">${dash(d.sl || p.sl)}</td>
               <td class="num">${dash(d.tp || p.tp)}</td>
               <td class="actions">
-                <button type="button" class="btn-ghost" data-act="tp" data-symbol="${esc(p.symbol)}" data-side="${esc(p.side)}" data-tp="${esc(d.tp || p.tp || "—")}">TP</button>
-                <button type="button" class="btn-ghost" data-act="sl" data-symbol="${esc(p.symbol)}" data-side="${esc(p.side)}" data-sl="${esc(d.sl || p.sl || "—")}">SL</button>
-                <button type="button" class="btn-danger" data-act="close" data-symbol="${esc(p.symbol)}" data-side="${esc(p.side)}" data-size="${esc(d.size || p.size)}" data-mark="${esc(d.mark || p.mark)}">Close</button>
+                <button type="button" class="btn-ghost" data-act="tp" data-symbol="${esc(p.symbol)}" data-native="${native}" data-side="${esc(p.side)}" data-tp="${esc(d.tp || p.tp || "—")}">TP</button>
+                <button type="button" class="btn-ghost" data-act="sl" data-symbol="${esc(p.symbol)}" data-native="${native}" data-side="${esc(p.side)}" data-sl="${esc(d.sl || p.sl || "—")}">SL</button>
+                <button type="button" class="btn-danger" data-act="close" data-symbol="${esc(p.symbol)}" data-native="${native}" data-side="${esc(p.side)}" data-size="${esc(d.size || p.size)}" data-mark="${esc(d.mark || p.mark)}">Close</button>
               </td>
             </tr>`;
           })
@@ -1071,13 +1090,14 @@
             }
             const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
             const ids = Array.isArray(g.order_ids) ? g.order_ids.join(",") : "";
+            const native = esc(g.native_symbol || g.exchange_instrument || "");
             const cancelLabel = isProt
               ? classification === "take_profit"
                 ? "Cancel TP"
                 : "Cancel SL"
               : "Cancel";
             return `<tr data-class="${esc(classification)}">
-              <td class="${sideClass}"><button type="button" class="link-sym" data-symbol="${esc(g.symbol)}">${symLabel}</button></td>
+              <td class="${sideClass}"><button type="button" class="link-sym" data-symbol="${esc(g.symbol)}" data-native="${native}">${symLabel}</button></td>
               <td class="${sideClass}">${esc(typeLabel)}${g.reduce_only ? " · RO" : ""}</td>
               <td class="num">${dash(g.count)}</td>
               <td class="num">${dash(d.total_remaining_size || g.total_remaining_size)}</td>
@@ -1085,7 +1105,7 @@
               <td class="num">${dash(d.vwap || g.vwap)}</td>
               <td class="actions">
                 <button type="button" class="${isProt ? "btn-danger" : "btn-danger"}" data-cancel-group="1"
-                  data-symbol="${esc(g.symbol)}" data-side="${esc(side)}" data-count="${esc(g.count)}"
+                  data-symbol="${esc(g.symbol)}" data-native="${native}" data-side="${esc(side)}" data-count="${esc(g.count)}"
                   data-vol="${esc(d.total_remaining_size || g.total_remaining_size)}"
                   data-range="${esc(range)}" data-vwap="${esc(d.vwap || g.vwap)}"
                   data-classification="${esc(classification)}" data-display-type="${esc(typeLabel)}"
@@ -1315,7 +1335,7 @@
       const { data } = await apiPost("/api/trade/preview_order", {
         exchange: exchangeEl.value,
         account: accountEl.value,
-        symbol: (symbolEl.value || "").trim(),
+        symbol: activeTradeSymbol(),
         side: tradeSide,
         order_type: "limit",
         size,
@@ -1348,7 +1368,7 @@
       const { data } = await apiPost("/api/trade/preview_ladder", {
         exchange: exchangeEl.value,
         account: accountEl.value,
-        symbol: (symbolEl.value || "").trim(),
+        symbol: activeTradeSymbol(),
         side: tradeSide,
         distribution: $("ladderDist").value,
         order_count: count,
@@ -1380,15 +1400,26 @@
         showToast("Selection changed; ignored stale execute result.", "error");
         return;
       }
-      if (!data.success) {
-        throw new Error((data.error && data.error.message) || data.message || "Execution failed");
+      const accepted = Number(data.accepted || 0);
+      const requested = Number(data.requested || 0);
+      const partial = !!(data.partial || (requested && accepted > 0 && accepted < requested));
+      // Partial ladder: accepted > 0 must refresh Orders even if overall success=false.
+      // Never auto-retry — preview_id is one-shot.
+      if (data.success || (partial && accepted > 0)) {
+        const msg =
+          data.message ||
+          (partial
+            ? `Ladder partially placed: ${accepted} / ${requested} accepted`
+            : "Submitted");
+        showToast(msg, partial ? "error" : "ok");
+        setLine($("tradeStatus"), msg, partial ? "error" : "ok");
+        invalidateTradePreview();
+        await loadOrders(true);
+        await loadPositions(true);
+        loadAccountFinancials(true);
+        return;
       }
-      showToast(data.message || "Submitted", data.partial ? "error" : "ok");
-      setLine($("tradeStatus"), data.message || "Submitted", data.partial ? "error" : "ok");
-      invalidateTradePreview();
-      await loadOrders(true);
-      await loadPositions(true);
-      loadAccountFinancials(true);
+      throw new Error((data.error && data.error.message) || data.message || "Execution failed");
     } catch (e) {
       $("previewError").hidden = false;
       $("previewError").textContent = String(e.message || e);
