@@ -35,6 +35,8 @@
   let ordersTimer = null;
   let quoteTimer = null;
   let nativeInstrument = null;
+  /** Last native successfully applied to the candle series (drives price-scale reset). */
+  let chartRenderedNative = null;
   let formatMeta = null;
   let resolvedOk = false;
   let activeTab = "positions";
@@ -86,6 +88,156 @@
     updateTradeEnablement();
   }
 
+  /** Candle series style — reused when recreating series on instrument switch. */
+  function candleSeriesOptions() {
+    return {
+      upColor: "#3dd68c",
+      downColor: "#ff6b6b",
+      borderVisible: false,
+      wickUpColor: "#3dd68c",
+      wickDownColor: "#ff6b6b",
+      // Keep price line for current bar off so it cannot anchor a stale scale.
+      priceLineVisible: false,
+      lastValueVisible: true,
+    };
+  }
+
+  const _scale = (typeof TradeMenuChartScale !== "undefined" && TradeMenuChartScale) || null;
+
+  /**
+   * Decide whether a candle render must discard the previous Y-axis range.
+   * Prefer shared pure helper (chart_scale.js) so tests and UI stay in lockstep.
+   */
+  function shouldResetPriceScale(prevNative, nextNative) {
+    if (_scale && typeof _scale.shouldResetPriceScale === "function") {
+      return _scale.shouldResetPriceScale(prevNative, nextNative);
+    }
+    const a = String(prevNative || "").trim().toUpperCase();
+    const b = String(nextNative || "").trim().toUpperCase();
+    if (!b) return false;
+    if (!a) return true;
+    return a !== b;
+  }
+
+  /** Inclusive OHLC range + padding for an explicit visible price window. */
+  function computeAutoscaleRange(candles, padRatio) {
+    if (_scale && typeof _scale.computeAutoscaleRange === "function") {
+      return _scale.computeAutoscaleRange(candles, padRatio);
+    }
+    const pad = padRatio == null ? 0.08 : Number(padRatio);
+    if (!Array.isArray(candles) || !candles.length) return null;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const c of candles) {
+      const low = Number(c && c.low);
+      const high = Number(c && c.high);
+      if (Number.isFinite(low)) lo = Math.min(lo, low);
+      if (Number.isFinite(high)) hi = Math.max(hi, high);
+    }
+    if (!(Number.isFinite(lo) && Number.isFinite(hi))) return null;
+    if (hi < lo) return null;
+    if (hi === lo) {
+      const eps = Math.max(Math.abs(hi) * 0.001, 1e-6);
+      return { from: lo - eps, to: hi + eps };
+    }
+    const span = hi - lo;
+    const p = Math.max(0, pad) * span;
+    return { from: lo - p, to: hi + p };
+  }
+
+  function getRightPriceScale() {
+    if (!chart) return null;
+    try {
+      if (candleSeries && typeof candleSeries.priceScale === "function") {
+        return candleSeries.priceScale();
+      }
+    } catch (_) {}
+    try {
+      if (typeof chart.priceScale === "function") return chart.priceScale("right");
+    } catch (_) {}
+    return null;
+  }
+
+  /** Drop series-bound price lines; arrays must be emptied after series replace. */
+  function forgetAllPriceLines() {
+    positionLines = [];
+    previewLines = [];
+    liveOrderLines = [];
+  }
+
+  /**
+   * Recreate the candlestick series so Lightweight Charts cannot keep a
+   * manually locked Y-axis from the previous instrument (autoScale:false).
+   * Chart instance is preserved.
+   */
+  function replaceCandleSeries() {
+    if (!chart) return;
+    try {
+      if (candleSeries) chart.removeSeries(candleSeries);
+    } catch (_) {}
+    candleSeries = chart.addCandlestickSeries(candleSeriesOptions());
+    forgetAllPriceLines();
+  }
+
+  /**
+   * After setData(newCandles): unlock autoScale and, on instrument change,
+   * force a visible range derived from the NEW candles so ETH~2400 cannot
+   * remain off-screen under a leftover SP500 ~7600 window.
+   */
+  function applyPriceScaleAfterSetData(candles, { instrumentChanged } = {}) {
+    if (!chart || !candleSeries) return;
+    const ps = getRightPriceScale();
+    try {
+      if (ps && typeof ps.applyOptions === "function") {
+        // Re-enable autoscaling (user drag sets autoScale=false permanently until this).
+        ps.applyOptions({ autoScale: true });
+      }
+      // Also poke chart-level right scale options for v4.2 consistency.
+      chart.applyOptions({ rightPriceScale: { autoScale: true } });
+    } catch (_) {}
+
+    if (instrumentChanged && candles && candles.length) {
+      const range = computeAutoscaleRange(candles, 0.1);
+      if (range && ps) {
+        try {
+          // v4.2 IPriceScaleApi may expose setVisibleRange in some builds.
+          if (typeof ps.setVisibleRange === "function") {
+            ps.setVisibleRange(range);
+            // Immediately hand control back to autoscaling for further pans.
+            ps.applyOptions({ autoScale: true });
+          } else {
+            // Toggle autoScale false→true to force a recompute against new data.
+            ps.applyOptions({ autoScale: false });
+            ps.applyOptions({ autoScale: true });
+          }
+        } catch (_) {
+          try {
+            ps.applyOptions({ autoScale: false });
+            ps.applyOptions({ autoScale: true });
+          } catch (__) {}
+        }
+      }
+    }
+
+    try {
+      chart.timeScale().fitContent();
+    } catch (_) {}
+
+    // Second layout pass: some builds only recompute autoScale after rAF.
+    if (instrumentChanged) {
+      try {
+        requestAnimationFrame(() => {
+          try {
+            const ps2 = getRightPriceScale();
+            if (ps2) ps2.applyOptions({ autoScale: true });
+            chart.applyOptions({ rightPriceScale: { autoScale: true } });
+            chart.timeScale().fitContent();
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
+  }
+
   function clearMarketState(reason) {
     quoteFresh = false;
     lastPrice.textContent = "—";
@@ -93,16 +245,13 @@
       candleSeries && candleSeries.setData([]);
     } catch (_) {}
     try {
-      // Drop prior instrument autoscale (e.g. 1k–1.5k leftover on BTC ~76k).
-      if (candleSeries && typeof candleSeries.applyOptions === "function") {
-        candleSeries.applyOptions({ autoscaleInfoProvider: undefined });
-      }
-      if (chart && chart.priceScale) {
-        chart.priceScale("right").applyOptions({ autoScale: true });
-      }
+      const ps = getRightPriceScale();
+      if (ps) ps.applyOptions({ autoScale: true });
+      if (chart) chart.applyOptions({ rightPriceScale: { autoScale: true } });
     } catch (_) {}
     candleCount.textContent = "0";
     clearPositionLines();
+    clearLiveOrderLines();
     clearPreviewLines();
     invalidateTradePreview();
     updateTradeEnablement(reason);
@@ -386,16 +535,15 @@
       layout: { background: { color: "#0a0d12" }, textColor: "#c5d0e0" },
       grid: { vertLines: { color: "#1a2030" }, horzLines: { color: "#1a2030" } },
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-      rightPriceScale: { borderColor: "#1e2630" },
+      rightPriceScale: { borderColor: "#1e2630", autoScale: true },
       timeScale: { borderColor: "#1e2630", timeVisible: true, secondsVisible: false },
+      handleScale: {
+        axisPressedMouseMove: { time: true, price: true },
+        axisDoubleClickReset: { time: true, price: true },
+      },
     });
-    candleSeries = chart.addCandlestickSeries({
-      upColor: "#3dd68c",
-      downColor: "#ff6b6b",
-      borderVisible: false,
-      wickUpColor: "#3dd68c",
-      wickDownColor: "#ff6b6b",
-    });
+    candleSeries = chart.addCandlestickSeries(candleSeriesOptions());
+    chartRenderedNative = null;
     const ro = new ResizeObserver(() => {
       chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
     });
@@ -610,9 +758,7 @@
       if (!data.success) {
         try {
           candleSeries.setData([]);
-          if (chart && chart.priceScale) {
-            chart.priceScale("right").applyOptions({ autoScale: true });
-          }
+          applyPriceScaleAfterSetData([], { instrumentChanged: true });
         } catch (_) {}
         candleCount.textContent = "0";
         // Do NOT wipe native identity just because candles failed — quote,
@@ -631,6 +777,9 @@
             nativeSym.textContent = data.display || `${sym} → unresolved`;
           }
         }
+        // Failed candle paint still advances rendered-native tracking when we
+        // know the target, so a later success treats it as same/new correctly.
+        if (nativeInstrument) chartRenderedNative = nativeInstrument;
         const label = nativeInstrument || sym;
         const msg =
           (data.error && data.error.message) ||
@@ -654,19 +803,28 @@
       if (data.display) nativeSym.textContent = data.display;
       nativeInstrument = data.native_symbol || nativeInstrument;
       resolvedOk = true;
+
+      const nextNative = nativeInstrument || data.native_symbol || "";
+      const instrumentChanged = shouldResetPriceScale(chartRenderedNative, nextNative);
+
       try {
+        // REQUIRED order on instrument change:
+        //   clear overlays → (replace series) → setData(NEW) → autoscale → fit → new overlays
+        clearPositionLines();
+        clearLiveOrderLines();
+        clearPreviewLines();
+
+        if (instrumentChanged) {
+          // Fresh series drops any manually locked Y-axis from SP500/BTC/etc.
+          replaceCandleSeries();
+        }
+
         candleSeries.setData(candles);
         if (candles.length) {
-          chart.timeScale().fitContent();
-          if (chart && chart.priceScale) {
-            chart.priceScale("right").applyOptions({ autoScale: true });
-          }
+          applyPriceScaleAfterSetData(candles, { instrumentChanged });
           setLastPrice(candles[candles.length - 1].close, formatMeta, { fromNative: nativeInstrument });
         } else {
-          candleSeries.setData([]);
-          if (chart && chart.priceScale) {
-            chart.priceScale("right").applyOptions({ autoScale: true });
-          }
+          applyPriceScaleAfterSetData([], { instrumentChanged: true });
           setLastPrice(null);
           setLine(
             chartStatus,
@@ -674,9 +832,10 @@
             "error"
           );
         }
+        chartRenderedNative = nextNative || chartRenderedNative;
       } catch (_) {}
       candleCount.textContent = String(candles.length);
-      // Overlays use native identity + lastPositions — independent of candle count.
+      // Overlays ONLY after new data + scale reset (never leave SP500 lines on ETH).
       updateOverlay();
       updateTradeEnablement();
       const rMs = data.resolve_timing_ms && data.resolve_timing_ms.tradedesk_ms;
@@ -1494,14 +1653,23 @@
     lastPositions = [];
     lastOrderGroups = [];
     clearPositionLines();
+    clearLiveOrderLines();
+    clearPreviewLines();
     invalidateTradePreview();
     // Drop previous instrument quote/chart immediately (BTC must not stick on ZEC).
     resolvedOk = false;
     nativeInstrument = null;
+    // Keep chartRenderedNative until new candles land so shouldResetPriceScale
+    // still sees the previous native and forces a Y-axis reset.
     formatMeta = null;
     quoteFresh = false;
     lastPrice.textContent = "—";
     try { candleSeries && candleSeries.setData([]); } catch (_) {}
+    try {
+      const ps = getRightPriceScale();
+      if (ps) ps.applyOptions({ autoScale: true });
+      if (chart) chart.applyOptions({ rightPriceScale: { autoScale: true } });
+    } catch (_) {}
     candleCount.textContent = "0";
     updateTradeCtx();
     updateTradeEnablement("Loading market data…");
