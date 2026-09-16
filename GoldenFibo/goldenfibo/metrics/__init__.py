@@ -236,3 +236,21 @@ def fmt_price(x) -> Optional[str]:
         return f"{float(x):.2f}"
     except (TypeError, ValueError):
         return str(x)
+
+
+# Trade-based VAP / VWAP (aggTrade) — optional analytics path; does not replace OHLC defaults.
+from .trade_vap import (  # noqa: E402
+    BTCUSDT_TICK_SIZE,
+    INCOMPLETE_TRADE_HISTORY,
+    AggTrade,
+    TradeHistoryCoverage,
+    TradeVapProfile,
+    TradeWindowMetrics,
+    assess_trade_history_coverage,
+    bin_price,
+    poc_sensitivity,
+    trade_metrics_for_windows,
+    trade_poc,
+    trade_vap_profile,
+    trade_vwap,
+)
