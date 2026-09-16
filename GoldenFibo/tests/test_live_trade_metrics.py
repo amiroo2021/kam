@@ -178,3 +178,34 @@ def test_progression_keeps_ladder_store_and_skips_rest_backfill():
         assert frag["ladder_poc"] is not None and frag["active_step_poc"] is not None
 
     asyncio.run(go())
+
+
+def test_snapshot_api_identifies_aggtrade_source_fields():
+    """Chart/API contract: metric_source + status fields present for LIVE path."""
+    ctrl = SessionController()
+    ctrl.mode = SessionMode.LIVE
+    ctrl._agg_trades_fetch = _fake_fetch
+    ctrl.engine.on_event(
+        MarketEvent(MarketEventKind.SEED_P0, ts_ms=1_000_000, price=Decimal("100"))
+    )
+    ctrl._p0_seeded = True
+    ctrl._aggtrade_metrics_enabled = True
+    ctrl.phase = SessionPhase.LIVE
+
+    async def go():
+        ctrl._sync_trade_windows_from_engine(schedule_backfill=True)
+        assert ctrl._trade_backfill_task is not None
+        await ctrl._trade_backfill_task
+        snap = ctrl.snapshot_dict()
+        for key in (
+            "metric_source",
+            "ladder_metric_status",
+            "step_metric_status",
+            "metrics_handoff_status",
+            "ladder_trade_count",
+        ):
+            assert key in snap
+        assert snap["metric_source"] == "AGGTRADE"
+        assert snap["ladder_metric_status"] == "COMPLETE"
+
+    asyncio.run(go())
