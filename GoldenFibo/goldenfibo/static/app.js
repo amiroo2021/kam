@@ -346,14 +346,10 @@
       { key: "active_step_vwap", title: "S-VWAP", color: "#f2c500", dashed: true, status: stepSt },
       { key: "ladder_poc", title: "L-POC", color: "#eceff1", dashed: false, status: ladderSt },
       { key: "active_step_poc", title: "S-POC", color: "#eceff1", dashed: true, status: stepSt },
+      // Single VAH/VAL = whole ladder P0→now (same profile as L-POC); never step VA
+      { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true, status: ladderSt },
+      { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true, status: ladderSt },
     ];
-    // VAL/VAH only for OHLC research path (not primary LIVE)
-    if (src === "OHLC_APPROXIMATION") {
-      specs.push(
-        { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true, status: ladderSt },
-        { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true, status: ladderSt }
-      );
-    }
 
     // Dedupe equal L/S VWAP and L/S POC for readability
     const lv = Number(msg.ladder_vwap);

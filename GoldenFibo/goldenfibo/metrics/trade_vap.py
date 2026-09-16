@@ -172,6 +172,65 @@ def trade_poc(
     return None if prof is None else prof.poc_price
 
 
+def trade_value_area(
+    profile: TradeVapProfile,
+    *,
+    value_area_pct: float = 0.70,
+) -> Tuple[float, float]:
+    """VAL/VAH edges from a trade VAP profile (same bins as POC).
+
+    Expands from the POC bin among sorted non-empty price bins until cumulative
+    volume reaches ``value_area_pct`` of total (default 70%), matching the OHLC
+    profile expansion rule: prefer the higher-volume adjacent side; ties expand
+    right then left.
+
+    Returns (VAL, VAH) where VAL is the low edge of the leftmost included bin
+    and VAH is the high edge of the rightmost included bin (bin + bin_size).
+    """
+    if not profile.vols or profile.total_volume <= 0:
+        p = float(profile.poc_price)
+        return p, p + float(profile.bin_size)
+    bins = sorted(profile.vols.keys())
+    vols = [float(profile.vols[b]) for b in bins]
+    total = sum(vols)
+    target = total * float(value_area_pct)
+    # POC is stored as bin low edge
+    try:
+        poc_idx = bins.index(float(profile.poc_price))
+    except ValueError:
+        poc_idx = max(range(len(vols)), key=lambda i: (vols[i], -bins[i]))
+    left = right = poc_idx
+    acc = vols[poc_idx]
+    n = len(vols)
+    while acc + 1e-15 < target:
+        lval = vols[left - 1] if left > 0 else -1.0
+        rval = vols[right + 1] if right < n - 1 else -1.0
+        if lval < 0 and rval < 0:
+            break
+        if rval > lval:
+            right += 1
+            acc += vols[right]
+        elif lval > rval:
+            left -= 1
+            acc += vols[left]
+        else:
+            expanded = False
+            if right < n - 1:
+                right += 1
+                acc += vols[right]
+                expanded = True
+            if acc + 1e-15 < target and left > 0:
+                left -= 1
+                acc += vols[left]
+                expanded = True
+            if not expanded:
+                break
+    width = float(profile.bin_size)
+    val = float(bins[left])
+    vah = float(bins[right]) + width
+    return val, vah
+
+
 def assess_trade_history_coverage(
     trades: Sequence[AggTrade],
     *,

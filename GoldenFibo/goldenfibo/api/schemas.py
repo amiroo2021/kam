@@ -177,10 +177,12 @@ def build_state_payload(
         last_candle_time = candles[-1].get("time")
 
     metric_fields = md.as_payload_fields()
-    # OHLC path still exposes VAL/VAH via MetricDisplay
-    if md.source == SOURCE_OHLC:
-        metric_fields["ladder_val"] = fmt_metric(md.ladder_val)
-        metric_fields["ladder_vah"] = fmt_metric(md.ladder_vah)
+    # Ensure OHLC path always has formatted VAL/VAH when complete (as_payload already does)
+    if md.source == SOURCE_OHLC and md.ladder_status == STATUS_COMPLETE:
+        if metric_fields.get("ladder_val") is None and md.ladder_val is not None:
+            metric_fields["ladder_val"] = fmt_metric(md.ladder_val)
+        if metric_fields.get("ladder_vah") is None and md.ladder_vah is not None:
+            metric_fields["ladder_vah"] = fmt_metric(md.ladder_vah)
 
     payload = {
         "v": PROTOCOL_VERSION,

@@ -251,6 +251,7 @@ from .trade_vap import (  # noqa: E402
     poc_sensitivity,
     trade_metrics_for_windows,
     trade_poc,
+    trade_value_area,
     trade_vap_profile,
     trade_vwap,
 )

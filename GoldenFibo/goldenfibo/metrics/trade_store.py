@@ -21,6 +21,7 @@ from .trade_vap import (
     assess_trade_history_coverage,
     trade_metrics_for_windows,
     trade_vap_profile,
+    trade_value_area,
     trade_vwap,
 )
 
@@ -73,8 +74,9 @@ class MetricDisplay:
             "active_step_vwap": status_or_value(self.step_status, self.step_vwap),
             "ladder_poc": status_or_value(self.ladder_status, self.ladder_poc),
             "active_step_poc": status_or_value(self.step_status, self.step_poc),
-            "ladder_val": status_or_value(self.ladder_status, self.ladder_val) if self.source == SOURCE_OHLC else None,
-            "ladder_vah": status_or_value(self.ladder_status, self.ladder_vah) if self.source == SOURCE_OHLC else None,
+            # Single chart VAH/VAL = whole ladder only (P0→now), never step VA
+            "ladder_val": status_or_value(self.ladder_status, self.ladder_val),
+            "ladder_vah": status_or_value(self.ladder_status, self.ladder_vah),
             "ladder_metric_status": self.ladder_status,
             "step_metric_status": self.step_status,
             "metrics_handoff_status": self.handoff_status,
@@ -324,7 +326,7 @@ class TradeMetricStore:
         step_ok, step_st, step_detail = self._coverage_ok_for(step_start)
 
         trades = self.trades
-        lv = lp = sv = sp = None
+        lv = lp = sv = sp = l_val = l_vah = None
         lprof = sprof = None
         lcnt = scnt = 0
         lqty = sqty = 0.0
@@ -336,6 +338,7 @@ class TradeMetricStore:
                 lp = lprof.poc_price
                 lqty = lprof.total_volume
                 lcnt = sum(1 for t in trades if int(t.ts_ms) >= ladder_start)
+                l_val, l_vah = trade_value_area(lprof, value_area_pct=0.70)
         if step_ok:
             sv = trade_vwap(trades, step_start)
             sprof = trade_vap_profile(trades, step_start, bin_size=self.tick_size)
@@ -350,6 +353,8 @@ class TradeMetricStore:
             step_vwap=sv,
             ladder_poc=lp,
             step_poc=sp,
+            ladder_val=l_val,
+            ladder_vah=l_vah,
             ladder_status=ladder_st,
             step_status=step_st,
             ladder_trade_count=lcnt,
