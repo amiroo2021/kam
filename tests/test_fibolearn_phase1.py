@@ -47,10 +47,10 @@ def test_ladder_extraction_buy_and_sell_pn_context():
     sell = extract_ladder_observation(
         LadderStateInput(symbol="BTC", timestamp_ms=1, direction="SELL", percentage=Decimal("0.001"), cycle_id=8, p0=Decimal("100"), active_step=2, current_price=Decimal("99.75"), active_since_ms=0)
     )
-    assert buy.pn > buy.pn_minus_1
-    assert buy.pn_plus_2 > buy.pn_plus_1 > buy.pn
-    assert sell.pn < sell.pn_minus_1
-    assert sell.pn_plus_2 < sell.pn_plus_1 < sell.pn
+    assert buy.pn < buy.pn_minus_1
+    assert buy.pn_plus_2 < buy.pn_plus_1 < buy.pn
+    assert sell.pn > sell.pn_minus_1
+    assert sell.pn_plus_2 > sell.pn_plus_1 > sell.pn
     assert buy.distance_to_pn == Decimal("100.25") - buy.pn
 
 

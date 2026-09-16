@@ -3,7 +3,9 @@ from dataclasses import dataclass, asdict
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-PHI = Decimal("1.618033988749894848204586834")
+from fibolearn.goldenfibo_compat import GF_ROOT  # noqa: F401
+from goldenfibo.engine.config import Side
+from goldenfibo.engine.levels import ladder_step
 
 @dataclass(frozen=True)
 class LadderStateInput:
@@ -21,6 +23,7 @@ class LadderStateInput:
     lowest_excursion: Decimal | None = None
     last_progression_ts_ms: Optional[int] = None
     last_step_change_ts_ms: Optional[int] = None
+    closed_count: int = 0
 
 @dataclass(frozen=True)
 class LadderObservation:
@@ -53,41 +56,62 @@ class LadderObservation:
     time_since_active_step_changed_ms: int | None
     distance_to_tp: Decimal | None
     cycle_age_ms: int
+    fraction_to_next_step: Decimal | None
+    normalized_distance_to_next_step: Decimal | None
+    normalized_distance_to_pn_plus_2: Decimal | None
+    normalized_distance_to_tp: Decimal | None
+    closed_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        d=asdict(self)
-        for k,v in list(d.items()):
-            if isinstance(v, Decimal): d[k]=str(v)
+        d = asdict(self)
+        for k, v in list(d.items()):
+            if isinstance(v, Decimal):
+                d[k] = str(v)
         return d
 
 def ladder_price(direction: str, p0: Decimal, step: int, percentage: Decimal) -> Decimal:
-    # GoldenFibo geometry: each step is phi^step * percentage away from P0.
-    if step < 0:
-        step = 0
-    pct = Decimal(str(percentage)) / Decimal("100") if Decimal(str(percentage)) >= 1 else Decimal(str(percentage))
-    offset = p0 * pct * (PHI ** step)
-    return p0 + offset if direction.upper() == "BUY" else p0 - offset
+    return ladder_step(Side(direction.upper()), p0, max(0, int(step)), percentage=percentage)[0]
+
+def _norm(price: Decimal, a: Decimal, b: Decimal) -> Decimal | None:
+    den = b - a
+    if den == 0:
+        return None
+    return (price - a) / den
 
 def extract_ladder_observation(inp: LadderStateInput) -> LadderObservation:
-    direction=inp.direction.upper()
-    n=int(inp.active_step)
-    pn=ladder_price(direction, inp.p0, n, inp.percentage)
-    pnm1=ladder_price(direction, inp.p0, n-1, inp.percentage) if n>=1 else None
-    pn1=ladder_price(direction, inp.p0, n+1, inp.percentage)
-    pn2=ladder_price(direction, inp.p0, n+2, inp.percentage)
-    price=inp.current_price
-    dist_tp=(price-pnm1) if pnm1 is not None else None
+    direction = inp.direction.upper()
+    n = int(inp.active_step)
+    pn = ladder_price(direction, inp.p0, n, inp.percentage)
+    pnm1 = ladder_price(direction, inp.p0, n - 1, inp.percentage) if n >= 1 else None
+    pn1 = ladder_price(direction, inp.p0, n + 1, inp.percentage)
+    pn2 = ladder_price(direction, inp.p0, n + 2, inp.percentage)
+    price = Decimal(str(inp.current_price))
+    dist_tp = (price - pnm1) if pnm1 is not None else None
+    fraction = _norm(price, pn, pn1)
+    norm_next = (price - pn1) / (pn1 - pn) if pn1 != pn else None
+    norm_pn2 = (price - pn2) / (pn2 - pn) if pn2 != pn else None
+    norm_tp = ((price - pnm1) / (pn - pnm1)) if pnm1 is not None and pn != pnm1 else None
     progressing = (price >= pn if direction == "BUY" else price <= pn)
     retreating = (pnm1 is not None and (price <= pn if direction == "BUY" else price >= pn))
     return LadderObservation(
-        symbol=inp.symbol, timestamp_ms=int(inp.timestamp_ms), direction=direction, percentage=inp.percentage,
-        cycle_id=int(inp.cycle_id), active_step=n, pn_minus_1=pnm1, pn=pn, pn_plus_1=pn1, pn_plus_2=pn2, current_price=price,
-        distance_to_pn_minus_1=(price-pnm1) if pnm1 is not None else None, distance_to_pn=price-pn, distance_to_pn_plus_1=price-pn1, distance_to_pn_plus_2=price-pn2,
-        time_since_pn_active_ms=max(0, int(inp.timestamp_ms)-int(inp.active_since_ms)), pn_retested=inp.pn_retests>0, pn_retest_count=inp.pn_retests,
+        symbol=inp.symbol, timestamp_ms=int(inp.timestamp_ms), direction=direction, percentage=Decimal(str(inp.percentage)), cycle_id=int(inp.cycle_id), active_step=n,
+        pn_minus_1=pnm1, pn=pn, pn_plus_1=pn1, pn_plus_2=pn2, current_price=price,
+        distance_to_pn_minus_1=(price - pnm1) if pnm1 is not None else None, distance_to_pn=price - pn, distance_to_pn_plus_1=price - pn1, distance_to_pn_plus_2=price - pn2,
+        time_since_pn_active_ms=max(0, int(inp.timestamp_ms) - int(inp.active_since_ms)), pn_retested=inp.pn_retests > 0, pn_retest_count=int(inp.pn_retests),
         highest_excursion_since_pn=inp.highest_excursion, lowest_excursion_since_pn=inp.lowest_excursion,
         progression_state="progressing" if progressing else ("retreating_to_tp" if retreating else "between_levels"), progression_depth=n, highest_step_reached=n,
         progressing=progressing, retreating_toward_tp=retreating,
-        time_since_last_progression_ms=(int(inp.timestamp_ms)-inp.last_progression_ts_ms) if inp.last_progression_ts_ms is not None else None,
-        time_since_active_step_changed_ms=(int(inp.timestamp_ms)-inp.last_step_change_ts_ms) if inp.last_step_change_ts_ms is not None else None,
-        distance_to_tp=dist_tp, cycle_age_ms=max(0, int(inp.timestamp_ms)-int(inp.active_since_ms)),
+        time_since_last_progression_ms=(int(inp.timestamp_ms) - int(inp.last_progression_ts_ms)) if inp.last_progression_ts_ms is not None else None,
+        time_since_active_step_changed_ms=(int(inp.timestamp_ms) - int(inp.last_step_change_ts_ms)) if inp.last_step_change_ts_ms is not None else None,
+        distance_to_tp=dist_tp, cycle_age_ms=max(0, int(inp.timestamp_ms) - int(inp.active_since_ms)),
+        fraction_to_next_step=fraction, normalized_distance_to_next_step=norm_next, normalized_distance_to_pn_plus_2=norm_pn2, normalized_distance_to_tp=norm_tp, closed_count=int(inp.closed_count),
     )
+
+def observation_from_engine(symbol: str, timestamp_ms: int, percentage: Decimal, direction: str, engine, price: Decimal, *, retests: int = 0, high: Decimal | None = None, low: Decimal | None = None, last_progression_ts_ms: int | None = None, last_step_change_ts_ms: int | None = None) -> LadderObservation:
+    st = engine.state
+    if st.p0 is None:
+        p0 = price; n = 0; cycle_id = 0; active_since = timestamp_ms
+    else:
+        p0 = Decimal(str(st.p0)); n = int(st.highest_filled); cycle_id = int(st.cycle_id)
+        active_since = int(st.legs[-1].ts_ms) if st.legs else timestamp_ms
+    return extract_ladder_observation(LadderStateInput(symbol=symbol, timestamp_ms=timestamp_ms, direction=direction, percentage=Decimal(str(percentage)), cycle_id=cycle_id, p0=p0, active_step=n, current_price=price, active_since_ms=active_since, pn_retests=retests, highest_excursion=high, lowest_excursion=low, last_progression_ts_ms=last_progression_ts_ms, last_step_change_ts_ms=last_step_change_ts_ms, closed_count=len(getattr(st, 'closed', []) or [])))
