@@ -17,6 +17,7 @@ QFEX HMAC auth per docs:
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import hmac
 import json
@@ -1143,6 +1144,8 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _resolve_instrument(account, request)
     if operation == "market_price":
         return _market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     if operation == "balance":
         return _balance(account)
     if operation in {"positions_orders", "positions_management"}:

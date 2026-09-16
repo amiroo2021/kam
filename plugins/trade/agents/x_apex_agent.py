@@ -25,6 +25,7 @@ parse ``APEX_*`` environment variables or Apex-native payloads.
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import logging
 import os
@@ -399,6 +400,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _apex_list_instruments(account, request)
         if operation == "market_price":
             return _apex_market_price(account, request)
+        if operation == "candles":
+            return handle_candles_operation(name, account, request)
         if operation == "set_tp":
             return _apex_set_tp(request)
         if operation == "set_sl":

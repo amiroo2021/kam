@@ -14,6 +14,7 @@ parse ``LIGHTER_*`` environment variables or Lighter-native payloads.
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import asyncio
 import importlib
@@ -5902,6 +5903,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_list_instruments(request)
         if operation == "market_price":
             return _execute_market_price(request)
+        if operation == "candles":
+            return handle_candles_operation(name, account, request)
         if operation == "position_state":
             return _execute_position_state(request)
         if operation == "get_order_state":

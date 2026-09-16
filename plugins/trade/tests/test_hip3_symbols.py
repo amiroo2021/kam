@@ -38,11 +38,12 @@ class Hip3CandleTests(unittest.TestCase):
 
     def test_fetch_candles_structured_error_not_raw_500(self) -> None:
         import urllib.error
+        from plugins.trade import candles as cmod
 
         def boom(*a, **k):
             raise urllib.error.HTTPError("https://x", 500, "Internal Server Error", hdrs=None, fp=None)
 
-        with mock.patch.object(md, "_http_json", side_effect=boom):
+        with mock.patch.object(cmod, "_http_json", side_effect=boom):
             out = md.fetch_candles("hyperliquid", "FLEX", "xyz:SP500", "15m", limit=10)
         self.assertFalse(out["success"])
         self.assertEqual(out["error"]["code"], "CANDLES_UNAVAILABLE")
@@ -103,9 +104,21 @@ class Hip3ResolveServiceTests(unittest.TestCase):
                 return ["FLEX"]
 
             def capabilities(self, exchange):
-                return ["resolve_instrument"]
+                return ["resolve_instrument", "candles"]
 
             def execute(self, request):
+                if request.get("operation") == "candles":
+                    self.last_candle_symbol = request.get("symbol")
+                    return make_success(
+                        "candles",
+                        "hyperliquid",
+                        "FLEX",
+                        data={
+                            "candles": [{"time": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 1}],
+                            "symbol": request.get("symbol"),
+                            "source": "native",
+                        },
+                    )
                 return make_success(
                     "resolve_instrument",
                     "hyperliquid",
@@ -117,16 +130,18 @@ class Hip3ResolveServiceTests(unittest.TestCase):
                     ),
                 )
 
-        svc = TradeMenuService(desk=Desk())  # type: ignore[arg-type]
+        desk = Desk()
+        svc = TradeMenuService(desk=desk)  # type: ignore[arg-type]
         resolved = svc.resolve_instrument("hyperliquid", "FLEX", "SP500")
         native = resolved["native_symbol"]
-        with mock.patch.object(md, "fetch_hyperliquid_candles", return_value=[
-            {"time": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 1}
-        ]) as m:
+        self.assertEqual(native, "xyz:SP500")
+
+        with mock.patch("plugins.trade.tradedesk.TradeDesk", return_value=desk):
             out = md.fetch_candles("hyperliquid", "FLEX", native, "15m", 50)
         self.assertTrue(out["success"])
-        m.assert_called()
-        self.assertEqual(m.call_args[0][0], "xyz:SP500")
+        self.assertEqual(out["symbol"], "xyz:SP500")
+        self.assertEqual(len(out["candles"]), 1)
+        self.assertEqual(getattr(desk, "last_candle_symbol", None), "xyz:SP500")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ Public-only: resolves Binance Spot / USD-M Futures symbols and returns latest pr
 No credentials, balances, or order operations.
 """
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import json
 import urllib.parse
@@ -19,7 +20,11 @@ _TIMEOUT = 15
 
 
 def capabilities():
-    return ["resolve_instrument", "market_price"]
+    return [
+        "candles",
+        "resolve_instrument",
+        "market_price",
+    ]
 
 
 def list_accounts():
@@ -116,6 +121,12 @@ def _market_price(account: str, request: Mapping[str, Any]):
 
 
 def execute(request: Mapping[str, Any]):
+    operation = str(request.get("operation") or "").strip().lower()
+    account = str(request.get("account") or "spot")
+    if operation == "candles":
+        # account selects spot vs futures for public klines
+        return handle_candles_operation(name, account, dict(request))
+
     op = str(request.get("operation") or "").strip()
     account = str(request.get("account") or request.get("market_type") or "spot")
     if op == "resolve_instrument":

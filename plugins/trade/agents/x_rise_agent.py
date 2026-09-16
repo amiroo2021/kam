@@ -15,6 +15,7 @@ parse ``RISE_*`` environment variables or Rise-native payloads.
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import base64
 import json
@@ -217,6 +218,7 @@ def list_accounts() -> List[str]:
 def capabilities() -> List[str]:
     # Phase 1: market_immediate is bounded-limit IOC fill.
     return [
+        "candles",
         "balance",
         "positions_orders",
         "positions_management",
@@ -425,6 +427,16 @@ def _rise_alias_keys(symbol: str) -> List[str]:
         base, rest = raw.split("-", 1)
         if rest in _RISE_QUOTE_SUFFIXES and base:
             keys.append(base)
+    # BTCUSD / BTCUSDC / BTCUSDT (no separator) → also try BTC
+    compact = raw.replace("-", "").replace("/", "").replace("_", "")
+    if compact and compact not in keys:
+        keys.append(compact)
+    for suffix in ("USDT", "USDC", "USD", "PERP"):
+        if compact.endswith(suffix) and len(compact) > len(suffix):
+            base = compact[: -len(suffix)]
+            if base and base not in keys:
+                keys.append(base)
+            break
     return keys
 
 
@@ -535,9 +547,10 @@ def _normalize_positions(
         sl_orders = list(protections.get("sl") or [])
         tp_price = tp_orders[0].get("_normalized_stop_price") if tp_orders else None
         sl_price = sl_orders[0].get("_normalized_stop_price") if sl_orders else None
+        symbol = _rise_symbol(item.get("market_name"))
         positions.append(
             CanonicalPosition(
-                symbol=_rise_symbol(item.get("market_name")),
+                symbol=symbol,
                 side=side,
                 size=size_text,
                 entry_price=entry_price_text,
@@ -547,7 +560,8 @@ def _normalize_positions(
                 sl=str(sl_price) if sl_price not in (None, "") else None,
                 tp_count=len(tp_orders) or None,
                 sl_count=len(sl_orders) or None,
-                exchange_instrument=str(item.get("market_name") or "") or None,
+                # Match resolve_instrument native (BTC), not raw BTC/USDC label.
+                exchange_instrument=symbol or None,
             )
         )
     positions.sort(key=lambda item: (item.symbol, item.side))
@@ -905,6 +919,7 @@ def _aggregate_open_orders(orders: List[Dict[str, Any]]) -> List[CanonicalOrderG
                 vwap=_format_decimal_places(vwap, precision),
                 min_price=_decimal_text(group["min_price"]),
                 max_price=_decimal_text(group["max_price"]),
+                exchange_instrument=str(group.get("symbol") or "") or None,
             )
         )
     rows.sort(key=lambda item: (item.symbol, item.side))
@@ -3995,6 +4010,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_market_constraints(normalized_request)
     if operation == "market_price":
         return _execute_market_price(normalized_request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     if operation == "position_state":
         return _execute_position_state(account, normalized_request)
     if operation == "get_order_state":

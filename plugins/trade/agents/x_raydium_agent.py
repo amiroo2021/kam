@@ -15,6 +15,7 @@ Configured accounts are discovered from either the live environment or
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import base64
 import json
@@ -149,6 +150,7 @@ def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
 
 def capabilities() -> List[str]:
     return [
+        "candles",
         "balance",
         "positions_orders",
         "new_order",
@@ -1645,6 +1647,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _raydium_list_instruments(account, request)
     if operation == "market_price":
         return _raydium_market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     return make_failure(
         operation=operation or "unknown",
         exchange=name,

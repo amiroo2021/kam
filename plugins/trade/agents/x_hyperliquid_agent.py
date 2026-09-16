@@ -25,6 +25,7 @@ module's responsibility.
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import json
 import logging
@@ -236,7 +237,8 @@ def list_accounts() -> List[str]:
 
 def capabilities() -> List[str]:
     """Return the operations this agent supports."""
-    return ["balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
+    return [
+        "candles","balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
  # Phase 2.4: catalog + mark price (metaAndAssetCtxs).
  "list_instruments", "market_price"]
 
@@ -299,6 +301,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     if operation == "new_order":
         return _execute_new_order(account, request)
     if operation == "cancel_order_group":

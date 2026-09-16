@@ -41,6 +41,7 @@ payloads.
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import json
 import logging
@@ -396,6 +397,7 @@ def _lookup_credentials(alias: str) -> Optional[Dict[str, str]]:
 
 def capabilities() -> List[str]:
     return [
+        "candles",
         "balance",
         "positions_orders",
         "new_order",
@@ -4172,6 +4174,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
 
     return make_failure(
         operation=operation,

@@ -16,6 +16,7 @@ used for public context, candles, and history.
 No withdrawals / transfers are implemented (API keys cannot withdraw).
 """
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import base64
 import hashlib
@@ -2208,6 +2209,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _list_instruments(account, request)
     if operation == "market_price":
         return _market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     if operation == "new_order":
         return _new_order(request)
     if operation in {"cancel_order_group", "cancel_orders"}:

@@ -28,6 +28,7 @@ Unified contract account endpoints:
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import hashlib
 import hmac
@@ -196,6 +197,7 @@ def list_accounts() -> List[str]:
 
 def capabilities() -> List[str]:
     return [
+        "candles",
         "balance",
         "positions_orders",
         "positions_management",
@@ -2349,6 +2351,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _list_instruments(account, request)
         if operation == "market_price":
             return _market_price(account, request)
+        if operation == "candles":
+            return handle_candles_operation(name, account, request)
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation=operation,

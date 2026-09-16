@@ -12,6 +12,7 @@ no separate venv, no subprocess, no JSON/IPC plumbing. Compatibility
 was verified end-to-end with the shared-venv package set.
 """
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import asyncio
 import base64
@@ -1354,6 +1355,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     return make_failure(
         operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED",
         message=f"EdgeX does not implement '{operation}' yet.",

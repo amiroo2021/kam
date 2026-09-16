@@ -20,6 +20,7 @@ Optional fields supported for flexibility:
 """
 
 from __future__ import annotations
+from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import json
 import logging
@@ -302,6 +303,7 @@ def capabilities() -> List[str]:
     # the wizard dispatches; ``cancel_orders`` (plural) is an alias kept for
     # backwards-compat with any caller that already uses the plural form.
     return [
+        "candles",
         "balance",
         "positions_orders",
         "new_order",
@@ -3753,6 +3755,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_market_constraints(request)
     if operation == "market_price":
         return _execute_market_price(request)
+    if operation == "candles":
+        return handle_candles_operation(name, account, request)
     if operation == "position_state":
         return _execute_position_state(request)
     if operation == "get_order_state":

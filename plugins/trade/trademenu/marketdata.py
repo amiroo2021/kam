@@ -503,7 +503,11 @@ def fetch_arcus_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[str
 
 
 def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int = 300) -> Dict[str, Any]:
-    """Return {success, candles, ...} or explicit unsupported error."""
+    """Return {success, candles, ...} via TradeDesk agent ``candles`` operation.
+
+    Exchange-specific HTTP/symbol logic lives in agents + ``plugins.trade.candles``.
+    TradeMenu must not grow a per-venue if/elif switch here.
+    """
     ex = str(exchange or "").strip().lower()
     tf_n = str(tf or "").strip()
     if tf_n not in SUPPORTED_TFS:
@@ -516,31 +520,53 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             "candles": [],
         }
     try:
-        if ex == "binance":
-            market = "futures" if str(account).lower() in {"futures", "future", "perp", "perps"} else "spot"
-            candles = fetch_binance_candles(symbol, tf_n, market=market, limit=limit)
-        elif ex == "hyperliquid":
-            candles = fetch_hyperliquid_candles(symbol, tf_n, limit=limit)
-        elif ex == "phemex":
-            candles = fetch_phemex_candles(symbol, tf_n, limit=limit)
-        elif ex == "mexc":
-            candles = fetch_mexc_candles(symbol, tf_n, limit=limit)
-        elif ex == "raydium":
-            candles = fetch_raydium_candles(symbol, tf_n, limit=limit)
-        elif ex == "arcus":
-            candles = fetch_arcus_candles(symbol, tf_n, limit=limit)
-        else:
+        from plugins.trade.tradedesk import TradeDesk
+
+        desk = TradeDesk()
+        caps = desk.capabilities(ex) if ex in desk.list_exchanges() else []
+        if "candles" not in (caps or []):
             return {
                 "success": False,
                 "error": {
                     "code": "UNSUPPORTED_CANDLES",
-                    "message": f"Candles are not implemented for exchange '{ex}' in TradeMenu Phase 1.",
+                    "message": f"Candles unavailable for {symbol} on {ex}.",
                 },
                 "candles": [],
                 "exchange": ex,
                 "symbol": symbol,
                 "timeframe": tf_n,
             }
+        resp = desk.execute(
+            {
+                "operation": "candles",
+                "exchange": ex,
+                "account": account,
+                "symbol": symbol,
+                "interval": tf_n,
+                "limit": limit,
+            }
+        )
+        if not getattr(resp, "success", False):
+            err = getattr(resp, "error", None)
+            code = getattr(err, "code", None) or "CANDLES_UNAVAILABLE"
+            msg = getattr(err, "message", None) or f"Candles unavailable for {symbol} on {ex}."
+            # Never surface Phase-1 leftovers or raw HTTP URLs.
+            if "Phase 1" in str(msg):
+                msg = f"Candles unavailable for {symbol} on {ex}."
+            if "url:" in str(msg).lower() or "HTTP Error" in str(msg):
+                msg = f"Candles unavailable for {symbol} on {ex}."
+            return {
+                "success": False,
+                "error": {"code": str(code), "message": str(msg)[:300]},
+                "candles": [],
+                "exchange": ex,
+                "symbol": symbol,
+                "timeframe": tf_n,
+            }
+        data = getattr(resp, "data", None) or {}
+        candles = data.get("candles") if isinstance(data, dict) else None
+        if not isinstance(candles, list):
+            candles = []
         return {
             "success": True,
             "exchange": ex,
@@ -548,24 +574,15 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             "symbol": symbol,
             "timeframe": tf_n,
             "candles": candles,
+            "source": (data.get("source") if isinstance(data, dict) else None) or "native",
         }
-    except ValueError as exc:
-        code = str(exc)
-        if code == "UNSUPPORTED_TIMEFRAME":
-            return {
-                "success": False,
-                "error": {"code": "UNSUPPORTED_TIMEFRAME", "message": f"Timeframe {tf_n!r} is not supported on {ex}."},
-                "candles": [],
-            }
-        return {"success": False, "error": {"code": "CANDLE_ERROR", "message": code}, "candles": []}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)[:300]
         code = "CANDLES_UNAVAILABLE" if "CANDLES_UNAVAILABLE" in msg or "HTTP Error" in msg else "CANDLE_ERROR"
-        # Prefer clean user-facing text over raw urllib "HTTP Error 500".
         if msg.startswith("CANDLES_UNAVAILABLE:"):
             msg = msg.split(":", 1)[1].strip()
         elif "HTTP Error" in msg:
-            msg = f"Market data unavailable for {symbol} on {ex}."
+            msg = f"Candles unavailable for {symbol} on {ex}."
         return {
             "success": False,
             "error": {"code": code, "message": msg},
