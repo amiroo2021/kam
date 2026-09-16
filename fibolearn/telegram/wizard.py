@@ -42,19 +42,53 @@ class FiboLearnWizard:
             if obs is None:
                 return Screen('Research job requires at least one stored synchronized observation. Status: CANDIDATE. Matches: 0')
             report=study_setup(self._store, obs, min_matches=1)
-            return Screen(f'Research job created from frozen synchronized state. Status: {report.pattern.status.value}.\nMatches: {report.match_count}\nOutcome rate: {report.outcome_rate if report.outcome_rate is not None else "insufficient evidence"}', [[_b('◀️ Back','fibolearn:live')]])
+            return Screen(f'Research job created from frozen synchronized state. Status: {report.pattern.status.value}.\nCandidate class: CANDIDATE until independently validated.\nMatches: {report.match_count}\nOutcome rate: {report.outcome_rate if report.outcome_rate is not None else "insufficient evidence"}', [[_b('◀️ Back','fibolearn:live')]])
         if suffix == 'patterns':
             return Screen('Pattern Discoveries\nRecent Discoveries · Validated Patterns · Candidate Patterns · Rejected Patterns · Degraded Patterns · Patterns Being Watched')
         if suffix == 'backtests':
             return Screen('Backtests\nAutomatic Research · Test Live Pattern · Test Existing Pattern · Custom Hypothesis · Recent Tests')
         if suffix == 'report':
-            counts=self._store.observation_counts_by_symbol()
-            return Screen('Learning Report\nObservations by symbol: '+str(counts))
+            return Screen('Learning Report\n\nDataset Status\nBaselines', [[_b('Dataset Status','fibolearn:report:dataset')], [_b('Baselines','fibolearn:report:baselines')]])
+        if suffix == 'report:dataset':
+            return self._dataset_status_screen()
+        if suffix == 'report:baselines':
+            return Screen('Baselines — choose symbol', [[_b(s, f'fibolearn:report:baseline:{s}:0.001:BUY') for s in ('BTC','ETH','SOL')], [_b(s, f'fibolearn:report:baseline:{s}:0.001:BUY') for s in ('ZEC','PAXG')]])
+        if suffix.startswith('report:baseline:'):
+            _,_,sym,pct,side = suffix.split(':',4)
+            return self._baseline_screen(sym,pct,side)
         if suffix == 'ask':
             return Screen('Ask FiboLearn\nQuestions must query stored observations/backtests. If no traceable result exists, FiboLearn reports insufficient evidence.')
         if suffix == 'settings':
             return Screen('Settings\nSymbols: BTC ETH SOL ZEC PAXG\nDirections: BUY SELL\nResearch: automatic discovery, backtests, cross-symbol, walk-forward\nAlerts: new/validated/strong/degraded patterns')
         return self.open()
+    def _dataset_status_screen(self) -> Screen:
+        from datetime import datetime, timezone
+        def iso(ms):
+            return datetime.fromtimestamp(int(ms)/1000, timezone.utc).isoformat().replace('+00:00','Z') if ms else '—'
+        status=self._store.dataset_status_by_symbol()
+        lines=['Dataset Status']
+        for sym in ('BTC','ETH','SOL','ZEC','PAXG'):
+            s=status.get(sym, {'candles':0,'observations':0,'episodes':0,'cycles':0})
+            lines += ['', sym, f"Candles: {s.get('candles',0)}", f"Observations: {s.get('observations',0)}", f"Episodes: {s.get('episodes',0)}", f"Cycles: {s.get('cycles',0)}", f"Historical range: {iso(s.get('first_timestamp_ms'))} → {iso(s.get('last_timestamp_ms'))}"]
+        return Screen('\n'.join(lines))
+
+    def _baseline_screen(self, sym: str, pct: str, side: str) -> Screen:
+        b=self._store.episode_baselines().get((sym,pct,side.upper()))
+        if not b:
+            return Screen(f'{sym} / {pct}% / {side.upper()}\nEpisodes: 0\nNo actual episode data stored yet.')
+        n=max(1,b['episodes'])
+        return Screen('\n'.join([
+            f'{sym} / {pct}% / {side.upper()}',
+            f"Episodes: {b['episodes']}",
+            f"Raw observations: {b['raw_observations']}",
+            f"P(n+1) before TP: {100*b['pn_plus_1_before_tp']/n:.2f}%",
+            f"TP before P(n+1): {100*b['tp_before_pn_plus_1']/n:.2f}%",
+            f"Censored: {100*b['other_censored']/n:.2f}%",
+            f"Median episode duration: {b.get('median_duration_ms')} ms",
+            f"Median MFE: {b.get('median_mfe')}",
+            f"Median MAE: {b.get('median_mae')}",
+        ]))
+
     def _live_screen(self, sym: str) -> Screen:
         obs=self._store.latest_observation(None if sym=='ALL' else sym)
         if not obs:

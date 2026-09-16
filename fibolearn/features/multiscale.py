@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Any, Dict
 from fibolearn.collector.state_adapter import LadderStateInput, LadderObservation, extract_ladder_observation
 from fibolearn.config.defaults import DEFAULT_DIRECTIONS, DEFAULT_PERCENTAGES
+from fibolearn.features.definitions import FEATURE_DEFINITION
 
 @dataclass(frozen=True)
 class MultiScaleVector:
@@ -14,7 +15,7 @@ class MultiScaleVector:
     features: Dict[str, Any]
     raw: Dict[str, Any]
     def to_dict(self):
-        return {'symbol': self.symbol, 'timestamp_ms': self.timestamp_ms, 'market': _ser(self.market), 'ladders': {p: {d: o.to_dict() for d, o in sides.items()} for p, sides in self.ladders.items()}, 'features': _ser(self.features), 'raw': _ser(self.raw)}
+        return {'symbol': self.symbol, 'timestamp_ms': self.timestamp_ms, 'market': _ser(self.market), 'ladders': {p: {d: o.to_dict() for d, o in sides.items()} for p, sides in self.ladders.items()}, 'features': _ser(self.features), 'feature_definition': _ser(FEATURE_DEFINITION), 'raw': _ser(self.raw)}
 
 def _ser(x):
     if isinstance(x, Decimal): return str(x)

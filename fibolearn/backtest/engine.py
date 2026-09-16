@@ -13,25 +13,39 @@ from fibolearn.config.defaults import DEFAULT_DIRECTIONS, DEFAULT_PERCENTAGES
 from fibolearn.features.market import vwap_series, volume_profile
 from fibolearn.features.multiscale import build_multiscale_vector, MultiScaleVector
 from fibolearn.features.price_action import price_action_features
+from fibolearn.features.definitions import FEATURE_DEFINITION, level_record
+from datetime import datetime, timezone
 
 def D(x): return Decimal(str(x))
 
 def _new_engine(symbol: str, direction: str, pct: Decimal):
     return GoldenFiboEngine(EngineConfig(side=Side(direction), percentage=Decimal(str(pct)), symbol=symbol.upper()))
 
+def _utc_day(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms/1000, timezone.utc).strftime('%Y-%m-%d')
+
 def _market_for(candles: list[list]) -> dict:
     last = candles[-1]
-    vwaps = vwap_series(candles)
-    prof = volume_profile(candles, bins=80)
+    ts = int(last[0])
+    day = _utc_day(ts)
+    daily = [k for k in candles if _utc_day(int(k[0])) == day]
+    prior_days = sorted({_utc_day(int(k[0])) for k in candles if _utc_day(int(k[0])) < day})
+    prev = [k for k in candles if prior_days and _utc_day(int(k[0])) == prior_days[-1]]
+    vwaps = vwap_series(daily)
+    prof = volume_profile(daily, bins=80)
     highs = [D(k[2]) for k in candles]
     lows = [D(k[3]) for k in candles]
+    prev_high = max([D(k[2]) for k in prev]) if prev else None
+    prev_low = min([D(k[3]) for k in prev]) if prev else None
     return {
         'price': D(last[4]), 'volume': D(last[5]), 'vwap': vwaps[-1].vwap if vwaps else None,
         'vwap_slope': vwaps[-1].slope if vwaps else None, 'vwap_migration': vwaps[-1].migration if vwaps else None,
         'poc': prof.poc, 'vah': prof.vah, 'val': prof.val,
         'swing_high': max(highs[-20:]), 'swing_low': min(lows[-20:]),
-        'previous_day_high': max(highs[:-1]) if len(highs)>1 else highs[-1],
-        'previous_day_low': min(lows[:-1]) if len(lows)>1 else lows[-1],
+        'previous_day_high': prev_high, 'previous_day_low': prev_low,
+        'vwap_definition': FEATURE_DEFINITION['VWAP']['calculation_definition'],
+        'profile_definition': FEATURE_DEFINITION['POC']['calculation_definition'],
+        'session_definition': 'UTC daily session, no look-ahead, current day through observation timestamp',
     }
 
 def replay_multiscale(symbol: str, candles: List[list], *, percentages=DEFAULT_PERCENTAGES, directions=DEFAULT_DIRECTIONS, timeframe: str='1m') -> List[MultiScaleVector]:
@@ -64,6 +78,11 @@ def replay_multiscale(symbol: str, candles: List[list], *, percentages=DEFAULT_P
             ladders[pct_s] = sides
         market = _market_for(sofar)
         pa = price_action_features(sofar, active_pn=price, active_since_ms=max(0, ts - 20*60_000))
-        features = {'price_action': pa, 'significant_levels': {k: market[k] for k in ('vwap','poc','vah','val','swing_high','swing_low','previous_day_high','previous_day_low')}}
+        level_values = {'VWAP': market.get('vwap'), 'POC': market.get('poc'), 'VAH': market.get('vah'), 'VAL': market.get('val'), 'swing_high': market.get('swing_high'), 'swing_low': market.get('swing_low'), 'previous_day_high': market.get('previous_day_high'), 'previous_day_low': market.get('previous_day_low')}
+        features = {
+            'price_action': pa,
+            'significant_levels': {k.lower() if k in {'VWAP','POC','VAH','VAL'} else k: v for k,v in level_values.items()},
+            'significant_levels_versioned': {k: level_record(k, ts, v) for k,v in level_values.items()},
+        }
         out.append(build_multiscale_vector(symbol, ts, price, percentages=percentages, directions=directions, market=market, raw={'source_candles': len(sofar), 'last_candle': k, 'domain_events': raw_events}, ladders=ladders, features=features))
     return out
