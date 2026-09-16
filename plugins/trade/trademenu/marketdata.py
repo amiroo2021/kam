@@ -185,38 +185,113 @@ def fetch_phemex_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[st
     res = _PHEMEX_RESOLUTION.get(tf)
     if res is None:
         raise ValueError("UNSUPPORTED_TIMEFRAME")
-    sym = str(symbol or "").upper().replace("-", "")
-    if not sym.endswith("USDT"):
-        if sym.endswith("USD"):
-            sym = sym + "T"
-        else:
-            sym = f"{sym}USDT"
-    # public kline
-    qs = urllib.parse.urlencode({"symbol": sym, "resolution": res, "limit": min(limit, 1000)})
-    data = _http_json(f"https://api.phemex.com/phemex-user/public/md/v2/kline?{qs}")
-    # response shapes vary; try common
-    rows = data.get("data", {}).get("rows") if isinstance(data, dict) else None
-    if rows is None and isinstance(data, dict):
-        rows = data.get("data")
-    if not isinstance(rows, list):
-        # fallback older endpoint
-        qs2 = urllib.parse.urlencode({"symbol": sym, "resolution": res, "limit": min(limit, 1000)})
-        data = _http_json(f"https://api.phemex.com/exchange/public/md/v2/kline?{qs2}")
-        rows = data.get("data", {}).get("rows") if isinstance(data, dict) else None
-        if rows is None and isinstance(data, dict):
-            rows = data.get("data")
-    if not isinstance(rows, list):
-        raise RuntimeError("Unexpected Phemex candle response")
-    out = []
+    # Normalize to Phemex market-data symbol.
+    # Linear USDT-m perps (PerpetualV2) use BTCUSDT with Rp (human) prices.
+    # Inverse BTCUSD uses scaled Ev prices; spot uses sBTCUSDT with priceScale 8.
+    raw = str(symbol or "").upper().replace("-", "").replace("_", "").replace("/", "")
+    if not raw:
+        raise RuntimeError("Empty Phemex candle symbol")
+    if raw.startswith("S") and len(raw) > 1 and raw[1:].endswith("USDT"):
+        # already spot-style sBTCUSDT
+        kline_symbol = raw if raw.startswith("s") else "s" + raw[1:]
+        # keep as provided lower-s convention: sBTCUSDT
+        if not kline_symbol.startswith("s"):
+            kline_symbol = "s" + kline_symbol.lstrip("S")
+    elif raw.endswith("USDT") or raw.endswith("USDC"):
+        kline_symbol = raw
+    elif raw.endswith("USD"):
+        # Prefer linear USDT-m klines for TradeMenu (matches USDT positions).
+        kline_symbol = raw[:-3] + "USDT"
+    else:
+        kline_symbol = f"{raw}USDT"
+
+    limit_n = max(1, min(int(limit), 1000))
+    rows: Any = None
+    last_err: Optional[BaseException] = None
+
+    # 1) kline/last — works for PerpetualV2 BTCUSDT with human Rp OHLC
+    try:
+        qs = urllib.parse.urlencode(
+            {"symbol": kline_symbol, "resolution": res, "limit": limit_n}
+        )
+        data = _http_json(f"https://api.phemex.com/exchange/public/md/v2/kline/last?{qs}")
+        if isinstance(data, dict) and data.get("code") in (0, "0", None):
+            payload = data.get("data")
+            if isinstance(payload, dict):
+                rows = payload.get("rows")
+            elif isinstance(payload, list):
+                rows = payload
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+
+    # 2) kline/list with from/to window
+    if not isinstance(rows, list) or not rows:
+        try:
+            to_ts = int(time.time())
+            fr_ts = to_ts - int(res) * max(limit_n + 5, 20)
+            qs2 = urllib.parse.urlencode(
+                {
+                    "symbol": kline_symbol,
+                    "resolution": res,
+                    "from": fr_ts,
+                    "to": to_ts,
+                }
+            )
+            data = _http_json(f"https://api.phemex.com/exchange/public/md/v2/kline/list?{qs2}")
+            if isinstance(data, dict) and data.get("code") in (0, "0", None):
+                payload = data.get("data")
+                if isinstance(payload, dict):
+                    rows = payload.get("rows")
+                elif isinstance(payload, list):
+                    rows = payload
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+
+    if not isinstance(rows, list) or not rows:
+        msg = f"Unexpected Phemex candle response for {kline_symbol}"
+        if last_err is not None:
+            msg = f"{msg}: {last_err}"
+        raise RuntimeError(msg)
+
+    # Detect scaled Ev prices (spot s* or inverse) vs human Rp (linear USDT).
+    # Human BTCUSDT sample close ~76000; scaled sBTCUSDT ~7.5e12; inverse ~7.5e8.
+    def _scale_for_symbol(sym: str, sample_close: float) -> float:
+        if sym.startswith("s") and sample_close > 1e9:
+            return 1e8  # spot priceScale 8
+        if (sym.endswith("USD") and not sym.endswith(("USDT", "USDC"))) and sample_close > 1e5:
+            return 1e4  # classic inverse Ev
+        return 1.0
+
+    sample_close = 0.0
     for row in rows:
-        # [timestamp, interval, lastClose, open, high, low, close, volume, turnover]
+        if isinstance(row, (list, tuple)) and len(row) >= 7:
+            try:
+                sample_close = abs(float(row[6]))
+                if sample_close > 0:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    scale = _scale_for_symbol(kline_symbol, sample_close)
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        # [timestamp, interval, lastClose, open, high, low, close, volume, turnover, symbol?]
         if isinstance(row, (list, tuple)) and len(row) >= 7:
             ts = int(row[0])
-            # phemex timestamps sometimes seconds
             ts_ms = ts * 1000 if ts < 10_000_000_000 else ts
-            out.append(_normalize_candle(ts_ms, float(row[3]), float(row[4]), float(row[5]), float(row[6]), float(row[7] if len(row) > 7 else 0)))
+            o = float(row[3]) / scale
+            h = float(row[4]) / scale
+            l = float(row[5]) / scale
+            c = float(row[6]) / scale
+            v = float(row[7] if len(row) > 7 else 0)
+            out.append(_normalize_candle(ts_ms, o, h, l, c, v))
     out.sort(key=lambda c: c["time"])
-    return out[-limit:]
+    # de-dupe by time
+    dedup: Dict[int, Dict[str, Any]] = {}
+    for c in out:
+        dedup[int(c["time"])] = c
+    ordered = [dedup[k] for k in sorted(dedup.keys())]
+    return ordered[-limit_n:]
 
 
 def fetch_mexc_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:

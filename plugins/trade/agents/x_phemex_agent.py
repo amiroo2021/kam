@@ -332,6 +332,18 @@ def _decimal_or_zero(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def _decimal_or_none(value: Any) -> Optional[Decimal]:
+    try:
+        if value is None or value == "":
+            return None
+        d = Decimal(str(value))
+        if not d.is_finite():
+            return None
+        return d
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _format_decimal(value: Decimal) -> str:
     quantized = value.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
     text = format(quantized.normalize(), "f")
@@ -438,39 +450,46 @@ def _resolve_native_symbol(credentials: Mapping[str, str], requested: str) -> Tu
     if not raw:
         raise ValueError("MISSING_SYMBOL")
     products = _load_products(credentials)
+    chosen: Optional[str] = None
     if raw in products:
-        return raw, products[raw]
-    # BTC -> prefer BTCUSDT then BTCUSD
-    base = raw
-    for quote in ("USDT", "USDC", "USD"):
-        if base.endswith(quote) and len(base) > len(quote):
-            base = base[: -len(quote)]
-            break
-    candidates = list(_PRODUCT_CACHE.get("by_base", {}).get(base) or [])
-    # also direct
-    for q in ("USDT", "USDC", "USD"):
-        sym = base + q
-        if sym in products and sym not in candidates:
-            candidates.append(sym)
-    if not candidates:
-        raise ValueError("INSTRUMENT_NOT_FOUND")
-    # Prefer USDT perpetual v2
-    def score(sym: str) -> Tuple[int, int]:
-        meta = products[sym]
-        s = 0
-        if meta.get("settle") == "USDT":
-            s += 10
-        if meta.get("type") == "PerpetualV2":
-            s += 5
-        if meta.get("status") == "Listed":
-            s += 1
-        return (s, -len(sym))
+        chosen = raw
+        # Friendly *USD (not USDT/USDC) often means the linear USDT-m book the
+        # account actually trades. Prefer PerpetualV2 USDT sibling over inverse.
+        if raw.endswith("USD") and not raw.endswith(("USDT", "USDC")):
+            base = raw[:-3]
+            usdt = f"{base}USDT"
+            if usdt in products and products[usdt].get("type") == "PerpetualV2":
+                chosen = usdt
+    if chosen is None:
+        # BTC -> prefer BTCUSDT then BTCUSD
+        base = raw
+        for quote in ("USDT", "USDC", "USD"):
+            if base.endswith(quote) and len(base) > len(quote):
+                base = base[: -len(quote)]
+                break
+        candidates = list(_PRODUCT_CACHE.get("by_base", {}).get(base) or [])
+        # also direct
+        for q in ("USDT", "USDC", "USD"):
+            sym = base + q
+            if sym in products and sym not in candidates:
+                candidates.append(sym)
+        if not candidates:
+            raise ValueError("INSTRUMENT_NOT_FOUND")
+        # Prefer USDT perpetual v2
+        def score(sym: str) -> Tuple[int, int]:
+            meta = products[sym]
+            s = 0
+            if meta.get("settle") == "USDT":
+                s += 10
+            if meta.get("type") == "PerpetualV2":
+                s += 5
+            if meta.get("status") == "Listed":
+                s += 1
+            return (s, -len(sym))
 
-    candidates.sort(key=score, reverse=True)
-    if len(candidates) > 1 and score(candidates[0]) == score(candidates[1]):
-        # still ok pick first preferred
-        pass
-    chosen = candidates[0]
+        candidates.sort(key=score, reverse=True)
+        chosen = candidates[0]
+    assert chosen is not None
     return chosen, products[chosen]
 
 
@@ -649,21 +668,42 @@ def _normalize_positions(rows: Any) -> List[CanonicalPosition]:
             continue
         symbol_raw = str(row.get("symbol") or "").strip()
         symbol = _display_symbol(symbol_raw) or symbol_raw
-        entry = _decimal_or_zero(
+        entry = _decimal_or_none(
             row.get("avgEntryPriceRp") or row.get("avgEntryPrice") or row.get("entryPrice")
+        ) or Decimal("0")
+        mark = _decimal_or_none(
+            row.get("markPriceRp")
+            or row.get("markPrice")
+            or row.get("markPx")
+            or row.get("mark_price")
         )
-        pnl = _decimal_or_zero(
+        if mark is not None and mark <= 0:
+            mark = None
+        # Prefer exchange-reported unrealized PnL. These USDT-m rows often omit
+        # it entirely — never coerce missing → 0 (that made mark look like entry).
+        pnl = _decimal_or_none(
             row.get("unrealisedPnlRv")
             or row.get("unrealisedPnlRp")
+            or row.get("unrealizedPnlRv")
+            or row.get("unrealizedPnlRp")
             or row.get("unrealizedPnl")
+            or row.get("unrealisedPnl")
         )
+        settle = str(row.get("currency") or row.get("settleCurrency") or "").strip().upper()
+        # Linear USDT/USDC contracts: size is base coins; PnL ≈ (mark-entry)*size.
+        if pnl is None and mark is not None and entry > 0 and size > 0 and settle in {"USDT", "USDC", "USD"}:
+            if side == "long":
+                pnl = (mark - entry) * size
+            else:
+                pnl = (entry - mark) * size
         positions.append(
             CanonicalPosition(
                 symbol=symbol,
                 side=side,
                 size=_format_decimal(size),
                 entry_price=_format_decimal(entry) if entry > 0 else "0",
-                pnl=_format_decimal(pnl),
+                pnl=_format_decimal(pnl) if pnl is not None else "",
+                mark=_format_decimal(mark) if mark is not None and mark > 0 else None,
                 exchange_instrument=symbol_raw or None,
             )
         )
@@ -702,6 +742,7 @@ def _enrich_positions_with_protections(
                 size=pos.size,
                 entry_price=pos.entry_price,
                 pnl=pos.pnl,
+                mark=pos.mark,
                 tp=tp,
                 sl=sl,
                 tp_count=tp_count or None,
@@ -1067,7 +1108,8 @@ def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalRe
         )
     instrument = CanonicalInstrument(
         requested_symbol=requested or native,
-        symbol=_display_symbol(native) or native,
+        # Native exchange symbol (e.g. BTCUSDT) — not the display base BTC.
+        symbol=native,
         display_name=str(meta.get("display") or native),
         price_increment=_format_decimal(meta["tick_size"]),
         size_increment=_format_decimal(meta["qty_step"]),

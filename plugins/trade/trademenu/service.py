@@ -19,7 +19,8 @@ logger = logging.getLogger("trademenu")
 # Short in-process TTL so Positions + Orders share one agent fetch and
 # rapid UI polls do not re-hit multi-dex Hyperliquid open-order fanout.
 # Must exceed cold HL multi-dex fanout (~8–15s) or the entry expires before reuse.
-_POSITIONS_CACHE_TTL_SECONDS = 45.0
+# Keep short enough that mark/PnL do not look frozen after a few reloads.
+_POSITIONS_CACHE_TTL_SECONDS = 20.0
 _RESOLVE_CACHE_TTL_SECONDS = 60.0
 # Balance / portfolio is cheaper than multi-dex positions; keep a short TTL so
 # exchange/account switches and Reload all stay snappy without thrashing.
@@ -80,11 +81,17 @@ def _derive_mark(side: str, entry: Any, size: Any, pnl: Any) -> Optional[str]:
 
     long:  pnl = size * (mark - entry)  => mark = entry + pnl/size
     short: pnl = size * (entry - mark)  => mark = entry - pnl/size
+
+    Only used when PnL is present and authoritative. A missing/blank PnL
+    must NOT yield mark=entry (that looked like a frozen market).
     """
     e = _dec(entry)
     s = _dec(size)
     p = _dec(pnl)
     if e is None or s is None or p is None or s == 0:
+        return None
+    # Explicit blank/"—" pnl means unavailable — do not invent mark.
+    if pnl in ("", "—", None):
         return None
     side_l = str(side or "").strip().lower()
     if side_l in {"long", "buy"}:
@@ -196,7 +203,17 @@ class TradeMenuService:
         if resp.instrument is not None:
             inst = _to_plain(resp.instrument)
             data["instrument"] = inst
-            data["native_symbol"] = inst.get("symbol")
+            payload_early = _to_plain(resp.data) if resp.data else None
+            native_from_data = None
+            if isinstance(payload_early, dict):
+                native_from_data = payload_early.get("native_symbol")
+            native = str(native_from_data or inst.get("symbol") or "").strip()
+            data["native_symbol"] = native or inst.get("symbol")
+            if native and inst.get("symbol") != native:
+                # Prefer full native id for candles/quotes when agent used a short display symbol.
+                inst = dict(inst)
+                inst["symbol"] = native
+                data["instrument"] = inst
             data["display"] = f"{requested} → {inst.get('symbol')}"
             meta = {
                 "price_increment": inst.get("price_increment") or inst.get("tick_size"),
@@ -449,7 +466,12 @@ class TradeMenuService:
             row = _to_plain(p)
             mark = row.get("mark")
             if mark in (None, "", "—"):
+                # Derive only from real PnL — never substitute entry for mark.
                 mark = _derive_mark(row.get("side"), row.get("entry_price"), row.get("size"), row.get("pnl"))
+            pnl_raw = row.get("pnl")
+            # Blank pnl from agents means "unavailable" (not zero).
+            if pnl_raw in ("", "—"):
+                pnl_raw = None
             # Lightweight meta from exchange_instrument if present
             meta: Dict[str, Any] = {}
             ei = row.get("exchange_instrument")
@@ -467,7 +489,7 @@ class TradeMenuService:
                     "size": row.get("size"),
                     "entry": row.get("entry_price"),
                     "mark": mark,
-                    "pnl": row.get("pnl"),
+                    "pnl": pnl_raw,
                     "sl": row.get("sl"),
                     "tp": row.get("tp"),
                     "exchange_instrument": row.get("exchange_instrument"),
@@ -475,8 +497,8 @@ class TradeMenuService:
                     "display": {
                         "size": format_size(row.get("size"), meta),
                         "entry": format_price(row.get("entry_price"), meta),
-                        "mark": format_price(mark, meta),
-                        "pnl": format_pnl(row.get("pnl"), meta),
+                        "mark": format_price(mark, meta) if mark not in (None, "", "—") else "—",
+                        "pnl": format_pnl(pnl_raw, meta) if pnl_raw is not None else "—",
                         "sl": format_price(row.get("sl"), meta),
                         "tp": format_price(row.get("tp"), meta),
                     },

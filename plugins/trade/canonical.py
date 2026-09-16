@@ -109,6 +109,9 @@ class CanonicalPosition:
     tp_count: Optional[int] = None
     sl_count: Optional[int] = None
     exchange_instrument: Optional[str] = None
+    # Authoritative mark when the exchange supplies one. Optional so older
+    # agents remain valid; TradeMenu must not invent mark=entry when absent.
+    mark: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -122,6 +125,7 @@ class CanonicalPosition:
             "tp_count": self.tp_count,
             "sl_count": self.sl_count,
             "exchange_instrument": self.exchange_instrument,
+            "mark": self.mark,
         }
 
 
