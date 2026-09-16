@@ -5,8 +5,15 @@ from pathlib import Path
 from PIL import Image
 
 from golden_fibo.constants import Side
-from golden_fibo.historical_replay import ReplayLeg, ReplayState
+from golden_fibo.historical_replay import ReplayLeg, ReplayState, replay_ohlc
 from plugins.trade import backtest_wizard as wizard
+
+
+def _candle(ts, o, h, l, c, base_vol, quote_vol=None):
+    """Binance-style 1m kline row used by VWAP/POC helpers."""
+    if quote_vol is None:
+        quote_vol = base_vol * ((h + l + c) / 3.0)
+    return [ts, str(o), str(h), str(l), str(c), str(base_vol), ts + 59_999, str(quote_vol)]
 
 
 class BacktestActiveLadderWindowTests(unittest.TestCase):
@@ -77,6 +84,211 @@ class BacktestActiveLadderWindowTests(unittest.TestCase):
         # Active value-area region should contain many pink pixels.
         active_band_pixels = [img.getpixel((x, y)) for x in range(220, 1000, 40) for y in range(1265, 1335, 10)]
         self.assertGreater(sum(1 for px in active_band_pixels if pinkish(px)), 20)
+
+    def test_ladder_vwap_and_poc_share_identical_p0_window(self):
+        """Ladder VWAP start == Ladder POC start == current P0 timestamp."""
+        p0_ts = 1_000_000
+        state = ReplayState(side=Side.SELL, cycle=3, p0=100.0, highest_filled=1, shared_tp=99.9)
+        state.legs = [
+            ReplayLeg(0, 100.0, p0_ts, "t0"),
+            ReplayLeg(1, 101.0, p0_ts + 120_000, "t1"),
+        ]
+        candles = [
+            _candle(0, 50, 55, 45, 50, 10_000, 500_000),  # before P0 — must not enter
+            _candle(p0_ts, 100, 101, 99, 100, 10, 1000),
+            _candle(p0_ts + 60_000, 100.5, 102, 100, 101, 20, 2020),
+            _candle(p0_ts + 120_000, 101, 103, 100.5, 102, 30, 3060),
+        ]
+
+        ladder_start = wizard._active_ladder_start_ts(state)
+        self.assertEqual(ladder_start, p0_ts)
+
+        # Both metrics filter on the same >= start boundary.
+        ladder_rel = [k for k in candles if int(k[0]) >= ladder_start]
+        self.assertEqual(len(ladder_rel), 3)
+        self.assertTrue(all(int(k[0]) >= p0_ts for k in ladder_rel))
+        self.assertFalse(any(int(k[0]) < p0_ts for k in ladder_rel))
+
+        vwap = wizard._vwap(candles, ladder_start)
+        poc = wizard._poc(candles, ladder_start)
+        profile = wizard._volume_profile(candles, ladder_start, bins=160)
+        self.assertIsNotNone(profile)
+        self.assertEqual(len(profile["vols"]), 160)
+        self.assertTrue(math.isfinite(vwap))
+        self.assertTrue(math.isfinite(poc))
+        # Pre-P0 volume would pull VWAP near 50 if incorrectly included.
+        self.assertGreater(vwap, 90.0)
+
+    def test_step_vwap_and_poc_share_identical_pn_activation_window(self):
+        """Step VWAP start == Step POC start == current P(n) activation timestamp."""
+        p0_ts = 1_000_000
+        pn_ts = 1_180_000
+        state = ReplayState(side=Side.SELL, cycle=1, p0=100.0, highest_filled=2, shared_tp=99.9)
+        state.legs = [
+            ReplayLeg(0, 100.0, p0_ts, "t0"),
+            ReplayLeg(1, 101.0, p0_ts + 60_000, "t1"),
+            ReplayLeg(2, 102.0, pn_ts, "t2"),
+        ]
+        candles = [
+            _candle(p0_ts, 100, 101, 99, 100, 100, 10_000),  # ladder-only volume
+            _candle(p0_ts + 60_000, 101, 102, 100, 101, 100, 10_100),
+            _candle(pn_ts, 102, 103, 101.5, 102.5, 10, 1025),
+            _candle(pn_ts + 60_000, 102.5, 104, 102, 103, 10, 1030),
+        ]
+
+        step_start = wizard._active_step_start_ts(state)
+        ladder_start = wizard._active_ladder_start_ts(state)
+        self.assertEqual(step_start, pn_ts)
+        self.assertEqual(ladder_start, p0_ts)
+        self.assertNotEqual(step_start, ladder_start)
+
+        step_rel = [k for k in candles if int(k[0]) >= step_start]
+        self.assertEqual(len(step_rel), 2)
+        self.assertTrue(all(int(k[0]) >= pn_ts for k in step_rel))
+        self.assertFalse(any(int(k[0]) < pn_ts for k in step_rel))
+
+        step_vwap = wizard._vwap(candles, step_start)
+        step_poc = wizard._poc(candles, step_start)
+        ladder_vwap = wizard._vwap(candles, ladder_start)
+        self.assertTrue(math.isfinite(step_vwap) and math.isfinite(step_poc))
+        # Step window excludes heavy early ladder volume near 100.
+        self.assertGreater(step_vwap, ladder_vwap)
+
+    def test_tp_new_p0_resets_both_ladder_metrics_together(self):
+        """TP / new cycle: previous ladder ends; both ladder metrics start at new P0 ts."""
+        # Candle 0 opens first cycle. Candle 1 fills P1 then hits TP (low <= shared_tp for SELL)
+        # chaining a new P0 at the TP price on candle 1's timestamp. Candle 2 is new ladder only.
+        candles = [
+            _candle(0, 100.0, 100.5, 99.5, 100.0, 50, 5000),
+            # High reaches a later step then low prints through shared TP of early cycle.
+            # Use a path that opens at 100, never progresses far, TP is P(-1) side of P0.
+            # For SELL, shared_tp after P0 is below P0. Touch low <= tp closes and chains.
+            _candle(60_000, 100.0, 100.2, 99.0, 99.5, 50, 4975),
+            _candle(120_000, 99.5, 100.0, 99.0, 99.8, 10, 995),
+        ]
+        state = replay_ohlc(candles, side=Side.SELL)
+        self.assertGreaterEqual(state.cycle, 2)
+        self.assertEqual(state.legs[0].step, 0)
+        new_p0_ts = int(state.legs[0].ts)
+        self.assertEqual(wizard._active_ladder_start_ts(state), new_p0_ts)
+        self.assertEqual(wizard._active_step_start_ts(state), int(state.legs[-1].ts))
+
+        # Ladder metrics only see candles from new P0 onward.
+        ladder_start = wizard._active_ladder_start_ts(state)
+        for k in candles:
+            if int(k[0]) < ladder_start:
+                # Explicit: pre-new-P0 rows are excluded by the shared filter both metrics use.
+                self.assertLess(int(k[0]), ladder_start)
+        rel = [k for k in candles if int(k[0]) >= ladder_start]
+        self.assertTrue(rel)
+        self.assertEqual(int(rel[0][0]), ladder_start)
+
+        vwap = wizard._vwap(candles, ladder_start)
+        poc = wizard._poc(candles, ladder_start)
+        self.assertTrue(math.isfinite(vwap) and math.isfinite(poc))
+
+    def test_progression_resets_both_active_step_metrics_together(self):
+        """P(n) fill advances legs[-1]; both step metrics restart at that fill ts."""
+        # SELL: after Pn fills, shared_tp = P(n-1). Keep every low strictly above
+        # the TP that will apply after the fills on that candle.
+        candles = [
+            _candle(0, 100.0, 100.0, 100.0, 100.0, 5, 500),
+            # Fill P1 only (≈100.162). TP becomes P0=100.0; low 100.05 is safe.
+            _candle(60_000, 100.05, 100.20, 100.05, 100.18, 5, 505),
+            # Fill P2 only (≈100.424). TP becomes P1≈100.162; low 100.20 is safe.
+            _candle(180_000, 100.20, 100.45, 100.20, 100.40, 5, 512),
+            _candle(240_000, 100.40, 100.55, 100.35, 100.50, 5, 515),
+        ]
+        state = replay_ohlc(candles, side=Side.SELL)
+        self.assertGreaterEqual(state.highest_filled, 1)
+        self.assertEqual(len(state.closed), 0)
+        self.assertEqual(state.legs[-1].step, state.highest_filled)
+
+        step_start = wizard._active_step_start_ts(state)
+        ladder_start = wizard._active_ladder_start_ts(state)
+        self.assertEqual(step_start, int(state.legs[-1].ts))
+        self.assertEqual(ladder_start, int(state.legs[0].ts))
+        self.assertGreaterEqual(step_start, ladder_start)
+
+        pre = [k for k in candles if int(k[0]) < step_start]
+        post = [k for k in candles if int(k[0]) >= step_start]
+        self.assertTrue(post)
+        step_vwap = wizard._vwap(candles, step_start)
+        step_poc = wizard._poc(candles, step_start)
+        self.assertAlmostEqual(step_vwap, wizard._vwap(post, step_start))
+        self.assertAlmostEqual(step_poc, wizard._poc(post, step_start))
+        if pre and state.highest_filled >= 1:
+            self.assertNotEqual(step_start, ladder_start)
+
+    def test_data_before_p0_cannot_enter_ladder_vwap_or_poc(self):
+        p0_ts = 500_000
+        state = ReplayState(side=Side.BUY, cycle=1, p0=100.0, highest_filled=0, shared_tp=100.1)
+        state.legs = [ReplayLeg(0, 100.0, p0_ts, "p0")]
+        candles = [
+            _candle(0, 10, 11, 9, 10, 1_000_000, 10_000_000),
+            _candle(p0_ts, 100, 101, 99, 100, 1, 100),
+        ]
+        start = wizard._active_ladder_start_ts(state)
+        self.assertEqual(start, p0_ts)
+        self.assertAlmostEqual(wizard._vwap(candles, start), 100.0)
+        poc = wizard._poc(candles, start)
+        self.assertTrue(99 <= poc <= 101)
+        profile = wizard._volume_profile(candles, start)
+        self.assertAlmostEqual(sum(profile["vols"]), 1.0, places=6)
+
+    def test_data_before_pn_cannot_enter_step_vwap_or_poc(self):
+        p0_ts = 100_000
+        pn_ts = 300_000
+        state = ReplayState(side=Side.SELL, cycle=1, p0=100.0, highest_filled=1, shared_tp=99.9)
+        state.legs = [
+            ReplayLeg(0, 100.0, p0_ts, "p0"),
+            ReplayLeg(1, 101.0, pn_ts, "p1"),
+        ]
+        candles = [
+            _candle(p0_ts, 100, 100.5, 99.5, 100, 1_000, 100_000),
+            _candle(pn_ts, 200, 201, 199, 200, 1, 200),
+        ]
+        step_start = wizard._active_step_start_ts(state)
+        self.assertEqual(step_start, pn_ts)
+        self.assertAlmostEqual(wizard._vwap(candles, step_start), 200.0)
+        poc = wizard._poc(candles, step_start)
+        self.assertTrue(199 <= poc <= 201)
+
+    def test_ohlc_poc_below_p0_is_valid_when_volume_clusters_near_window_low(self):
+        """L-POC can sit below P0 under the 160-bin OHLC overlap approximation.
+
+        Mirrors the live suspicious case (L-POC ~75468 with P0 ~75509): heavy
+        base volume on tight candles near the window low wins the POC bin even
+        though P0 and VWAP sit higher. Windowing is correct; this is the math.
+        """
+        p0_ts = 1_000_000
+        p0 = 75_509.48
+        candles = [
+            # Tight, heavy volume just below P0 (like the real 01:56 candle).
+            _candle(p0_ts, p0, 75_467.70, 75_463.83, 75_465.0, 19.0),
+            _candle(p0_ts + 60_000, 75_465.0, 75_469.0, 75_464.0, 75_468.0, 12.0),
+            # Later wider, lighter volume higher in the range.
+            _candle(p0_ts + 120_000, 75_500.0, 75_830.0, 75_480.0, 75_700.0, 8.0),
+            _candle(p0_ts + 180_000, 75_700.0, 75_900.0, 75_650.0, 75_800.0, 5.0),
+        ]
+        profile = wizard._volume_profile(candles, p0_ts, bins=160)
+        self.assertIsNotNone(profile)
+        lo, hi, width, vols = profile["lo"], profile["hi"], profile["width"], profile["vols"]
+        self.assertEqual(len(vols), 160)
+        self.assertLess(lo, p0)
+        idx = max(range(len(vols)), key=lambda i: vols[i])
+        center = lo + (idx + 0.5) * width
+        bin_lo = lo + idx * width
+        bin_hi = bin_lo + width
+        poc = wizard._poc(candles, p0_ts, bins=160)
+        self.assertAlmostEqual(poc, center)
+        self.assertLess(poc, p0)
+        self.assertTrue(bin_lo <= poc <= bin_hi)
+        # Top bin should be near the tight low cluster, not the high range.
+        self.assertLess(center, 75_500.0)
+        ranked = sorted(enumerate(vols), key=lambda x: -x[1])[:10]
+        self.assertEqual(ranked[0][0], idx)
+        self.assertGreater(ranked[0][1], ranked[1][1])
 
 
 if __name__ == "__main__":

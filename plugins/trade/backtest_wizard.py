@@ -297,10 +297,24 @@ def _active_ladder_start_ts(state) -> int:
     ladder volume area. ``replay_ohlc`` replaces ``state.legs`` whenever a TP
     closes a cycle and chains a new P0, so the first current leg is the active
     P0 open time.
+
+    Ladder VWAP and Ladder POC MUST share this exact start timestamp.
     """
     if not getattr(state, "legs", None):
         raise ValueError("active ladder has no open P0 leg")
     return int(state.legs[0].ts)
+
+
+def _active_step_start_ts(state) -> int:
+    """Return the timestamp when the current active step P(n) became filled.
+
+    ``state.legs[-1]`` is the highest filled step for the open cycle. Active
+    Step VWAP and Active Step POC MUST share this exact start timestamp.
+    When only P0 is open, this equals the ladder (P0) start.
+    """
+    if not getattr(state, "legs", None):
+        raise ValueError("active ladder has no open step leg")
+    return int(state.legs[-1].ts)
 
 
 def _volume_profile(candles, ts, bins: int = 160):
@@ -398,7 +412,7 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     pn2,_=ladder_step(side,state.p0,min(n+2,20), percentage=percentage)
     pnm1,_=ladder_step(side,state.p0,n-1, percentage=percentage) if n>=1 else (state.shared_tp,None)
     active_ladder_start_ts=_active_ladder_start_ts(state)
-    active_step_start_ts=int(state.legs[-1].ts)
+    active_step_start_ts=_active_step_start_ts(state)
     ladder_vwap=_vwap(candles,active_ladder_start_ts)
     step_vwap=_vwap(candles,active_step_start_ts)
     ladder_poc=_poc(candles,active_ladder_start_ts)
