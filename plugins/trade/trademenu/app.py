@@ -48,7 +48,7 @@ def create_app(
 
     sessions = SessionManager(cfg)
     limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)
-    svc = service or TradeMenuService()
+    svc = service or TradeMenuService(session_secret=cfg.session_secret)
 
     app = FastAPI(title="TradeMenu", version="0.2.0")
     if STATIC_DIR.is_dir():
@@ -399,6 +399,51 @@ def create_app(
             str(body.get("classification") or ""),
             body.get("order_ids") if isinstance(body.get("order_ids"), list) else None,
         )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/trade/preview_order")
+    async def api_preview_order(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.preview_order(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+            str(body.get("side") or ""),
+            str(body.get("order_type") or body.get("type") or "limit"),
+            str(body.get("size") or body.get("volume") or ""),
+            str(body.get("price") or ""),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/trade/preview_ladder")
+    async def api_preview_ladder(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.preview_ladder(
+            str(body.get("exchange") or ""),
+            str(body.get("account") or ""),
+            str(body.get("symbol") or ""),
+            str(body.get("side") or ""),
+            str(body.get("distribution") or ""),
+            body.get("order_count"),
+            str(body.get("total_size") or body.get("total_volume") or ""),
+            str(body.get("start_price") or ""),
+            str(body.get("end_price") or ""),
+        )
+        return JSONResponse(out, status_code=200 if out.get("success") else 400)
+
+    @app.post("/api/trade/execute")
+    async def api_trade_execute(request: Request) -> JSONResponse:
+        denied = _require_csrf(request)
+        if denied:
+            return denied
+        body = await _read_json(request)
+        out = svc.execute_preview(str(body.get("preview_id") or ""))
         return JSONResponse(out, status_code=200 if out.get("success") else 400)
 
     return app

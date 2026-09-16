@@ -40,7 +40,13 @@
   let activeTab = "positions";
   let ordersLoadedOnce = false;
   let lastPositions = [];
+  let lastOrderGroups = [];
   let positionLines = [];
+  let previewLines = [];
+  let liveOrderLines = [];
+  let tradeSide = "buy";
+  let tradeMode = "single";
+  let activePreview = null; // {id, kind, data}
   let csrfToken = "";
   let modalState = null;
 
@@ -192,33 +198,99 @@
     return false;
   }
 
+  function clearPreviewLines() {
+    for (const line of previewLines) {
+      try { candleSeries.removePriceLine(line); } catch (_) {}
+    }
+    previewLines = [];
+  }
+  function clearLiveOrderLines() {
+    for (const line of liveOrderLines) {
+      try { candleSeries.removePriceLine(line); } catch (_) {}
+    }
+    liveOrderLines = [];
+  }
+
   function updateOverlay() {
     if (!candleSeries) return;
     clearPositionLines();
+    clearLiveOrderLines();
     if (!resolvedOk || !nativeInstrument) return;
     const req = (symbolEl.value || "").trim();
     const match = lastPositions.find((p) => symbolsMatch(p.symbol, nativeInstrument, req));
-    if (!match) return;
-    const side = String(match.side || "").toUpperCase();
-    const meta = match.format_meta || formatMeta || {};
-    const add = (price, color, title) => {
-      if (price == null || price === "" || price === "—") return;
-      const n = Number(String(price).replace(/,/g, ""));
-      if (!Number.isFinite(n)) return;
+    if (match) {
+      const side = String(match.side || "").toUpperCase();
+      const meta = match.format_meta || formatMeta || {};
+      const add = (price, color, title) => {
+        if (price == null || price === "" || price === "—") return;
+        const n = Number(String(price).replace(/,/g, ""));
+        if (!Number.isFinite(n)) return;
+        const line = candleSeries.createPriceLine({
+          price: n,
+          color,
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title,
+        });
+        positionLines.push(line);
+      };
+      add(match.tp, "#3dd68c", `TP ${fmtPriceClient(match.tp, meta)}`);
+      add(match.entry, side.includes("SHORT") || side === "SELL" ? "#ff6b6b" : "#4ea1ff",
+        `${dash(match.symbol)} ${side.includes("SHORT") || side === "SELL" ? "SHORT" : "LONG"} ENTRY ${fmtPriceClient(match.entry, meta)}`);
+      add(match.sl, "#ff9f43", `SL ${fmtPriceClient(match.sl, meta)}`);
+    }
+    // Live open ladder VWAP overlays for active symbol
+    if ($("showOrdersOverlay") && $("showOrdersOverlay").checked) {
+      const groups = (lastOrderGroups || []).filter((g) => symbolsMatch(g.symbol, nativeInstrument, req));
+      for (const g of groups) {
+        if (String(g.classification || "entry_limit") !== "entry_limit") continue;
+        const vwap = Number(String(g.vwap || "").replace(/,/g, ""));
+        if (!Number.isFinite(vwap)) continue;
+        const side = String(g.side || "").toLowerCase();
+        const line = candleSeries.createPriceLine({
+          price: vwap,
+          color: side === "buy" ? "#4ea1ff" : "#ff6b6b",
+          lineWidth: 1,
+          lineStyle: 0,
+          axisLabelVisible: true,
+          title: side === "buy" ? `OPEN BUY VWAP ${fmtPriceClient(vwap, formatMeta)}` : `OPEN SELL VWAP ${fmtPriceClient(vwap, formatMeta)}`,
+        });
+        liveOrderLines.push(line);
+      }
+    }
+  }
+
+  function drawLadderPreview(data) {
+    clearPreviewLines();
+    if (!candleSeries || !data || !Array.isArray(data.children)) return;
+    const children = data.children;
+    // Subtle child lines (no per-line labels)
+    for (const c of children) {
+      const n = Number(String(c.price).replace(/,/g, ""));
+      if (!Number.isFinite(n)) continue;
       const line = candleSeries.createPriceLine({
         price: n,
-        color,
+        color: "rgba(61,214,140,0.25)",
         lineWidth: 1,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title,
+        lineStyle: 3,
+        axisLabelVisible: false,
+        title: "",
       });
-      positionLines.push(line);
-    };
-    add(match.tp, "#3dd68c", `TP ${fmtPriceClient(match.tp, meta)}`);
-    add(match.entry, side.includes("SHORT") || side === "SELL" ? "#ff6b6b" : "#4ea1ff",
-      `${dash(match.symbol)} ${side.includes("SHORT") || side === "SELL" ? "SHORT" : "LONG"} ENTRY ${fmtPriceClient(match.entry, meta)}`);
-    add(match.sl, "#ff9f43", `SL ${fmtPriceClient(match.sl, meta)}`);
+      previewLines.push(line);
+    }
+    const vwap = Number(String(data.vwap || "").replace(/,/g, ""));
+    if (Number.isFinite(vwap)) {
+      const line = candleSeries.createPriceLine({
+        price: vwap,
+        color: "#9b59b6",
+        lineWidth: 2,
+        lineStyle: 0,
+        axisLabelVisible: true,
+        title: `PREVIEW VWAP ${fmtPriceClient(vwap, formatMeta)}`,
+      });
+      previewLines.push(line);
+    }
   }
 
   function initChart() {
@@ -752,6 +824,7 @@
         return;
       }
       const groups = data.groups || [];
+      lastOrderGroups = groups;
       if (!groups.length) {
         ordersBody.innerHTML = `<tr><td colspan="7">No open orders</td></tr>`;
       } else {
@@ -816,6 +889,7 @@
         `Orders OK · ${groups.length} groups · open ${dash(data.open_order_count)} · browser ${browserMs} ms · desk ${deskMs != null ? deskMs : "—"} ms${cacheHit}`,
         "ok"
       );
+      updateOverlay();
     } catch (e) {
       if (e.name === "AbortError") return;
       if (String(e.message) !== "unauthorized") setLine(ordersStatus, String(e.message || e), "error");
@@ -846,10 +920,176 @@
     }, ORD_POLL_MS);
   }
 
+  function invalidateTradePreview() {
+    activePreview = null;
+    clearPreviewLines();
+    const box = $("previewBox");
+    if (box) box.hidden = true;
+    const pe = $("previewError");
+    if (pe) { pe.hidden = true; pe.textContent = ""; }
+    const place = $("placeBtn");
+    if (place) { place.disabled = false; place.textContent = "Place"; }
+    updateTradeCtx();
+  }
+
+  function updateTradeCtx() {
+    const el = $("tradeCtx");
+    if (!el) return;
+    const native = nativeInstrument || "—";
+    el.textContent = `${(symbolEl.value || "").trim() || "—"} · ${exchangeEl.value || "—"} · ${accountEl.value || "—"} → ${native}`;
+  }
+
+  function setTradeSide(side) {
+    tradeSide = side;
+    $("sideBuy").classList.toggle("active", side === "buy");
+    $("sideBuy").classList.toggle("buy", true);
+    $("sideSell").classList.toggle("active", side === "sell");
+    $("sideSell").classList.toggle("sell", true);
+    invalidateTradePreview();
+  }
+
+  function setTradeMode(mode) {
+    tradeMode = mode;
+    $("modeSingle").classList.toggle("active", mode === "single");
+    $("modeLadder").classList.toggle("active", mode === "ladder");
+    $("singleForm").hidden = mode !== "single";
+    $("ladderForm").hidden = mode !== "ladder";
+    invalidateTradePreview();
+  }
+
+  function showPreview(data) {
+    activePreview = { id: data.preview_id, kind: data.kind, data };
+    $("previewBox").hidden = false;
+    $("previewError").hidden = true;
+    $("previewError").textContent = "";
+    const place = $("placeBtn");
+    place.disabled = false;
+    if (data.kind === "ladder") {
+      place.textContent = `Place ${data.order_count || (data.children || []).length} Orders`;
+      const lines = [
+        `${String(data.side || "").toUpperCase()} ${data.native_symbol} LADDER`,
+        `Distribution: ${data.distribution === "half_gaussian" ? "Half-Gaussian" : "Uniform"}`,
+        `Orders: ${data.order_count}`,
+        `Total Size: ${data.total_size}`,
+        `Price Range: ${data.min_price} – ${data.max_price}`,
+        `VWAP: ${data.vwap}`,
+        lastPrice.textContent && lastPrice.textContent !== "—" ? `Current Price: ${lastPrice.textContent}` : "",
+      ].filter(Boolean);
+      $("previewText").textContent = lines.join("\n");
+      const kids = data.children || [];
+      $("childTableWrap").hidden = !kids.length;
+      $("childBody").innerHTML = kids
+        .map((c, i) => `<tr><td>${i + 1}</td><td class="num">${c.price}</td><td class="num">${c.size}</td></tr>`)
+        .join("");
+      drawLadderPreview(data);
+    } else {
+      place.textContent = "Place Order";
+      const rp = data.requested_price;
+      const fp = data.final_price;
+      const rs = data.requested_size;
+      const fs = data.final_size;
+      const lines = [
+        `${String(data.side || "").toUpperCase()} ${data.native_symbol} LIMIT`,
+        rp !== fp ? `Requested Price: ${rp}\nFinal Price:     ${fp}` : `Price: ${fp}`,
+        rs !== fs ? `Requested Size:  ${rs}\nFinal Size:      ${fs}` : `Size: ${fs}`,
+        `Estimated Notional: ${data.notional}`,
+      ];
+      $("previewText").textContent = lines.join("\n");
+      $("childTableWrap").hidden = true;
+      clearPreviewLines();
+    }
+    updateOverlay();
+  }
+
+  async function doPreviewOrder() {
+    setLine($("tradeStatus"), "Building order preview…");
+    try {
+      const { data, res } = await apiPost("/api/trade/preview_order", {
+        exchange: exchangeEl.value,
+        account: accountEl.value,
+        symbol: (symbolEl.value || "").trim(),
+        side: tradeSide,
+        order_type: "limit",
+        size: ($("orderSize").value || "").trim(),
+        price: ($("orderPrice").value || "").trim(),
+      });
+      if (!data.success) throw new Error((data.error && data.error.message) || "Preview failed");
+      showPreview(data);
+      setLine($("tradeStatus"), data.summary || "Preview ready", "ok");
+    } catch (e) {
+      invalidateTradePreview();
+      setLine($("tradeStatus"), String(e.message || e), "error");
+    }
+  }
+
+  async function doPreviewLadder() {
+    setLine($("tradeStatus"), "Building ladder preview…");
+    try {
+      const { data } = await apiPost("/api/trade/preview_ladder", {
+        exchange: exchangeEl.value,
+        account: accountEl.value,
+        symbol: (symbolEl.value || "").trim(),
+        side: tradeSide,
+        distribution: $("ladderDist").value,
+        order_count: $("ladderCount").value,
+        total_size: ($("ladderTotal").value || "").trim(),
+        start_price: ($("ladderStart").value || "").trim(),
+        end_price: ($("ladderEnd").value || "").trim(),
+      });
+      if (!data.success) throw new Error((data.error && data.error.message) || "Preview failed");
+      showPreview(data);
+      setLine($("tradeStatus"), data.summary || "Ladder preview ready", "ok");
+    } catch (e) {
+      invalidateTradePreview();
+      setLine($("tradeStatus"), String(e.message || e), "error");
+    }
+  }
+
+  async function doPlace() {
+    if (!activePreview || !activePreview.id) return;
+    const place = $("placeBtn");
+    if (place.disabled) return;
+    place.disabled = true;
+    place.textContent = "Placing…";
+    $("previewError").hidden = true;
+    const snap = accountKey();
+    const previewId = activePreview.id;
+    try {
+      const { data } = await apiPost("/api/trade/execute", { preview_id: previewId });
+      if (snap !== accountKey()) {
+        showToast("Selection changed; ignored stale execute result.", "error");
+        return;
+      }
+      if (!data.success) {
+        throw new Error((data.error && data.error.message) || data.message || "Execution failed");
+      }
+      showToast(data.message || "Submitted", data.partial ? "error" : "ok");
+      setLine($("tradeStatus"), data.message || "Submitted", data.partial ? "error" : "ok");
+      invalidateTradePreview();
+      await loadOrders(true);
+      await loadPositions(true);
+    } catch (e) {
+      $("previewError").hidden = false;
+      $("previewError").textContent = String(e.message || e);
+      // Do not re-enable place with same preview_id — it may be consumed.
+      place.textContent = "Preview again";
+      place.disabled = false;
+      place.onclick = () => {
+        invalidateTradePreview();
+        if (tradeMode === "ladder") doPreviewLadder();
+        else doPreviewOrder();
+      };
+      showToast(String(e.message || e), "error");
+    }
+  }
+
   function onSelectionChanged() {
     ordersLoadedOnce = false;
     lastPositions = [];
+    lastOrderGroups = [];
     clearPositionLines();
+    invalidateTradePreview();
+    updateTradeCtx();
     loadCandles();
     loadPositions();
     if (activeTab === "orders") loadOrders();
@@ -875,6 +1115,36 @@
   });
   tabPositions.addEventListener("click", () => setTab("positions"));
   tabOrders.addEventListener("click", () => setTab("orders"));
+
+  // Trade panel
+  if ($("sideBuy")) {
+    $("sideBuy").addEventListener("click", () => setTradeSide("buy"));
+    $("sideSell").addEventListener("click", () => setTradeSide("sell"));
+    $("modeSingle").addEventListener("click", () => setTradeMode("single"));
+    $("modeLadder").addEventListener("click", () => setTradeMode("ladder"));
+    $("previewOrderBtn").addEventListener("click", doPreviewOrder);
+    $("previewLadderBtn").addEventListener("click", doPreviewLadder);
+    $("previewBackBtn").addEventListener("click", invalidateTradePreview);
+    $("placeBtn").addEventListener("click", doPlace);
+    $("useCurrentPrice").addEventListener("click", () => {
+      if (lastPrice.textContent && lastPrice.textContent !== "—")
+        $("orderPrice").value = String(lastPrice.textContent).replace(/,/g, "");
+    });
+    $("ladderStartCurrent").addEventListener("click", () => {
+      if (lastPrice.textContent && lastPrice.textContent !== "—")
+        $("ladderStart").value = String(lastPrice.textContent).replace(/,/g, "");
+    });
+    ["orderPrice", "orderSize", "ladderStart", "ladderEnd", "ladderCount", "ladderTotal", "ladderDist"].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener("input", () => { if (activePreview) invalidateTradePreview(); });
+      if (el) el.addEventListener("change", () => { if (activePreview) invalidateTradePreview(); });
+    });
+    if ($("showOrdersOverlay")) {
+      $("showOrdersOverlay").addEventListener("change", updateOverlay);
+    }
+    setTradeSide("buy");
+    setTradeMode("single");
+  }
 
   initChart();
   ensureCsrf()

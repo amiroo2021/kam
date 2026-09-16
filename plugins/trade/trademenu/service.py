@@ -10,7 +10,9 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..tradedesk import TradeDesk, get_tradedesk
+from ..ladder_math import build_ladder_children, ladder_vwap, quantize_to_increment
 from .formatting import format_pnl, format_price, format_size
+from .preview_plans import PreviewPlanStore
 
 logger = logging.getLogger("trademenu")
 
@@ -93,7 +95,13 @@ def _derive_mark(side: str, entry: Any, size: Any, pnl: Any) -> Optional[str]:
 class TradeMenuService:
     """Thin facade over TradeDesk — no exchange-native secrets escape."""
 
-    def __init__(self, desk: Optional[TradeDesk] = None, cache_ttl: float = _POSITIONS_CACHE_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        desk: Optional[TradeDesk] = None,
+        cache_ttl: float = _POSITIONS_CACHE_TTL_SECONDS,
+        preview_store: Optional[PreviewPlanStore] = None,
+        session_secret: str = "trademenu-dev-secret",
+    ) -> None:
         self.desk = desk or get_tradedesk()
         self.cache_ttl = float(cache_ttl)
         self.resolve_cache_ttl = _RESOLVE_CACHE_TTL_SECONDS
@@ -102,6 +110,7 @@ class TradeMenuService:
         self._po_cache: Dict[Tuple[str, str], Tuple[float, float, Dict[str, Any]]] = {}
         # (exchange, account, symbol_key) -> (expires_at, payload)
         self._resolve_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+        self.previews = preview_store or PreviewPlanStore(session_secret, ttl_seconds=300)
 
     def invalidate_positions_cache(self, exchange: str = "", account: str = "") -> None:
         with self._lock:
@@ -594,3 +603,468 @@ class TradeMenuService:
             account,
             extra,
         )
+
+    # --- New order / ladder preview + execute ---------------------------------
+
+    def _meta_increments(self, resolved: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
+        meta = resolved.get("format_meta") or {}
+        inst = resolved.get("instrument") or {}
+        px_inc = _dec(meta.get("price_increment") or inst.get("price_increment") or "0.1") or Decimal("0.1")
+        sz_inc = _dec(meta.get("size_increment") or inst.get("size_increment") or "0.001") or Decimal("0.001")
+        if px_inc <= 0:
+            px_inc = Decimal("0.1")
+        if sz_inc <= 0:
+            sz_inc = Decimal("0.001")
+        return px_inc, sz_inc
+
+    def _round_order_price(self, exchange: str, price: Decimal, resolved: Dict[str, Any]) -> Decimal:
+        px_inc, _ = self._meta_increments(resolved)
+        if str(exchange).lower() == "hyperliquid":
+            try:
+                from ..agents.x_hyperliquid_agent import _normalize_hyperliquid_order_price
+
+                # szDecimals is size precision; HL price normalizer still needs it.
+                inst = resolved.get("instrument") or {}
+                sz_decimals = inst.get("size_decimals") or inst.get("sz_decimals")
+                return _normalize_hyperliquid_order_price(price, sz_decimals)
+            except Exception:
+                pass
+        return quantize_to_increment(price, px_inc)
+
+    def _round_order_size(self, size: Decimal, resolved: Dict[str, Any]) -> Decimal:
+        _, sz_inc = self._meta_increments(resolved)
+        return quantize_to_increment(size, sz_inc)
+
+    def preview_order(
+        self,
+        exchange: str,
+        account: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        size: str,
+        price: str = "",
+    ) -> Dict[str, Any]:
+        err = self.validate_exchange_account(exchange, account)
+        if err:
+            return {"success": False, "error": {"code": err, "message": err.replace("_", " ").title()}}
+        side_n = str(side or "").strip().lower()
+        if side_n not in {"buy", "sell"}:
+            return {"success": False, "error": {"code": "INVALID_SIDE", "message": "Side must be buy or sell."}}
+        ot = str(order_type or "limit").strip().lower() or "limit"
+        if ot != "limit":
+            # Match Hyperliquid agent: only limit is safely supported via TradeDesk today.
+            return {
+                "success": False,
+                "error": {"code": "INVALID_ORDER_TYPE", "message": "Only LIMIT orders are supported via TradeMenu."},
+            }
+        caps = set(self.desk.capabilities(exchange))
+        if "new_order" not in caps:
+            return {
+                "success": False,
+                "error": {"code": "UNSUPPORTED", "message": f"{exchange} does not expose new_order."},
+            }
+        resolved = self.resolve_instrument(exchange, account, symbol)
+        if not resolved.get("success") or not resolved.get("native_symbol"):
+            return {
+                "success": False,
+                "error": resolved.get("error") or {"code": "INSTRUMENT_NOT_FOUND", "message": "Unresolved symbol."},
+                "display": resolved.get("display"),
+            }
+        native = str(resolved["native_symbol"])
+        req_size = _dec(size)
+        req_price = _dec(price)
+        if req_size is None or req_size <= 0:
+            return {"success": False, "error": {"code": "INVALID_SIZE", "message": "Size must be positive."}}
+        if req_price is None or req_price <= 0:
+            return {"success": False, "error": {"code": "INVALID_PRICE", "message": "Price must be positive."}}
+        try:
+            final_size = self._round_order_size(req_size, resolved)
+            final_price = self._round_order_price(exchange, req_price, resolved)
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": {"code": "INVALID_ORDER_PRECISION", "message": str(exc)}}
+        if final_size <= 0 or final_price <= 0:
+            return {"success": False, "error": {"code": "INVALID_ORDER_PRECISION", "message": "Rounded size/price invalid."}}
+        notional = final_price * final_size
+        meta = resolved.get("format_meta") or {}
+        plan = {
+            "kind": "order",
+            "exchange": exchange,
+            "account": account,
+            "requested_symbol": str(symbol or "").strip(),
+            "native_symbol": native,
+            "side": side_n,
+            "order_type": "limit",
+            "requested_price": format(req_price.normalize(), "f"),
+            "requested_size": format(req_size.normalize(), "f"),
+            "final_price": format(final_price.normalize(), "f"),
+            "final_size": format(final_size.normalize(), "f"),
+            "notional": format(notional.normalize(), "f"),
+        }
+        preview_id = self.previews.issue(plan)
+        return {
+            "success": True,
+            "preview_id": preview_id,
+            "kind": "order",
+            "exchange": exchange,
+            "account": account,
+            "requested_symbol": plan["requested_symbol"],
+            "native_symbol": native,
+            "display": resolved.get("display") or f"{symbol} → {native}",
+            "side": side_n,
+            "order_type": "limit",
+            "requested_price": plan["requested_price"],
+            "final_price": plan["final_price"],
+            "requested_size": plan["requested_size"],
+            "final_size": plan["final_size"],
+            "notional": plan["notional"],
+            "format_meta": meta,
+            "expires_in_s": self.previews.ttl_seconds,
+            "summary": f"{side_n.upper()} {native} LIMIT @ {plan['final_price']} × {plan['final_size']}",
+        }
+
+    def preview_ladder(
+        self,
+        exchange: str,
+        account: str,
+        symbol: str,
+        side: str,
+        distribution: str,
+        order_count: Any,
+        total_size: str,
+        start_price: str,
+        end_price: str,
+    ) -> Dict[str, Any]:
+        err = self.validate_exchange_account(exchange, account)
+        if err:
+            return {"success": False, "error": {"code": err, "message": err.replace("_", " ").title()}}
+        side_n = str(side or "").strip().lower()
+        if side_n not in {"buy", "sell"}:
+            return {"success": False, "error": {"code": "INVALID_SIDE", "message": "Side must be buy or sell."}}
+        dist = str(distribution or "").strip().lower()
+        if dist not in {"uniform", "half_gaussian"}:
+            return {
+                "success": False,
+                "error": {"code": "UNSUPPORTED_DISTRIBUTION", "message": "Distribution must be uniform or half_gaussian."},
+            }
+        caps = set(self.desk.capabilities(exchange))
+        if "ladder" not in caps:
+            return {"success": False, "error": {"code": "UNSUPPORTED", "message": f"{exchange} does not expose ladder."}}
+        try:
+            n = int(str(order_count).strip())
+        except Exception:
+            n = 0
+        if n <= 0:
+            return {"success": False, "error": {"code": "INVALID_ORDER_COUNT", "message": "Order count must be positive."}}
+        if n > 200:
+            return {"success": False, "error": {"code": "INVALID_ORDER_COUNT", "message": "Order count too large (max 200)."}}
+        tv = _dec(total_size)
+        sp = _dec(start_price)
+        ep = _dec(end_price)
+        if tv is None or tv <= 0:
+            return {"success": False, "error": {"code": "INVALID_SIZE", "message": "Total size must be positive."}}
+        if sp is None or ep is None or sp <= 0 or ep <= 0:
+            return {"success": False, "error": {"code": "INVALID_PRICE", "message": "Start and end price must be positive."}}
+        if side_n == "buy" and ep >= sp:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_LADDER_DIRECTION",
+                    "message": "BUY ladders require end price below start price.",
+                },
+            }
+        if side_n == "sell" and ep <= sp:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_LADDER_DIRECTION",
+                    "message": "SELL ladders require end price above start price.",
+                },
+            }
+        resolved = self.resolve_instrument(exchange, account, symbol)
+        if not resolved.get("success") or not resolved.get("native_symbol"):
+            return {
+                "success": False,
+                "error": resolved.get("error") or {"code": "INSTRUMENT_NOT_FOUND", "message": "Unresolved symbol."},
+            }
+        native = str(resolved["native_symbol"])
+        px_inc, sz_inc = self._meta_increments(resolved)
+        # Hyperliquid uses specialized price normalizer for each step.
+        if str(exchange).lower() == "hyperliquid":
+            try:
+                from ..agents.x_hyperliquid_agent import (
+                    _build_ladder_order_requests,
+                    _candidate_sz_decimals,
+                    _decimal_from_request,
+                )
+
+                # Prefer agent builder so children match Telegram exactly.
+                inst = resolved.get("instrument") or {}
+                # Build a candidate-like dict for sz decimals
+                candidate = {
+                    "public_symbol": native,
+                    "size_increment": str(sz_inc),
+                    "szDecimals": inst.get("sz_decimals") or inst.get("size_decimals"),
+                }
+                sz_decimals = None
+                try:
+                    from ..agents import x_hyperliquid_agent as hl
+
+                    # Use public builder with HL price rules when possible
+                    order_requests, submitted = _build_ladder_order_requests(
+                        symbol=native,
+                        side=side_n,
+                        distribution=dist,
+                        order_count=n,
+                        total_volume=tv,
+                        start_price=sp,
+                        end_price=ep,
+                        sz_decimals=candidate.get("szDecimals"),
+                        size_increment=sz_inc,
+                    )
+                    children = [
+                        {
+                            "price": format((_decimal_from_request(r.get("limit_px")) or Decimal("0")).normalize(), "f"),
+                            "size": format((_decimal_from_request(r.get("sz")) or Decimal("0")).normalize(), "f"),
+                        }
+                        for r in order_requests
+                    ]
+                    submitted_vol = submitted
+                    vwap = ladder_vwap(children)
+                except ValueError as exc:
+                    code = str(exc) or "INVALID_LADDER_REQUEST"
+                    return {
+                        "success": False,
+                        "error": {"code": code, "message": code.replace("_", " ").title()},
+                    }
+            except Exception:
+                try:
+                    children, submitted_vol, vwap = build_ladder_children(
+                        side=side_n,
+                        distribution=dist,
+                        order_count=n,
+                        total_volume=tv,
+                        start_price=sp,
+                        end_price=ep,
+                        size_increment=sz_inc,
+                        price_increment=px_inc,
+                    )
+                except ValueError as exc:
+                    code = str(exc) or "INVALID_LADDER_REQUEST"
+                    msg = {
+                        "INVALID_LADDER_DIRECTION": (
+                            "BUY ladders require end price below start price."
+                            if side_n == "buy"
+                            else "SELL ladders require end price above start price."
+                        )
+                    }.get(code, code.replace("_", " ").title())
+                    return {"success": False, "error": {"code": code, "message": msg}}
+        else:
+            try:
+                children, submitted_vol, vwap = build_ladder_children(
+                    side=side_n,
+                    distribution=dist,
+                    order_count=n,
+                    total_volume=tv,
+                    start_price=sp,
+                    end_price=ep,
+                    size_increment=sz_inc,
+                    price_increment=px_inc,
+                )
+            except ValueError as exc:
+                code = str(exc) or "INVALID_LADDER_REQUEST"
+                msg = {
+                    "INVALID_LADDER_DIRECTION": (
+                        "BUY ladders require end price below start price."
+                        if side_n == "buy"
+                        else "SELL ladders require end price above start price."
+                    )
+                }.get(code, code.replace("_", " ").title())
+                return {"success": False, "error": {"code": code, "message": msg}}
+
+        prices = [Decimal(c["price"]) for c in children]
+        sizes = [Decimal(c["size"]) for c in children]
+        plan = {
+            "kind": "ladder",
+            "exchange": exchange,
+            "account": account,
+            "requested_symbol": str(symbol or "").strip(),
+            "native_symbol": native,
+            "side": side_n,
+            "distribution": dist,
+            "order_count": n,
+            "requested_total_size": format(tv.normalize(), "f"),
+            "final_total_size": format(sum(sizes).normalize(), "f"),
+            "start_price": format(sp.normalize(), "f"),
+            "end_price": format(ep.normalize(), "f"),
+            "min_price": format(min(prices).normalize(), "f"),
+            "max_price": format(max(prices).normalize(), "f"),
+            "vwap": format(vwap.normalize(), "f"),
+            "children": children,
+            # Execution uses TradeDesk ladder inputs (deterministic) + children for audit.
+            "exec": {
+                "symbol": native,
+                "side": side_n,
+                "distribution": dist,
+                "order_count": n,
+                "total_volume": format(tv.normalize(), "f"),
+                "start_price": format(sp.normalize(), "f"),
+                "end_price": format(ep.normalize(), "f"),
+            },
+        }
+        preview_id = self.previews.issue(plan)
+        meta = resolved.get("format_meta") or {}
+        return {
+            "success": True,
+            "preview_id": preview_id,
+            "kind": "ladder",
+            "exchange": exchange,
+            "account": account,
+            "requested_symbol": plan["requested_symbol"],
+            "native_symbol": native,
+            "display": resolved.get("display") or f"{symbol} → {native}",
+            "side": side_n,
+            "distribution": dist,
+            "order_count": len(children),
+            "requested_order_count": n,
+            "total_size": plan["final_total_size"],
+            "min_price": plan["min_price"],
+            "max_price": plan["max_price"],
+            "vwap": plan["vwap"],
+            "children": children,
+            "format_meta": meta,
+            "expires_in_s": self.previews.ttl_seconds,
+            "summary": (
+                f"{side_n.upper()} {native} LADDER · {dist} · {len(children)} orders · "
+                f"VWAP {plan['vwap']}"
+            ),
+        }
+
+    def execute_preview(self, preview_id: str) -> Dict[str, Any]:
+        plan, err = self.previews.consume(str(preview_id or ""))
+        if err or not plan:
+            return {
+                "success": False,
+                "error": {
+                    "code": err or "PREVIEW_INVALID",
+                    "message": {
+                        "PREVIEW_EXPIRED": "Preview expired. Generate a new preview.",
+                        "PREVIEW_CONSUMED": "Preview already used. Generate a new preview.",
+                        "PREVIEW_INVALID": "Invalid preview. Generate a new preview.",
+                    }.get(err or "", "Invalid preview."),
+                },
+            }
+        exchange = str(plan.get("exchange") or "")
+        account = str(plan.get("account") or "")
+        verr = self.validate_exchange_account(exchange, account)
+        if verr:
+            return {"success": False, "error": {"code": verr, "message": verr.replace("_", " ").title()}}
+        kind = str(plan.get("kind") or "")
+        if kind == "order":
+            req = {
+                "operation": "new_order",
+                "exchange": exchange,
+                "account": account,
+                "symbol": plan.get("native_symbol") or plan.get("requested_symbol"),
+                "side": plan.get("side"),
+                "order_type": "limit",
+                "volume": plan.get("final_size"),
+                "price": plan.get("final_price"),
+            }
+            t0 = time.perf_counter()
+            resp = self.desk.execute(req)
+            desk_ms = (time.perf_counter() - t0) * 1000.0
+            self.invalidate_positions_cache(exchange, account)
+            out: Dict[str, Any] = {
+                "success": bool(resp.success),
+                "kind": "order",
+                "operation": "new_order",
+                "exchange": exchange,
+                "account": account,
+                "symbol": plan.get("native_symbol"),
+                "side": plan.get("side"),
+                "final_price": plan.get("final_price"),
+                "final_size": plan.get("final_size"),
+                "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
+            }
+            if resp.success:
+                out["message"] = (
+                    f"{str(plan.get('side')).upper()} {plan.get('native_symbol')} LIMIT submitted."
+                )
+                logger.info(
+                    "TradeMenu order ok exchange=%s account=%s symbol=%s side=%s",
+                    exchange,
+                    account,
+                    plan.get("native_symbol"),
+                    plan.get("side"),
+                )
+            else:
+                out["error"] = self._safe_error(resp)
+            if getattr(resp, "order", None) is not None:
+                out["order"] = _to_plain(resp.order)
+            return out
+
+        if kind == "ladder":
+            exec_body = plan.get("exec") or {}
+            req = {
+                "operation": "ladder",
+                "exchange": exchange,
+                "account": account,
+                "symbol": exec_body.get("symbol") or plan.get("native_symbol"),
+                "side": exec_body.get("side") or plan.get("side"),
+                "distribution": exec_body.get("distribution") or plan.get("distribution"),
+                "order_count": exec_body.get("order_count") or plan.get("order_count"),
+                "total_volume": exec_body.get("total_volume") or plan.get("requested_total_size"),
+                "start_price": exec_body.get("start_price") or plan.get("start_price"),
+                "end_price": exec_body.get("end_price") or plan.get("end_price"),
+                # Audit only — agents may ignore; execution still uses same inputs.
+                "preview_children": plan.get("children"),
+            }
+            t0 = time.perf_counter()
+            resp = self.desk.execute(req)
+            desk_ms = (time.perf_counter() - t0) * 1000.0
+            self.invalidate_positions_cache(exchange, account)
+            out = {
+                "success": bool(resp.success),
+                "kind": "ladder",
+                "operation": "ladder",
+                "exchange": exchange,
+                "account": account,
+                "symbol": plan.get("native_symbol"),
+                "side": plan.get("side"),
+                "distribution": plan.get("distribution"),
+                "preview_order_count": len(plan.get("children") or []),
+                "preview_vwap": plan.get("vwap"),
+                "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
+            }
+            ladder = _to_plain(getattr(resp, "ladder", None)) if getattr(resp, "ladder", None) else None
+            if ladder:
+                out["ladder"] = ladder
+                accepted = int(ladder.get("accepted_child_count") or ladder.get("submitted_order_count") or 0)
+                requested = int(ladder.get("requested_order_count") or plan.get("order_count") or 0)
+                out["accepted"] = accepted
+                out["requested"] = requested
+                if ladder.get("partial") or (requested and accepted < requested):
+                    out["partial"] = True
+                    out["message"] = f"{accepted} of {requested} orders accepted."
+                else:
+                    out["message"] = f"Ladder submitted ({accepted} orders)."
+            if resp.success:
+                logger.info(
+                    "TradeMenu ladder ok exchange=%s account=%s symbol=%s children=%s",
+                    exchange,
+                    account,
+                    plan.get("native_symbol"),
+                    len(plan.get("children") or []),
+                )
+            else:
+                out["error"] = self._safe_error(resp)
+                if ladder and (ladder.get("accepted_child_count") or 0):
+                    out["partial"] = True
+                    out["message"] = (
+                        f"{ladder.get('accepted_child_count')} of "
+                        f"{ladder.get('requested_order_count')} orders accepted."
+                    )
+            return out
+
+        return {"success": False, "error": {"code": "PREVIEW_INVALID", "message": "Unknown preview kind."}}

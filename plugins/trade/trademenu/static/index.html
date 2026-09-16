@@ -37,18 +37,92 @@
           <option value="1D">1D</option>
         </select>
       </label>
+      <label class="chk"><input type="checkbox" id="showOrdersOverlay" checked /> Orders</label>
       <label>&nbsp;<button type="button" id="reloadBtn">Reload all</button></label>
     </section>
 
-    <div class="main">
-      <div class="meta">
-        <span>Native <strong id="nativeSym">—</strong></span>
-        <span>Last <strong id="lastPrice">—</strong></span>
-        <span>Candles <strong id="candleCount">—</strong></span>
+    <div class="workspace">
+      <div class="chart-col">
+        <div class="meta">
+          <span>Native <strong id="nativeSym">—</strong></span>
+          <span>Last <strong id="lastPrice">—</strong></span>
+          <span>Candles <strong id="candleCount">—</strong></span>
+        </div>
+        <div id="chartStatus" class="status-line">Chart idle</div>
+        <div id="chart" aria-label="TradeMenu chart"></div>
       </div>
-      <div id="chartStatus" class="status-line">Chart idle</div>
-      <div id="chart" aria-label="TradeMenu chart"></div>
 
+      <aside class="trade-panel" id="tradePanel">
+        <div class="trade-ctx" id="tradeCtx">—</div>
+        <div class="seg">
+          <button type="button" class="seg-btn buy active" id="sideBuy" data-side="buy">BUY</button>
+          <button type="button" class="seg-btn sell" id="sideSell" data-side="sell">SELL</button>
+        </div>
+        <div class="seg">
+          <button type="button" class="seg-btn active" id="modeSingle" data-mode="single">Single</button>
+          <button type="button" class="seg-btn" id="modeLadder" data-mode="ladder">Ladder</button>
+        </div>
+
+        <div id="singleForm" class="trade-form">
+          <label>Type
+            <select id="orderType"><option value="limit">LIMIT</option></select>
+          </label>
+          <label>Price
+            <div class="row">
+              <input id="orderPrice" type="text" inputmode="decimal" placeholder="Limit price" />
+              <button type="button" class="btn-ghost" id="useCurrentPrice">Current</button>
+            </div>
+          </label>
+          <label>Size
+            <input id="orderSize" type="text" inputmode="decimal" placeholder="Size" />
+          </label>
+          <button type="button" id="previewOrderBtn">Preview Order</button>
+        </div>
+
+        <div id="ladderForm" class="trade-form" hidden>
+          <label>Distribution
+            <select id="ladderDist">
+              <option value="half_gaussian">Half-Gaussian</option>
+              <option value="uniform">Uniform</option>
+            </select>
+          </label>
+          <label>Start Price
+            <div class="row">
+              <input id="ladderStart" type="text" inputmode="decimal" />
+              <button type="button" class="btn-ghost" id="ladderStartCurrent">Current</button>
+            </div>
+          </label>
+          <label>End Price
+            <input id="ladderEnd" type="text" inputmode="decimal" />
+          </label>
+          <label>Orders
+            <input id="ladderCount" type="number" min="2" max="200" value="20" />
+          </label>
+          <label>Total Size
+            <input id="ladderTotal" type="text" inputmode="decimal" />
+          </label>
+          <button type="button" id="previewLadderBtn">Preview Ladder</button>
+        </div>
+
+        <div id="previewBox" class="preview-box" hidden>
+          <pre id="previewText"></pre>
+          <div id="childTableWrap" class="child-table" hidden>
+            <table>
+              <thead><tr><th>#</th><th class="num">Price</th><th class="num">Size</th></tr></thead>
+              <tbody id="childBody"></tbody>
+            </table>
+          </div>
+          <div class="row">
+            <button type="button" class="btn-secondary" id="previewBackBtn">Back</button>
+            <button type="button" class="btn-danger" id="placeBtn">Place</button>
+          </div>
+          <p id="previewError" class="error" hidden></p>
+        </div>
+        <p id="tradeStatus" class="status-line"></p>
+      </aside>
+    </div>
+
+    <div class="main">
       <div class="tabs" role="tablist">
         <button type="button" class="tab active" id="tabPositions" data-tab="positions" role="tab" aria-selected="true">Positions</button>
         <button type="button" class="tab" id="tabOrders" data-tab="orders" role="tab" aria-selected="false">Orders</button>
