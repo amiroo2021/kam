@@ -27,7 +27,7 @@ class FakeDesk:
     def __init__(self) -> None:
         self._exchanges = ["hyperliquid", "binance", "phemex"]
         self._accounts = {
-            "hyperliquid": ["FIBO", "BITGET"],
+            "hyperliquid": ["FIBO", "BITGET", "FLEX"],
             "binance": [{"account": "spot", "label": "Spot"}, {"account": "futures", "label": "Futures"}],
             "phemex": ["dramiroo"],
         }
@@ -49,8 +49,13 @@ class FakeDesk:
         acct = str(request.get("account") or "")
         if op == "resolve_instrument":
             sym = str(request.get("symbol") or "")
+            key = sym.upper().replace("-", "").replace("_", "")
+            for suffix in ("USDT", "USDC", "USD"):
+                if key.endswith(suffix) and len(key) > len(suffix):
+                    key = key[: -len(suffix)]
+                    break
             native = "BTC" if ex == "hyperliquid" else "BTCUSDT"
-            if sym.upper().replace("-", "") in {"BTCUSD", "BTCUSDT", "BTC"}:
+            if key in {"BTC", "XBT"} or sym.upper().replace("-", "") in {"BTCUSD", "BTCUSDT", "BTC"}:
                 return make_success(
                     op,
                     ex,
@@ -71,7 +76,9 @@ class FakeDesk:
                 ),
             )
         if op in {"positions_management", "positions_orders"}:
-            if ex == "hyperliquid" and acct == "FIBO":
+            if ex == "hyperliquid" and acct in {"FIBO", "FLEX"}:
+                from plugins.trade.canonical import CanonicalOrderGroup
+
                 return make_success(
                     op,
                     ex,
@@ -82,13 +89,34 @@ class FakeDesk:
                             side="long",
                             size="1.5",
                             entry_price="74000",
-                            pnl="100",
+                            pnl="1500",
                             tp="77500",
                             sl="74500",
                         )
                     ],
+                    open_order_count=12,
+                    order_groups=[
+                        CanonicalOrderGroup(
+                            symbol="BTC",
+                            side="buy",
+                            order_count=12,
+                            total_size="11.754",
+                            vwap="75200",
+                            min_price="75000",
+                            max_price="75700",
+                        ),
+                        CanonicalOrderGroup(
+                            symbol="BTC",
+                            side="sell",
+                            order_count=1,
+                            total_size="1.5",
+                            vwap="76000",
+                            min_price="76000",
+                            max_price="76000",
+                        ),
+                    ],
                 )
-            return make_success(op, ex, acct, positions=[])
+            return make_success(op, ex, acct, positions=[], order_groups=[], open_order_count=0)
         return make_failure(op or "unknown", ex or "", acct or "", "NOT_IMPLEMENTED", "nope")
 
 
@@ -177,7 +205,7 @@ class TradeMenuApiTests(unittest.TestCase):
         r = self.client.get("/api/accounts?exchange=hyperliquid")
         self.assertEqual(r.status_code, 200)
         aliases = [a["account"] for a in r.json()["accounts"]]
-        self.assertEqual(set(aliases), {"BITGET", "FIBO"})
+        self.assertEqual(set(aliases), {"BITGET", "FIBO", "FLEX"})
         r2 = self.client.get("/api/accounts?exchange=binance")
         aliases2 = [a["account"] for a in r2.json()["accounts"]]
         self.assertEqual(set(aliases2), {"futures", "spot"})
@@ -202,8 +230,47 @@ class TradeMenuApiTests(unittest.TestCase):
         self.assertEqual(len(body["positions"]), 1)
         self.assertEqual(body["positions"][0]["symbol"], "BTC")
         self.assertEqual(body["positions"][0]["tp"], "77500")
+        # mark derived from entry + pnl/size = 74000 + 1500/1.5 = 75000
+        self.assertEqual(body["positions"][0]["mark"], "75000")
         r2 = self.client.get("/api/positions", params={"exchange": "hyperliquid", "account": "BITGET"})
         self.assertEqual(r2.json()["positions"], [])
+
+    def test_orders_aggregated_from_tradedesk_groups(self) -> None:
+        self._login()
+        r = self.client.get("/api/orders", params={"exchange": "hyperliquid", "account": "FLEX"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["open_order_count"], 12)
+        groups = body["groups"]
+        self.assertEqual(len(groups), 2)
+        buy = next(g for g in groups if g["side"] == "buy")
+        self.assertEqual(buy["count"], 12)
+        self.assertEqual(buy["total_remaining_size"], "11.754")
+        self.assertEqual(buy["min_price"], "75000")
+        self.assertEqual(buy["max_price"], "75700")
+        self.assertEqual(buy["vwap"], "75200")
+        self.assertEqual(buy["type"], "limit")
+
+    def test_positions_orders_share_cache(self) -> None:
+        self._login()
+        r1 = self.client.get("/api/positions", params={"exchange": "hyperliquid", "account": "FLEX"})
+        r2 = self.client.get("/api/orders", params={"exchange": "hyperliquid", "account": "FLEX"})
+        self.assertTrue(r1.json()["success"])
+        self.assertTrue(r2.json()["success"])
+        self.assertTrue(r2.json().get("cache_hit"))
+
+    def test_resolve_btcusd_case_insensitive_display(self) -> None:
+        self._login()
+        for sym in ("BTCUSD", "btcusd", "btcUSD"):
+            r = self.client.get(
+                "/api/instruments/resolve",
+                params={"exchange": "hyperliquid", "account": "FIBO", "symbol": sym},
+            )
+            body = r.json()
+            self.assertTrue(body["success"], body)
+            self.assertEqual(body["instrument"]["symbol"], "BTC")
+            self.assertIn("→", body["display"])
 
     def test_candles_endpoint_uses_marketdata(self) -> None:
         self._login()

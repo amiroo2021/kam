@@ -205,15 +205,42 @@ def create_app(
                 {"success": False, "error": {"code": err, "message": err.replace("_", " ").title()}, "candles": []},
                 status_code=400,
             )
-        # Resolve friendly symbol to native first when possible.
-        native = symbol
+        # Require canonical resolve before market-data fetch — never pass an
+        # unresolved friendly symbol through as if it were native.
         resolved = svc.resolve_instrument(exchange, account, symbol)
-        if resolved.get("success") and isinstance(resolved.get("instrument"), dict):
-            native = str(resolved["instrument"].get("symbol") or symbol)
+        if not resolved.get("success") or not isinstance(resolved.get("instrument"), dict):
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": resolved.get("error")
+                    or {"code": "INSTRUMENT_NOT_FOUND", "message": "Instrument unresolved."},
+                    "requested_symbol": symbol,
+                    "display": resolved.get("display") or f"{symbol} → unresolved",
+                    "candles": [],
+                    "timeframes": list(SUPPORTED_TFS),
+                    "timing_ms": resolved.get("timing_ms"),
+                },
+                status_code=400,
+            )
+        native = str(resolved["instrument"].get("symbol") or "").strip()
+        if not native:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": {"code": "INSTRUMENT_NOT_FOUND", "message": "Resolver returned empty native symbol."},
+                    "requested_symbol": symbol,
+                    "display": f"{symbol} → unresolved",
+                    "candles": [],
+                },
+                status_code=400,
+            )
         payload = fetch_candles(exchange, account, native, tf, limit=limit)
         payload["requested_symbol"] = symbol
         payload["native_symbol"] = native
+        payload["display"] = resolved.get("display") or f"{symbol} → {native}"
+        payload["resolved"] = True
         payload["timeframes"] = list(SUPPORTED_TFS)
+        payload["resolve_timing_ms"] = resolved.get("timing_ms")
         status = 200 if payload.get("success") else 400
         return JSONResponse(payload, status_code=status)
 
@@ -227,6 +254,17 @@ def create_app(
         if denied:
             return denied
         return JSONResponse(svc.positions(exchange, account))
+
+    @app.get("/api/orders")
+    async def api_orders(
+        request: Request,
+        exchange: str = Query(...),
+        account: str = Query(...),
+    ) -> JSONResponse:
+        denied = _require_auth(request)
+        if denied:
+            return denied
+        return JSONResponse(svc.orders(exchange, account))
 
     return app
 

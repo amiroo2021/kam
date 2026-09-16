@@ -461,8 +461,12 @@ def _market_price_decimals_by_symbol(payload: Any) -> Dict[str, int]:
 
 def _symbol_key(value: Any) -> str:
     text = re.sub(r"[^A-Za-z0-9]+", "", str(value or "")).upper()
-    if text.endswith("USDC") and len(text) > 4:
-        text = text[:-4]
+    # Peel quote suffixes so friendly inputs like BTCUSD / BTCUSDT / BTCUSDC
+    # match public coin keys (BTC). Order matters: longer suffixes first.
+    for suffix in ("USDT", "USDC", "USD"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
     return text
 
 
@@ -810,9 +814,22 @@ def _resolve_instrument_candidate(requested_symbol: str, candidates: List[Dict[s
 
     if exact_public:
         routes = {str(item.get("route_symbol") or "") for item in exact_public}
-        if len(routes) > 1:
-            return None, "INSTRUMENT_AMBIGUOUS"
-        return exact_public[0], ""
+        if len(routes) == 1:
+            return exact_public[0], ""
+        # Friendly inputs (BTCUSD → BTC) often match native + HIP-3/cash
+        # variants. Prefer the unqualified native coin route when unique.
+        native = [
+            item
+            for item in exact_public
+            if ":" not in str(item.get("route_symbol") or "")
+            and str(item.get("dex") or "") == ""
+        ]
+        if len(native) == 1:
+            return native[0], ""
+        native2 = [item for item in exact_public if ":" not in str(item.get("route_symbol") or "")]
+        if len(native2) == 1:
+            return native2[0], ""
+        return None, "INSTRUMENT_AMBIGUOUS"
 
     return None, "INSTRUMENT_NOT_FOUND"
 

@@ -45,28 +45,56 @@
         <span>Last <strong id="lastPrice">—</strong></span>
         <span>Candles <strong id="candleCount">—</strong></span>
       </div>
+      <div id="chartStatus" class="status-line">Chart idle</div>
       <div id="chart" aria-label="TradeMenu chart"></div>
-      <div class="status-line" id="statusLine">Loading…</div>
 
-      <section class="positions">
-        <h2>Open Positions</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Side</th>
-              <th>Size</th>
-              <th>Entry</th>
-              <th>Mark</th>
-              <th>PnL</th>
-              <th>SL</th>
-              <th>TP</th>
-            </tr>
-          </thead>
-          <tbody id="positionsBody">
-            <tr><td colspan="8">—</td></tr>
-          </tbody>
-        </table>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab active" id="tabPositions" data-tab="positions" role="tab" aria-selected="true">Positions</button>
+        <button type="button" class="tab" id="tabOrders" data-tab="orders" role="tab" aria-selected="false">Orders</button>
+      </div>
+
+      <section class="panel" id="panelPositions">
+        <div id="positionsStatus" class="status-line">Positions idle</div>
+        <div class="positions">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th>Size</th>
+                <th>Entry</th>
+                <th>Mark</th>
+                <th>PnL</th>
+                <th>SL</th>
+                <th>TP</th>
+              </tr>
+            </thead>
+            <tbody id="positionsBody">
+              <tr><td colspan="8">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" id="panelOrders" hidden>
+        <div id="ordersStatus" class="status-line">Orders idle</div>
+        <div class="positions">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side / Type</th>
+                <th>Orders</th>
+                <th>Total Volume</th>
+                <th>Price Range</th>
+                <th>VWAP</th>
+              </tr>
+            </thead>
+            <tbody id="ordersBody">
+              <tr><td colspan="6">—</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
   </div>

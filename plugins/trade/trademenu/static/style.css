@@ -7,7 +7,8 @@
   --accent: #3d8bfd;
   --danger: #ff6b6b;
   --ok: #3dd68c;
-  --pink: #ffe6ef;
+  --buy: #4ea1ff;
+  --sell: #ff6b6b;
 }
 
 * { box-sizing: border-box; }
@@ -55,7 +56,7 @@ body {
 .login-card .hint { color: var(--muted); font-size: 13px; margin: 0; }
 .login-card .error { color: var(--danger); margin: 0; font-size: 14px; }
 
-.shell { min-height: 100%; display: grid; grid-template-rows: auto auto 1fr auto; }
+.shell { min-height: 100%; display: grid; grid-template-rows: auto auto 1fr; }
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 18px; border-bottom: 1px solid var(--border); background: #0e131a;
@@ -72,25 +73,41 @@ body {
   border-radius: 8px; padding: 8px 10px; min-width: 140px;
 }
 #chart {
-  min-height: 480px; height: calc(100vh - 340px); margin: 0 18px;
+  min-height: 420px; height: calc(100vh - 420px); margin: 0 18px;
   border: 1px solid var(--border); border-radius: 12px; background: #0a0d12;
 }
 .meta {
   display: flex; gap: 16px; flex-wrap: wrap; padding: 8px 18px; color: var(--muted); font-size: 13px;
 }
 .meta strong { color: var(--text); }
-.positions {
-  margin: 0 18px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
-  overflow: auto;
+
+.tabs {
+  display: flex; gap: 8px; padding: 12px 18px 0;
 }
-.positions h2 {
-  margin: 0; padding: 12px 14px; font-size: 14px; letter-spacing: 0.04em;
-  border-bottom: 1px solid var(--border); color: var(--muted); text-transform: uppercase;
+.tab {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 10px 10px 0 0;
+  padding: 10px 16px;
+}
+.tab.active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.panel { margin: 0 18px 18px; }
+.positions {
+  border: 1px solid var(--border); border-radius: 0 12px 12px 12px; background: var(--panel);
+  overflow: auto;
 }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; }
-.side-long { color: var(--ok); }
-.side-short { color: var(--danger); }
-.status-line { padding: 0 18px 10px; color: var(--muted); font-size: 12px; }
+.side-long, .side-buy { color: var(--buy); font-weight: 700; }
+.side-short, .side-sell { color: var(--sell); font-weight: 700; }
+.status-line { padding: 6px 18px 8px; color: var(--muted); font-size: 12px; }
 .status-line.error { color: var(--danger); }
+.status-line.ok { color: var(--ok); }
