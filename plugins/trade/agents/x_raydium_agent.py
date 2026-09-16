@@ -154,7 +154,11 @@ def capabilities() -> List[str]:
         "new_order",
         "ladder",
         "cancel_orders",
+        "cancel_order_group",
         "positions_management",
+        "set_tp",
+        "set_sl",
+        "close_position",
         "resolve_instrument",
         "list_instruments",
         "market_price",
@@ -392,10 +396,14 @@ def _resolve_symbol_metadata(symbol: Any) -> Dict[str, Any]:
         "display_symbol": _symbol_from_orderly(data.get("symbol") or orderly_symbol),
         "price_precision": _tick_decimals(data.get("quote_tick")),
         "size_precision": _tick_decimals(data.get("base_tick")),
+        "quote_tick": _decimal_or_zero(data.get("quote_tick")),
+        "base_tick": _decimal_or_zero(data.get("base_tick")),
         "min_quantity": _decimal_or_zero(data.get("base_min") if data.get("base_min") is not None else data.get("min_quantity")),
         "min_notional": _decimal_or_zero(data.get("min_notional")),
         "price_scope": _decimal_or_zero(data.get("price_scope")),
         "mark_price": mark_price,
+        "quote_currency": str(data.get("quote_ticker") or data.get("quote_token") or "USDC"),
+        "base_currency": str(data.get("base_ticker") or data.get("base_token") or _symbol_from_orderly(orderly_symbol)),
     }
 
 
@@ -444,12 +452,20 @@ def _normalize_positions(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, A
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
         else:
-            pnl_value = _decimal_or_zero(row.get("unsettled_pnl")).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            )
-        pnl_text = _decimal_text(pnl_value)
-        if pnl_value > 0:
-            pnl_text = f"+{pnl_text}"
+            # Prefer reported unsettled only when mark is unavailable — never invent 0.
+            raw_pnl = row.get("unsettled_pnl")
+            if raw_pnl in (None, ""):
+                pnl_value = None
+            else:
+                pnl_value = _decimal_or_zero(raw_pnl).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+        if pnl_value is None:
+            pnl_text = ""
+        else:
+            pnl_text = _decimal_text(pnl_value)
+            if pnl_value > 0:
+                pnl_text = f"+{pnl_text}"
         orderly_symbol = _orderly_symbol(row.get("symbol"))
         rule = (symbol_rules or {}).get(orderly_symbol, {})
         symbol = str(rule.get("symbol") or _symbol_from_orderly(row.get("symbol"))).strip().upper()
@@ -459,8 +475,10 @@ def _normalize_positions(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, A
             symbol=symbol,
             side="long" if size > 0 else "short",
             size=_format_decimal_places(abs(size), size_precision),
-            entry_price=_format_decimal_places(entry, price_precision),
+            entry_price=_format_decimal_places(entry, price_precision) if entry > 0 else "0",
             pnl=pnl_text,
+            mark=_format_decimal_places(mark, price_precision) if mark > 0 else None,
+            exchange_instrument=orderly_symbol or None,
         ))
     positions.sort(key=lambda item: (item.symbol, item.side))
     return positions
@@ -489,7 +507,7 @@ def _remaining_order_quantity(row: Dict[str, Any]) -> Decimal:
 def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None) -> tuple[int, List[CanonicalOrderGroup]]:
     if not isinstance(rows, list):
         return (0, [])
-    grouped: Dict[tuple[str, str], Dict[str, Any]] = {}
+    grouped: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     open_count = 0
     for row in rows:
         if not isinstance(row, dict):
@@ -506,12 +524,23 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
         side = str(row.get("side") or "").strip().lower()
         if side not in {"buy", "sell"}:
             continue
+        # Ordinary open book orders are entry limits. Algo TP/SL live on a
+        # separate endpoint and are not mixed into this aggregation.
+        otype = str(row.get("order_type") or row.get("type") or "LIMIT").strip().upper()
+        reduce_only = bool(row.get("reduce_only"))
+        if reduce_only and otype in {"STOP", "TAKE_PROFIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            classification = "stop_loss" if "STOP" in otype and "TAKE" not in otype else "take_profit"
+        elif reduce_only:
+            classification = "other"
+        else:
+            classification = "entry_limit"
         price = _decimal_or_zero(row.get("order_price") if row.get("order_price") is not None else row.get("price"))
         open_count += 1
-        key = (symbol, side)
+        key = (symbol, side, classification)
         group = grouped.setdefault(key, {
             "symbol": symbol,
             "side": side,
+            "classification": classification,
             "count": 0,
             "size": Decimal("0"),
             "notional": Decimal("0"),
@@ -519,6 +548,8 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
             "max_price": None,
             "price_precision": 0,
             "size_precision": int(rule.get("size_precision") or 0),
+            "order_ids": [],
+            "reduce_only": reduce_only,
         })
         group["count"] += 1
         group["size"] += remaining
@@ -526,10 +557,24 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
         group["price_precision"] = max(int(group.get("price_precision") or 0), int(rule.get("price_precision") or _decimal_places(price)))
         group["min_price"] = price if group["min_price"] is None or price < group["min_price"] else group["min_price"]
         group["max_price"] = price if group["max_price"] is None or price > group["max_price"] else group["max_price"]
+        oid = row.get("order_id") or row.get("orderId")
+        try:
+            if oid is not None:
+                group["order_ids"].append(int(oid))
+        except Exception:  # noqa: BLE001
+            pass
+    display_map = {
+        "take_profit": "TAKE PROFIT",
+        "stop_loss": "STOP LOSS",
+        "trigger": "TRIGGER",
+        "other": "OTHER",
+    }
     groups: List[CanonicalOrderGroup] = []
     for group in grouped.values():
         total_size: Decimal = group["size"]
         vwap = (group["notional"] / total_size) if total_size else Decimal("0")
+        classification = group["classification"]
+        side_u = str(group["side"]).upper()
         groups.append(CanonicalOrderGroup(
             symbol=group["symbol"],
             side=group["side"],
@@ -538,8 +583,12 @@ def _aggregate_orders(rows: Any, symbol_rules: Optional[Dict[str, Dict[str, Any]
             vwap=_format_decimal_places(vwap, int(group.get("price_precision") or 0)),
             min_price=_decimal_text(group["min_price"]),
             max_price=_decimal_text(group["max_price"]),
+            classification=classification,
+            display_type=display_map.get(classification) or f"{side_u} LIMIT",
+            reduce_only=bool(group.get("reduce_only")),
+            order_ids=list(group["order_ids"]) or None,
         ))
-    groups.sort(key=lambda item: (item.symbol, item.side))
+    groups.sort(key=lambda item: (item.symbol, item.classification, item.side))
     return (open_count, groups)
 
 
@@ -647,7 +696,9 @@ def _overlay_position_protection(positions: List[CanonicalPosition], algo_orders
     updated: List[CanonicalPosition] = []
     for position in positions:
         closing_side = "SELL" if position.side == "long" else "BUY"
-        protection = _extract_protection_from_algo_orders(algo_orders, position.symbol, closing_side)
+        # Match algo orders on Orderly native id when present.
+        match_sym = str(position.exchange_instrument or position.symbol or "")
+        protection = _extract_protection_from_algo_orders(algo_orders, match_sym, closing_side)
         tp_orders = protection["tp"]
         sl_orders = protection["sl"]
         updated.append(CanonicalPosition(
@@ -656,6 +707,8 @@ def _overlay_position_protection(positions: List[CanonicalPosition], algo_orders
             size=position.size,
             entry_price=position.entry_price,
             pnl=position.pnl,
+            mark=position.mark,
+            exchange_instrument=position.exchange_instrument,
             tp=str(tp_orders[0].get("trigger_price")) if tp_orders and tp_orders[0].get("trigger_price") is not None else None,
             sl=str(sl_orders[0].get("trigger_price")) if sl_orders and sl_orders[0].get("trigger_price") is not None else None,
             tp_count=len(tp_orders) or None,
@@ -740,6 +793,13 @@ def _positions_orders(account: str) -> CanonicalResponse:
         symbols.extend(str(row.get("symbol") or "") for row in orders_rows if isinstance(row, dict))
         symbol_rules = _fetch_symbol_rules(symbols)
         positions = _normalize_positions(positions_rows, symbol_rules=symbol_rules)
+        # Soft-fetch algo TP/SL so positions_orders matches positions_management.
+        try:
+            algo_orders = _fetch_algo_orders(credentials, None)
+        except Exception:  # noqa: BLE001
+            algo_orders = []
+        if algo_orders:
+            positions = _overlay_position_protection(positions, algo_orders)
         open_order_count, order_groups = _aggregate_orders(orders_rows, symbol_rules=symbol_rules)
         return make_success(
             operation="positions_orders",
@@ -1371,16 +1431,35 @@ def _raydium_resolve_instrument(account: str, request: Dict[str, Any]) -> Canoni
                             code="INSTRUMENT_NOT_FOUND",
                             message=f"Raydium instrument '{requested}' is not available.")
     display_symbol = str(metadata.get("display_symbol") or _symbol_from_orderly(orderly_symbol))
+    price_tick = metadata.get("quote_tick")
+    size_tick = metadata.get("base_tick")
+    if not isinstance(price_tick, Decimal) or price_tick <= 0:
+        pp = int(metadata.get("price_precision") or 0)
+        price_tick = Decimal(1).scaleb(-pp) if pp > 0 else None
+    if not isinstance(size_tick, Decimal) or size_tick <= 0:
+        sp = int(metadata.get("size_precision") or 0)
+        size_tick = Decimal(1).scaleb(-sp) if sp > 0 else None
     instrument = CanonicalInstrument(
         requested_symbol=requested,
         symbol=orderly_symbol,
         display_name=display_symbol,
-        price_increment=None,
-        size_increment=None,
+        price_increment=_decimal_text(price_tick) if price_tick and price_tick > 0 else None,
+        size_increment=_decimal_text(size_tick) if size_tick and size_tick > 0 else None,
         minimum_size=str(metadata.get("min_quantity") or "") or None,
     )
-    return make_success(operation="resolve_instrument", exchange=name, account=credentials["account"],
-                        instrument=instrument)
+    return make_success(
+        operation="resolve_instrument",
+        exchange=name,
+        account=credentials["account"],
+        instrument=instrument,
+        data={
+            "native_symbol": orderly_symbol,
+            "min_notional": _decimal_text(metadata.get("min_notional")) if metadata.get("min_notional") else None,
+            "quote_currency": metadata.get("quote_currency") or "USDC",
+            "base_currency": metadata.get("base_currency") or display_symbol,
+            "mark_price": _decimal_text(metadata.get("mark_price")) if metadata.get("mark_price") else None,
+        },
+    )
 
 
 

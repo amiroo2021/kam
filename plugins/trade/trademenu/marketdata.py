@@ -55,6 +55,17 @@ _MEXC_INTERVAL = {
     "1D": "Day1",
 }
 
+# Orderly Network (Raydium Perps white-label) public candles intervals.
+_ORDERLY_INTERVAL = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "4h",
+    "1D": "1d",
+}
+
 
 def _http_json(url: str, *, method: str = "GET", body: Optional[dict] = None, timeout: int = 20) -> Any:
     data = None
@@ -345,6 +356,74 @@ def fetch_mexc_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[str,
     return out[-limit:]
 
 
+def _orderly_symbol_from_any(symbol: str) -> str:
+    raw = str(symbol or "").strip().upper().replace("-", "_").replace("/", "_")
+    if not raw:
+        return ""
+    if raw.startswith("PERP_"):
+        return raw
+    for q in ("USDC", "USDT", "USD"):
+        if raw.endswith(q) and len(raw) > len(q):
+            base = raw[: -len(q)].rstrip("_")
+            return f"PERP_{base}_USDC"
+    return f"PERP_{raw}_USDC"
+
+
+def fetch_raydium_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    """Orderly Network public candles (Raydium Perps white-label on Orderly)."""
+    interval = _ORDERLY_INTERVAL.get(tf)
+    if not interval:
+        raise ValueError("UNSUPPORTED_TIMEFRAME")
+    orderly = _orderly_symbol_from_any(symbol)
+    if not orderly:
+        raise RuntimeError("Empty Raydium/Orderly candle symbol")
+    limit_n = max(1, min(int(limit), 1000))
+    body = {
+        "type": "candles",
+        "symbol": orderly,
+        "interval": interval,
+        "limit": limit_n,
+    }
+    data = _http_json(
+        "https://api.orderly.org/v1/public/query",
+        method="POST",
+        body=body,
+        timeout=25,
+    )
+    if not isinstance(data, dict) or not data.get("success"):
+        raise RuntimeError(f"Orderly candles failed for {orderly}")
+    payload = data.get("data")
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("rows")
+    elif isinstance(payload, list):
+        rows = payload
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Empty Orderly candles for {orderly}")
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ts = int(row.get("timestamp") or row.get("start_timestamp") or row.get("t") or 0)
+        if ts <= 0:
+            continue
+        ts_ms = ts if ts > 10_000_000_000 else ts * 1000
+        out.append(
+            _normalize_candle(
+                ts_ms,
+                float(row.get("open")),
+                float(row.get("high")),
+                float(row.get("low")),
+                float(row.get("close")),
+                float(row.get("volume") or 0),
+            )
+        )
+    out.sort(key=lambda c: c["time"])
+    dedup: Dict[int, Dict[str, Any]] = {int(c["time"]): c for c in out}
+    ordered = [dedup[k] for k in sorted(dedup.keys())]
+    return ordered[-limit_n:]
+
+
 def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int = 300) -> Dict[str, Any]:
     """Return {success, candles, ...} or explicit unsupported error."""
     ex = str(exchange or "").strip().lower()
@@ -368,6 +447,8 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             candles = fetch_phemex_candles(symbol, tf_n, limit=limit)
         elif ex == "mexc":
             candles = fetch_mexc_candles(symbol, tf_n, limit=limit)
+        elif ex == "raydium":
+            candles = fetch_raydium_candles(symbol, tf_n, limit=limit)
         else:
             return {
                 "success": False,

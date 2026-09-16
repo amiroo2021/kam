@@ -55,17 +55,66 @@
   let ordersReq = 0;
   let resolveReq = 0;
   let financialsReq = 0;
-  const controllers = { chart: null, positions: null, orders: null, resolve: null, financials: null };
+  let quoteReq = 0;
+  const controllers = { chart: null, positions: null, orders: null, resolve: null, financials: null, quote: null };
   const POS_POLL_MS = 15 * 60 * 1000;
   const ORD_POLL_MS = 15 * 60 * 1000;
   let lastFinancials = null; // { accountKey, data }
   let lastFinancialsStale = false;
+  let quoteFresh = false; // true only when Last belongs to current nativeInstrument
 
   function selectionKey() {
     return `${exchangeEl.value}|${accountEl.value}|${(symbolEl.value || "").trim()}|${tfEl.value}`;
   }
   function accountKey() {
     return `${exchangeEl.value}|${accountEl.value}`;
+  }
+  function instrumentKey() {
+    return `${exchangeEl.value}|${accountEl.value}|${nativeInstrument || ""}|${tfEl.value}`;
+  }
+
+  function setLastPrice(value, meta, { fromNative } = {}) {
+    if (fromNative && fromNative !== nativeInstrument) return;
+    if (value == null || value === "" || value === "—") {
+      lastPrice.textContent = "—";
+      quoteFresh = false;
+      updateTradeEnablement();
+      return;
+    }
+    lastPrice.textContent = fmtPriceClient(value, meta || formatMeta);
+    quoteFresh = true;
+    updateTradeEnablement();
+  }
+
+  function clearMarketState(reason) {
+    quoteFresh = false;
+    lastPrice.textContent = "—";
+    try {
+      candleSeries && candleSeries.setData([]);
+    } catch (_) {}
+    candleCount.textContent = "0";
+    clearPositionLines();
+    clearPreviewLines();
+    invalidateTradePreview();
+    updateTradeEnablement(reason);
+  }
+
+  function updateTradeEnablement(reason) {
+    const ready = !!(resolvedOk && nativeInstrument && quoteFresh);
+    const waitingMsg =
+      reason ||
+      (!resolvedOk
+        ? "Waiting for instrument resolution…"
+        : !quoteFresh
+          ? "Waiting for market data…"
+          : "");
+    ["previewOrderBtn", "previewLadderBtn", "useCurrentPrice", "ladderStartCurrent"].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.disabled = !ready;
+      if (!ready && waitingMsg) el.title = waitingMsg;
+      else el.removeAttribute("title");
+    });
   }
   function setLine(el, msg, kind) {
     el.textContent = msg || "";
@@ -521,9 +570,9 @@
     const acct = accountEl.value;
     const sym = (symbolEl.value || "BTCUSD").trim();
     const tf = tfEl.value;
+    // Invalidate previous instrument Last immediately so BTC cannot stick on ZEC.
+    clearMarketState("Loading market data…");
     try {
-      // Candles endpoint resolves server-side (cached). Skip a separate resolve
-      // round-trip unless we need native for overlay matching sooner.
       setLine(chartStatus, `Loading ${sym} ${tf} candles…`);
       const signal = abort("chart");
       const t0 = performance.now();
@@ -538,9 +587,18 @@
         candleCount.textContent = "0";
         resolvedOk = false;
         nativeInstrument = null;
+        quoteFresh = false;
+        lastPrice.textContent = "—";
         clearPositionLines();
         nativeSym.textContent = data.display || `${sym} → unresolved`;
         setLine(chartStatus, (data.error && data.error.message) || "Candles unavailable", "error");
+        updateTradeEnablement((data.error && data.error.message) || "Candles unavailable");
+        // Still try resolve+quote so trading can proceed without candles on some venues.
+        const native = await resolveSymbol();
+        if (reqId !== chartReq || key !== selectionKey()) return;
+        if (native) {
+          await loadQuote(true);
+        }
         return;
       }
       const candles = (data.candles || []).map((c) => ({
@@ -552,15 +610,18 @@
       }));
       candleSeries.setData(candles);
       formatMeta = data.format_meta || formatMeta;
-      if (candles.length) {
-        chart.timeScale().fitContent();
-        lastPrice.textContent = fmtPriceClient(candles[candles.length - 1].close, formatMeta);
-      }
-      candleCount.textContent = String(candles.length);
       if (data.display) nativeSym.textContent = data.display;
       nativeInstrument = data.native_symbol || nativeInstrument;
       resolvedOk = true;
+      if (candles.length) {
+        chart.timeScale().fitContent();
+        setLastPrice(candles[candles.length - 1].close, formatMeta, { fromNative: nativeInstrument });
+      } else {
+        setLastPrice(null);
+      }
+      candleCount.textContent = String(candles.length);
       updateOverlay();
+      updateTradeEnablement();
       const rMs = data.resolve_timing_ms && data.resolve_timing_ms.tradedesk_ms;
       const rCache = data.resolve_cache_hit ? " resolve-cache" : "";
       setLine(
@@ -568,24 +629,37 @@
         `Chart OK · ${data.native_symbol || "—"} · ${tf} · ${candles.length} bars · browser ${browserMs} ms · resolve ${rMs != null ? rMs : "—"} ms${rCache}`,
         "ok"
       );
+      // Authoritative quote for Current button (may refine Last).
+      loadQuote(true);
     } catch (e) {
       if (e.name === "AbortError") return;
       if (String(e.message) !== "unauthorized") setLine(chartStatus, String(e.message || e), "error");
     }
   }
 
-  async function loadQuote() {
+  async function loadQuote(force) {
     if (!resolvedOk || !nativeInstrument) return;
+    const reqId = ++quoteReq;
     const key = selectionKey();
+    const nativeAtStart = nativeInstrument;
     const ex = exchangeEl.value;
     const acct = accountEl.value;
     try {
+      const signal = abort("quote");
       const { data } = await api(
-        `/api/quote?exchange=${encodeURIComponent(ex)}&account=${encodeURIComponent(acct)}&symbol=${encodeURIComponent(nativeInstrument)}`
+        `/api/quote?exchange=${encodeURIComponent(ex)}&account=${encodeURIComponent(acct)}&symbol=${encodeURIComponent(nativeAtStart)}`,
+        signal
       );
-      if (key !== selectionKey()) return;
-      if (data.success && data.price != null) lastPrice.textContent = fmtPriceClient(data.price, formatMeta);
-    } catch (_) {}
+      if (reqId !== quoteReq || key !== selectionKey()) return;
+      if (nativeInstrument !== nativeAtStart) return;
+      if (data.success && data.price != null) {
+        setLastPrice(data.price, formatMeta, { fromNative: nativeAtStart });
+      } else if (force && !quoteFresh) {
+        setLastPrice(null);
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+    }
   }
 
   function openModal(cfg) {
@@ -1336,7 +1410,16 @@
     lastOrderGroups = [];
     clearPositionLines();
     invalidateTradePreview();
+    // Drop previous instrument quote/chart immediately (BTC must not stick on ZEC).
+    resolvedOk = false;
+    nativeInstrument = null;
+    formatMeta = null;
+    quoteFresh = false;
+    lastPrice.textContent = "—";
+    try { candleSeries && candleSeries.setData([]); } catch (_) {}
+    candleCount.textContent = "0";
     updateTradeCtx();
+    updateTradeEnablement("Loading market data…");
     loadCandles();
     loadPositions();
     if (activeTab === "orders") loadOrders();
@@ -1375,12 +1458,19 @@
     $("previewBackBtn").addEventListener("click", invalidateTradePreview);
     $("placeBtn").addEventListener("click", doPlace);
     $("useCurrentPrice").addEventListener("click", () => {
-      if (lastPrice.textContent && lastPrice.textContent !== "—")
-        $("orderPrice").value = String(lastPrice.textContent).replace(/,/g, "");
+      if (!quoteFresh || !lastPrice.textContent || lastPrice.textContent === "—") {
+        showToast("No fresh market price for the active instrument.", "error");
+        return;
+      }
+      $("orderPrice").value = String(lastPrice.textContent).replace(/,/g, "");
+      updateSingleNotional();
     });
     $("ladderStartCurrent").addEventListener("click", () => {
-      if (lastPrice.textContent && lastPrice.textContent !== "—")
-        $("ladderStart").value = String(lastPrice.textContent).replace(/,/g, "");
+      if (!quoteFresh || !lastPrice.textContent || lastPrice.textContent === "—") {
+        showToast("No fresh market price for the active instrument.", "error");
+        return;
+      }
+      $("ladderStart").value = String(lastPrice.textContent).replace(/,/g, "");
     });
     ["orderPrice", "orderSize", "ladderStart", "ladderEnd", "ladderCount", "ladderTotal", "ladderDist"].forEach((id) => {
       const el = $(id);
