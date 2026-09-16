@@ -329,6 +329,7 @@
   /**
    * Metrics: segments from latest candle → right edge only (not drawn backward).
    * Values & windows come from backend; JS does not recompute VWAP/POC.
+   * LIVE AGGTRADE: only draw when status === COMPLETE; loading → no line.
    */
   function applyMetricSegments(msg) {
     clearSeriesMap(metricSeries);
@@ -336,14 +337,24 @@
     const tRight = rightEdgeTime(msg);
     if (!Number.isFinite(t0)) return;
 
+    const src = msg.metric_source || "OHLC_APPROXIMATION";
+    const ladderSt = msg.ladder_metric_status || (msg.ladder_poc != null ? "COMPLETE" : "loading");
+    const stepSt = msg.step_metric_status || (msg.active_step_poc != null ? "COMPLETE" : "loading");
+
     const specs = [
-      { key: "ladder_vwap", title: "L-VWAP", color: "#f2c500", dashed: false },
-      { key: "active_step_vwap", title: "S-VWAP", color: "#f2c500", dashed: true },
-      { key: "ladder_poc", title: "L-POC", color: "#eceff1", dashed: false },
-      { key: "active_step_poc", title: "S-POC", color: "#eceff1", dashed: true },
-      { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true },
-      { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true },
+      { key: "ladder_vwap", title: "L-VWAP", color: "#f2c500", dashed: false, status: ladderSt },
+      { key: "active_step_vwap", title: "S-VWAP", color: "#f2c500", dashed: true, status: stepSt },
+      { key: "ladder_poc", title: "L-POC", color: "#eceff1", dashed: false, status: ladderSt },
+      { key: "active_step_poc", title: "S-POC", color: "#eceff1", dashed: true, status: stepSt },
     ];
+    // VAL/VAH only for OHLC research path (not primary LIVE)
+    if (src === "OHLC_APPROXIMATION") {
+      specs.push(
+        { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true, status: ladderSt },
+        { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true, status: ladderSt }
+      );
+    }
+
     // Dedupe equal L/S VWAP and L/S POC for readability
     const lv = Number(msg.ladder_vwap);
     const sv = Number(msg.active_step_vwap);
@@ -361,6 +372,7 @@
 
     specs.forEach((s) => {
       if (skip.has(s.key)) return;
+      if (s.status && s.status !== "COMPLETE") return; // loading / incomplete → no line
       const price = Number(msg[s.key]);
       if (!Number.isFinite(price)) return;
       const bounds = chartTimeBounds(msg);
@@ -425,7 +437,28 @@
     if (msg.shared_tp != null) hudTp.textContent = format2(msg.shared_tp);
     if (msg.phase != null && hudPhase) hudPhase.textContent = msg.phase;
     if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
-    if (msg.note_historical && histNote) histNote.textContent = msg.note_historical;
+    if (msg.note_historical && histNote) {
+      const src = msg.metric_source ? ` · metrics ${msg.metric_source}` : "";
+      const ls = msg.ladder_metric_status ? ` · L-POC ${msg.ladder_metric_status === "COMPLETE" ? format2(msg.ladder_poc) : msg.ladder_metric_status}` : "";
+      const ss = msg.step_metric_status ? ` · S-POC ${msg.step_metric_status === "COMPLETE" ? format2(msg.active_step_poc) : msg.step_metric_status}` : "";
+      histNote.textContent = msg.note_historical + src + ls + ss;
+    }
+  }
+
+  function mergeMetricFields(target, src) {
+    if (!src) return target;
+    const keys = [
+      "ladder_vwap", "active_step_vwap", "ladder_poc", "active_step_poc",
+      "ladder_val", "ladder_vah", "metric_source",
+      "ladder_metric_status", "step_metric_status", "metrics_handoff_status",
+      "metrics_gap_count", "ladder_trade_count", "step_trade_count",
+      "ladder_total_qty", "step_total_qty", "metrics_detail",
+      "ladder_top_vap_bins", "step_top_vap_bins", "metric_windows",
+    ];
+    keys.forEach((k) => {
+      if (src[k] !== undefined) target[k] = src[k];
+    });
+    return target;
   }
 
   function applyPhase(msg) {
@@ -534,6 +567,13 @@
           break;
         case "price_update":
           if (msg.price != null) hudPrice.textContent = format2(msg.price);
+          if (msg.metric_source || msg.ladder_metric_status || msg.ladder_poc != null || msg.ladder_vwap != null) {
+            if (lastOverlayMsg) {
+              mergeMetricFields(lastOverlayMsg, msg);
+              applyMetricSegments(lastOverlayMsg);
+              applyHud(lastOverlayMsg);
+            }
+          }
           break;
         case "phase":
           applyPhase(msg);
@@ -561,6 +601,7 @@
             // keep candle tail time if fragment omits it
             if (merged.last_candle_time == null && lastOverlayMsg)
               merged.last_candle_time = lastOverlayMsg.last_candle_time;
+            mergeMetricFields(merged, msg.state);
             applyOverlayState(merged);
           }
           break;

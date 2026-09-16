@@ -10,6 +10,13 @@ from ..engine.events import DomainEvent
 from ..engine.levels import ladder_step
 from ..engine.state import EngineState, StateSnapshot
 from ..metrics import OhlcvBar, fmt_metric, fmt_price, metrics_for_legs
+from ..metrics.trade_store import (
+    SOURCE_AGGTRADE,
+    SOURCE_OHLC,
+    STATUS_COMPLETE,
+    STATUS_LOADING,
+    MetricDisplay,
+)
 
 
 PROTOCOL_VERSION = 1
@@ -114,6 +121,31 @@ def markers_from_domain(events: List[DomainEvent]) -> List[Dict[str, Any]]:
     return markers
 
 
+def ohlc_metric_display(
+    bars: List[OhlcvBar],
+    *,
+    ladder_ts: Optional[int],
+    step_ts: Optional[int],
+) -> MetricDisplay:
+    """Historical/research path: OHLC approximation (preserved)."""
+    lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
+        bars, ladder_start_ts_ms=ladder_ts, step_start_ts_ms=step_ts
+    )
+    return MetricDisplay(
+        source=SOURCE_OHLC,
+        ladder_vwap=lv,
+        step_vwap=sv,
+        ladder_poc=lp,
+        step_poc=sp,
+        ladder_val=l_val,
+        ladder_vah=l_vah,
+        ladder_status=STATUS_COMPLETE if ladder_ts is not None else STATUS_LOADING,
+        step_status=STATUS_COMPLETE if step_ts is not None else STATUS_LOADING,
+        handoff_status="ohlc",
+        detail="OHLC approximation",
+    )
+
+
 def build_state_payload(
     *,
     mode: str,
@@ -127,18 +159,28 @@ def build_state_payload(
     bars: List[OhlcvBar],
     recent_domain: Optional[List[DomainEvent]] = None,
     connected: bool = True,
+    metric_display: Optional[MetricDisplay] = None,
+    prefer_aggtrade: bool = False,
 ) -> Dict[str, Any]:
     st = engine.state
     snap = StateSnapshot.from_state(st)
     ladder_ts = st.legs[0].ts_ms if st.legs else None
     step_ts = st.legs[-1].ts_ms if st.legs else None
-    lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
-        bars, ladder_start_ts_ms=ladder_ts, step_start_ts_ms=step_ts
-    )
+
+    if prefer_aggtrade and metric_display is not None:
+        md = metric_display
+    else:
+        md = ohlc_metric_display(bars, ladder_ts=ladder_ts, step_ts=step_ts)
 
     last_candle_time = None
     if candles:
         last_candle_time = candles[-1].get("time")
+
+    metric_fields = md.as_payload_fields()
+    # OHLC path still exposes VAL/VAH via MetricDisplay
+    if md.source == SOURCE_OHLC:
+        metric_fields["ladder_val"] = fmt_metric(md.ladder_val)
+        metric_fields["ladder_vah"] = fmt_metric(md.ladder_vah)
 
     payload = {
         "v": PROTOCOL_VERSION,
@@ -182,12 +224,6 @@ def build_state_payload(
             "step_start_time": (step_ts // 1000) if step_ts is not None else None,
             "latest_candle_time": last_candle_time,
         },
-        "ladder_vwap": fmt_metric(lv),
-        "active_step_vwap": fmt_metric(sv),
-        "ladder_poc": fmt_metric(lp),
-        "active_step_poc": fmt_metric(sp),
-        "ladder_val": fmt_metric(l_val),
-        "ladder_vah": fmt_metric(l_vah),
         "markers": markers_from_domain(recent_domain or []),
         "snapshot": {
             "symbol": snap.symbol,
@@ -200,6 +236,7 @@ def build_state_payload(
             "further_p": snap.further_p,
         },
     }
+    payload.update(metric_fields)
     return payload
 
 
@@ -207,8 +244,21 @@ def candle_update_msg(candle: Dict[str, Any], *, final: bool = False) -> Dict[st
     return {"v": PROTOCOL_VERSION, "type": "candle_update", "candle": candle, "final": final}
 
 
-def price_update_msg(price: str, ts_ms: int) -> Dict[str, Any]:
-    return {"v": PROTOCOL_VERSION, "type": "price_update", "price": fmt_price(price) or price, "ts_ms": ts_ms}
+def price_update_msg(
+    price: str,
+    ts_ms: int,
+    *,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    msg: Dict[str, Any] = {
+        "v": PROTOCOL_VERSION,
+        "type": "price_update",
+        "price": fmt_price(price) or price,
+        "ts_ms": ts_ms,
+    }
+    if metrics:
+        msg.update(metrics)
+    return msg
 
 
 def engine_event_msg(events: List[DomainEvent], state_fragment: Dict[str, Any]) -> Dict[str, Any]:

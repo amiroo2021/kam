@@ -26,6 +26,8 @@ from ..marketdata.timeframes import (
     validate_interval,
 )
 from ..metrics import OhlcvBar, bar_from_binance_kline
+from ..metrics.trade_store import TradeMetricStore
+from ..marketdata.binance_agg_trades import fetch_agg_trades_range
 from .event_log import EventLog
 from .runner import apply_ohlc_page, new_engine_for_run, run_ohlc_on_engine
 from .types import SessionMode, SessionPhase
@@ -79,6 +81,16 @@ class SessionController:
         self.kline_source = CachedBinanceKlineSource(cache=self.kline_cache, policy=self.cache_policy)
         self.cache_stats: Dict[str, Any] = {}
         self.history_limit_live = 300
+        self.trade_store = TradeMetricStore(tick_size=0.01)
+        self._trade_backfill_task: Optional[asyncio.Task] = None
+        self._last_metric_broadcast_ms: int = 0
+        self._metric_broadcast_min_interval_ms: int = 500
+        # Full aggTrade buffer while hist replay (id, price, qty, ts)
+        self._agg_trade_buffer: List[Dict[str, Any]] = []
+        # Explicit enable for LIVE AGGTRADE metrics (avoids REST in unit tests)
+        self._aggtrade_metrics_enabled: bool = False
+        # Injectable fetch for tests
+        self._agg_trades_fetch = fetch_agg_trades_range
 
     def register_client(self, ws: Any) -> None:
         self._clients.add(ws)
@@ -117,6 +129,8 @@ class SessionController:
         )
 
     def snapshot_dict(self) -> Dict[str, Any]:
+        prefer = self._prefer_aggtrade_metrics()
+        md = self.trade_store.compute(now_ms=int(time.time() * 1000)) if prefer else None
         payload = schemas.build_state_payload(
             mode=self.mode.value,
             symbol=self.symbol,
@@ -138,6 +152,8 @@ class SessionController:
                 SessionPhase.CATCHING_UP,
             )
             or self.feed_status in ("live", "seeded", "buffering"),
+            metric_display=md,
+            prefer_aggtrade=prefer,
         )
         payload.update(
             {
@@ -157,10 +173,114 @@ class SessionController:
                 "note_historical": (
                     "LEGACY OHLC uses deterministic intrabar assumptions; "
                     "not tick-perfect vs continuous aggTrade."
+                    if not prefer
+                    else "LIVE metrics: aggTrade VAP POC + trade VWAP when coverage COMPLETE."
                 ),
             }
         )
         return payload
+
+    def _prefer_aggtrade_metrics(self) -> bool:
+        """LIVE chart path prefers AGGTRADE; BACKTEST/historical replay use OHLC."""
+        if not self._aggtrade_metrics_enabled:
+            return False
+        if self.mode is SessionMode.BACKTEST:
+            return False
+        if self.phase is SessionPhase.LIVE:
+            return True
+        if self.mode is SessionMode.LIVE and self._p0_seeded:
+            return True
+        if self.mode is SessionMode.REPLAY_TO_LIVE and self._live_enabled:
+            return True
+        return False
+
+    def _sync_trade_windows_from_engine(self, *, schedule_backfill: bool = False) -> bool:
+        """Update trade-store windows from engine legs.
+
+        Returns True if ladder P0 start advanced (new cycle).
+        REST backfill is scheduled only when ``schedule_backfill`` is True or
+        when a mid-session TP advances P0 while LIVE metrics are preferred.
+        """
+        st = self.engine.state
+        if not st.legs:
+            return False
+        ladder = int(st.legs[0].ts_ms)
+        step = int(st.legs[-1].ts_ms)
+        prev_ladder = self.trade_store.ladder_start_ms
+        new_p0 = prev_ladder is None or ladder > int(prev_ladder)
+        self.trade_store.set_windows(ladder_start_ms=ladder, step_start_ms=step)
+        if not self._prefer_aggtrade_metrics():
+            return new_p0
+        if schedule_backfill and new_p0:
+            self._schedule_trade_backfill()
+        elif new_p0 and prev_ladder is not None:
+            # TP / new cycle while already live — must re-backfill new P0 window
+            self._schedule_trade_backfill()
+        return new_p0
+
+    def _schedule_trade_backfill(self) -> None:
+        if self._trade_backfill_task and not self._trade_backfill_task.done():
+            self._trade_backfill_task.cancel()
+        self._trade_backfill_task = asyncio.create_task(
+            self._run_trade_backfill(), name="gf-aggtrade-backfill"
+        )
+
+    async def _run_trade_backfill(self) -> None:
+        st = self.engine.state
+        if not st.legs:
+            return
+        start_ms = int(st.legs[0].ts_ms)
+        end_ms = int(time.time() * 1000)
+        self.trade_store.set_windows(
+            ladder_start_ms=start_ms,
+            step_start_ms=int(st.legs[-1].ts_ms),
+        )
+        self.trade_store.handoff_status = "backfilling"
+        self.trade_store.backfill_complete = False
+        try:
+            trades = await asyncio.to_thread(
+                self._agg_trades_fetch,
+                self.symbol,
+                start_ms,
+                end_ms,
+                pause_s=0.03,
+            )
+            if self._stopped():
+                return
+            # Merge any WS buffer trades collected during backfill
+            async with self._lock:
+                buf = list(self._agg_trade_buffer)
+                self._agg_trade_buffer.clear()
+            for row in buf:
+                self.trade_store.ingest_ws_message(row)
+            self.trade_store.apply_rest_backfill(
+                trades, requested_start_ms=start_ms, requested_end_ms=end_ms
+            )
+            self.trade_store.mark_ws_attached()
+            await self.broadcast_snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("aggTrade backfill failed: %s", exc)
+            self.trade_store.note_backfill_failure(str(exc))
+            await self.broadcast_snapshot()
+
+    def _metric_fragment(self) -> Dict[str, Any]:
+        from ..metrics import fmt_metric
+
+        if not self._prefer_aggtrade_metrics():
+            st = self.engine.state
+            md = schemas.ohlc_metric_display(
+                self.bars,
+                ladder_ts=st.legs[0].ts_ms if st.legs else None,
+                step_ts=st.legs[-1].ts_ms if st.legs else None,
+            )
+            fields = md.as_payload_fields()
+            fields["ladder_val"] = fmt_metric(md.ladder_val)
+            fields["ladder_vah"] = fmt_metric(md.ladder_vah)
+            return fields
+        md = self.trade_store.compute(now_ms=int(time.time() * 1000))
+        return md.as_payload_fields()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -203,6 +323,12 @@ class SessionController:
         self.event_log.clear()
         self.recent_domain.clear()
         self._trade_buffer.clear()
+        self._agg_trade_buffer.clear()
+        self.trade_store.clear()
+        self._aggtrade_metrics_enabled = False
+        if self._trade_backfill_task and not self._trade_backfill_task.done():
+            self._trade_backfill_task.cancel()
+            self._trade_backfill_task = None
         self.ambiguity_count = 0
         self.bars_processed = 0
         self.fence_ms = None
@@ -504,11 +630,22 @@ class SessionController:
                     self._p0_seeded = True
                     self.last_price = str(klines[-1][4])
                 self.feed_status = "seeded"
+            # Open WS early so trades buffer during REST backfill
+            self._buffering = True
+            await self._ensure_ws()
+            self._aggtrade_metrics_enabled = True
+            self._sync_trade_windows_from_engine(schedule_backfill=True)
+            if self._trade_backfill_task:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._trade_backfill_task), timeout=120)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
             await self.broadcast_snapshot()
             self._live_enabled = True
+            self._buffering = False
             self.fence_ms = int(klines[-1][0]) if klines else now
             await self._set_phase(SessionPhase.LIVE)
-            await self._ensure_ws()
+            await self.broadcast_snapshot()
         except Exception as exc:
             logger.exception("live start failed")
             self.error = str(exc)
@@ -592,6 +729,13 @@ class SessionController:
             self._buffering = False
             self._live_enabled = True
             self.feed_status = "live"
+            self._aggtrade_metrics_enabled = True
+            self._sync_trade_windows_from_engine(schedule_backfill=True)
+            if self._trade_backfill_task:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._trade_backfill_task), timeout=180)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
             await self.broadcast(
                 {
                     "v": 1,
@@ -601,6 +745,7 @@ class SessionController:
                     "fence_ms": self.fence_ms,
                     "engine_id": engine_id,
                     "ambiguity_count": self.ambiguity_count,
+                    "metrics_handoff_status": self.trade_store.handoff_status,
                 }
             )
             await self._set_phase(SessionPhase.LIVE, pct=100.0)
@@ -661,15 +806,26 @@ class SessionController:
         if event == "aggTrade":
             price = Decimal(str(data["p"]))
             ts_ms = int(data.get("T") or data.get("E") or 0)
+            # Always retain full trade for metric store when LIVE metrics desired
             if self._buffering and not self._live_enabled:
                 async with self._lock:
                     self._trade_buffer.append((ts_ms, price))
+                    self._agg_trade_buffer.append(dict(data))
                     if len(self._trade_buffer) > 50_000:
                         self._trade_buffer = self._trade_buffer[-30_000:]
+                    if len(self._agg_trade_buffer) > 50_000:
+                        self._agg_trade_buffer = self._agg_trade_buffer[-30_000:]
+                # Also feed store if windows already set (live seed backfill overlap)
+                if self.trade_store.ladder_start_ms is not None:
+                    self.trade_store.ingest_ws_message(data)
                 return
             if not self._live_enabled:
+                if self.trade_store.ladder_start_ms is not None:
+                    self.trade_store.ingest_ws_message(data)
                 return
             fence = self.fence_ms or 0
+            # Metrics accumulate regardless of fence (fence is for engine path only)
+            self.trade_store.ingest_ws_message(data)
             if ts_ms < fence:
                 return
             await self._apply_live_price(price, ts_ms, broadcast=True)
@@ -677,16 +833,24 @@ class SessionController:
             await self._on_kline(data)
 
     async def _apply_live_price(self, price: Decimal, ts_ms: int, *, broadcast: bool) -> None:
-        from ..metrics import fmt_metric, fmt_price, metrics_for_legs
+        from ..metrics import fmt_price
 
         async with self._lock:
             self.last_price = str(price)
             domain = apply_price_to_engine(self.engine, price, ts_ms)
+            windows_changed = False
             if domain:
                 self.recent_domain.extend(domain)
                 self.event_log.extend(domain)
                 if len(self.recent_domain) > 300:
                     self.recent_domain = self.recent_domain[-300:]
+                prev_l = self.trade_store.ladder_start_ms
+                prev_s = self.trade_store.step_start_ms
+                self._sync_trade_windows_from_engine(schedule_backfill=False)
+                windows_changed = (
+                    self.trade_store.ladder_start_ms != prev_l
+                    or self.trade_store.step_start_ms != prev_s
+                )
                 frag = {
                     "cycle_id": self.engine.state.cycle_id,
                     "n": self.engine.state.highest_filled,
@@ -720,21 +884,15 @@ class SessionController:
                     "markers": schemas.markers_from_domain(domain),
                     "ambiguity_count": self.ambiguity_count,
                 }
-                st = self.engine.state
-                lv, sv, lp, sp, l_val, l_vah = metrics_for_legs(
-                    self.bars,
-                    ladder_start_ts_ms=st.legs[0].ts_ms if st.legs else None,
-                    step_start_ts_ms=st.legs[-1].ts_ms if st.legs else None,
-                )
-                frag["ladder_vwap"] = fmt_metric(lv)
-                frag["active_step_vwap"] = fmt_metric(sv)
-                frag["ladder_poc"] = fmt_metric(lp)
-                frag["active_step_poc"] = fmt_metric(sp)
-                frag["ladder_val"] = fmt_metric(l_val)
-                frag["ladder_vah"] = fmt_metric(l_vah)
+                frag.update(self._metric_fragment())
                 msg: Dict[str, Any] = schemas.engine_event_msg(domain, frag)
             else:
-                msg = schemas.price_update_msg(str(price), ts_ms)
+                metrics = None
+                # Throttle metric broadcasts on pure price ticks
+                if ts_ms - self._last_metric_broadcast_ms >= self._metric_broadcast_min_interval_ms:
+                    metrics = self._metric_fragment()
+                    self._last_metric_broadcast_ms = ts_ms
+                msg = schemas.price_update_msg(str(price), ts_ms, metrics=metrics)
         if broadcast:
             await self.broadcast(msg)
 
