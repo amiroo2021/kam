@@ -54,9 +54,12 @@
   let positionsReq = 0;
   let ordersReq = 0;
   let resolveReq = 0;
-  const controllers = { chart: null, positions: null, orders: null, resolve: null };
+  let financialsReq = 0;
+  const controllers = { chart: null, positions: null, orders: null, resolve: null, financials: null };
   const POS_POLL_MS = 15 * 60 * 1000;
   const ORD_POLL_MS = 15 * 60 * 1000;
+  let lastFinancials = null; // { accountKey, data }
+  let lastFinancialsStale = false;
 
   function selectionKey() {
     return `${exchangeEl.value}|${accountEl.value}|${(symbolEl.value || "").trim()}|${tfEl.value}`;
@@ -373,6 +376,101 @@
     }
   }
 
+  function renderAccountFinancials(data, { stale = false, loading = false } = {}) {
+    const el = $("accountFinancials");
+    if (!el) return;
+    el.classList.toggle("loading", !!loading);
+    el.classList.toggle("stale", !!stale && !loading);
+    el.classList.remove("unavailable");
+    const fields = (data && Array.isArray(data.fields)) ? data.fields : [];
+    const currency = (data && data.currency) ? String(data.currency) : "";
+    if (!fields.length) {
+      el.classList.add("unavailable");
+      el.textContent = "Balance unavailable";
+      el.title = (data && data.error && data.error.message) || "Balance unavailable";
+      return;
+    }
+    el.innerHTML = "";
+    el.title = stale ? "Account financials may be stale" : (currency ? `Currency: ${currency}` : "");
+    for (const f of fields) {
+      const item = document.createElement("span");
+      item.className = "fin-item";
+      const tip = f.title || f.label || "";
+      if (tip) item.title = tip;
+      const lab = document.createElement("span");
+      lab.className = "fin-label";
+      lab.textContent = f.short_label || f.label || f.key || "";
+      const val = document.createElement("span");
+      val.className = "fin-value";
+      val.textContent = f.display || f.value || "—";
+      item.appendChild(lab);
+      item.appendChild(val);
+      if (currency && f === fields[0]) {
+        const u = document.createElement("span");
+        u.className = "fin-unit";
+        u.textContent = currency;
+        item.appendChild(u);
+      }
+      el.appendChild(item);
+    }
+  }
+
+  async function loadAccountFinancials(force) {
+    const el = $("accountFinancials");
+    const reqId = ++financialsReq;
+    const key = accountKey();
+    const ex = exchangeEl.value;
+    const acct = accountEl.value;
+    if (!ex || !acct) {
+      if (el) {
+        el.classList.add("unavailable");
+        el.textContent = "";
+      }
+      return;
+    }
+    // Keep prior values for this account while refreshing; clear only on account switch.
+    if (lastFinancials && lastFinancials.accountKey === key) {
+      renderAccountFinancials(lastFinancials.data, { stale: lastFinancialsStale, loading: true });
+    } else if (el) {
+      el.classList.remove("stale", "unavailable");
+      el.classList.add("loading");
+      if (!el.childElementCount) el.textContent = "…";
+    }
+    try {
+      const signal = abort("financials");
+      const q = force ? "&force=1" : "";
+      const { data } = await api(
+        `/api/account/financials?exchange=${encodeURIComponent(ex)}&account=${encodeURIComponent(acct)}${q}`,
+        signal
+      );
+      if (reqId !== financialsReq || key !== accountKey()) return;
+      if (data && data.success && Array.isArray(data.fields) && data.fields.length) {
+        lastFinancials = { accountKey: key, data };
+        lastFinancialsStale = false;
+        renderAccountFinancials(data, { stale: false, loading: false });
+      } else if (lastFinancials && lastFinancials.accountKey === key) {
+        lastFinancialsStale = true;
+        renderAccountFinancials(lastFinancials.data, { stale: true, loading: false });
+      } else {
+        lastFinancials = null;
+        lastFinancialsStale = false;
+        renderAccountFinancials(data || {}, { stale: false, loading: false });
+      }
+    } catch (e) {
+      if (reqId !== financialsReq || key !== accountKey()) return;
+      if (String(e.name || "") === "AbortError") return;
+      if (lastFinancials && lastFinancials.accountKey === key) {
+        lastFinancialsStale = true;
+        renderAccountFinancials(lastFinancials.data, { stale: true, loading: false });
+      } else if (el) {
+        el.classList.remove("loading", "stale");
+        el.classList.add("unavailable");
+        el.textContent = "Balance unavailable";
+        el.title = String(e.message || e);
+      }
+    }
+  }
+
   async function resolveSymbol() {
     const reqId = ++resolveReq;
     const key = selectionKey();
@@ -538,6 +636,7 @@
     // (server invalidates on write; force client re-fetch)
     await loadPositions(true);
     await loadOrders(true);
+    loadAccountFinancials(true);
     const row = (lastPositions || []).find((p) => symbolsMatch(p.symbol, symbol, symbol));
     const field = kind === "TP" ? "tp" : "sl";
     const got = row ? String(row[field] ?? "").replace(/,/g, "") : "";
@@ -643,6 +742,7 @@
               showToast(`${sym} close confirmed`, "ok");
               await loadPositions(true);
               await loadOrders(true);
+              loadAccountFinancials(true);
               return data;
             },
           });
@@ -736,6 +836,7 @@
             showToast(msg, data.partial ? "error" : "ok");
             await loadOrders(true);
             await loadPositions(true);
+            loadAccountFinancials(true);
             return data;
           },
         });
@@ -1213,6 +1314,7 @@
       invalidateTradePreview();
       await loadOrders(true);
       await loadPositions(true);
+      loadAccountFinancials(true);
     } catch (e) {
       $("previewError").hidden = false;
       $("previewError").textContent = String(e.message || e);
@@ -1238,6 +1340,7 @@
     loadCandles();
     loadPositions();
     if (activeTab === "orders") loadOrders();
+    loadAccountFinancials(true);
   }
 
   exchangeEl.addEventListener("change", async () => {

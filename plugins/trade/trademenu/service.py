@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..tradedesk import TradeDesk, get_tradedesk
 from ..ladder_math import build_ladder_children, ladder_vwap, quantize_to_increment
-from .formatting import format_pnl, format_price, format_size
+from .formatting import format_money, format_pnl, format_price, format_size
 from .preview_plans import PreviewPlanStore
 
 logger = logging.getLogger("trademenu")
@@ -21,6 +21,9 @@ logger = logging.getLogger("trademenu")
 # Must exceed cold HL multi-dex fanout (~8–15s) or the entry expires before reuse.
 _POSITIONS_CACHE_TTL_SECONDS = 45.0
 _RESOLVE_CACHE_TTL_SECONDS = 60.0
+# Balance / portfolio is cheaper than multi-dex positions; keep a short TTL so
+# exchange/account switches and Reload all stay snappy without thrashing.
+_BALANCE_CACHE_TTL_SECONDS = 20.0
 
 
 def _account_alias(entry: Any) -> str:
@@ -106,9 +109,12 @@ class TradeMenuService:
         self.desk = desk or get_tradedesk()
         self.cache_ttl = float(cache_ttl)
         self.resolve_cache_ttl = _RESOLVE_CACHE_TTL_SECONDS
+        self.balance_cache_ttl = _BALANCE_CACHE_TTL_SECONDS
         self._lock = Lock()
         # key -> (expires_at, timing_ms, CanonicalResponse-like dict payload)
         self._po_cache: Dict[Tuple[str, str], Tuple[float, float, Dict[str, Any]]] = {}
+        # (exchange, account) -> (expires_at, timing_ms, normalized financials)
+        self._bal_cache: Dict[Tuple[str, str], Tuple[float, float, Dict[str, Any]]] = {}
         # (exchange, account, symbol_key) -> (expires_at, payload)
         self._resolve_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
         self.previews = preview_store or PreviewPlanStore(session_secret, ttl_seconds=300)
@@ -119,6 +125,13 @@ class TradeMenuService:
                 self._po_cache.pop((str(exchange), str(account)), None)
             else:
                 self._po_cache.clear()
+
+    def invalidate_balance_cache(self, exchange: str = "", account: str = "") -> None:
+        with self._lock:
+            if exchange and account:
+                self._bal_cache.pop((str(exchange), str(account)), None)
+            else:
+                self._bal_cache.clear()
 
     def list_exchanges(self) -> List[str]:
         return list(self.desk.list_exchanges())
@@ -234,6 +247,167 @@ class TradeMenuService:
         if resp.error is not None:
             data["error"] = _to_plain(resp.error)
         return data
+
+    def account_financials(
+        self,
+        exchange: str,
+        account: str,
+        *,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Normalized account money for the toolbar (TradeDesk ``balance`` only).
+
+        Fields are omitted when the agent does not supply them — never fabricate
+        Available / Equity from position notionals. ``available`` maps to
+        canonical ``portfolio_summary.withdrawable`` (same field Telegram /trade
+        labels Withdrawable).
+        """
+        err = self.validate_exchange_account(exchange, account)
+        if err:
+            return {
+                "success": False,
+                "error": {"code": err, "message": err.replace("_", " ").title()},
+                "exchange": exchange,
+                "account": account,
+            }
+        key = (str(exchange), str(account))
+        now = time.time()
+        if not force:
+            with self._lock:
+                hit = self._bal_cache.get(key)
+                if hit and hit[0] > now:
+                    payload = dict(hit[2])
+                    payload["cache_hit"] = True
+                    payload["timing_ms"] = {
+                        "tradedesk_ms": 0.0,
+                        "cached_tradedesk_ms": hit[1],
+                        "cache_ttl_s": self.balance_cache_ttl,
+                    }
+                    return payload
+
+        caps = set(self.desk.capabilities(exchange))
+        if "balance" not in caps:
+            return {
+                "success": False,
+                "error": {
+                    "code": "UNSUPPORTED",
+                    "message": "Exchange does not expose balance.",
+                },
+                "exchange": exchange,
+                "account": account,
+                "fields": [],
+            }
+
+        t0 = time.perf_counter()
+        resp = self.desk.execute(
+            {
+                "operation": "balance",
+                "exchange": exchange,
+                "account": account,
+            }
+        )
+        desk_ms = (time.perf_counter() - t0) * 1000.0
+        data = self._normalize_account_financials(
+            resp,
+            exchange=exchange,
+            account=account,
+            desk_ms=desk_ms,
+        )
+        if data.get("success"):
+            with self._lock:
+                self._bal_cache[key] = (now + self.balance_cache_ttl, desk_ms, dict(data))
+        return data
+
+    def _normalize_account_financials(
+        self,
+        resp: Any,
+        *,
+        exchange: str,
+        account: str,
+        desk_ms: float,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "success": bool(getattr(resp, "success", False)),
+            "exchange": exchange,
+            "account": account,
+            "cache_hit": False,
+            "timing_ms": {"tradedesk_ms": round(desk_ms, 1)},
+            "fields": [],
+        }
+        if not out["success"]:
+            out["error"] = self._safe_error(resp)
+            return out
+
+        bal = getattr(resp, "balance", None)
+        bal_plain = _to_plain(bal) if bal is not None else None
+        currency = ""
+        balance_raw: Optional[str] = None
+        if isinstance(bal_plain, dict):
+            balance_raw = bal_plain.get("value")
+            currency = str(bal_plain.get("unit") or "").strip()
+        elif bal_plain is not None:
+            balance_raw = str(bal_plain)
+
+        summary = getattr(resp, "portfolio_summary", None)
+        summary_plain = _to_plain(summary) if summary is not None else None
+        if isinstance(summary_plain, dict) and not currency:
+            currency = str(summary_plain.get("unit") or "").strip()
+
+        fields: List[Dict[str, Any]] = []
+        balance_disp = format_money(balance_raw)
+        if balance_disp is not None:
+            out["balance"] = str(balance_raw)
+            out["balance_display"] = balance_disp
+            fields.append({"key": "balance", "label": "Balance", "value": str(balance_raw), "display": balance_disp})
+
+        equity_raw = None
+        if isinstance(summary_plain, dict):
+            equity_raw = summary_plain.get("account_value")
+        equity_disp = format_money(equity_raw)
+        if equity_disp is not None:
+            out["equity"] = str(equity_raw)
+            out["equity_display"] = equity_disp
+            fields.append({"key": "equity", "label": "Equity", "value": str(equity_raw), "display": equity_disp})
+
+        # Canonical portfolio_summary.withdrawable — same source Telegram shows as Withdrawable.
+        # Do not invent "Available Margin" from balance − positions.
+        available_raw = None
+        if isinstance(summary_plain, dict):
+            available_raw = summary_plain.get("withdrawable")
+        available_disp = format_money(available_raw)
+        if available_disp is not None:
+            available_label = "Withdrawable"
+            out["available"] = str(available_raw)
+            out["available_display"] = available_disp
+            out["available_label"] = available_label
+            fields.append(
+                {
+                    "key": "available",
+                    "label": available_label,
+                    "short_label": "Available",
+                    "value": str(available_raw),
+                    "display": available_disp,
+                    "title": "Withdrawable (canonical portfolio_summary.withdrawable)",
+                }
+            )
+
+        if currency:
+            out["currency"] = currency
+        if isinstance(summary_plain, dict):
+            # Pass through for tooltips/debug; UI should prefer fields[].
+            out["portfolio_summary"] = {
+                k: summary_plain.get(k)
+                for k in ("account_value", "withdrawable", "margin_used", "total_position_value", "unit")
+                if summary_plain.get(k) is not None
+            }
+        out["fields"] = fields
+        if not fields:
+            out["success"] = False
+            out["error"] = {
+                "code": "BALANCE_UNAVAILABLE",
+                "message": "Balance unavailable.",
+            }
+        return out
 
     def _fetch_positions_orders_payload(self, exchange: str, account: str) -> Dict[str, Any]:
         """Single TradeDesk positions_orders call with short TTL cache."""
@@ -465,6 +639,7 @@ class TradeMenuService:
         resp = self.desk.execute(req)
         desk_ms = (time.perf_counter() - t0) * 1000.0
         self.invalidate_positions_cache(exchange, account)
+        self.invalidate_balance_cache(exchange, account)
         out: Dict[str, Any] = {
             "success": bool(resp.success),
             "operation": operation,
@@ -978,6 +1153,7 @@ class TradeMenuService:
             resp = self.desk.execute(req)
             desk_ms = (time.perf_counter() - t0) * 1000.0
             self.invalidate_positions_cache(exchange, account)
+            self.invalidate_balance_cache(exchange, account)
             out: Dict[str, Any] = {
                 "success": bool(resp.success),
                 "kind": "order",
@@ -1027,6 +1203,7 @@ class TradeMenuService:
             resp = self.desk.execute(req)
             desk_ms = (time.perf_counter() - t0) * 1000.0
             self.invalidate_positions_cache(exchange, account)
+            self.invalidate_balance_cache(exchange, account)
             out = {
                 "success": bool(resp.success),
                 "kind": "ladder",

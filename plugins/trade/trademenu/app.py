@@ -336,6 +336,18 @@ def create_app(
             return denied
         return JSONResponse(svc.orders(exchange, account))
 
+    @app.get("/api/account/financials")
+    async def api_account_financials(
+        request: Request,
+        exchange: str = Query(...),
+        account: str = Query(...),
+        force: int = Query(0, ge=0, le=1),
+    ) -> JSONResponse:
+        denied = _require_auth(request)
+        if denied:
+            return denied
+        return JSONResponse(svc.account_financials(exchange, account, force=bool(force)))
+
     async def _read_json(request: Request) -> Dict[str, Any]:
         try:
             body = await request.json()

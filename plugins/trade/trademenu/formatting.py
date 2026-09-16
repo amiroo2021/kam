@@ -115,3 +115,24 @@ def format_pnl(value: Any, meta: Optional[dict] = None) -> str:
     quantized = abs(quantized)
     whole, _, frac = f"{quantized:.2f}".partition(".")
     return f"{sign}{int(whole):,}.{frac}"
+
+
+def format_money(value: Any, *, decimals: int = 2) -> Optional[str]:
+    """Compact account-money display (thousands separators, fixed decimals).
+
+    Returns None when value is missing/unparseable so callers can omit the field
+    rather than showing a fabricated zero.
+    """
+    d = _dec(value)
+    if d is None:
+        return None
+    decs = max(0, min(int(decimals), 8))
+    q = Decimal(1).scaleb(-decs) if decs else Decimal(1)
+    quantized = d.quantize(q, rounding=ROUND_HALF_UP)
+    sign = "-" if quantized < 0 else ""
+    quantized = abs(quantized)
+    if decs == 0:
+        return f"{sign}{int(quantized):,}"
+    text = f"{quantized:.{decs}f}"
+    whole, _, frac = text.partition(".")
+    return f"{sign}{int(whole):,}.{frac}"
