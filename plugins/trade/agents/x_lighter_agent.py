@@ -1376,10 +1376,46 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             except Exception:  # noqa: BLE001
                 return make_failure(operation="cancel_order_group", exchange=name, account=account_name, code="INVALID_ORDER_IDS", message=f"order_ids contains a non-integer value: {raw!r}")
 
+    # Classification scope (same contract as Hyperliquid): when the UI
+    # cancels TAKE PROFIT / STOP LOSS, only those types are eligible.
+    # Default with no classification and no order_ids: entry_limit only —
+    # never sweep TP/SL when cancelling an ordinary LIMIT ladder.
+    requested_classification = str(
+        request.get("classification") or request.get("kind") or request.get("order_kind") or ""
+    ).strip().lower()
+    aliases = {
+        "tp": "take_profit",
+        "take-profit": "take_profit",
+        "take_profit": "take_profit",
+        "sl": "stop_loss",
+        "stop-loss": "stop_loss",
+        "stop_loss": "stop_loss",
+        "entry": "entry_limit",
+        "entry_limit": "entry_limit",
+        "limit": "entry_limit",
+        "trigger": "trigger",
+    }
+    if requested_classification:
+        scope_classification = aliases.get(requested_classification, requested_classification)
+    elif explicit_ids is not None:
+        scope_classification = None  # exact OIDs only
+    else:
+        scope_classification = "entry_limit"
+
     try:
         pre_orders = _fetch_active_orders(credentials, _mint_auth_token_cached(credentials))
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation="cancel_order_group", exchange=name, account=account_name, code="OPEN_ORDERS_UNAVAILABLE", message=sanitize_error_message(str(exc)))
+
+    def _order_class(order: Dict[str, Any]) -> str:
+        kind = _order_protection_kind(order)
+        if kind == "tp":
+            return "take_profit"
+        if kind == "sl":
+            return "stop_loss"
+        if bool(order.get("reduce_only")) and _decimal_or_none(order.get("trigger_price")) is not None:
+            return "trigger"
+        return "entry_limit"
 
     target_orders: List[Dict[str, Any]] = []
     target_ids: List[int] = []
@@ -1391,16 +1427,19 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             order_market_id = int(str(order.get("market_index") or 0))
         except Exception:  # noqa: BLE001
             continue
-        raw_order_id = str(order.get("order_id") or "").strip()
+        raw_order_id = str(order.get("order_id") or order.get("order_index") or "").strip()
         try:
             parsed_order_id = int(raw_order_id)
         except Exception:  # noqa: BLE001
             continue
         side = "sell" if bool(order.get("is_ask")) else "buy"
         matches_scope = order_market_id == market_id and side == requested_side
+        if matches_scope and scope_classification is not None:
+            if _order_class(order) != scope_classification:
+                matches_scope = False
         if explicit_ids is not None:
             # Exact-identity mode: only an OID in the explicit set AND
-            # matching the symbol+side scope is a target.
+            # matching the symbol+side(+class) scope is a target.
             if matches_scope and parsed_order_id in explicit_ids:
                 target_orders.append(order)
                 target_ids.append(parsed_order_id)
@@ -3993,6 +4032,16 @@ def _position_action_result(
     )
 
 
+def _order_protection_kind(order: Dict[str, Any]) -> Optional[str]:
+    """Return 'tp' / 'sl' from Lighter order type metadata, else None."""
+    order_type = str(order.get("type") or "").strip().lower()
+    if order_type in {"take-profit", "take-profit-limit"}:
+        return "tp"
+    if order_type in {"stop-loss", "stop-loss-limit"}:
+        return "sl"
+    return None
+
+
 def _classify_protection_orders(*, orders: List[Dict[str, Any]], market_id: int, closing_side: str) -> Dict[str, List[Dict[str, Any]]]:
     bucket: Dict[str, List[Dict[str, Any]]] = {"tp": [], "sl": []}
     for order in orders:
@@ -4012,10 +4061,10 @@ def _classify_protection_orders(*, orders: List[Dict[str, Any]], market_id: int,
             continue
         if not bool(order.get("reduce_only")):
             continue
-        order_type = str(order.get("type") or "").strip().lower()
-        if order_type in {"take-profit", "take-profit-limit"}:
+        kind = _order_protection_kind(order)
+        if kind == "tp":
             bucket["tp"].append(order)
-        elif order_type in {"stop-loss", "stop-loss-limit"}:
+        elif kind == "sl":
             bucket["sl"].append(order)
     return bucket
 
@@ -4077,7 +4126,12 @@ def _aggregate_open_orders(
     market_map: Optional[Dict[int, Dict[str, Any]]] = None,
     fallback_symbols: Optional[Dict[int, str]] = None,
 ) -> List[CanonicalOrderGroup]:
-    grouped: Dict[tuple[str, str], Dict[str, Any]] = {}
+    """Group open orders by (symbol, side, classification).
+
+    Lighter TP/SL use ``type`` of ``take-profit`` / ``stop-loss`` (and
+    *-limit variants). Those must not collapse into ordinary LIMIT ladders.
+    """
+    grouped: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     for order in orders:
         if not isinstance(order, dict):
             continue
@@ -4096,24 +4150,41 @@ def _aggregate_open_orders(
             size = _decimal_or_none(order.get("initial_base_amount")) or Decimal("0")
         if size <= 0:
             continue
-        price = _decimal_or_none(order.get("price")) or Decimal("0")
+        # Prefer trigger_price for protection; fall back to limit price.
+        kind = _order_protection_kind(order)
+        if kind == "tp":
+            classification = "take_profit"
+        elif kind == "sl":
+            classification = "stop_loss"
+        elif bool(order.get("reduce_only")) and _decimal_or_none(order.get("trigger_price")) is not None:
+            classification = "trigger"
+        else:
+            classification = "entry_limit"
+        price = _decimal_or_none(order.get("trigger_price")) if classification != "entry_limit" else None
+        if price is None:
+            price = _decimal_or_none(order.get("price")) or Decimal("0")
+        if price <= 0 and classification == "entry_limit":
+            continue
         precision_value = market_info.get("price_precision")
         try:
-            price_precision = int(precision_value) if precision_value is not None else _decimal_places(order.get("price"))
+            price_precision = int(precision_value) if precision_value is not None else _decimal_places(order.get("price") or order.get("trigger_price"))
         except Exception:  # noqa: BLE001
-            price_precision = _decimal_places(order.get("price"))
-        key = (symbol, side)
+            price_precision = _decimal_places(order.get("price") or order.get("trigger_price"))
+        key = (symbol, side, classification)
         group = grouped.setdefault(
             key,
             {
                 "symbol": symbol,
                 "side": side,
+                "classification": classification,
                 "order_count": 0,
                 "total_size": Decimal("0"),
                 "notional": Decimal("0"),
                 "min_price": None,
                 "max_price": None,
                 "price_precision": price_precision,
+                "order_ids": [],
+                "reduce_only": classification != "entry_limit",
             },
         )
         group["order_count"] += 1
@@ -4124,11 +4195,27 @@ def _aggregate_open_orders(
             group["min_price"] = price
         if group["max_price"] is None or price > group["max_price"]:
             group["max_price"] = price
+        oid = order.get("order_index") or order.get("order_id")
+        try:
+            if oid is not None:
+                group["order_ids"].append(int(oid))
+        except Exception:  # noqa: BLE001
+            pass
 
+    display_map = {
+        "take_profit": "TAKE PROFIT",
+        "stop_loss": "STOP LOSS",
+        "trigger": "TRIGGER",
+    }
     rows: List[CanonicalOrderGroup] = []
     for group in grouped.values():
         total_size: Decimal = group["total_size"]
         vwap = (group["notional"] / total_size) if total_size != 0 else Decimal("0")
+        classification = group["classification"]
+        side_u = str(group["side"]).upper()
+        display_type = display_map.get(classification) or f"{side_u} LIMIT"
+        min_p = group["min_price"]
+        max_p = group["max_price"]
         rows.append(
             CanonicalOrderGroup(
                 symbol=group["symbol"],
@@ -4136,11 +4223,20 @@ def _aggregate_open_orders(
                 order_count=int(group["order_count"]),
                 total_size=_decimal_text(total_size),
                 vwap=_format_decimal_places(vwap, int(group.get("price_precision") or 0)),
-                min_price=_decimal_text(group["min_price"]),
-                max_price=_decimal_text(group["max_price"]),
+                min_price=_decimal_text(min_p) if min_p is not None else "",
+                max_price=_decimal_text(max_p) if max_p is not None else "",
+                classification=classification,
+                display_type=display_type,
+                reduce_only=bool(group.get("reduce_only")),
+                trigger_price=(
+                    _decimal_text(min_p)
+                    if classification in {"take_profit", "stop_loss", "trigger"} and min_p is not None
+                    else None
+                ),
+                order_ids=list(group["order_ids"]) or None,
             )
         )
-    rows.sort(key=lambda item: (item.symbol, item.side))
+    rows.sort(key=lambda item: (item.symbol, item.classification, item.side))
     return rows
 
 
@@ -4203,6 +4299,12 @@ def _positions_orders(request: Dict[str, Any]) -> CanonicalResponse:
             continue
         observed_price_precisions[market_id] = max(observed_price_precisions.get(market_id, 0), _decimal_places(order.get("price")))
     positions = _normalize_positions(target, market_map=market_map, price_precisions=observed_price_precisions)
+    positions = _augment_positions_with_protection(
+        positions,
+        target=target,
+        active_orders=active_orders,
+        market_map=market_map,
+    )
     order_groups = _aggregate_open_orders(active_orders, market_map=market_map, fallback_symbols=fallback_symbols)
     return make_success(
         operation="positions_orders",
