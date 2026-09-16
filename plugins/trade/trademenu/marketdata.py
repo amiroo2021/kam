@@ -124,13 +124,23 @@ def fetch_hyperliquid_candles(symbol: str, tf: str, limit: int = 300) -> List[Di
     if not interval:
         raise ValueError("UNSUPPORTED_TIMEFRAME")
     coin = str(symbol or "").strip()
-    # Hyperliquid coins are usually bare e.g. BTC
+    # Preserve HIP-3 / dex-prefixed natives (e.g. xyz:SP500). Only peel quote
+    # suffixes from the public tail, never drop a dex route prefix.
     if ":" in coin:
-        coin = coin.split(":")[-1]
-    for suffix in ("-USD", "-USDT", "USDT", "USD"):
-        if coin.upper().endswith(suffix) and len(coin) > len(suffix):
-            coin = coin[: -len(suffix)]
-            break
+        dex, _, tail = coin.partition(":")
+        tail = tail.strip()
+        for suffix in ("-USD", "-USDT", "USDT", "USDC", "USD"):
+            if tail.upper().endswith(suffix) and len(tail) > len(suffix):
+                tail = tail[: -len(suffix)]
+                break
+        coin = f"{dex}:{tail}" if tail else coin
+    else:
+        for suffix in ("-USD", "-USDT", "USDT", "USDC", "USD"):
+            if coin.upper().endswith(suffix) and len(coin) > len(suffix):
+                coin = coin[: -len(suffix)]
+                break
+    if not coin:
+        raise ValueError("MISSING_SYMBOL")
     end_ms = int(time.time() * 1000)
     # rough window by timeframe
     tf_ms = {
@@ -147,7 +157,11 @@ def fetch_hyperliquid_candles(symbol: str, tf: str, limit: int = 300) -> List[Di
         "type": "candleSnapshot",
         "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
     }
-    rows = _http_json("https://api.hyperliquid.xyz/info", method="POST", body=payload)
+    try:
+        rows = _http_json("https://api.hyperliquid.xyz/info", method="POST", body=payload)
+    except urllib.error.HTTPError as exc:
+        # HL returns 500 for unknown coins; surface as structured candle miss.
+        raise RuntimeError(f"CANDLES_UNAVAILABLE: Hyperliquid rejected coin {coin!r} ({exc.code})") from exc
     if not isinstance(rows, list):
         raise RuntimeError("Unexpected Hyperliquid candle response")
     out = []
@@ -309,9 +323,16 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             }
         return {"success": False, "error": {"code": "CANDLE_ERROR", "message": code}, "candles": []}
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)[:300]
+        code = "CANDLES_UNAVAILABLE" if "CANDLES_UNAVAILABLE" in msg or "HTTP Error" in msg else "CANDLE_ERROR"
+        # Prefer clean user-facing text over raw urllib "HTTP Error 500".
+        if msg.startswith("CANDLES_UNAVAILABLE:"):
+            msg = msg.split(":", 1)[1].strip()
+        elif "HTTP Error" in msg:
+            msg = f"Market data unavailable for {symbol} on {ex}."
         return {
             "success": False,
-            "error": {"code": "CANDLE_ERROR", "message": str(exc)[:300]},
+            "error": {"code": code, "message": msg},
             "candles": [],
             "exchange": ex,
             "symbol": symbol,

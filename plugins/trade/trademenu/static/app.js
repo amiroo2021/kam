@@ -186,15 +186,25 @@
   }
 
   function symbolsMatch(posSym, native, requested) {
-    const a = String(posSym || "").trim().toUpperCase();
-    const b = String(native || "").trim().toUpperCase();
-    const c = String(requested || "").trim().toUpperCase();
+    const a = String(posSym || "").trim();
+    const b = String(native || "").trim();
+    const c = String(requested || "").trim();
     if (!a) return false;
-    if (b && (a === b || a.endsWith(":" + b) || b.endsWith(":" + a))) return true;
+    const au = a.toUpperCase();
+    const bu = b.toUpperCase();
+    const cu = c.toUpperCase();
+    if (bu && au === bu) return true;
+    if (cu && au === cu) return true;
+    // HIP-3: native xyz:SP500 matches position xyz:SP500 or friendly SP500
+    const aTail = au.includes(":") ? au.split(":").pop() : au;
+    const bTail = bu.includes(":") ? bu.split(":").pop() : bu;
+    const cTail = cu.includes(":") ? cu.split(":").pop() : cu;
+    if (bTail && aTail === bTail) return true;
+    if (cTail && aTail === cTail) return true;
     const peel = (s) => s.replace(/[-_/]/g, "").replace(/(USDT|USDC|USD)$/i, "");
-    const pa = peel(a);
-    if (b && pa === peel(b)) return true;
-    if (c && pa === peel(c)) return true;
+    const pa = peel(aTail || au);
+    if (bTail && pa === peel(bTail)) return true;
+    if (cTail && pa === peel(cTail)) return true;
     return false;
   }
 
@@ -619,10 +629,15 @@
       btn.addEventListener("click", () => {
         const sym = btn.getAttribute("data-symbol") || "";
         if (!sym) return;
-        // Prefer friendly *USD form for the existing TradeDesk resolver.
-        const peeled = sym.includes(":") ? sym.split(":").pop() : sym;
-        const friendly = /USD|USDT|USDC/i.test(peeled) ? peeled : `${peeled}USD`;
-        symbolEl.value = friendly;
+        // Exact native (incl. HIP-3 dex prefix xyz:SP500) must stay intact.
+        // Do NOT invent SP500USD from xyz:SP500.
+        if (sym.includes(":")) {
+          symbolEl.value = sym;
+        } else {
+          const peeled = sym;
+          const friendly = /USD|USDT|USDC/i.test(peeled) ? peeled : `${peeled}USD`;
+          symbolEl.value = friendly;
+        }
         onSelectionChanged();
       });
     });

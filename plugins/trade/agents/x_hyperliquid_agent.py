@@ -2225,24 +2225,65 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
         aggregated_positions: Dict[str, Any] = {"assetPositions": []}
         aggregated_orders: List[Dict[str, Any]] = []
         price_decimals_by_symbol: Dict[str, int] = {}
+
+        # Prefer price precision from the process-lifetime candidates cache so we
+        # do not re-hit metaAndAssetCtxs once per dex on every positions poll.
+        try:
+            for cand in _fetch_perp_market_candidates():
+                sym = str(cand.get("route_symbol") or cand.get("public_symbol") or "").strip()
+                if not sym:
+                    continue
+                inc = cand.get("price_increment")
+                if inc is None:
+                    continue
+                try:
+                    text = format(Decimal(str(inc)).normalize(), "f")
+                    if "." in text:
+                        price_decimals_by_symbol.setdefault(sym, len(text.split(".", 1)[1].rstrip("0") or "0"))
+                    else:
+                        price_decimals_by_symbol.setdefault(sym, 0)
+                    # Also index public suffix for bare matches
+                    pub = str(cand.get("public_symbol") or "").strip()
+                    if pub and pub not in price_decimals_by_symbol:
+                        price_decimals_by_symbol[pub] = price_decimals_by_symbol[sym]
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _load_dex(dex: str) -> Tuple[List[Any], List[Dict[str, Any]], Dict[str, int]]:
+            positions_part: List[Any] = []
+            orders_part: List[Dict[str, Any]] = []
+            decimals_part: Dict[str, int] = {}
+            try:
+                positions_raw = _fetch_clearinghouse_state(wallet, dex)
+                open_orders = _fetch_open_orders_for_dex(wallet, dex)
+            except Exception:  # noqa: BLE001
+                return positions_part, orders_part, decimals_part
+            dex_positions = positions_raw.get("assetPositions")
+            if isinstance(dex_positions, list):
+                positions_part = list(dex_positions)
+            orders_part = list(open_orders)
+            if not price_decimals_by_symbol:
+                try:
+                    decimals_part = _price_decimal_map_for_dex(dex)
+                except Exception:  # noqa: BLE001
+                    decimals_part = {}
+            return positions_part, orders_part, decimals_part
+
         if dex_names:
-            for dex_idx, dex in enumerate(dex_names):
-                try:
-                    positions_raw = _fetch_clearinghouse_state(wallet, dex)
-                    open_orders = _fetch_open_orders_for_dex(wallet, dex)
-                except Exception:  # noqa: BLE001
-                    continue
-                dex_positions = positions_raw.get("assetPositions")
-                if isinstance(dex_positions, list):
-                    aggregated_positions["assetPositions"].extend(dex_positions)
-                aggregated_orders.extend(open_orders)
-                try:
-                    _decimals = _price_decimal_map_for_dex(dex)
-                    for sym, prec in _decimals.items():
-                        if sym not in price_decimals_by_symbol:
-                            price_decimals_by_symbol[sym] = prec
-                except Exception:  # noqa: BLE001
-                    continue
+            # Parallelize multi-dex clearinghouse + open-order fanout (HIP-3).
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            max_workers = min(8, max(1, len(dex_names)))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_load_dex, dex): dex for dex in dex_names}
+                for fut in as_completed(futures):
+                    positions_part, orders_part, decimals_part = fut.result()
+                    aggregated_positions["assetPositions"].extend(positions_part)
+                    aggregated_orders.extend(orders_part)
+                    for sym, prec in decimals_part.items():
+                        price_decimals_by_symbol.setdefault(sym, prec)
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation="positions_orders",

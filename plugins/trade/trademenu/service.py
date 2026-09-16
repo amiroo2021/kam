@@ -18,7 +18,8 @@ logger = logging.getLogger("trademenu")
 
 # Short in-process TTL so Positions + Orders share one agent fetch and
 # rapid UI polls do not re-hit multi-dex Hyperliquid open-order fanout.
-_POSITIONS_CACHE_TTL_SECONDS = 12.0
+# Must exceed cold HL multi-dex fanout (~8–15s) or the entry expires before reuse.
+_POSITIONS_CACHE_TTL_SECONDS = 45.0
 _RESOLVE_CACHE_TTL_SECONDS = 60.0
 
 
@@ -376,7 +377,9 @@ class TradeMenuService:
 
         if resp.success:
             with self._lock:
-                self._po_cache[key] = (now + self.cache_ttl, round(desk_ms, 1), dict(payload))
+                # Expire from *now* (post-fetch). Using the pre-fetch timestamp
+                # made a 10s HL fanout expire the entry immediately.
+                self._po_cache[key] = (time.time() + self.cache_ttl, round(desk_ms, 1), dict(payload))
         return payload
 
     def positions(self, exchange: str, account: str) -> Dict[str, Any]:
