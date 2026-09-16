@@ -68,6 +68,25 @@ if data.startswith("fibo:"):
         return
 '''
 
+_FIBOLEARN_CALLBACK_BLOCK = '''\
+if data.startswith("fibolearn:"):
+    try:
+        from plugins.trade.fibolearn_wizard import handle_fibolearn_callback
+
+        await handle_fibolearn_callback(self, query, data)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] /fibolearn callback dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+'''
+
 # --- Seam B: wizard free-text interception ---------------------------------
 _TEXT_BLOCK = '''\
 try:
@@ -91,6 +110,19 @@ try:
 except Exception as exc:  # noqa: BLE001
     logger.error(
         "[%s] /fibo text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
+'''
+
+_FIBOLEARN_TEXT_BLOCK = '''\
+try:
+    from plugins.trade.fibolearn_wizard import handle_fibolearn_text
+
+    if await handle_fibolearn_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /fibolearn text dispatch failed: %s",
         self.name, exc, exc_info=True,
     )
 '''
@@ -133,6 +165,26 @@ if first_token:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[%s] /fibo command dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+            # Fall through to normal dispatch rather than swallow.
+'''
+
+_FIBOLEARN_COMMAND_BLOCK = '''\
+raw_text = (msg.text or "").strip()
+first_token = raw_text.split(None, 1)[0] if raw_text else ""
+if first_token:
+    cmd_body = first_token.lstrip("/").split("@", 1)[0].lower()
+    if cmd_body == "fibolearn":
+        try:
+            from plugins.trade.fibolearn_wizard import handle_fibolearn_command
+
+            handled = await handle_fibolearn_command(self, msg)
+            if handled:
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[%s] /fibolearn command dispatch failed: %s",
                 self.name, exc, exc_info=True,
             )
             # Fall through to normal dispatch rather than swallow.
@@ -751,15 +803,55 @@ def fibo_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
     ]
 
 
-def adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
-    """Telegram adapter seams for /trade and /fibo, in file order.
+def fibolearn_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
+    """Telegram adapter seams for /fibolearn only (command + callback + text)."""
+    adapter_text = _read_adapter_text(hermes_root)
+    cb_before, cb_after = _callback_anchor_pair(adapter_text)
+    text_before, text_after = _text_anchor_pair(adapter_text)
+    cmd_before, cmd_after = _command_anchor_pair(adapter_text)
+    return [
+        PatchSpec(
+            seam="fibolearn callback dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cb_before,
+            anchor_after=cb_after,
+            block=_FIBOLEARN_CALLBACK_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibolearn_wizard import handle_fibolearn_callback",
+            method_name="_handle_callback_query",
+            method_name_candidates=["_handle_callback_query", "handle_callback_query", "_on_callback_query"],
+            method_after_substrings=["data = query.data", "query.data", "callback_query"],
+        ),
+        PatchSpec(
+            seam="fibolearn text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=text_before,
+            anchor_after=text_after,
+            block=_FIBOLEARN_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibolearn_wizard import handle_fibolearn_text",
+            method_name="_handle_text",
+            method_name_candidates=["_handle_text", "_handle_text_message", "_on_text", "handle_text"],
+            method_after_substrings=["await self._ensure_forum_commands(update.message)", "await self._ensure_forum_commands(msg)", "_ensure_forum_commands", "MessageType.TEXT"],
+        ),
+        PatchSpec(
+            seam="fibolearn slash command dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cmd_before,
+            anchor_after=cmd_after,
+            block=_FIBOLEARN_COMMAND_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.fibolearn_wizard import handle_fibolearn_command",
+            method_name="_handle_command",
+            method_name_candidates=["_handle_command", "handle_command", "_on_command"],
+            method_after_substrings=["await self._ensure_forum_commands(msg)", "await self._ensure_forum_commands(update.message)", "_ensure_forum_commands", "is_command=True"],
+        ),
+    ]
 
-    Fibo blocks are listed before trade blocks so both can share the same
-    anchors: each insert lands after ``anchor_before``, so applying fibo
-    first keeps trade inserts closer to the anchor and both stay between
-    the anchors.
-    """
-    return fibo_adapter_specs(hermes_root) + trade_adapter_specs(hermes_root)
+
+def adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
+    """Telegram adapter seams for /fibolearn, /fibo, and /trade, in file order."""
+    return fibolearn_adapter_specs(hermes_root) + fibo_adapter_specs(hermes_root) + trade_adapter_specs(hermes_root)
 
 
 def specs_for_capabilities(
@@ -774,6 +866,7 @@ def specs_for_capabilities(
     caps = {str(c).strip().lower() for c in capabilities if str(c).strip()}
     specs: List[PatchSpec] = []
     if "fibo" in caps:
+        specs.extend(fibolearn_adapter_specs(hermes_root))
         specs.extend(fibo_adapter_specs(hermes_root))
     if "trade" in caps:
         specs.extend(trade_adapter_specs(hermes_root))

@@ -77,6 +77,15 @@ def _handle_backtest_slash(raw_args: str) -> str:
     )
 
 
+def _handle_fibolearn_slash(raw_args: str) -> str:
+    """Handler invoked by non-Telegram surfaces for /fibolearn."""
+    return (
+        "`/fibolearn` is a Telegram-only research wizard. "
+        "Open Hermes on Telegram and type /fibolearn to start. "
+        "Phase 1 is read-only and cannot trade."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Capability manifest resolution (read-only)
 # ---------------------------------------------------------------------------
@@ -179,6 +188,12 @@ def register(ctx: Any) -> None:
             handler=_handle_fibo_slash,
             description="Open the Fibo wizard",
         )
+        _try_register_command(
+            ctx,
+            "fibolearn",
+            handler=_handle_fibolearn_slash,
+            description="Open the FiboLearn read-only research wizard",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +215,7 @@ def registered_commands() -> List[str]:
         out.append("backtest")
     if caps.get("fibo"):
         out.append("fibo")
+        out.append("fibolearn")
     return out
 
 
@@ -209,4 +225,5 @@ __all__ = [
     "_handle_trade_slash",
     "_handle_fibo_slash",
     "_handle_backtest_slash",
+    "_handle_fibolearn_slash",
 ]
