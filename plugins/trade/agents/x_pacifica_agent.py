@@ -1840,6 +1840,122 @@ def _classify_tpsl_stop_orders(
     return tp, sl
 
 
+def _attach_pacifica_protection(
+    positions: List[CanonicalPosition],
+    stop_children: List[Dict[str, Any]],
+) -> List[CanonicalPosition]:
+    """Merge stop/TP/SL children into canonical position tp/sl fields."""
+    if not positions:
+        return []
+    out: List[CanonicalPosition] = []
+    for position in positions:
+        try:
+            entry_dec = Decimal(str(position.entry_price or "0"))
+        except Exception:  # noqa: BLE001
+            entry_dec = Decimal("0")
+        tp_row, sl_row = _classify_tpsl_stop_orders(
+            stop_children,
+            position.symbol,
+            position.side,
+            entry_dec,
+        )
+        out.append(
+            CanonicalPosition(
+                symbol=position.symbol,
+                side=position.side,
+                size=position.size,
+                entry_price=position.entry_price,
+                pnl=position.pnl,
+                tp=_format_decimal_for_wizard(tp_row.get("stop_price")) if tp_row else position.tp,
+                sl=_format_decimal_for_wizard(sl_row.get("stop_price")) if sl_row else position.sl,
+                tp_count=(1 if tp_row else None) or position.tp_count,
+                sl_count=(1 if sl_row else None) or position.sl_count,
+            )
+        )
+    return out
+
+
+def _aggregate_pacifica_protection_orders(
+    stop_children: List[Dict[str, Any]],
+    positions: List[CanonicalPosition],
+) -> List[CanonicalOrderGroup]:
+    """Surface TP/SL stop children as classified order groups (not entry limits)."""
+    by_symbol_side: Dict[str, Tuple[str, Decimal]] = {}
+    for position in positions:
+        try:
+            entry = Decimal(str(position.entry_price or "0"))
+        except Exception:  # noqa: BLE001
+            entry = Decimal("0")
+        by_symbol_side[str(position.symbol or "").strip().upper()] = (str(position.side or "").lower(), entry)
+
+    groups: List[CanonicalOrderGroup] = []
+    for row in stop_children:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        side_info = by_symbol_side.get(symbol)
+        if not side_info:
+            # Unattached protection still classified by order_type when possible.
+            order_type = str(row.get("order_type") or "").strip().lower()
+            stop_price = str(row.get("stop_price") or "").strip()
+            if not stop_price:
+                continue
+            if "take_profit" in order_type or order_type.startswith("tp"):
+                classification = "take_profit"
+            elif "stop" in order_type:
+                classification = "stop_loss"
+            else:
+                classification = "trigger"
+            # Closing side unknown — use ask as sell-like
+            raw_side = str(row.get("side") or "").strip().lower()
+            side = "buy" if raw_side == "bid" else "sell"
+            groups.append(
+                CanonicalOrderGroup(
+                    symbol=symbol,
+                    side=side,
+                    order_count=1,
+                    total_size=str(row.get("initial_amount") or row.get("amount") or "0"),
+                    vwap=stop_price,
+                    min_price=stop_price,
+                    max_price=stop_price,
+                    classification=classification,
+                    display_type="TAKE PROFIT" if classification == "take_profit" else ("STOP LOSS" if classification == "stop_loss" else "TRIGGER"),
+                    reduce_only=True,
+                    trigger_price=stop_price,
+                    order_ids=[row.get("order_id")] if row.get("order_id") is not None else None,
+                )
+            )
+            continue
+        pos_side, entry = side_info
+        tp_row, sl_row = _classify_tpsl_stop_orders([row], symbol, pos_side, entry)
+        for kind, child in (("take_profit", tp_row), ("stop_loss", sl_row)):
+            if not child:
+                continue
+            stop_price = _format_decimal_for_wizard(child.get("stop_price"))
+            raw_side = str(child.get("side") or "").strip().lower()
+            side = "buy" if raw_side == "bid" else "sell"
+            size = str(child.get("initial_amount") or child.get("amount") or "0")
+            groups.append(
+                CanonicalOrderGroup(
+                    symbol=symbol,
+                    side=side,
+                    order_count=1,
+                    total_size=size,
+                    vwap=stop_price,
+                    min_price=stop_price,
+                    max_price=stop_price,
+                    classification=kind,
+                    display_type="TAKE PROFIT" if kind == "take_profit" else "STOP LOSS",
+                    reduce_only=True,
+                    trigger_price=stop_price,
+                    order_ids=[child.get("order_id")] if child.get("order_id") is not None else None,
+                )
+            )
+    return groups
+
+
 def _cancel_stop_child(
     credentials: Dict[str, str],
     order: Dict[str, Any],
@@ -3787,12 +3903,25 @@ def _execute_positions_orders(account: str) -> CanonicalResponse:
         # orders block.
         open_order_count = 0
         order_groups: List[CanonicalOrderGroup] = []
+        stop_children: List[Dict[str, Any]] = []
         try:
             open_orders = _get_open_orders(creds["address"])
             open_order_count = len(open_orders)
             order_groups = _aggregate_open_orders(open_orders)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Pacifica open-orders fetch failed: %s", exc)
+
+        # Soft-fetch stop/TP/SL children and merge into positions + order groups.
+        try:
+            stop_children = _get_stop_child_orders(creds["address"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pacifica stop-child fetch failed: %s", exc)
+            stop_children = []
+
+        if stop_children:
+            positions = _attach_pacifica_protection(positions, stop_children)
+            order_groups = list(order_groups) + _aggregate_pacifica_protection_orders(stop_children, positions)
+            open_order_count = int(open_order_count) + len(stop_children)
 
         return make_success(
             operation="positions_orders",

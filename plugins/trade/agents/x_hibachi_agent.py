@@ -3003,8 +3003,11 @@ def _positions_orders(account: str) -> CanonicalResponse:
                 message=_redact(sanitize_error_message(str(exc))),
             )
 
-        positions = _normalize_positions_from_account_info(raw_account)
-        open_order_count, order_groups = _group_open_orders(raw_orders)
+        positions = _augment_positions_with_protection(
+            _normalize_positions_from_account_info(raw_account),
+            raw_orders,
+        )
+        open_order_count, order_groups = _group_open_orders(raw_orders, positions=positions)
         return make_success(
             operation="positions_orders",
             exchange=name,
@@ -3607,25 +3610,26 @@ def _normalize_positions_from_account_info(
 
 def _group_open_orders(
     raw_orders: List[Dict[str, Any]],
+    positions: Optional[Sequence[CanonicalPosition]] = None,
 ) -> Tuple[int, List[CanonicalOrderGroup]]:
-    """Bucket ``/trade/orders`` rows into the canonical
-    ``(symbol, side)`` order-group shape.
+    """Bucket ``/trade/orders`` rows into canonical order groups.
 
-    Each Hibachi order object carries ``side: "BID" / "ASK"``,
-    ``price`` and ``totalQuantity`` (the originally submitted size
-    — not the remaining size; the spec defines ``totalQuantity`` as
-    the value the user submitted and ``availableQuantity`` as the
-    remainder, so we honour the documented field). The
-    ``open_order_count`` is the raw row count, regardless of how
-    many buckets the rows collapse into.
-
-    The bucket key is the **canonical** symbol so the wizard can
-    line up the group with the corresponding position row in the
-    same view.
+    Ordinary resting limits are grouped by ``(symbol, side, entry_limit)``.
+    Protective trigger rows (reduce-only + triggerDirection) are grouped
+    separately as ``take_profit`` / ``stop_loss`` so TP/SL never merge into
+    plain SELL LIMIT ladders.
     """
     if not raw_orders:
         return 0, []
-    buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    position_side_by_symbol: Dict[str, str] = {}
+    for position in positions or []:
+        sym = _canonical_symbol_from_request(getattr(position, "symbol", None))
+        side = str(getattr(position, "side", "") or "").strip().lower()
+        if sym and side in {"long", "short"}:
+            position_side_by_symbol[sym] = side
+
+    buckets: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    counted = 0
     for entry in raw_orders:
         if not isinstance(entry, dict):
             continue
@@ -3637,46 +3641,105 @@ def _group_open_orders(
         symbol = _canonical_symbol_from_request(entry.get("symbol"))
         if not symbol:
             continue
-        price = _decimal_or_none(entry.get("price"))
-        size = _decimal_or_none(entry.get("totalQuantity"))
-        if price is None or size is None or size <= 0:
-            continue
-        key = (symbol, side)
+
+        classification = "entry_limit"
+        trigger_price = _decimal_or_none(entry.get("triggerPrice"))
+        trigger_direction = str(entry.get("triggerDirection") or "").strip().upper()
+        is_reduce = _order_flags_include_reduce_only(entry.get("orderFlags"))
+        if is_reduce and trigger_price is not None and trigger_price > 0 and trigger_direction in {"HIGH", "LOW"}:
+            current_side = position_side_by_symbol.get(symbol)
+            if current_side is None:
+                # Infer from closing side + direction without inventing from entry.
+                if side == "sell":
+                    current_side = "long"
+                elif side == "buy":
+                    current_side = "short"
+            if current_side == "long":
+                classification = "take_profit" if trigger_direction == "HIGH" else "stop_loss"
+            elif current_side == "short":
+                classification = "take_profit" if trigger_direction == "LOW" else "stop_loss"
+            else:
+                classification = "trigger"
+            price = trigger_price
+            size = (
+                _decimal_or_none(entry.get("availableQuantity"))
+                or _decimal_or_none(entry.get("totalQuantity"))
+                or _decimal_or_none(entry.get("quantity"))
+                or Decimal("0")
+            )
+            # Protective market triggers may omit size; still surface one row.
+            if size is None or size < 0:
+                size = Decimal("0")
+        else:
+            price = _decimal_or_none(entry.get("price"))
+            size = _decimal_or_none(entry.get("totalQuantity"))
+            if price is None or size is None or size <= 0:
+                continue
+
+        counted += 1
+        key = (symbol, side, classification)
         bucket = buckets.setdefault(key, {
             "symbol": symbol,
             "side": side,
+            "classification": classification,
             "count": 0,
             "total_size": Decimal("0"),
             "weighted_price": Decimal("0"),
             "min_price": price,
             "max_price": price,
+            "order_ids": [],
+            "reduce_only": bool(is_reduce and classification != "entry_limit"),
         })
         bucket["count"] += 1
-        bucket["total_size"] += size
-        bucket["weighted_price"] += price * size
-        if price < bucket["min_price"]:
-            bucket["min_price"] = price
-        if price > bucket["max_price"]:
-            bucket["max_price"] = price
+        if size and size > 0 and price is not None:
+            bucket["total_size"] += size
+            bucket["weighted_price"] += price * size
+        if price is not None:
+            if bucket["min_price"] is None or price < bucket["min_price"]:
+                bucket["min_price"] = price
+            if bucket["max_price"] is None or price > bucket["max_price"]:
+                bucket["max_price"] = price
+        oid = _parse_optional_int(entry.get("orderId") or entry.get("order_id"))
+        if oid is not None:
+            bucket["order_ids"].append(oid)
 
+    display_map = {
+        "entry_limit": None,  # filled below with SIDE LIMIT
+        "take_profit": "TAKE PROFIT",
+        "stop_loss": "STOP LOSS",
+        "trigger": "TRIGGER",
+    }
     groups: List[CanonicalOrderGroup] = []
-    for (symbol, side), bucket in sorted(buckets.items()):
+    for (symbol, side, classification), bucket in sorted(buckets.items()):
         total_size = bucket["total_size"]
-        if total_size > 0:
+        if total_size > 0 and bucket["weighted_price"] is not None:
             vwap = bucket["weighted_price"] / total_size
         else:
-            vwap = bucket["min_price"]
+            vwap = bucket["min_price"] or Decimal("0")
         size_precision = _decimal_places_from_text(bucket["total_size"]) or 0
+        side_u = str(side).upper()
+        display_type = display_map.get(classification) or f"{side_u} LIMIT"
+        min_p = bucket["min_price"] or Decimal("0")
+        max_p = bucket["max_price"] or min_p
         groups.append(CanonicalOrderGroup(
             symbol=symbol,
             side=side,
             order_count=int(bucket["count"]),
-            total_size=_format_decimal_places_trimmed(total_size, size_precision),
-            vwap=_format_hibachi_display_price(vwap, symbol=symbol, fallback_places=_decimal_places_from_text(bucket["min_price"])),
-            min_price=_format_hibachi_display_price(bucket["min_price"], symbol=symbol, fallback_places=_decimal_places_from_text(bucket["min_price"])),
-            max_price=_format_hibachi_display_price(bucket["max_price"], symbol=symbol, fallback_places=_decimal_places_from_text(bucket["max_price"])),
+            total_size=_format_decimal_places_trimmed(total_size, size_precision) if total_size > 0 else "0",
+            vwap=_format_hibachi_display_price(vwap, symbol=symbol, fallback_places=_decimal_places_from_text(min_p)),
+            min_price=_format_hibachi_display_price(min_p, symbol=symbol, fallback_places=_decimal_places_from_text(min_p)),
+            max_price=_format_hibachi_display_price(max_p, symbol=symbol, fallback_places=_decimal_places_from_text(max_p)),
+            classification=classification,
+            display_type=display_type,
+            reduce_only=bool(bucket.get("reduce_only")),
+            trigger_price=(
+                _format_hibachi_display_price(min_p, symbol=symbol, fallback_places=_decimal_places_from_text(min_p))
+                if classification in {"take_profit", "stop_loss", "trigger"}
+                else None
+            ),
+            order_ids=list(bucket["order_ids"]) or None,
         ))
-    return len(raw_orders), groups
+    return counted or len(raw_orders), groups
 
 
 def _decimal_or_none(value: Any) -> Optional[Decimal]:

@@ -532,6 +532,36 @@
     return data;
   }
 
+  async function confirmProtectionAfterWrite(kind, symbol, price) {
+    showToast(`${kind} request accepted at ${price}. Confirming…`, "busy");
+    // Invalidate short TTL so we don't re-read stale pre-write cache.
+    // (server invalidates on write; force client re-fetch)
+    await loadPositions(true);
+    await loadOrders(true);
+    const row = (lastPositions || []).find((p) => symbolsMatch(p.symbol, symbol, symbol));
+    const field = kind === "TP" ? "tp" : "sl";
+    const got = row ? String(row[field] ?? "").replace(/,/g, "") : "";
+    const want = String(price).replace(/,/g, "");
+    if (got && want && Number(got) === Number(want)) {
+      showToast(`${kind} confirmed at ${got}`, "ok");
+      return true;
+    }
+    // One brief readback retry (eventual consistency); READ only.
+    await new Promise((r) => setTimeout(r, 800));
+    await loadPositions(true);
+    const row2 = (lastPositions || []).find((p) => symbolsMatch(p.symbol, symbol, symbol));
+    const got2 = row2 ? String(row2[field] ?? "").replace(/,/g, "") : "";
+    if (got2 && want && Number(got2) === Number(want)) {
+      showToast(`${kind} confirmed at ${got2}`, "ok");
+      return true;
+    }
+    showToast(
+      `${kind} request was accepted, but current protection could not be confirmed from exchange state.`,
+      "error"
+    );
+    return false;
+  }
+
   function wirePositionActions() {
     positionsBody.querySelectorAll("[data-act]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -565,9 +595,7 @@
               }, snap);
               if (!data) return { aborted: true };
               if (!data.success) throw new Error((data.error && data.error.message) || "Failed to update TP");
-              showToast(`TP updated to ${price}`, "ok");
-              await loadPositions(true);
-              if (activeTab === "orders") await loadOrders(true);
+              await confirmProtectionAfterWrite("TP", sym, price);
               return data;
             },
           });
@@ -592,8 +620,7 @@
               }, snap);
               if (!data) return { aborted: true };
               if (!data.success) throw new Error((data.error && data.error.message) || "Failed to update SL");
-              showToast(`SL updated to ${price}`, "ok");
-              await loadPositions(true);
+              await confirmProtectionAfterWrite("SL", sym, price);
               return data;
             },
           });
