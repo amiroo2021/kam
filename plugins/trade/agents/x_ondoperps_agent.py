@@ -126,6 +126,7 @@ _PATH_PERPS_BALANCE = "/v1/perps/balance"
 _PATH_PERPS_POSITIONS = "/v1/perps/positions"
 _PATH_PERPS_ORDERS = "/v1/perps/orders"
 _PATH_PERPS_MARK_PRICES = "/v1/perps/mark_prices"
+_PATH_PERPS_CANDLES = "/v1/perps/candles"
 _PATH_MARKETS = "/v1/markets"
 _PATH_ACCOUNT = "/v1/account"
 
@@ -425,6 +426,7 @@ def capabilities() -> List[str]:
         "set_position_protections",
         "position_state",
         "market_price",
+        "candles",
         "close_position",
         "resolve_instrument",
         # Phase 2.4: read-only catalog enumeration.
@@ -522,7 +524,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         if operation == "market_price":
             return _market_price(account, request)
         if operation == "candles":
-            return handle_candles_operation(name, account, request)
+            return _execute_candles(account, request)
         if operation == "list_instruments":
             return _execute_list_instruments(account, request)
         if operation == "close_position":
@@ -1247,11 +1249,14 @@ def _normalize_open_orders(
                 "min_price": None,
                 "max_price": None,
                 "price_places": _price_places_for(symbol, market_metadata),
+                "exchange_instrument": market.upper() or None,
             },
         )
         entry["order_count"] += 1
         entry["total_size"] += size
         entry["notional"] += size * price
+        if market.upper() and not entry.get("exchange_instrument"):
+            entry["exchange_instrument"] = market.upper()
         if entry["min_price"] is None or price < entry["min_price"]:
             entry["min_price"] = price
         if entry["max_price"] is None or price > entry["max_price"]:
@@ -1272,6 +1277,7 @@ def _normalize_open_orders(
                 vwap=_decimal_text_quantized(vwap, price_places),
                 min_price=_decimal_text_quantized(entry["min_price"] or Decimal("0"), price_places),
                 max_price=_decimal_text_quantized(entry["max_price"] or Decimal("0"), price_places),
+                exchange_instrument=entry.get("exchange_instrument") or None,
             )
         )
     return groups
@@ -4001,6 +4007,201 @@ def _execute_list_instruments(
         exchange=name,
         account=account,
         data={"instruments": instruments},
+    )
+
+
+def _execute_candles(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """OHLCV via authenticated GET /v1/perps/candles (market=BTC-USD.P).
+
+    TradeMenu/TradeDesk pass the canonical resolved instrument (e.g.
+    ``BTC-USD.P``). The Ondo candle API uses the same market id — no
+    frontend rewrite. Resolution strings are minutes (``15``) or ``1D``.
+    """
+    from datetime import datetime, timezone
+
+    requested = str(
+        request.get("symbol") or request.get("native_symbol") or ""
+    ).strip()
+    interval = str(
+        request.get("interval") or request.get("tf") or request.get("timeframe") or "15m"
+    ).strip()
+    try:
+        limit = int(request.get("limit") or 300)
+    except (TypeError, ValueError):
+        limit = 300
+    limit = max(1, min(limit, 1000))
+
+    if not requested:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="symbol is required for candles.",
+        )
+
+    # TradeMenu TFs → Ondo resolution (minutes, or 1D).
+    resolution_map = {
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "1h": "60",
+        "4h": "240",
+        "1D": "1D",
+    }
+    resolution = resolution_map.get(interval)
+    if not resolution:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="UNSUPPORTED_TIMEFRAME",
+            message=f"Timeframe {interval!r} is not supported on ondoperps.",
+        )
+
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Ondo Perps account configuration",
+        )
+
+    # Resolve to venue market id (BTC → BTC-USD.P) so candle wire symbol is
+    # always the canonical perps market, matching mark_price / positions.
+    metadata, error = _resolve_market_metadata(credentials, requested)
+    if error is not None:
+        return _bubble_failure(error, "candles", account)
+    market = str(metadata.get("market") or requested).strip()
+    if not market:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="INSTRUMENT_NOT_FOUND",
+            message=f"Ondo Perps has no market for symbol '{requested}'.",
+        )
+
+    # Window: resolution minutes (1D = 1440).
+    if resolution == "1D":
+        step_sec = 86400
+    else:
+        try:
+            step_sec = int(resolution) * 60
+        except ValueError:
+            step_sec = 900
+    to_s = int(time.time())
+    from_s = to_s - step_sec * max(limit + 5, 20)
+
+    query = urllib.parse.urlencode(
+        {
+            "market": market,
+            "resolution": resolution,
+            "from": from_s,
+            "to": to_s,
+        }
+    )
+    path = f"{_PATH_PERPS_CANDLES}?{query}"
+    try:
+        payload = _signed_get(credentials, path)
+    except OndoHTTPError as exc:
+        return _map_http_error_to_failure(exc, operation="candles", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="CANDLES_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    rows: Any = payload
+    if isinstance(payload, dict):
+        nested = payload.get("result")
+        if isinstance(nested, list):
+            rows = nested
+        elif payload.get("success") is False:
+            msg = str(payload.get("error") or "Candles unavailable.")
+            return make_failure(
+                operation="candles",
+                exchange=name,
+                account=account,
+                code="CANDLES_UNAVAILABLE",
+                message=_redact(sanitize_error_message(msg)),
+            )
+    if not isinstance(rows, list) or not rows:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="CANDLES_UNAVAILABLE",
+            message=f"Empty candles for {market} on ondoperps.",
+        )
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        start = row.get("startTime") or row.get("start_time") or row.get("t")
+        ts_sec: Optional[int] = None
+        if isinstance(start, (int, float)):
+            ts = int(start)
+            ts_sec = ts // 1000 if ts > 10_000_000_000 else ts
+        elif isinstance(start, str) and start.strip():
+            text = start.strip().replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts_sec = int(dt.timestamp())
+            except ValueError:
+                continue
+        if ts_sec is None or ts_sec <= 0:
+            continue
+        try:
+            o = float(row.get("open"))
+            h = float(row.get("high"))
+            l = float(row.get("low"))
+            c = float(row.get("close"))
+            v = float(row.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "time": ts_sec,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+            }
+        )
+    out.sort(key=lambda c: int(c["time"]))
+    dedup = {int(c["time"]): c for c in out}
+    ordered = [dedup[k] for k in sorted(dedup.keys())][-limit:]
+    if not ordered:
+        return make_failure(
+            operation="candles",
+            exchange=name,
+            account=account,
+            code="CANDLES_UNAVAILABLE",
+            message=f"Empty candles after normalize for {market}.",
+        )
+    return make_success(
+        operation="candles",
+        exchange=name,
+        account=account,
+        data={
+            "candles": ordered,
+            "symbol": market,
+            "native_symbol": market,
+            "interval": interval,
+            "source": "native",
+            "count": len(ordered),
+        },
     )
 
 

@@ -357,6 +357,8 @@ FETCHERS: Dict[str, Fetcher] = {
 }
 
 # Documented gaps (no public OHLCV found / auth-walled / empty) — do not fake.
+# OndoPerps candles are authenticated via the agent (GET /v1/perps/candles) —
+# not listed here; capabilities advertise "candles" and agent handles them.
 UNSUPPORTED_NATIVE_CANDLES: Dict[str, str] = {
     "lighter": "Public candlesticks endpoint returns 403 without session; no alternate public OHLCV found.",
     "hibachi": "No public OHLCV endpoint discovered on api.hibachi.xyz / data-api.hibachi.xyz.",
@@ -365,12 +367,16 @@ UNSUPPORTED_NATIVE_CANDLES: Dict[str, str] = {
     "nado": "No candlesticks query variant accepted on gateway/archive hosts.",
     "qfex": "Market data endpoints require authentication; no public candle path found.",
     "perpl": "No stable public candle API (TLS/host issues on probed endpoints).",
-    "ondoperps": "No /v1/candles (or equivalent) on api.ondoperps.xyz.",
 }
 
 
 def has_native_candles(exchange: str) -> bool:
-    return str(exchange or "").strip().lower() in FETCHERS
+    """True when the exchange can serve TradeMenu candles (public or agent-auth)."""
+    ex = str(exchange or "").strip().lower()
+    if ex in FETCHERS:
+        return True
+    # Agent-authenticated native OHLCV (not in public FETCHERS map).
+    return ex in {"ondoperps"}
 
 
 def fetch_for_exchange(exchange: str, symbol: str, tf: str, limit: int = 300, *, account: str = "") -> List[Dict[str, Any]]:
