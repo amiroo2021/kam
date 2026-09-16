@@ -970,8 +970,40 @@
     const pe = $("previewError");
     if (pe) { pe.hidden = true; pe.textContent = ""; }
     const place = $("placeBtn");
-    if (place) { place.disabled = false; place.textContent = "Place"; }
+    if (place) {
+      place.disabled = false;
+      place.textContent = "Place";
+      place.onclick = null;
+    }
+    // Restore mode editor after leaving preview.
+    applyModeVisibility();
     updateTradeCtx();
+    updateSingleNotional();
+  }
+
+  function applyModeVisibility() {
+    const single = $("singleForm");
+    const ladder = $("ladderForm");
+    const preview = $("previewBox");
+    const inPreview = !!(preview && !preview.hidden && activePreview);
+    if (single) {
+      single.hidden = tradeMode !== "single" || inPreview;
+    }
+    if (ladder) {
+      ladder.hidden = tradeMode !== "ladder" || inPreview;
+    }
+    const ms = $("modeSingle");
+    const ml = $("modeLadder");
+    if (ms) {
+      ms.classList.toggle("active", tradeMode === "single");
+      ms.setAttribute("aria-pressed", tradeMode === "single" ? "true" : "false");
+      ms.textContent = tradeMode === "single" ? "SINGLE" : "Single";
+    }
+    if (ml) {
+      ml.classList.toggle("active", tradeMode === "ladder");
+      ml.setAttribute("aria-pressed", tradeMode === "ladder" ? "true" : "false");
+      ml.textContent = tradeMode === "ladder" ? "LADDER" : "Ladder";
+    }
   }
 
   function updateTradeCtx() {
@@ -981,33 +1013,82 @@
     el.textContent = `${(symbolEl.value || "").trim() || "—"} · ${exchangeEl.value || "—"} · ${accountEl.value || "—"} → ${native}`;
   }
 
+  function updateSingleNotional() {
+    const el = $("singleNotional");
+    if (!el) return;
+    if (tradeMode !== "single") {
+      el.hidden = true;
+      return;
+    }
+    const px = Number(String($("orderPrice").value || "").replace(/,/g, ""));
+    const sz = Number(String($("orderSize").value || "").replace(/,/g, ""));
+    if (!Number.isFinite(px) || !Number.isFinite(sz) || px <= 0 || sz <= 0) {
+      el.hidden = true;
+      el.textContent = "";
+      return;
+    }
+    const n = px * sz;
+    el.hidden = false;
+    el.textContent = `≈ ${n.toLocaleString(undefined, { maximumFractionDigits: 2 })} (est. notional)`;
+  }
+
   function setTradeSide(side) {
     tradeSide = side;
     $("sideBuy").classList.toggle("active", side === "buy");
     $("sideBuy").classList.toggle("buy", true);
+    $("sideBuy").setAttribute("aria-pressed", side === "buy" ? "true" : "false");
     $("sideSell").classList.toggle("active", side === "sell");
     $("sideSell").classList.toggle("sell", true);
+    $("sideSell").setAttribute("aria-pressed", side === "sell" ? "true" : "false");
     invalidateTradePreview();
   }
 
   function setTradeMode(mode) {
+    if (mode !== "single" && mode !== "ladder") return;
+    const prev = tradeMode;
     tradeMode = mode;
-    $("modeSingle").classList.toggle("active", mode === "single");
-    $("modeLadder").classList.toggle("active", mode === "ladder");
-    $("singleForm").hidden = mode !== "single";
-    $("ladderForm").hidden = mode !== "ladder";
-    invalidateTradePreview();
+    // Mode switch always kills any active preview (and chart PREVIEW lines).
+    if (prev !== mode || activePreview) {
+      activePreview = null;
+      clearPreviewLines();
+      const box = $("previewBox");
+      if (box) box.hidden = true;
+      const pe = $("previewError");
+      if (pe) { pe.hidden = true; pe.textContent = ""; }
+    }
+    applyModeVisibility();
+    updateTradeCtx();
+    updateSingleNotional();
+    setLine($("tradeStatus"), mode === "ladder" ? "Ladder mode" : "Single order mode");
   }
 
   function showPreview(data) {
+    // Guard: never show a preview for the inactive mode.
+    if (data.kind === "ladder" && tradeMode !== "ladder") {
+      invalidateTradePreview();
+      return;
+    }
+    if (data.kind === "order" && tradeMode !== "single") {
+      invalidateTradePreview();
+      return;
+    }
     activePreview = { id: data.preview_id, kind: data.kind, data };
     $("previewBox").hidden = false;
     $("previewError").hidden = true;
     $("previewError").textContent = "";
+    applyModeVisibility(); // hide the editor while preview is open
     const place = $("placeBtn");
     place.disabled = false;
+    place.onclick = null;
     if (data.kind === "ladder") {
       place.textContent = `Place ${data.order_count || (data.children || []).length} Orders`;
+      const kids = data.children || [];
+      let notional = 0;
+      for (const c of kids) {
+        const p = Number(String(c.price || "").replace(/,/g, ""));
+        const s = Number(String(c.size || "").replace(/,/g, ""));
+        if (Number.isFinite(p) && Number.isFinite(s)) notional += p * s;
+      }
       const lines = [
         `${String(data.side || "").toUpperCase()} ${data.native_symbol} LADDER`,
         `Distribution: ${data.distribution === "half_gaussian" ? "Half-Gaussian" : "Uniform"}`,
@@ -1015,10 +1096,10 @@
         `Total Size: ${data.total_size}`,
         `Price Range: ${data.min_price} – ${data.max_price}`,
         `VWAP: ${data.vwap}`,
+        notional > 0 ? `Estimated ladder notional: ≈ ${notional.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "",
         lastPrice.textContent && lastPrice.textContent !== "—" ? `Current Price: ${lastPrice.textContent}` : "",
       ].filter(Boolean);
       $("previewText").textContent = lines.join("\n");
-      const kids = data.children || [];
       $("childTableWrap").hidden = !kids.length;
       $("childBody").innerHTML = kids
         .map((c, i) => `<tr><td>${i + 1}</td><td class="num">${c.price}</td><td class="num">${c.size}</td></tr>`)
@@ -1044,16 +1125,26 @@
   }
 
   async function doPreviewOrder() {
+    if (tradeMode !== "single") {
+      setLine($("tradeStatus"), "Switch to Single mode to preview an order.", "error");
+      return;
+    }
+    const price = ($("orderPrice").value || "").trim();
+    const size = ($("orderSize").value || "").trim();
+    if (!price || !size) {
+      setLine($("tradeStatus"), "Enter Limit Price and Size.", "error");
+      return;
+    }
     setLine($("tradeStatus"), "Building order preview…");
     try {
-      const { data, res } = await apiPost("/api/trade/preview_order", {
+      const { data } = await apiPost("/api/trade/preview_order", {
         exchange: exchangeEl.value,
         account: accountEl.value,
         symbol: (symbolEl.value || "").trim(),
         side: tradeSide,
         order_type: "limit",
-        size: ($("orderSize").value || "").trim(),
-        price: ($("orderPrice").value || "").trim(),
+        size,
+        price,
       });
       if (!data.success) throw new Error((data.error && data.error.message) || "Preview failed");
       showPreview(data);
@@ -1065,6 +1156,18 @@
   }
 
   async function doPreviewLadder() {
+    if (tradeMode !== "ladder") {
+      setLine($("tradeStatus"), "Switch to Ladder mode to preview a ladder.", "error");
+      return;
+    }
+    const start = ($("ladderStart").value || "").trim();
+    const end = ($("ladderEnd").value || "").trim();
+    const total = ($("ladderTotal").value || "").trim();
+    const count = ($("ladderCount").value || "").trim();
+    if (!start || !end || !total || !count) {
+      setLine($("tradeStatus"), "Enter Start, End, Orders, and Total Size.", "error");
+      return;
+    }
     setLine($("tradeStatus"), "Building ladder preview…");
     try {
       const { data } = await apiPost("/api/trade/preview_ladder", {
@@ -1073,10 +1176,10 @@
         symbol: (symbolEl.value || "").trim(),
         side: tradeSide,
         distribution: $("ladderDist").value,
-        order_count: $("ladderCount").value,
-        total_size: ($("ladderTotal").value || "").trim(),
-        start_price: ($("ladderStart").value || "").trim(),
-        end_price: ($("ladderEnd").value || "").trim(),
+        order_count: count,
+        total_size: total,
+        start_price: start,
+        end_price: end,
       });
       if (!data.success) throw new Error((data.error && data.error.message) || "Preview failed");
       showPreview(data);
@@ -1178,8 +1281,14 @@
     });
     ["orderPrice", "orderSize", "ladderStart", "ladderEnd", "ladderCount", "ladderTotal", "ladderDist"].forEach((id) => {
       const el = $(id);
-      if (el) el.addEventListener("input", () => { if (activePreview) invalidateTradePreview(); });
-      if (el) el.addEventListener("change", () => { if (activePreview) invalidateTradePreview(); });
+      if (el) el.addEventListener("input", () => {
+        if (id === "orderPrice" || id === "orderSize") updateSingleNotional();
+        if (activePreview) invalidateTradePreview();
+      });
+      if (el) el.addEventListener("change", () => {
+        if (id === "orderPrice" || id === "orderSize") updateSingleNotional();
+        if (activePreview) invalidateTradePreview();
+      });
     });
     if ($("showOrdersOverlay")) {
       $("showOrdersOverlay").addEventListener("change", updateOverlay);

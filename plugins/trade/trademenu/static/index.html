@@ -63,43 +63,44 @@
           <button type="button" class="seg-btn" id="modeLadder" data-mode="ladder">Ladder</button>
         </div>
 
-        <div id="singleForm" class="trade-form">
+        <div id="singleForm" class="trade-form" data-mode-panel="single">
           <label>Type
             <select id="orderType"><option value="limit">LIMIT</option></select>
           </label>
           <label>Price
             <div class="row">
-              <input id="orderPrice" type="text" inputmode="decimal" placeholder="Limit price" />
+              <input id="orderPrice" type="text" inputmode="decimal" placeholder="Limit price" autocomplete="off" />
               <button type="button" class="btn-ghost" id="useCurrentPrice">Current</button>
             </div>
           </label>
-          <label>Size
-            <input id="orderSize" type="text" inputmode="decimal" placeholder="Size" />
+          <label>Size <span class="hint-inline">(this order only)</span>
+            <input id="orderSize" type="text" inputmode="decimal" placeholder="Size" autocomplete="off" />
           </label>
+          <p id="singleNotional" class="notional-hint" hidden></p>
           <button type="button" id="previewOrderBtn">Preview Order</button>
         </div>
 
-        <div id="ladderForm" class="trade-form" hidden>
+        <div id="ladderForm" class="trade-form" data-mode-panel="ladder" hidden>
+          <label>Start Price
+            <div class="row">
+              <input id="ladderStart" type="text" inputmode="decimal" placeholder="Start price" autocomplete="off" />
+              <button type="button" class="btn-ghost" id="ladderStartCurrent">Current</button>
+            </div>
+          </label>
+          <label>End Price
+            <input id="ladderEnd" type="text" inputmode="decimal" placeholder="End price" autocomplete="off" />
+          </label>
+          <label>Orders
+            <input id="ladderCount" type="number" min="2" max="200" value="20" />
+          </label>
+          <label>Total Size <span class="hint-inline">(distributed across children)</span>
+            <input id="ladderTotal" type="text" inputmode="decimal" placeholder="Total size" autocomplete="off" />
+          </label>
           <label>Distribution
             <select id="ladderDist">
               <option value="half_gaussian">Half-Gaussian</option>
               <option value="uniform">Uniform</option>
             </select>
-          </label>
-          <label>Start Price
-            <div class="row">
-              <input id="ladderStart" type="text" inputmode="decimal" />
-              <button type="button" class="btn-ghost" id="ladderStartCurrent">Current</button>
-            </div>
-          </label>
-          <label>End Price
-            <input id="ladderEnd" type="text" inputmode="decimal" />
-          </label>
-          <label>Orders
-            <input id="ladderCount" type="number" min="2" max="200" value="20" />
-          </label>
-          <label>Total Size
-            <input id="ladderTotal" type="text" inputmode="decimal" />
           </label>
           <button type="button" id="previewLadderBtn">Preview Ladder</button>
         </div>
@@ -112,7 +113,7 @@
               <tbody id="childBody"></tbody>
             </table>
           </div>
-          <div class="row">
+          <div class="row preview-actions">
             <button type="button" class="btn-secondary" id="previewBackBtn">Back</button>
             <button type="button" class="btn-danger" id="placeBtn">Place</button>
           </div>
