@@ -1,0 +1,18 @@
+[Unit]
+Description=TradeMenu Phase 1 read-only web UI
+After=network.target
+# Independent from GoldenFibo :8000 and Hermes gateway
+
+[Service]
+Type=simple
+WorkingDirectory=/root/kam
+Environment=PYTHONPATH=/root/kam
+Environment=HERMES_HOME=/root/.hermes
+# Use Hermes venv which has fastapi/uvicorn
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m plugins.trade.trademenu
+Restart=on-failure
+RestartSec=3
+# Do not escalate to restarting sibling services
+
+[Install]
+WantedBy=multi-user.target

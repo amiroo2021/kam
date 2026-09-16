@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradeMenu</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">TradeMenu</div>
+      <form method="post" action="/logout"><button type="submit">Logout</button></form>
+    </header>
+
+    <section class="controls">
+      <label>Exchange
+        <select id="exchange"></select>
+      </label>
+      <label>Account
+        <select id="account"></select>
+      </label>
+      <label>Symbol
+        <input id="symbol" value="BTCUSD" list="symbolSuggestions" />
+        <datalist id="symbolSuggestions"></datalist>
+      </label>
+      <label>TF
+        <select id="tf">
+          <option value="1m">1m</option>
+          <option value="5m">5m</option>
+          <option value="15m" selected>15m</option>
+          <option value="30m">30m</option>
+          <option value="1h">1h</option>
+          <option value="4h">4h</option>
+          <option value="1D">1D</option>
+        </select>
+      </label>
+      <label>&nbsp;<button type="button" id="reloadBtn">Reload</button></label>
+    </section>
+
+    <div>
+      <div class="meta">
+        <span>Native <strong id="nativeSym">—</strong></span>
+        <span>Last <strong id="lastPrice">—</strong></span>
+        <span>Candles <strong id="candleCount">—</strong></span>
+      </div>
+      <div id="chart" aria-label="TradeMenu chart"></div>
+      <div class="status-line" id="statusLine">Loading…</div>
+
+      <section class="positions">
+        <h2>Open Positions</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Size</th>
+              <th>Entry</th>
+              <th>Mark</th>
+              <th>PnL</th>
+              <th>SL</th>
+              <th>TP</th>
+            </tr>
+          </thead>
+          <tbody id="positionsBody">
+            <tr><td colspan="8">—</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
