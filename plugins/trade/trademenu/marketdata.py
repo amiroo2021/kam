@@ -66,6 +66,18 @@ _ORDERLY_INTERVAL = {
     "1D": "1d",
 }
 
+# Arcus public OHLCV (GET /v1/candles). Docs: timeframe enum uses lowercase day.
+_ARCUS_INTERVAL = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "4h",
+    "1D": "1d",
+}
+_ARCUS_API_BASE = "https://api.arcus.xyz"
+
 
 def _http_json(url: str, *, method: str = "GET", body: Optional[dict] = None, timeout: int = 20) -> Any:
     data = None
@@ -424,6 +436,72 @@ def fetch_raydium_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[s
     return ordered[-limit_n:]
 
 
+def _arcus_market_symbol(symbol: str) -> str:
+    """Preserve Arcus display natives (BTC-USD). Do not strip to BTCUSD."""
+    text = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
+    if not text:
+        raise RuntimeError("Empty Arcus candle market")
+    return text
+
+
+def fetch_arcus_candles(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    """Arcus public OHLCV via GET /v1/candles (oracle-priced bars + trade volume)."""
+    timeframe = _ARCUS_INTERVAL.get(tf)
+    if not timeframe:
+        raise ValueError("UNSUPPORTED_TIMEFRAME")
+    market = _arcus_market_symbol(symbol)
+    limit_n = max(1, min(int(limit), 1500))
+    # Server requires Unix microseconds for `to` (min 1e14).
+    to_us = int(time.time() * 1_000_000)
+    qs = urllib.parse.urlencode(
+        {
+            "market": market,
+            "timeframe": timeframe,
+            "to": to_us,
+            "countback": limit_n,
+        }
+    )
+    data = _http_json(f"{_ARCUS_API_BASE}/v1/candles?{qs}", timeout=25)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected Arcus candles response for {market}")
+    rows = data.get("candles")
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Empty Arcus candles for {market}")
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        open_time = row.get("openTime") or row.get("open_time") or row.get("t") or 0
+        try:
+            ts = int(open_time)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        # Arcus openTime is microseconds; other adapters feed ms into _normalize_candle.
+        if ts > 10_000_000_000_000:  # > ~year 2286 in ms → treat as µs
+            ts_ms = ts // 1000
+        elif ts > 10_000_000_000:  # ms
+            ts_ms = ts
+        else:  # seconds
+            ts_ms = ts * 1000
+        try:
+            o = float(row.get("open"))
+            h = float(row.get("high"))
+            l = float(row.get("low"))
+            c = float(row.get("close"))
+            v = float(row.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append(_normalize_candle(ts_ms, o, h, l, c, v))
+    out.sort(key=lambda c: c["time"])
+    dedup: Dict[int, Dict[str, Any]] = {int(c["time"]): c for c in out}
+    ordered = [dedup[k] for k in sorted(dedup.keys())]
+    if not ordered:
+        raise RuntimeError(f"Empty Arcus candles after normalize for {market}")
+    return ordered[-limit_n:]
+
+
 def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int = 300) -> Dict[str, Any]:
     """Return {success, candles, ...} or explicit unsupported error."""
     ex = str(exchange or "").strip().lower()
@@ -449,6 +527,8 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             candles = fetch_mexc_candles(symbol, tf_n, limit=limit)
         elif ex == "raydium":
             candles = fetch_raydium_candles(symbol, tf_n, limit=limit)
+        elif ex == "arcus":
+            candles = fetch_arcus_candles(symbol, tf_n, limit=limit)
         else:
             return {
                 "success": False,

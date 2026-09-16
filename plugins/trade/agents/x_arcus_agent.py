@@ -803,6 +803,10 @@ def _normalize_positions(
         size_precision = max(_decimal_places(row.get("size")), 0)
         price_precision = max(_decimal_places(row.get("averageEntryPrice")), _decimal_places(row.get("markPx")))
         prot = protections.get(symbol, {})
+        mark_raw = row.get("markPx") or row.get("markPrice") or row.get("oraclePrice")
+        mark_txt = None
+        if mark_raw is not None and str(mark_raw).strip() != "":
+            mark_txt = _format_decimal_places(_decimal_or_zero(mark_raw), price_precision)
         positions.append(
             CanonicalPosition(
                 symbol=symbol,
@@ -814,6 +818,9 @@ def _normalize_positions(
                 sl=prot.get("sl"),
                 tp_count=prot.get("tp_count"),
                 sl_count=prot.get("sl_count"),
+                # Arcus native identity is the market display name (BTC-USD).
+                exchange_instrument=symbol or None,
+                mark=mark_txt,
             )
         )
     return positions
@@ -867,6 +874,7 @@ def _aggregate_orders(orders_payload: Any) -> Tuple[int, List[CanonicalOrderGrou
                 vwap=_format_decimal_places(vwap, int(bucket["price_precision"])),
                 min_price=_format_decimal_places(bucket["min_price"], int(bucket["price_precision"])),
                 max_price=_format_decimal_places(bucket["max_price"], int(bucket["price_precision"])),
+                exchange_instrument=symbol or None,
             )
         )
     return (open_count, groups)
@@ -3470,15 +3478,18 @@ def _execute_position_state(request: Dict[str, Any]) -> CanonicalResponse:
         side = str(d.get("side") or "").lower()
         size = _decimal_or_zero(d.get("size"))
         if side in {"long", "short"} and size > 0:
+            native = str(identity.get("canonical_symbol") or d.get("symbol") or symbol)
             filtered.append(
                 CanonicalPosition(
-                    symbol=str(identity.get("canonical_symbol") or d.get("symbol") or symbol),
+                    symbol=native,
                     side=side,
                     size=_decimal_text(size),
                     entry_price=str(d.get("entry_price") or "0"),
                     pnl=str(d.get("pnl") or "0"),
                     tp=d.get("tp"),
                     sl=d.get("sl"),
+                    exchange_instrument=str(d.get("exchange_instrument") or native) or None,
+                    mark=d.get("mark"),
                 )
             )
     positions = filtered

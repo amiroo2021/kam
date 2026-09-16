@@ -92,6 +92,15 @@
     try {
       candleSeries && candleSeries.setData([]);
     } catch (_) {}
+    try {
+      // Drop prior instrument autoscale (e.g. 1k–1.5k leftover on BTC ~76k).
+      if (candleSeries && typeof candleSeries.applyOptions === "function") {
+        candleSeries.applyOptions({ autoscaleInfoProvider: undefined });
+      }
+      if (chart && chart.priceScale) {
+        chart.priceScale("right").applyOptions({ autoScale: true });
+      }
+    } catch (_) {}
     candleCount.textContent = "0";
     clearPositionLines();
     clearPreviewLines();
@@ -247,6 +256,13 @@
       String(requested || "").trim(),
     ].filter(Boolean);
     if (!candidates.length || !targets.length) return false;
+    // Exact native identity first (BTC-USD === BTC-USD) — highest priority.
+    for (const c of candidates) {
+      const cu = c.toUpperCase();
+      for (const t of targets) {
+        if (cu === String(t).toUpperCase()) return true;
+      }
+    }
     const peel = (s) => {
       const u = s.toUpperCase();
       const tail = u.includes(":") ? u.split(":").pop() : u;
@@ -259,7 +275,6 @@
       const cu = c.toUpperCase();
       for (const t of targets) {
         const tu = t.toUpperCase();
-        if (cu === tu) return true;
         if (peel(cu) && peel(cu) === peel(tu)) return true;
       }
     }
@@ -593,20 +608,37 @@
       if (reqId !== chartReq || key !== selectionKey()) return;
       const browserMs = Math.round(performance.now() - t0);
       if (!data.success) {
-        candleSeries.setData([]);
+        try {
+          candleSeries.setData([]);
+          if (chart && chart.priceScale) {
+            chart.priceScale("right").applyOptions({ autoScale: true });
+          }
+        } catch (_) {}
         candleCount.textContent = "0";
-        resolvedOk = false;
-        nativeInstrument = null;
-        quoteFresh = false;
-        lastPrice.textContent = "—";
-        clearPositionLines();
-        nativeSym.textContent = data.display || `${sym} → unresolved`;
-        setLine(chartStatus, (data.error && data.error.message) || "Candles unavailable", "error");
-        updateTradeEnablement((data.error && data.error.message) || "Candles unavailable");
-        // Still try resolve+quote so trading can proceed without candles on some venues.
-        const native = await resolveSymbol();
-        if (reqId !== chartReq || key !== selectionKey()) return;
-        if (native) {
+        // Do NOT wipe native identity just because candles failed — quote,
+        // overlays, and ticket still bind to the resolved instrument.
+        const failNative = data.native_symbol || null;
+        if (failNative) {
+          nativeInstrument = failNative;
+          resolvedOk = true;
+          if (data.display) nativeSym.textContent = data.display;
+          if (data.format_meta) formatMeta = data.format_meta;
+        } else {
+          // Resolve independently so overlays/quote can still attach.
+          const native = await resolveSymbol();
+          if (reqId !== chartReq || key !== selectionKey()) return;
+          if (!native) {
+            nativeSym.textContent = data.display || `${sym} → unresolved`;
+          }
+        }
+        const label = nativeInstrument || sym;
+        const msg =
+          (data.error && data.error.message) ||
+          `Chart unavailable for ${label} on ${ex}`;
+        setLine(chartStatus, `Chart unavailable for ${label} on ${ex}: ${msg}`, "error");
+        updateTradeEnablement(msg);
+        updateOverlay();
+        if (nativeInstrument) {
           await loadQuote(true);
         }
         return;
@@ -618,27 +650,44 @@
         low: c.low,
         close: c.close,
       }));
-      candleSeries.setData(candles);
       formatMeta = data.format_meta || formatMeta;
       if (data.display) nativeSym.textContent = data.display;
       nativeInstrument = data.native_symbol || nativeInstrument;
       resolvedOk = true;
-      if (candles.length) {
-        chart.timeScale().fitContent();
-        setLastPrice(candles[candles.length - 1].close, formatMeta, { fromNative: nativeInstrument });
-      } else {
-        setLastPrice(null);
-      }
+      try {
+        candleSeries.setData(candles);
+        if (candles.length) {
+          chart.timeScale().fitContent();
+          if (chart && chart.priceScale) {
+            chart.priceScale("right").applyOptions({ autoScale: true });
+          }
+          setLastPrice(candles[candles.length - 1].close, formatMeta, { fromNative: nativeInstrument });
+        } else {
+          candleSeries.setData([]);
+          if (chart && chart.priceScale) {
+            chart.priceScale("right").applyOptions({ autoScale: true });
+          }
+          setLastPrice(null);
+          setLine(
+            chartStatus,
+            `Chart unavailable for ${nativeInstrument || sym} on ${ex}: 0 candles`,
+            "error"
+          );
+        }
+      } catch (_) {}
       candleCount.textContent = String(candles.length);
+      // Overlays use native identity + lastPositions — independent of candle count.
       updateOverlay();
       updateTradeEnablement();
       const rMs = data.resolve_timing_ms && data.resolve_timing_ms.tradedesk_ms;
       const rCache = data.resolve_cache_hit ? " resolve-cache" : "";
-      setLine(
-        chartStatus,
-        `Chart OK · ${data.native_symbol || "—"} · ${tf} · ${candles.length} bars · browser ${browserMs} ms · resolve ${rMs != null ? rMs : "—"} ms${rCache}`,
-        "ok"
-      );
+      if (candles.length) {
+        setLine(
+          chartStatus,
+          `Chart OK · ${data.native_symbol || "—"} · ${tf} · ${candles.length} bars · browser ${browserMs} ms · resolve ${rMs != null ? rMs : "—"} ms${rCache}`,
+          "ok"
+        );
+      }
       // Authoritative quote for Current button (may refine Last).
       loadQuote(true);
     } catch (e) {
@@ -835,23 +884,28 @@
     });
   }
 
+  function activateInstrument(display, native) {
+    const d = String(display || "").trim();
+    const n = String(native || "").trim();
+    if (!d && !n) return;
+    // Prefer venue-native id when present (BTC-USD, PERP_ZEC_USDC, xyz:SP500).
+    // Never invent ZECUSD by concatenating USD onto ZEC when native is known.
+    if (n) {
+      symbolEl.value = n;
+    } else if (d.includes(":")) {
+      symbolEl.value = d;
+    } else {
+      symbolEl.value = d;
+    }
+    onSelectionChanged();
+  }
+
   function wireSymbolClicks(root) {
     root.querySelectorAll("button.link-sym[data-symbol]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const display = btn.getAttribute("data-symbol") || "";
         const native = btn.getAttribute("data-native") || "";
-        if (!display && !native) return;
-        // Prefer venue-native id when present (PERP_ZEC_USDC, xyz:SP500).
-        // Never invent ZECUSD by concatenating USD onto ZEC when native is known.
-        if (native) {
-          symbolEl.value = native;
-        } else if (display.includes(":")) {
-          symbolEl.value = display;
-        } else {
-          // Leave display as-is; agent resolve handles ZEC / BTC / SP500.
-          symbolEl.value = display;
-        }
-        onSelectionChanged();
+        activateInstrument(display, native);
       });
     });
   }
