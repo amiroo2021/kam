@@ -365,15 +365,37 @@ def _extract_portfolio_summary(data: Dict[str, Any]) -> CanonicalPortfolioSummar
 
 
 def _rise_side(raw_side: Any, size: Any) -> str:
-    side_text = str(raw_side).strip().lower()
-    if side_text in {"1", "short", "sell", "s"}:
-        return "short"
-    if side_text in {"0", "long", "buy", "b"}:
-        return "long"
+    """Map Rise position direction to canonical long/short.
+
+    Live Rise portfolio rows use a **signed** ``size`` for direction
+    (positive long, negative short). The integer ``side`` field is often
+    ``0`` for both longs and shorts and must not override a signed size.
+
+    Order of authority:
+      1. Non-zero signed size
+      2. Explicit textual side (long/short/buy/sell)
+      3. Numeric side enum only when size is missing/zero —
+         Rise docs map 0→long, 1→short for some order contexts; for
+         positions we still treat it as last resort.
+
+    Raises ValueError when direction cannot be established safely
+    (callers should skip the row rather than invent LONG).
+    """
     decimal_size = _decimal_or_none(size)
-    if decimal_size is not None and decimal_size < 0:
+    if decimal_size is not None and decimal_size != 0:
+        return "short" if decimal_size < 0 else "long"
+
+    side_text = str(raw_side if raw_side is not None else "").strip().lower()
+    if side_text in {"short", "sell", "s"}:
         return "short"
-    return "long"
+    if side_text in {"long", "buy", "b"}:
+        return "long"
+    # Numeric enum last-resort only when size did not establish direction.
+    if side_text in {"1"}:
+        return "short"
+    if side_text in {"0"}:
+        return "long"
+    raise ValueError("RISE_POSITION_SIDE_UNKNOWN")
 
 
 def _rise_order_side(raw_side: Any) -> str:
@@ -483,9 +505,28 @@ def _normalize_positions(
         size_text = _format_decimal_places(abs(raw_size), size_precision) if size_precision > 0 else _decimal_text(abs(raw_size))
         entry_price = _decimal_or_none(item.get("avg_entry_price"))
         entry_price_text = _format_decimal_places(entry_price, price_precision) if entry_price is not None and price_precision > 0 else str(item.get("avg_entry_price") or "0")
+        mark_price = _decimal_or_none(item.get("mark_price"))
+        mark_text = (
+            _format_decimal_places(mark_price, price_precision)
+            if mark_price is not None and mark_price > 0 and price_precision > 0
+            else (_decimal_text(mark_price) if mark_price is not None and mark_price > 0 else None)
+        )
         pnl_value = _decimal_or_none(item.get("unrealized_pnl"))
-        pnl_text = _format_decimal_places(pnl_value, 2) if pnl_value is not None else str(item.get("unrealized_pnl") or "0")
-        side = _rise_side(item.get("side"), item.get("size"))
+        if pnl_value is not None:
+            pnl_text = _format_decimal_places(pnl_value, 2)
+        else:
+            # Missing exchange PnL must not become a fabricated zero.
+            pnl_text = ""
+        try:
+            side = _rise_side(item.get("side"), item.get("size"))
+        except ValueError:
+            logger.warning(
+                "Rise position skipped; direction unknown market=%s side=%r size=%r",
+                item.get("market_name"),
+                item.get("side"),
+                item.get("size"),
+            )
+            continue
         protections = {"tp": [], "sl": []}
         if isinstance(tpsl_index, dict):
             key = (str(item.get("market_id") or "").strip(), _tpsl_closing_side_for_position(side))
@@ -501,10 +542,12 @@ def _normalize_positions(
                 size=size_text,
                 entry_price=entry_price_text,
                 pnl=pnl_text,
+                mark=mark_text,
                 tp=str(tp_price) if tp_price not in (None, "") else None,
                 sl=str(sl_price) if sl_price not in (None, "") else None,
                 tp_count=len(tp_orders) or None,
                 sl_count=len(sl_orders) or None,
+                exchange_instrument=str(item.get("market_name") or "") or None,
             )
         )
     positions.sort(key=lambda item: (item.symbol, item.side))
@@ -1186,7 +1229,10 @@ def _find_rise_position_context(
         break
     if current_position is None:
         raise ValueError("POSITION_NOT_FOUND")
-    current_side = _rise_side(current_position.get("side"), current_position.get("size"))
+    try:
+        current_side = _rise_side(current_position.get("side"), current_position.get("size"))
+    except ValueError as exc:
+        raise RuntimeError("RISE_POSITION_SIDE_UNKNOWN") from exc
     current_size_raw = _decimal_or_none(current_position.get("size"))
     size_precision = _step_precision(market.get("step_size"))
     if current_size_raw is None:
@@ -2073,10 +2119,14 @@ def _rise_position_snapshot(wallet: str, requested_symbol: str) -> Dict[str, Any
         return {"side": "flat", "size": Decimal("0"), "entry_price": Decimal("0"), "symbol": canonical}
     raw_size = _decimal_or_none(matched_item.get("size"))
     side_field = matched_item.get("side")
-    side_norm = _rise_side(side_field, raw_size)
     abs_size = abs(raw_size) if raw_size is not None else Decimal("0")
     if abs_size <= 0:
         side_norm = "flat"
+    else:
+        try:
+            side_norm = _rise_side(side_field, raw_size)
+        except ValueError as exc:
+            raise RuntimeError("RISE_POSITION_SIDE_UNKNOWN") from exc
     entry = _decimal_or_none(matched_item.get("avg_entry_price"))
     if entry is None:
         entry = Decimal("0")
