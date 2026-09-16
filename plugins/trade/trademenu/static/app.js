@@ -542,6 +542,20 @@
     });
   }
 
+  function wireSymbolClicks(root) {
+    root.querySelectorAll("button.link-sym[data-symbol]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sym = btn.getAttribute("data-symbol") || "";
+        if (!sym) return;
+        // Prefer friendly *USD form for the existing TradeDesk resolver.
+        const peeled = sym.includes(":") ? sym.split(":").pop() : sym;
+        const friendly = /USD|USDT|USDC/i.test(peeled) ? peeled : `${peeled}USD`;
+        symbolEl.value = friendly;
+        onSelectionChanged();
+      });
+    });
+  }
+
   function wireOrderActions() {
     ordersBody.querySelectorAll("[data-cancel-group]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -551,28 +565,63 @@
         const vol = btn.getAttribute("data-vol");
         const range = btn.getAttribute("data-range");
         const vwap = btn.getAttribute("data-vwap");
+        const classification = btn.getAttribute("data-classification") || "entry_limit";
+        const displayType = btn.getAttribute("data-display-type") || "";
+        const trigger = btn.getAttribute("data-trigger") || "";
+        const limit = btn.getAttribute("data-limit") || "";
+        const idsRaw = btn.getAttribute("data-order-ids") || "";
+        const orderIds = idsRaw
+          ? idsRaw.split(",").map((x) => x.trim()).filter(Boolean).map((x) => Number(x)).filter((n) => Number.isFinite(n))
+          : [];
         const snap = accountKey();
+        const isTp = classification === "take_profit";
+        const isSl = classification === "stop_loss";
+        let title = `Cancel ${count} ${sym} ${displayType || String(side).toUpperCase()} orders?`;
+        let body = `Total volume: ${vol}\nPrice range: ${range}\nVWAP: ${vwap}`;
+        let cancelLabel = "Keep Orders";
+        let confirmLabel = `Cancel ${count} Orders`;
+        if (isSl) {
+          title = `Cancel ${sym} Stop Loss?`;
+          body =
+            `Stop price: ${trigger || limit || range}\n` +
+            `Orders: ${count}\nSize: ${vol}\n\n` +
+            `This position may remain open without stop-loss protection.`;
+          cancelLabel = "Keep Stop Loss";
+          confirmLabel = "Cancel Stop Loss";
+        } else if (isTp) {
+          title = `Cancel ${sym} Take Profit?`;
+          body = `TP price: ${trigger || limit || range}\nOrders: ${count}\nSize: ${vol}`;
+          cancelLabel = "Keep Take Profit";
+          confirmLabel = "Cancel Take Profit";
+        }
         openModal({
-          title: `Cancel ${count} ${sym} ${String(side).toUpperCase()} LIMIT orders?`,
-          body: `Total volume: ${vol}\nPrice range: ${range}\nVWAP: ${vwap}`,
+          title,
+          body,
           danger: true,
-          cancelLabel: "Keep Orders",
-          confirmLabel: `Cancel ${count} Orders`,
+          cancelLabel,
+          confirmLabel,
           onConfirm: async () => {
             modalConfirm.disabled = true;
             modalConfirm.textContent = "Cancelling…";
-            const data = await runWrite("/api/orders/cancel_group", {
-              exchange: exchangeEl.value,
-              account: accountEl.value,
-              symbol: sym,
-              side,
-              type: "limit",
-            }, snap);
+            const data = await runWrite(
+              "/api/orders/cancel_group",
+              {
+                exchange: exchangeEl.value,
+                account: accountEl.value,
+                symbol: sym,
+                side,
+                type: displayType || "limit",
+                classification,
+                order_ids: orderIds,
+              },
+              snap
+            );
             if (!data) return { aborted: true };
             if (!data.success) throw new Error((data.error && data.error.message) || "Cancel failed");
             const msg = data.message || `Cancelled ${data.cancelled || count} orders.`;
             showToast(msg, data.partial ? "error" : "ok");
             await loadOrders(true);
+            await loadPositions(true);
             return data;
           },
         });
@@ -648,7 +697,7 @@
             const sym = dash(p.symbol);
             const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
             return `<tr>
-              <td>${sym}</td>
+              <td><button type="button" class="link-sym" data-symbol="${esc(p.symbol)}">${sym}</button></td>
               <td class="${sideClass}">${dash(p.side)}</td>
               <td class="num">${dash(d.size || p.size)}</td>
               <td class="num">${dash(d.entry || p.entry)}</td>
@@ -665,6 +714,7 @@
           })
           .join("");
         wirePositionActions();
+        wireSymbolClicks(positionsBody);
       }
       positionsUpdated.textContent = `Last updated: ${nowStamp()}`;
       setLine(
@@ -708,29 +758,56 @@
         ordersBody.innerHTML = groups
           .map((g) => {
             const side = String(g.side || "").toLowerCase();
-            const sideClass = side === "buy" ? "side-buy" : side === "sell" ? "side-sell" : "";
-            const sideType = `${String(g.side || "").toUpperCase()} ${String(g.type || "limit").toUpperCase()}`.trim();
+            const classification = String(g.classification || "entry_limit");
+            const isProt = classification === "take_profit" || classification === "stop_loss";
+            const sideClass =
+              classification === "take_profit"
+                ? "side-tp"
+                : classification === "stop_loss"
+                ? "side-sl"
+                : side === "buy"
+                ? "side-buy"
+                : side === "sell"
+                ? "side-sell"
+                : "";
             const d = g.display || {};
+            const typeLabel = g.display_type || g.type || `${String(side).toUpperCase()} LIMIT`;
             const symLabel = `${dash(g.symbol)} (${dash(g.count)})`;
-            const range = d.range || "—";
+            let range = d.range || "—";
+            if (g.trigger_price && g.limit_price && String(g.trigger_price) !== String(g.limit_price)) {
+              range = `trig ${d.trigger_price || g.trigger_price} / lim ${d.limit_price || g.limit_price}`;
+            } else if (g.trigger_price && isProt) {
+              range = dash(d.trigger_price || g.trigger_price);
+            }
             const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
-            return `<tr>
-              <td class="${sideClass}">${symLabel}</td>
-              <td class="${sideClass}">${sideType}</td>
+            const ids = Array.isArray(g.order_ids) ? g.order_ids.join(",") : "";
+            const cancelLabel = isProt
+              ? classification === "take_profit"
+                ? "Cancel TP"
+                : "Cancel SL"
+              : "Cancel";
+            return `<tr data-class="${esc(classification)}">
+              <td class="${sideClass}"><button type="button" class="link-sym" data-symbol="${esc(g.symbol)}">${symLabel}</button></td>
+              <td class="${sideClass}">${esc(typeLabel)}${g.reduce_only ? " · RO" : ""}</td>
               <td class="num">${dash(g.count)}</td>
               <td class="num">${dash(d.total_remaining_size || g.total_remaining_size)}</td>
               <td class="num">${range}</td>
               <td class="num">${dash(d.vwap || g.vwap)}</td>
               <td class="actions">
-                <button type="button" class="btn-danger" data-cancel-group="1"
+                <button type="button" class="${isProt ? "btn-danger" : "btn-danger"}" data-cancel-group="1"
                   data-symbol="${esc(g.symbol)}" data-side="${esc(side)}" data-count="${esc(g.count)}"
                   data-vol="${esc(d.total_remaining_size || g.total_remaining_size)}"
-                  data-range="${esc(range)}" data-vwap="${esc(d.vwap || g.vwap)}">Cancel</button>
+                  data-range="${esc(range)}" data-vwap="${esc(d.vwap || g.vwap)}"
+                  data-classification="${esc(classification)}" data-display-type="${esc(typeLabel)}"
+                  data-order-ids="${esc(ids)}" data-reduce-only="${g.reduce_only ? "1" : "0"}"
+                  data-trigger="${esc(g.trigger_price || "")}" data-limit="${esc(g.limit_price || g.min_price || "")}"
+                  >${cancelLabel}</button>
               </td>
             </tr>`;
           })
           .join("");
         wireOrderActions();
+        wireSymbolClicks(ordersBody);
       }
       ordersLoadedOnce = true;
       ordersUpdated.textContent = `Last updated: ${nowStamp()}`;

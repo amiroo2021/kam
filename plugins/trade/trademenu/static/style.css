@@ -136,6 +136,19 @@ th { color: var(--muted); font-weight: 600; }
 th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .side-long, .side-buy { color: var(--buy); font-weight: 700; }
 .side-short, .side-sell { color: var(--sell); font-weight: 700; }
+.side-tp { color: var(--ok); font-weight: 700; }
+.side-sl { color: #ff9f43; font-weight: 700; }
+button.link-sym {
+  background: transparent !important;
+  color: inherit;
+  border: 0 !important;
+  padding: 0 !important;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
 .status-line { color: var(--muted); font-size: 12px; padding: 0; }
 .status-line.error { color: var(--danger); }
 .status-line.ok { color: var(--ok); }

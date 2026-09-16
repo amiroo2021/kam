@@ -395,7 +395,9 @@ def create_app(
             str(body.get("account") or ""),
             str(body.get("symbol") or ""),
             str(body.get("side") or ""),
-            str(body.get("type") or body.get("order_type") or "limit"),
+            str(body.get("type") or body.get("order_type") or body.get("display_type") or "limit"),
+            str(body.get("classification") or ""),
+            body.get("order_ids") if isinstance(body.get("order_ids"), list) else None,
         )
         return JSONResponse(out, status_code=200 if out.get("success") else 400)
 

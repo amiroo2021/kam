@@ -2011,34 +2011,98 @@ def _normalize_open_orders(payload: Any) -> List[Dict[str, Any]]:
     return rows
 
 
+def _order_classification(order: Dict[str, Any]) -> str:
+    """Canonical open-order purpose from exchange/agent metadata.
+
+    Priority:
+      1. Explicit TP/SL protection metadata (``_protection_order_tpsl``)
+      2. Non-protective trigger orders
+      3. Reduce-only residuals without TP/SL label → other
+      4. Ordinary entry limit
+    Never classifies TP vs SL from price vs entry.
+    """
+    tpsl = _protection_order_tpsl(order)
+    if tpsl == "tp":
+        return "take_profit"
+    if tpsl == "sl":
+        return "stop_loss"
+    if bool(order.get("is_trigger")) or (
+        order.get("trigger_px") is not None and str(order.get("order_type") or "").lower().find("trigger") >= 0
+    ):
+        # Trigger without reliable TP/SL label.
+        return "trigger"
+    ot = str(order.get("order_type") or "").strip().lower()
+    if "trigger" in ot and tpsl is None:
+        return "trigger"
+    if bool(order.get("reduce_only")):
+        return "other"
+    return "entry_limit"
+
+
+def _order_display_type(classification: str, side: str) -> str:
+    side_u = str(side or "").strip().upper() or "?"
+    mapping = {
+        "take_profit": "TAKE PROFIT",
+        "stop_loss": "STOP LOSS",
+        "trigger": "TRIGGER",
+        "other": f"{side_u} OTHER",
+        "entry_limit": f"{side_u} LIMIT",
+    }
+    return mapping.get(classification, f"{side_u} LIMIT")
+
+
 def _aggregate_open_orders(
     orders: List[Dict[str, Any]],
     price_decimals_by_symbol: Optional[Dict[str, int]] = None,
 ) -> List[CanonicalOrderGroup]:
-    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # Group by symbol + side + classification so TP/SL never merge.
+    grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for order in orders:
-        key = (order["symbol"], order["side"])
+        classification = _order_classification(order)
+        key = (order["symbol"], order["side"], classification)
         group = grouped.setdefault(
             key,
             {
                 "symbol": order["symbol"],
                 "side": order["side"],
+                "classification": classification,
                 "order_count": 0,
                 "total_size": Decimal("0"),
                 "notional": Decimal("0"),
                 "min_price": None,
                 "max_price": None,
+                "min_trigger": None,
+                "max_trigger": None,
+                "reduce_only": False,
+                "order_ids": [],
             },
         )
         group["order_count"] += 1
         group["total_size"] += order["size"]
-        group["notional"] += order["price"] * order["size"]
-        min_price = group["min_price"]
-        max_price = group["max_price"]
-        if min_price is None or order["price"] < min_price:
-            group["min_price"] = order["price"]
-        if max_price is None or order["price"] > max_price:
-            group["max_price"] = order["price"]
+        # Prefer limit price for notional; fall back to trigger when limit missing.
+        px = order.get("price")
+        if px is None:
+            px = order.get("trigger_px") or Decimal("0")
+        group["notional"] += px * order["size"]
+        if order.get("price") is not None:
+            min_price = group["min_price"]
+            max_price = group["max_price"]
+            if min_price is None or order["price"] < min_price:
+                group["min_price"] = order["price"]
+            if max_price is None or order["price"] > max_price:
+                group["max_price"] = order["price"]
+        if order.get("trigger_px") is not None:
+            mt = group["min_trigger"]
+            xt = group["max_trigger"]
+            if mt is None or order["trigger_px"] < mt:
+                group["min_trigger"] = order["trigger_px"]
+            if xt is None or order["trigger_px"] > xt:
+                group["max_trigger"] = order["trigger_px"]
+        if order.get("reduce_only"):
+            group["reduce_only"] = True
+        oid = order.get("oid")
+        if isinstance(oid, int):
+            group["order_ids"].append(oid)
 
     rows: List[CanonicalOrderGroup] = []
     for group in grouped.values():
@@ -2048,6 +2112,28 @@ def _aggregate_open_orders(
         precision = None
         if price_decimals_by_symbol:
             precision = price_decimals_by_symbol.get(group["symbol"])
+        min_price = group["min_price"]
+        max_price = group["max_price"]
+        # Protective/trigger display prefers trigger band when limit band empty.
+        if min_price is None and group["min_trigger"] is not None:
+            min_price = group["min_trigger"]
+        if max_price is None and group["max_trigger"] is not None:
+            max_price = group["max_trigger"]
+        trigger_price = None
+        if group["min_trigger"] is not None and group["max_trigger"] is not None:
+            if group["min_trigger"] == group["max_trigger"]:
+                trigger_price = _decimal_text(group["min_trigger"])
+            else:
+                trigger_price = f"{_decimal_text(group['min_trigger'])}–{_decimal_text(group['max_trigger'])}"
+        elif group["min_trigger"] is not None:
+            trigger_price = _decimal_text(group["min_trigger"])
+        limit_price = None
+        if group["min_price"] is not None and group["max_price"] is not None:
+            if group["min_price"] == group["max_price"]:
+                limit_price = _decimal_text(group["min_price"])
+            else:
+                limit_price = f"{_decimal_text(group['min_price'])}–{_decimal_text(group['max_price'])}"
+        classification = group["classification"]
         rows.append(
             CanonicalOrderGroup(
                 symbol=group["symbol"],
@@ -2055,11 +2141,17 @@ def _aggregate_open_orders(
                 order_count=group["order_count"],
                 total_size=_decimal_text(total_size),
                 vwap=_format_decimal_places(vwap, precision) if precision is not None else _decimal_text(vwap),
-                min_price=_decimal_text(group["min_price"]),
-                max_price=_decimal_text(group["max_price"]),
+                min_price=_decimal_text(min_price) if min_price is not None else "",
+                max_price=_decimal_text(max_price) if max_price is not None else "",
+                classification=classification,
+                display_type=_order_display_type(classification, group["side"]),
+                reduce_only=bool(group["reduce_only"]),
+                trigger_price=trigger_price,
+                limit_price=limit_price,
+                order_ids=list(group["order_ids"]) or None,
             )
         )
-    rows.sort(key=lambda item: (item.symbol, item.side))
+    rows.sort(key=lambda item: (item.symbol, item.classification, item.side))
     return rows
 
 
@@ -4070,6 +4162,17 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
 
     requested_symbol = str(request.get("symbol") or "").strip()
     requested_side = str(request.get("side") or "").strip().lower()
+    requested_classification = str(
+        request.get("classification") or request.get("kind") or request.get("order_kind") or ""
+    ).strip().lower()
+    raw_ids = request.get("order_ids") or request.get("oids") or []
+    requested_oids: set[int] = set()
+    if isinstance(raw_ids, (list, tuple)):
+        for item in raw_ids:
+            try:
+                requested_oids.add(int(item))
+            except (TypeError, ValueError):
+                continue
     if not requested_symbol:
         return make_failure(
             operation="cancel_order_group",
@@ -4130,7 +4233,35 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
             message=sanitize_error_message(str(exc)),
         )
 
-    target_orders = [order for order in pre_orders if _order_matches_resolved_instrument(order, candidate, requested_side)]
+    target_orders = [
+        order
+        for order in pre_orders
+        if _order_matches_resolved_instrument(order, candidate, requested_side)
+    ]
+    # Scope by explicit order IDs from the UI group when provided.
+    if requested_oids:
+        target_orders = [order for order in target_orders if isinstance(order.get("oid"), int) and int(order["oid"]) in requested_oids]
+    # Scope by classification so TP cancel never includes SL (and vice versa).
+    # Default (no classification): entry_limit only — protects against accidental
+    # mass-cancel of TP/SL when the client still sends bare symbol+side.
+    if requested_classification:
+        allowed = {requested_classification}
+        # Accept friendly aliases from the web UI.
+        aliases = {
+            "tp": "take_profit",
+            "take_profit": "take_profit",
+            "sl": "stop_loss",
+            "stop_loss": "stop_loss",
+            "limit": "entry_limit",
+            "entry_limit": "entry_limit",
+            "entry": "entry_limit",
+            "trigger": "trigger",
+            "other": "other",
+        }
+        normalized = aliases.get(requested_classification, requested_classification)
+        target_orders = [order for order in target_orders if _order_classification(order) == normalized]
+    else:
+        target_orders = [order for order in target_orders if _order_classification(order) == "entry_limit"]
     if not target_orders:
         return make_failure(
             operation="cancel_order_group",
@@ -4210,7 +4341,16 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
     remaining_target_count = sum(1 for oid in target_oids if oid in post_oids)
     confirmed_absent_count = len(target_oids) - remaining_target_count
     non_target_preserved = all(oid in post_oids for oid in non_target_oids)
-    verified = remaining_target_count == 0 and non_target_preserved and cancelled_count == len(target_oids) and not partial
+    # Authoritative success: none of the targeted OIDs remain open, and we did
+    # not disturb non-target orders. Orders already filled/gone before cancel
+    # still count as confirmed-absent — not a partial failure.
+    targets_cleared = remaining_target_count == 0 and len(target_oids) > 0
+    verified = targets_cleared and non_target_preserved and not (partial and remaining_target_count > 0)
+    # Soften partial when every target OID is gone even if exchange accepted
+    # fewer cancels than requested (already filled / already cancelled).
+    if targets_cleared and non_target_preserved:
+        partial = False
+        verified = True
 
     cancel_result = CanonicalCancelGroupResult(
         symbol=str(candidate.get("public_symbol") or requested_symbol),
@@ -4220,10 +4360,12 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
         confirmed_absent_count=confirmed_absent_count,
         remaining_target_count=remaining_target_count,
         verified=verified,
-        partial=partial or not verified,
-        status="success" if verified else ("partial" if cancelled_count else "failed"),
+        partial=partial or (not verified and remaining_target_count > 0),
+        status="success" if verified else ("partial" if confirmed_absent_count or cancelled_count else "failed"),
         batch_count=submitted_batches,
         batches=batches or None,
+        requested_cancel_count=len(target_oids),
+        verified_cancel_count=confirmed_absent_count,
     )
 
     if verified:

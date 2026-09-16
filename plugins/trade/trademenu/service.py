@@ -309,20 +309,43 @@ class TradeMenuService:
                 {
                     "symbol": plain.get("symbol"),
                     "side": side,
-                    "type": "limit",
+                    "type": (
+                        "limit"
+                        if str(plain.get("classification") or "entry_limit") == "entry_limit"
+                        else str(plain.get("classification") or "other")
+                    ),
+                    "classification": plain.get("classification") or "entry_limit",
+                    "display_type": plain.get("display_type")
+                    or (
+                        f"{side.upper()} LIMIT"
+                        if str(plain.get("classification") or "entry_limit") == "entry_limit"
+                        else str(plain.get("classification") or "LIMIT").replace("_", " ").upper()
+                    ),
                     "count": int(plain.get("order_count") or 0),
                     "total_remaining_size": plain.get("total_size"),
                     "min_price": plain.get("min_price"),
                     "max_price": plain.get("max_price"),
                     "vwap": plain.get("vwap"),
+                    "reduce_only": bool(plain.get("reduce_only")),
+                    "trigger_price": plain.get("trigger_price"),
+                    "limit_price": plain.get("limit_price"),
+                    "order_ids": plain.get("order_ids"),
                     "display": {
                         "total_remaining_size": format_size(plain.get("total_size"), meta),
                         "min_price": format_price(plain.get("min_price"), meta),
                         "max_price": format_price(plain.get("max_price"), meta),
                         "vwap": format_price(plain.get("vwap"), meta),
+                        "trigger_price": format_price(plain.get("trigger_price"), meta)
+                        if plain.get("trigger_price") and "–" not in str(plain.get("trigger_price"))
+                        else (plain.get("trigger_price") or "—"),
+                        "limit_price": format_price(plain.get("limit_price"), meta)
+                        if plain.get("limit_price") and "–" not in str(plain.get("limit_price"))
+                        else (plain.get("limit_price") or "—"),
                         "range": (
                             f"{format_price(plain.get('min_price'), meta)}–"
                             f"{format_price(plain.get('max_price'), meta)}"
+                            if plain.get("min_price") and plain.get("max_price")
+                            else format_price(plain.get("min_price") or plain.get("max_price"), meta)
                         ),
                     },
                 }
@@ -453,12 +476,28 @@ class TradeMenuService:
                     or cg.get("order_count")
                     or cancelled
                 )
+                confirmed_absent = int(cg.get("confirmed_absent_count") or cg.get("verified_cancel_count") or 0)
+                remaining = int(cg.get("remaining_target_count") or 0)
                 out["cancelled"] = cancelled
                 out["requested"] = requested
+                out["confirmed_absent"] = confirmed_absent
+                out["remaining"] = remaining
                 out["verified"] = bool(cg.get("verified"))
-                if requested and cancelled < requested:
+                if out["verified"] or remaining == 0:
+                    out["partial"] = False
+                    if confirmed_absent and confirmed_absent >= requested:
+                        out["message"] = (
+                            f"All {requested} targeted orders are no longer open"
+                            + (f" ({cancelled} cancel acks)." if cancelled else ".")
+                        )
+                    else:
+                        out["message"] = f"Cancelled {cancelled} orders; none of the targets remain open."
+                elif requested and cancelled < requested:
                     out["partial"] = True
-                    out["message"] = f"Cancelled {cancelled}/{requested} orders."
+                    out["message"] = (
+                        f"Cancelled {cancelled}/{requested} orders; "
+                        f"{remaining} still open."
+                    )
                 else:
                     out["message"] = f"Cancelled {cancelled} orders."
             else:
@@ -514,6 +553,8 @@ class TradeMenuService:
         symbol: str,
         side: str,
         order_type: str = "limit",
+        classification: str = "",
+        order_ids: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         side_n = str(side or "").strip().lower()
         if side_n not in {"buy", "sell"}:
@@ -524,12 +565,32 @@ class TradeMenuService:
                 "exchange": exchange,
                 "account": account,
             }
+        extra: Dict[str, Any] = {
+            "symbol": str(symbol or "").strip(),
+            "side": side_n,
+        }
+        cls = str(classification or order_type or "").strip()
+        if cls:
+            # Map UI type labels to canonical classification.
+            low = cls.lower().replace(" ", "_")
+            aliases = {
+                "limit": "entry_limit",
+                "buy_limit": "entry_limit",
+                "sell_limit": "entry_limit",
+                "entry_limit": "entry_limit",
+                "take_profit": "take_profit",
+                "tp": "take_profit",
+                "stop_loss": "stop_loss",
+                "sl": "stop_loss",
+                "trigger": "trigger",
+                "other": "other",
+            }
+            extra["classification"] = aliases.get(low, low)
+        if order_ids:
+            extra["order_ids"] = list(order_ids)
         return self._execute_write(
             "cancel_order_group",
             exchange,
             account,
-            {
-                "symbol": str(symbol or "").strip(),
-                "side": side_n,
-            },
+            extra,
         )

@@ -219,14 +219,28 @@ def _order_group_summary_line(group: Any) -> str:
     vwap = _rounded_money_display(getattr(group, "vwap", ""))
     min_price = _display_or_dash(getattr(group, "min_price", ""))
     max_price = _display_or_dash(getattr(group, "max_price", ""))
+    display_type = str(getattr(group, "display_type", "") or "").strip()
+    classification = str(getattr(group, "classification", "") or "").strip()
+    kind_label = display_type or (
+        "TAKE PROFIT"
+        if classification == "take_profit"
+        else "STOP LOSS"
+        if classification == "stop_loss"
+        else "TRIGGER"
+        if classification == "trigger"
+        else f"{side}"
+    )
     count_label = "order" if count == 1 else "orders"
     if min_price == max_price:
         price_fragment = f"VWAP {vwap} · @ {min_price}"
     else:
         price_fragment = f"VWAP {vwap} · range {min_price}-{max_price}"
+    trigger = getattr(group, "trigger_price", None)
+    if trigger:
+        price_fragment = f"trigger {trigger} · {price_fragment}"
     return "\n".join(
         [
-            f"{_direction_emoji(side)} {symbol} {side}",
+            f"{_direction_emoji(side)} {symbol} {kind_label}",
             f"{count} {count_label} · total size {total_size}",
             price_fragment,
         ]
@@ -237,7 +251,16 @@ def _order_group_button_text(group: Any) -> str:
     side = str(getattr(group, "side", "")).strip().title() or "Side"
     symbol = str(getattr(group, "symbol", "")).strip() or "Symbol"
     count = getattr(group, "order_count", 0)
-    return f"{_direction_emoji(getattr(group, 'side', ''))} {symbol} {side} -- {count} orders"
+    display_type = str(getattr(group, "display_type", "") or "").strip()
+    classification = str(getattr(group, "classification", "") or "").strip()
+    kind = display_type or (
+        "TP"
+        if classification == "take_profit"
+        else "SL"
+        if classification == "stop_loss"
+        else side
+    )
+    return f"{_direction_emoji(getattr(group, 'side', ''))} {symbol} {kind} -- {count} orders"
 
 
 # ---------------------------------------------------------------------------

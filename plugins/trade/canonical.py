@@ -127,7 +127,12 @@ class CanonicalPosition:
 
 @dataclass(frozen=True)
 class CanonicalOrderGroup:
-    """Canonical aggregated open-order row."""
+    """Canonical aggregated open-order row.
+
+    ``classification`` separates ordinary entry ladders from protective /
+    trigger orders so TP and SL are never merged merely because they share
+    a side (e.g. both SELL on a long).
+    """
 
     symbol: str
     side: str
@@ -136,9 +141,16 @@ class CanonicalOrderGroup:
     vwap: str
     min_price: str
     max_price: str
+    # Additive classification metadata (defaults preserve older callers).
+    classification: str = "entry_limit"  # entry_limit|take_profit|stop_loss|trigger|other
+    display_type: str = "LIMIT"
+    reduce_only: bool = False
+    trigger_price: Optional[str] = None
+    limit_price: Optional[str] = None
+    order_ids: Optional[list] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "symbol": self.symbol,
             "side": self.side,
             "order_count": self.order_count,
@@ -146,7 +158,15 @@ class CanonicalOrderGroup:
             "vwap": self.vwap,
             "min_price": self.min_price,
             "max_price": self.max_price,
+            "classification": self.classification,
+            "display_type": self.display_type,
+            "reduce_only": self.reduce_only,
+            "trigger_price": self.trigger_price,
+            "limit_price": self.limit_price,
         }
+        if self.order_ids is not None:
+            data["order_ids"] = list(self.order_ids)
+        return data
 
 
 @dataclass(frozen=True)
