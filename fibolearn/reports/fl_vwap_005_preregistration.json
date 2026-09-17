@@ -1,0 +1,63 @@
+{
+  "ambiguity_policy": "same-candle ambiguous excluded from primary outcome; otherwise handled by frozen semantics",
+  "censoring_policy": "insufficient coverage or gap-bridged uncertainty -> censored/insufficient as dictated by frozen semantics",
+  "control_weighting": "matched-set weighting with up-to-5 controls and reuse-aware effective control N",
+  "descriptive_breakdowns": [
+    "symbol",
+    "BUY vs SELL",
+    "P0",
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5+"
+  ],
+  "freeze_artifact_path": "/root/kam/fibolearn/reports/fl_vwap_005_validation_freeze.json",
+  "frozen_methodology_commit": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+  "gap_policy": "Do not bridge missing 1m intervals; episodes crossing a gap are insufficient coverage/censored when timing or ordering would be unknowable.",
+  "matching_policy": "FL-VWAP-004 frozen landmark risk-set",
+  "primary_estimand": {
+    "absolute_difference_pp": true,
+    "ci95": "naive_or_approximate_if_reuse_not_fully_modeled",
+    "odds_ratio": true,
+    "relative_risk": true,
+    "treated_vs_control_progression_rate": true
+  },
+  "primary_outcome": "P(n+1) before TP after verified landmark vs TP before P(n+1) after verified landmark",
+  "prior_use_classifications": {
+    "BTC": "KNOWN_PREVIOUSLY_INSPECTED",
+    "ETH": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "PAXG": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "SOL": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "ZEC": "POSSIBLY_PREVIOUSLY_INSPECTED"
+  },
+  "raw_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "raw_manifest_path": "/root/kam/fibolearn/reports/fl_vwap_005_raw_data_manifest.json",
+  "result_groups": {
+    "all_symbols": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "ZEC",
+      "PAXG"
+    ],
+    "cleaner_validation": [
+      "ETH",
+      "SOL",
+      "PAXG"
+    ],
+    "secondary_sensitivity": [
+      "BTC",
+      "ZEC"
+    ]
+  },
+  "symbols": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "ZEC",
+    "PAXG"
+  ],
+  "validation_data_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "validation_db_path": "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite"
+}

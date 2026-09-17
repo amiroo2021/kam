@@ -1,0 +1,69 @@
+{
+  "cleaner_validation_symbols": [
+    "ETH",
+    "SOL",
+    "PAXG"
+  ],
+  "frozen_methodology_commit": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+  "gap_counts": {
+    "BTC": 35,
+    "ETH": 35,
+    "PAXG": 10,
+    "SOL": 11,
+    "ZEC": 21
+  },
+  "integrity": {
+    "BTC": {
+      "development_overlap_violations": 0,
+      "duplicate_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0
+    },
+    "ETH": {
+      "development_overlap_violations": 0,
+      "duplicate_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0
+    },
+    "PAXG": {
+      "development_overlap_violations": 0,
+      "duplicate_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0
+    },
+    "SOL": {
+      "development_overlap_violations": 0,
+      "duplicate_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0
+    },
+    "ZEC": {
+      "development_overlap_violations": 0,
+      "duplicate_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0
+    }
+  },
+  "no_outcomes_inspected": true,
+  "preregistration_path": "/root/kam/fibolearn/reports/fl_vwap_005_preregistration.json",
+  "prior_use_classifications": {
+    "BTC": "KNOWN_PREVIOUSLY_INSPECTED",
+    "ETH": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "PAXG": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "SOL": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION",
+    "ZEC": "POSSIBLY_PREVIOUSLY_INSPECTED"
+  },
+  "raw_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "raw_manifest_path": "/root/kam/fibolearn/reports/fl_vwap_005_raw_data_manifest.json",
+  "secondary_sensitivity_symbols": [
+    "BTC",
+    "ZEC"
+  ],
+  "status": "VALIDATION_FROZEN_READY_TO_RUN",
+  "test_results": {
+    "gap_policy_tests_passed": true,
+    "note": "No gap-bridging validation code was added; validation DB is read-only for freeze."
+  },
+  "validation_db_path": "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite",
+  "validation_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60"
+}
