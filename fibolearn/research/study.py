@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Sequence
 
 from fibolearn.research.discovery import create_candidate_from_live_state
 from fibolearn.research.validation import temporal_oos_split, walk_forward_validate, leave_one_symbol_out
+from fibolearn.research.phase3b import question_answer_from_reports
 
 
 @dataclass

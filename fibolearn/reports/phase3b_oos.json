@@ -1,0 +1,31 @@
+{
+  "cells_evaluated": 144,
+  "note": "Temporal group split by cycle_id and start timestamp; no ambiguous episodes in order-sensitive OOS.",
+  "oos": {
+    "ambiguous_excluded": 0,
+    "censored": 1819,
+    "ci95": [
+      0.43745553307097307,
+      0.45655207165296974
+    ],
+    "n_episodes": 12231,
+    "order_sensitive_n": 10412,
+    "progression": 4654,
+    "progression_rate": 0.4469842489435267,
+    "regression": 5758
+  },
+  "train": {
+    "ambiguous_excluded": 0,
+    "censored": 674,
+    "ci95": [
+      0.37455146941218204,
+      0.40728321363724546
+    ],
+    "n_episodes": 4085,
+    "order_sensitive_n": 3411,
+    "progression": 1333,
+    "progression_rate": 0.39079448841981823,
+    "regression": 2078
+  },
+  "train_fraction": 0.7
+}

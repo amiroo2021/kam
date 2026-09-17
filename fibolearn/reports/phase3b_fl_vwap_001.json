@@ -1,0 +1,6014 @@
+{
+  "cells": [
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "1",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3483664793465437,
+          0.4092943147702817
+        ],
+        "n_episodes": 970,
+        "order_sensitive_n": 970,
+        "progression": 367,
+        "progression_rate": 0.3783505154639175,
+        "regression": 603
+      },
+      "condition_timing": {
+        "early": 35,
+        "late": 32,
+        "middle": 29,
+        "start": 619
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.46692684720197897,
+          0.5400287880867969
+        ],
+        "n_episodes": 715,
+        "order_sensitive_n": 715,
+        "progression": 360,
+        "progression_rate": 0.5034965034965035,
+        "regression": 355
+      },
+      "direction": "SELL",
+      "lift_pp": 0.12514598803258603,
+      "low_n": false,
+      "odds_ratio": 1.6652735918558703,
+      "or_ci95": [
+        1.3693459029041886,
+        2.025153856195957
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.3307673253177341,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.34671865400968327,
+          0.537720722887437
+        ],
+        "n_episodes": 100,
+        "order_sensitive_n": 100,
+        "progression": 44,
+        "progression_rate": 0.44,
+        "regression": 56
+      },
+      "condition_timing": {
+        "early": 16,
+        "late": 4,
+        "middle": 6,
+        "start": 65
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3836068307058106,
+          0.5847614802463456
+        ],
+        "n_episodes": 91,
+        "order_sensitive_n": 91,
+        "progression": 44,
+        "progression_rate": 0.4835164835164835,
+        "regression": 47
+      },
+      "direction": "SELL",
+      "lift_pp": 0.04351648351648352,
+      "low_n": false,
+      "odds_ratio": 1.1894736842105262,
+      "or_ci95": [
+        0.6746773376555687,
+        2.0970730250786342
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.098901098901099,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.30505051566675334,
+          0.3762263040810412
+        ],
+        "n_episodes": 677,
+        "order_sensitive_n": 677,
+        "progression": 230,
+        "progression_rate": 0.3397341211225997,
+        "regression": 447
+      },
+      "condition_timing": {
+        "early": 39,
+        "late": 32,
+        "middle": 40,
+        "start": 350
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4427266928485241,
+          0.5336093321544015
+        ],
+        "n_episodes": 461,
+        "order_sensitive_n": 461,
+        "progression": 225,
+        "progression_rate": 0.4880694143167028,
+        "regression": 236
+      },
+      "direction": "SELL",
+      "lift_pp": 0.1483352931941031,
+      "low_n": false,
+      "odds_ratio": 1.851132522827019,
+      "or_ci95": [
+        1.4533438354106678,
+        2.357798294922861
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.4366217108365555,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.27418923513585514,
+          0.37922612758785545
+        ],
+        "n_episodes": 302,
+        "order_sensitive_n": 302,
+        "progression": 98,
+        "progression_rate": 0.32450331125827814,
+        "regression": 204
+      },
+      "condition_timing": {
+        "early": 32,
+        "late": 14,
+        "middle": 11,
+        "start": 148
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.40119619033828186,
+          0.5365556751904251
+        ],
+        "n_episodes": 205,
+        "order_sensitive_n": 205,
+        "progression": 96,
+        "progression_rate": 0.4682926829268293,
+        "regression": 109
+      },
+      "direction": "SELL",
+      "lift_pp": 0.14378937166855116,
+      "low_n": false,
+      "odds_ratio": 1.829659504438727,
+      "or_ci95": [
+        1.2710952189411047,
+        2.6336767319223773
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.4431060228969639,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.29934441579117815,
+          0.4791060847334511
+        ],
+        "n_episodes": 109,
+        "order_sensitive_n": 109,
+        "progression": 42,
+        "progression_rate": 0.3853211009174312,
+        "regression": 67
+      },
+      "condition_timing": {
+        "early": 22,
+        "late": 3,
+        "middle": 5,
+        "start": 44
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.42781145210146765,
+          0.6492681557174879
+        ],
+        "n_episodes": 74,
+        "order_sensitive_n": 74,
+        "progression": 40,
+        "progression_rate": 0.5405405405405406,
+        "regression": 34
+      },
+      "direction": "SELL",
+      "lift_pp": 0.15521943962310936,
+      "low_n": false,
+      "odds_ratio": 1.8644501278772379,
+      "or_ci95": [
+        1.0288077361906147,
+        3.378837616650068
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.4028314028314028,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3593756614871373,
+          0.43019628960173206
+        ],
+        "n_episodes": 728,
+        "order_sensitive_n": 728,
+        "progression": 287,
+        "progression_rate": 0.3942307692307692,
+        "regression": 441
+      },
+      "condition_timing": {
+        "early": 68,
+        "late": 37,
+        "middle": 55,
+        "start": 357
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4753273966291645,
+          0.5611520243694654
+        ],
+        "n_episodes": 517,
+        "order_sensitive_n": 517,
+        "progression": 268,
+        "progression_rate": 0.5183752417794971,
+        "regression": 249
+      },
+      "direction": "BUY",
+      "lift_pp": 0.1241444725487279,
+      "low_n": false,
+      "odds_ratio": 1.6525956260346781,
+      "or_ci95": [
+        1.3162950101325959,
+        2.074817789451194
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.3149030523187244,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3244106182615045,
+          0.4901866573567022
+        ],
+        "n_episodes": 131,
+        "order_sensitive_n": 131,
+        "progression": 53,
+        "progression_rate": 0.40458015267175573,
+        "regression": 78
+      },
+      "condition_timing": {
+        "early": 17,
+        "late": 4,
+        "middle": 7,
+        "start": 83
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3782506952330096,
+          0.5607957826983323
+        ],
+        "n_episodes": 111,
+        "order_sensitive_n": 111,
+        "progression": 52,
+        "progression_rate": 0.46846846846846846,
+        "regression": 59
+      },
+      "direction": "BUY",
+      "lift_pp": 0.06388831579671272,
+      "low_n": false,
+      "odds_ratio": 1.2946673996701483,
+      "or_ci95": [
+        0.7786787841114499,
+        2.1525739624219162
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1579126296107427,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3368485338739036,
+          0.4432293743014987
+        ],
+        "n_episodes": 319,
+        "order_sensitive_n": 319,
+        "progression": 124,
+        "progression_rate": 0.3887147335423197,
+        "regression": 195
+      },
+      "condition_timing": {
+        "early": 46,
+        "late": 15,
+        "middle": 12,
+        "start": 166
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4227263358025848,
+          0.5484482899616994
+        ],
+        "n_episodes": 239,
+        "order_sensitive_n": 239,
+        "progression": 116,
+        "progression_rate": 0.48535564853556484,
+        "regression": 123
+      },
+      "direction": "BUY",
+      "lift_pp": 0.09664091499324512,
+      "low_n": false,
+      "odds_ratio": 1.4812773360649074,
+      "or_ci95": [
+        1.0559036885296866,
+        2.0780139042746217
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.2486165474422999,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.255316102227993,
+          0.4216906547906502
+        ],
+        "n_episodes": 120,
+        "order_sensitive_n": 120,
+        "progression": 40,
+        "progression_rate": 0.3333333333333333,
+        "regression": 80
+      },
+      "condition_timing": {
+        "early": 20,
+        "late": 4,
+        "middle": 9,
+        "start": 53
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3525142050420289,
+          0.5584401857969586
+        ],
+        "n_episodes": 86,
+        "order_sensitive_n": 86,
+        "progression": 39,
+        "progression_rate": 0.45348837209302323,
+        "regression": 47
+      },
+      "direction": "BUY",
+      "lift_pp": 0.12015503875968991,
+      "low_n": false,
+      "odds_ratio": 1.6528914879792074,
+      "or_ci95": [
+        0.9382073523220419,
+        2.9119898328150553
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.3604651162790697,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.2740853339545992,
+          0.4727266992988882
+        ],
+        "n_episodes": 87,
+        "order_sensitive_n": 87,
+        "progression": 32,
+        "progression_rate": 0.367816091954023,
+        "regression": 55
+      },
+      "condition_timing": {
+        "early": 22,
+        "late": 2,
+        "middle": 3,
+        "start": 39
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.340239312591756,
+          0.5738520026129358
+        ],
+        "n_episodes": 66,
+        "order_sensitive_n": 66,
+        "progression": 30,
+        "progression_rate": 0.45454545454545453,
+        "regression": 36
+      },
+      "direction": "BUY",
+      "lift_pp": 0.08672936259143155,
+      "low_n": false,
+      "odds_ratio": 1.4269757639620653,
+      "or_ci95": [
+        0.7471759119977283,
+        2.725274996474071
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.2357954545454546,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.34678176065773125,
+          0.5191928091994765
+        ],
+        "n_episodes": 123,
+        "order_sensitive_n": 123,
+        "progression": 53,
+        "progression_rate": 0.43089430894308944,
+        "regression": 70
+      },
+      "condition_timing": {
+        "early": 18,
+        "late": 2,
+        "middle": 6,
+        "start": 74
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4134784047743415,
+          0.6057816990761385
+        ],
+        "n_episodes": 100,
+        "order_sensitive_n": 100,
+        "progression": 51,
+        "progression_rate": 0.51,
+        "regression": 49
+      },
+      "direction": "BUY",
+      "lift_pp": 0.07910569105691057,
+      "low_n": false,
+      "odds_ratio": 1.3709997167941093,
+      "or_ci95": [
+        0.8088114031325104,
+        2.3239536635731377
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1835849056603773,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.12436838109244344,
+          0.3999646280826443
+        ],
+        "n_episodes": 34,
+        "order_sensitive_n": 34,
+        "progression": 8,
+        "progression_rate": 0.23529411764705882,
+        "regression": 26
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 1,
+        "start": 19
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 24,
+        "order_sensitive_n": 24,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 16
+      },
+      "direction": "BUY",
+      "lift_pp": -0.23529411764705882,
+      "low_n": true,
+      "odds_ratio": 1.606060606060606,
+      "or_ci95": [
+        0.5177121663094327,
+        4.982364406707904
+      ],
+      "percentage": "0.001",
+      "relative_risk": 0.0,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.30721877180530943,
+          0.43366942770720285
+        ],
+        "n_episodes": 220,
+        "order_sensitive_n": 220,
+        "progression": 81,
+        "progression_rate": 0.36818181818181817,
+        "regression": 139
+      },
+      "condition_timing": {
+        "early": 30,
+        "late": 6,
+        "middle": 8,
+        "start": 141
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3527652674297814,
+          0.4936668746406099
+        ],
+        "n_episodes": 185,
+        "order_sensitive_n": 185,
+        "progression": 78,
+        "progression_rate": 0.42162162162162165,
+        "regression": 107
+      },
+      "direction": "BUY",
+      "lift_pp": 0.05343980343980348,
+      "low_n": false,
+      "odds_ratio": 1.2499072620915965,
+      "or_ci95": [
+        0.8385217691267149,
+        1.8631217713719552
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1451451451451453,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.2182540663110087,
+          0.5124127048243043
+        ],
+        "n_episodes": 37,
+        "order_sensitive_n": 37,
+        "progression": 13,
+        "progression_rate": 0.35135135135135137,
+        "regression": 24
+      },
+      "condition_timing": {
+        "early": 10,
+        "late": 4,
+        "middle": 1,
+        "start": 9
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 24,
+        "order_sensitive_n": 24,
+        "progression": 12,
+        "progression_rate": null,
+        "regression": 12
+      },
+      "direction": "BUY",
+      "lift_pp": -0.35135135135135137,
+      "low_n": true,
+      "odds_ratio": 1.8148148148148149,
+      "or_ci95": [
+        0.6494402760717453,
+        5.071371353795563
+      ],
+      "percentage": "0.001",
+      "relative_risk": 0.0,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3582611622067933,
+          0.5090821340469813
+        ],
+        "n_episodes": 162,
+        "order_sensitive_n": 162,
+        "progression": 70,
+        "progression_rate": 0.43209876543209874,
+        "regression": 92
+      },
+      "condition_timing": {
+        "early": 30,
+        "late": 4,
+        "middle": 8,
+        "start": 99
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.40823274403341875,
+          0.5710549744121107
+        ],
+        "n_episodes": 141,
+        "order_sensitive_n": 141,
+        "progression": 69,
+        "progression_rate": 0.48936170212765956,
+        "regression": 72
+      },
+      "direction": "SELL",
+      "lift_pp": 0.05726293669556082,
+      "low_n": false,
+      "odds_ratio": 1.2577647346539496,
+      "or_ci95": [
+        0.800401544054074,
+        1.9764731083930096
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1325227963525837,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.2544576592146297,
+          0.44716720651655983
+        ],
+        "n_episodes": 90,
+        "order_sensitive_n": 90,
+        "progression": 31,
+        "progression_rate": 0.34444444444444444,
+        "regression": 59
+      },
+      "condition_timing": {
+        "early": 24,
+        "late": 2,
+        "middle": 1,
+        "start": 40
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.32104123341736546,
+          0.5519147698349607
+        ],
+        "n_episodes": 67,
+        "order_sensitive_n": 67,
+        "progression": 29,
+        "progression_rate": 0.43283582089552236,
+        "regression": 38
+      },
+      "direction": "SELL",
+      "lift_pp": 0.08839137645107792,
+      "low_n": false,
+      "odds_ratio": 1.4473304473304474,
+      "or_ci95": [
+        0.7590654161195605,
+        2.759663896266624
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.2566201251805489,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.21116447741565816,
+          0.530523619571851
+        ],
+        "n_episodes": 31,
+        "order_sensitive_n": 31,
+        "progression": 11,
+        "progression_rate": 0.3548387096774194,
+        "regression": 20
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 2,
+        "middle": 2,
+        "start": 13
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 23,
+        "order_sensitive_n": 23,
+        "progression": 11,
+        "progression_rate": null,
+        "regression": 12
+      },
+      "direction": "SELL",
+      "lift_pp": -0.3548387096774194,
+      "low_n": true,
+      "odds_ratio": 1.64,
+      "or_ci95": [
+        0.5578592767638226,
+        4.821287575609643
+      ],
+      "percentage": "0.001",
+      "relative_risk": 0.0,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 13,
+        "order_sensitive_n": 13,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 11
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 10
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 11,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 9
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2105263157894737,
+      "or_ci95": [
+        0.17182046411202617,
+        8.528518234378762
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.17003106263656131,
+          0.44757438266189764
+        ],
+        "n_episodes": 38,
+        "order_sensitive_n": 38,
+        "progression": 11,
+        "progression_rate": 0.2894736842105263,
+        "regression": 27
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 0,
+        "middle": 1,
+        "start": 26
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.19750029467803698,
+          0.5039241820005003
+        ],
+        "n_episodes": 33,
+        "order_sensitive_n": 33,
+        "progression": 11,
+        "progression_rate": 0.3333333333333333,
+        "regression": 22
+      },
+      "direction": "SELL",
+      "lift_pp": 0.04385964912280699,
+      "low_n": false,
+      "odds_ratio": 1.2222222222222223,
+      "or_ci95": [
+        0.4545081519854177,
+        3.2866894773358317
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1515151515151514,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4467746369781275,
+          0.506576679111862
+        ],
+        "n_episodes": 1068,
+        "order_sensitive_n": 1068,
+        "progression": 509,
+        "progression_rate": 0.47659176029962547,
+        "regression": 559
+      },
+      "condition_timing": {
+        "early": 37,
+        "late": 50,
+        "middle": 39,
+        "start": 667
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.5568498255555294,
+          0.6251185857322348
+        ],
+        "n_episodes": 793,
+        "order_sensitive_n": 793,
+        "progression": 469,
+        "progression_rate": 0.5914249684741488,
+        "regression": 324
+      },
+      "direction": "BUY",
+      "lift_pp": 0.11483320817452336,
+      "low_n": false,
+      "odds_ratio": 1.5888276823557341,
+      "or_ci95": [
+        1.319762144175095,
+        1.9127487595863186
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.240946692201161,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.32773302014361433,
+          0.43926387132079653
+        ],
+        "n_episodes": 288,
+        "order_sensitive_n": 288,
+        "progression": 110,
+        "progression_rate": 0.3819444444444444,
+        "regression": 178
+      },
+      "condition_timing": {
+        "early": 36,
+        "late": 6,
+        "middle": 17,
+        "start": 162
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4102616147758983,
+          0.5408150543102496
+        ],
+        "n_episodes": 221,
+        "order_sensitive_n": 221,
+        "progression": 105,
+        "progression_rate": 0.4751131221719457,
+        "regression": 116
+      },
+      "direction": "BUY",
+      "lift_pp": 0.09316867772750126,
+      "low_n": false,
+      "odds_ratio": 1.4628590293826345,
+      "or_ci95": [
+        1.0262232084324274,
+        2.0852739659972435
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.243932538050185,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 18,
+        "order_sensitive_n": 18,
+        "progression": 7,
+        "progression_rate": null,
+        "regression": 11
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 11
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 15,
+        "order_sensitive_n": 15,
+        "progression": 7,
+        "progression_rate": null,
+        "regression": 8
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.3529411764705883,
+      "or_ci95": [
+        0.3523106396008039,
+        5.19555648124526
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": [
+          0.2430176984112362,
+          0.4930910670000117
+        ],
+        "n_episodes": 54,
+        "order_sensitive_n": 53,
+        "progression": 19,
+        "progression_rate": 0.3584905660377358,
+        "regression": 34
+      },
+      "condition_timing": {
+        "early": 7,
+        "late": 1,
+        "middle": 2,
+        "start": 36
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": [
+          0.28968487981687807,
+          0.566994672040555
+        ],
+        "n_episodes": 46,
+        "order_sensitive_n": 45,
+        "progression": 19,
+        "progression_rate": 0.4222222222222222,
+        "regression": 26
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0637316561844864,
+      "low_n": false,
+      "odds_ratio": 1.3018867924528301,
+      "or_ci95": [
+        0.581226957008433,
+        2.916088457229844
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1777777777777778,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 2.3333333333333335,
+      "or_ci95": [
+        0.12051951270426478,
+        45.17479636516807
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605203,
+        73.26953126902981
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 21,
+        "order_sensitive_n": 21,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 15
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 0,
+        "middle": 0,
+        "start": 11
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 17,
+        "order_sensitive_n": 17,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 11
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.3478260869565217,
+      "or_ci95": [
+        0.35713673386101663,
+        5.086665661750414
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3542642044623491,
+          0.48262638350740594
+        ],
+        "n_episodes": 223,
+        "order_sensitive_n": 223,
+        "progression": 93,
+        "progression_rate": 0.4170403587443946,
+        "regression": 130
+      },
+      "condition_timing": {
+        "early": 23,
+        "late": 5,
+        "middle": 5,
+        "start": 130
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.46939666121906576,
+          0.6205089738263904
+        ],
+        "n_episodes": 163,
+        "order_sensitive_n": 163,
+        "progression": 89,
+        "progression_rate": 0.5460122699386503,
+        "regression": 74
+      },
+      "direction": "BUY",
+      "lift_pp": 0.12897191119425566,
+      "low_n": false,
+      "odds_ratio": 1.6767397624089293,
+      "or_ci95": [
+        1.1169864308847801,
+        2.517001239322272
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.3092552279174088,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.16346223395491324,
+          0.41849154685509304
+        ],
+        "n_episodes": 44,
+        "order_sensitive_n": 44,
+        "progression": 12,
+        "progression_rate": 0.2727272727272727,
+        "regression": 32
+      },
+      "condition_timing": {
+        "early": 5,
+        "late": 0,
+        "middle": 2,
+        "start": 21
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 28,
+        "order_sensitive_n": 28,
+        "progression": 12,
+        "progression_rate": null,
+        "regression": 16
+      },
+      "direction": "SELL",
+      "lift_pp": -0.2727272727272727,
+      "low_n": true,
+      "odds_ratio": 1.9696969696969697,
+      "or_ci95": [
+        0.7372618444985508,
+        5.2623178337300365
+      ],
+      "percentage": "0.001",
+      "relative_risk": 0.0,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 13,
+        "order_sensitive_n": 13,
+        "progression": 10,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 0,
+        "middle": 0,
+        "start": 5
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 11,
+        "progression": 10,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 2.3333333333333335,
+      "or_ci95": [
+        0.2870696883330506,
+        18.96558454519916
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.13869273777487975,
+        7.21018285487419
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 10,
+        "order_sensitive_n": 10,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "condition_timing": {
+        "early": 3,
+        "late": 0,
+        "middle": 0,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 2.2,
+      "or_ci95": [
+        0.32714931743410813,
+        14.794467669873207
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 3.0,
+      "or_ci95": [
+        0.05952328423311088,
+        151.20133433419636
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.37446339467753015,
+          0.4749348437121497
+        ],
+        "n_episodes": 368,
+        "order_sensitive_n": 368,
+        "progression": 156,
+        "progression_rate": 0.42391304347826086,
+        "regression": 212
+      },
+      "condition_timing": {
+        "early": 49,
+        "late": 13,
+        "middle": 16,
+        "start": 212
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.45646408557609086,
+          0.5707614672387591
+        ],
+        "n_episodes": 290,
+        "order_sensitive_n": 290,
+        "progression": 149,
+        "progression_rate": 0.5137931034482759,
+        "regression": 141
+      },
+      "direction": "BUY",
+      "lift_pp": 0.08988005997001502,
+      "low_n": false,
+      "odds_ratio": 1.4345951071924496,
+      "or_ci95": [
+        1.0532700017818513,
+        1.953974876431327
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.2120247568523432,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.24000246078174026,
+          0.48058345411859105
+        ],
+        "n_episodes": 57,
+        "order_sensitive_n": 57,
+        "progression": 20,
+        "progression_rate": 0.3508771929824561,
+        "regression": 37
+      },
+      "condition_timing": {
+        "early": 11,
+        "late": 4,
+        "middle": 4,
+        "start": 31
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.2760818978624575,
+          0.5381881089724063
+        ],
+        "n_episodes": 50,
+        "order_sensitive_n": 50,
+        "progression": 20,
+        "progression_rate": 0.4,
+        "regression": 30
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0491228070175439,
+      "low_n": false,
+      "odds_ratio": 1.2295081967213115,
+      "or_ci95": [
+        0.5655045707870494,
+        2.673170976674819
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1400000000000001,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.19914562391353519,
+          0.4426984493221887
+        ],
+        "n_episodes": 52,
+        "order_sensitive_n": 52,
+        "progression": 16,
+        "progression_rate": 0.3076923076923077,
+        "regression": 36
+      },
+      "condition_timing": {
+        "early": 13,
+        "late": 2,
+        "middle": 3,
+        "start": 19
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.26346295839940137,
+          0.565143168686707
+        ],
+        "n_episodes": 37,
+        "order_sensitive_n": 37,
+        "progression": 15,
+        "progression_rate": 0.40540540540540543,
+        "regression": 22
+      },
+      "direction": "BUY",
+      "lift_pp": 0.09771309771309772,
+      "low_n": false,
+      "odds_ratio": 1.5239057239057239,
+      "or_ci95": [
+        0.638532023920579,
+        3.636918068875863
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.3175675675675675,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": [
+          0.19999129931673562,
+          0.46557172533126934
+        ],
+        "n_episodes": 45,
+        "order_sensitive_n": 44,
+        "progression": 14,
+        "progression_rate": 0.3181818181818182,
+        "regression": 30
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 1,
+        "middle": 0,
+        "start": 34
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": [
+          0.20084316962661725,
+          0.4798254191110201
+        ],
+        "n_episodes": 41,
+        "order_sensitive_n": 40,
+        "progression": 13,
+        "progression_rate": 0.325,
+        "regression": 27
+      },
+      "direction": "BUY",
+      "lift_pp": 0.006818181818181834,
+      "low_n": false,
+      "odds_ratio": 1.0326018808777429,
+      "or_ci95": [
+        0.4186271521681014,
+        2.547055629024485
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.0214285714285716,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 5,
+        "ci95": null,
+        "n_episodes": 24,
+        "order_sensitive_n": 19,
+        "progression": 7,
+        "progression_rate": null,
+        "regression": 12
+      },
+      "condition_timing": {
+        "early": 3,
+        "late": 0,
+        "middle": 1,
+        "start": 13
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 3,
+        "ci95": null,
+        "n_episodes": 17,
+        "order_sensitive_n": 14,
+        "progression": 7,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.6666666666666667,
+      "or_ci95": [
+        0.428655287211473,
+        6.480213497069005
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 8,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 8,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.06686651284010256,
+        14.955169000532349
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 9,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.06686651284010256,
+        14.955169000532349
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 11,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 5
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 2.142857142857143,
+      "or_ci95": [
+        0.34674150754863864,
+        13.24282393289694
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.4296579808442954,
+          0.5206489924269059
+        ],
+        "n_episodes": 459,
+        "order_sensitive_n": 459,
+        "progression": 218,
+        "progression_rate": 0.4749455337690632,
+        "regression": 241
+      },
+      "condition_timing": {
+        "early": 44,
+        "late": 14,
+        "middle": 22,
+        "start": 280
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.5289919213477904,
+          0.6304181076318537
+        ],
+        "n_episodes": 360,
+        "order_sensitive_n": 360,
+        "progression": 209,
+        "progression_rate": 0.5805555555555556,
+        "regression": 151
+      },
+      "direction": "BUY",
+      "lift_pp": 0.10561002178649243,
+      "low_n": false,
+      "odds_ratio": 1.5284002084418968,
+      "or_ci95": [
+        1.1576629054433247,
+        2.0178647740904028
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.222362385321101,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 19,
+        "order_sensitive_n": 19,
+        "progression": 9,
+        "progression_rate": null,
+        "regression": 10
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 1,
+        "start": 12
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 17,
+        "order_sensitive_n": 17,
+        "progression": 9,
+        "progression_rate": null,
+        "regression": 8
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2352941176470589,
+      "or_ci95": [
+        0.3450505392648728,
+        4.422400151422607
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 7,
+        "ci95": null,
+        "n_episodes": 14,
+        "order_sensitive_n": 7,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 3,
+        "late": 1,
+        "middle": 0,
+        "start": 10
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 7,
+        "ci95": null,
+        "n_episodes": 14,
+        "order_sensitive_n": 7,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.08120248314620729,
+        12.314894338877208
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 8,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 8,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 1,
+        "middle": 0,
+        "start": 6
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 8,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.08380809429116216,
+        11.9320217033673
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605191,
+        73.26953126902988
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3284690053363267,
+          0.5668057935912871
+        ],
+        "n_episodes": 63,
+        "order_sensitive_n": 63,
+        "progression": 28,
+        "progression_rate": 0.4444444444444444,
+        "regression": 35
+      },
+      "condition_timing": {
+        "early": 5,
+        "late": 0,
+        "middle": 0,
+        "start": 49
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.37114361988923295,
+          0.628856380110767
+        ],
+        "n_episodes": 54,
+        "order_sensitive_n": 54,
+        "progression": 27,
+        "progression_rate": 0.5,
+        "regression": 27
+      },
+      "direction": "BUY",
+      "lift_pp": 0.05555555555555558,
+      "low_n": false,
+      "odds_ratio": 1.2456140350877194,
+      "or_ci95": [
+        0.6046284312424715,
+        2.566128624185218
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.125,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3178096133212553,
+          0.434893155190274
+        ],
+        "n_episodes": 259,
+        "order_sensitive_n": 259,
+        "progression": 97,
+        "progression_rate": 0.3745173745173745,
+        "regression": 162
+      },
+      "condition_timing": {
+        "early": 26,
+        "late": 6,
+        "middle": 7,
+        "start": 175
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.38798245680526094,
+          0.5202077144017079
+        ],
+        "n_episodes": 214,
+        "order_sensitive_n": 214,
+        "progression": 97,
+        "progression_rate": 0.4532710280373832,
+        "regression": 117
+      },
+      "direction": "SELL",
+      "lift_pp": 0.07875365352000868,
+      "low_n": false,
+      "odds_ratio": 1.3829787234042554,
+      "or_ci95": [
+        0.9575566811806178,
+        1.9974067196008598
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.2102803738317758,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.37295502866769376,
+          0.4968798568846295
+        ],
+        "n_episodes": 242,
+        "order_sensitive_n": 242,
+        "progression": 105,
+        "progression_rate": 0.43388429752066116,
+        "regression": 137
+      },
+      "condition_timing": {
+        "early": 36,
+        "late": 9,
+        "middle": 11,
+        "start": 144
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.45597270710507,
+          0.5930849925990139
+        ],
+        "n_episodes": 200,
+        "order_sensitive_n": 200,
+        "progression": 105,
+        "progression_rate": 0.525,
+        "regression": 95
+      },
+      "direction": "SELL",
+      "lift_pp": 0.09111570247933887,
+      "low_n": false,
+      "odds_ratio": 1.4397905759162304,
+      "or_ci95": [
+        0.9890693300098613,
+        2.0959065654947793
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.21,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.343816476111844,
+          0.5153842848298212
+        ],
+        "n_episodes": 124,
+        "order_sensitive_n": 124,
+        "progression": 53,
+        "progression_rate": 0.4274193548387097,
+        "regression": 71
+      },
+      "condition_timing": {
+        "early": 24,
+        "late": 5,
+        "middle": 3,
+        "start": 72
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.39637419660186013,
+          0.5850800844918921
+        ],
+        "n_episodes": 104,
+        "order_sensitive_n": 104,
+        "progression": 51,
+        "progression_rate": 0.49038461538461536,
+        "regression": 53
+      },
+      "direction": "SELL",
+      "lift_pp": 0.06296526054590568,
+      "low_n": false,
+      "odds_ratio": 1.2864879028736134,
+      "or_ci95": [
+        0.7637177288612458,
+        2.1670979495368528
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1473149492017416,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 12,
+        "order_sensitive_n": 12,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 8
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 2,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 9,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.5454545454545454,
+      "or_ci95": [
+        0.2850228769907261,
+        8.379782624058732
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": [
+          0.2532032972099011,
+          0.5097503729966575
+        ],
+        "n_episodes": 52,
+        "order_sensitive_n": 51,
+        "progression": 19,
+        "progression_rate": 0.37254901960784315,
+        "regression": 32
+      },
+      "condition_timing": {
+        "early": 11,
+        "late": 2,
+        "middle": 3,
+        "start": 28
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.29682504164854573,
+          0.5777610925944561
+        ],
+        "n_episodes": 44,
+        "order_sensitive_n": 44,
+        "progression": 19,
+        "progression_rate": 0.4318181818181818,
+        "regression": 25
+      },
+      "direction": "SELL",
+      "lift_pp": 0.05926916221033868,
+      "low_n": false,
+      "odds_ratio": 1.2745098039215685,
+      "or_ci95": [
+        0.564619538402844,
+        2.8769377072694176
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1590909090909092,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 11,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 6
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 8,
+        "order_sensitive_n": 8,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.8571428571428572,
+      "or_ci95": [
+        0.32060762815706045,
+        10.757634219941695
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.13912036561131397,
+          0.37935416169118025
+        ],
+        "n_episodes": 46,
+        "order_sensitive_n": 46,
+        "progression": 11,
+        "progression_rate": 0.2391304347826087,
+        "regression": 35
+      },
+      "condition_timing": {
+        "early": 14,
+        "late": 1,
+        "middle": 3,
+        "start": 18
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.18004270282805354,
+          0.46856578679083716
+        ],
+        "n_episodes": 36,
+        "order_sensitive_n": 36,
+        "progression": 11,
+        "progression_rate": 0.3055555555555556,
+        "regression": 25
+      },
+      "direction": "BUY",
+      "lift_pp": 0.06642512077294688,
+      "low_n": false,
+      "odds_ratio": 1.392156862745098,
+      "or_ci95": [
+        0.5315604976561967,
+        3.6460586123948593
+      ],
+      "percentage": "0.01",
+      "relative_risk": 1.277777777777778,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 21,
+        "order_sensitive_n": 21,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 15
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 15
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 19,
+        "order_sensitive_n": 19,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 13
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.1481481481481481,
+      "or_ci95": [
+        0.30998992008046156,
+        4.25253882369419
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3956901955548621,
+          0.4967371175806235
+        ],
+        "n_episodes": 368,
+        "order_sensitive_n": 368,
+        "progression": 164,
+        "progression_rate": 0.44565217391304346,
+        "regression": 204
+      },
+      "condition_timing": {
+        "early": 39,
+        "late": 6,
+        "middle": 15,
+        "start": 222
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.5019259701385718,
+          0.6170210270794679
+        ],
+        "n_episodes": 282,
+        "order_sensitive_n": 282,
+        "progression": 158,
+        "progression_rate": 0.5602836879432624,
+        "regression": 124
+      },
+      "direction": "SELL",
+      "lift_pp": 0.11463151403021898,
+      "low_n": false,
+      "odds_ratio": 1.582658903089562,
+      "or_ci95": [
+        1.1586851477740043,
+        2.1617686291575784
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.257221933921467,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 20,
+        "order_sensitive_n": 19,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 14
+      },
+      "condition_timing": {
+        "early": 5,
+        "late": 0,
+        "middle": 0,
+        "start": 12
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 17,
+        "order_sensitive_n": 16,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 11
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2608695652173914,
+      "or_ci95": [
+        0.3069795270422538,
+        5.178821127940135
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 18,
+        "order_sensitive_n": 18,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 13
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 0,
+        "middle": 1,
+        "start": 6
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 13,
+        "order_sensitive_n": 13,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 9
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.1626794258373205,
+      "or_ci95": [
+        0.2602000865522767,
+        5.195322819363502
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 49,
+        "ci95": [
+          0.3739329993460827,
+          0.48599304160353873
+        ],
+        "n_episodes": 345,
+        "order_sensitive_n": 296,
+        "progression": 127,
+        "progression_rate": 0.42905405405405406,
+        "regression": 169
+      },
+      "condition_timing": {
+        "early": 28,
+        "late": 9,
+        "middle": 15,
+        "start": 143
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 19,
+        "ci95": [
+          0.6038778796375378,
+          0.7408699428907316
+        ],
+        "n_episodes": 195,
+        "order_sensitive_n": 176,
+        "progression": 119,
+        "progression_rate": 0.6761363636363636,
+        "regression": 57
+      },
+      "direction": "BUY",
+      "lift_pp": 0.2470823095823096,
+      "low_n": false,
+      "odds_ratio": 2.762864450127877,
+      "or_ci95": [
+        1.871451092693418,
+        4.078877615120733
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.5758768790264854,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 24,
+        "ci95": [
+          0.35358257090400147,
+          0.5796096644303581
+        ],
+        "n_episodes": 95,
+        "order_sensitive_n": 71,
+        "progression": 33,
+        "progression_rate": 0.4647887323943662,
+        "regression": 38
+      },
+      "condition_timing": {
+        "early": 11,
+        "late": 5,
+        "middle": 0,
+        "start": 57
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 17,
+        "ci95": [
+          0.4413738892040555,
+          0.6923123758690708
+        ],
+        "n_episodes": 73,
+        "order_sensitive_n": 56,
+        "progression": 32,
+        "progression_rate": 0.5714285714285714,
+        "regression": 24
+      },
+      "direction": "BUY",
+      "lift_pp": 0.10663983903420521,
+      "low_n": false,
+      "odds_ratio": 1.5245202558635393,
+      "or_ci95": [
+        0.7573467566611309,
+        3.068821500978791
+      ],
+      "percentage": "0.01",
+      "relative_risk": 1.2294372294372293,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 46,
+        "ci95": [
+          0.4043923748342188,
+          0.4877153214346824
+        ],
+        "n_episodes": 589,
+        "order_sensitive_n": 543,
+        "progression": 242,
+        "progression_rate": 0.44567219152854515,
+        "regression": 301
+      },
+      "condition_timing": {
+        "early": 32,
+        "late": 18,
+        "middle": 13,
+        "start": 266
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 16,
+        "ci95": [
+          0.6533468927337209,
+          0.7537966136745284
+        ],
+        "n_episodes": 329,
+        "order_sensitive_n": 313,
+        "progression": 221,
+        "progression_rate": 0.7060702875399361,
+        "regression": 92
+      },
+      "direction": "BUY",
+      "lift_pp": 0.2603980960113909,
+      "low_n": false,
+      "odds_ratio": 2.977196990805238,
+      "or_ci95": [
+        2.2149943468690716,
+        4.00168150974685
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.584281678240435,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.6666666666666667,
+      "or_ci95": [
+        0.08001082670435397,
+        34.71752376765056
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2857142857142858,
+      "or_ci95": [
+        0.08997025318157566,
+        18.373419725224405
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 5,
+        "ci95": null,
+        "n_episodes": 6,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 4,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.040735041060201926,
+        24.548888965696868
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 4,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 10,
+        "ci95": null,
+        "n_episodes": 19,
+        "order_sensitive_n": 9,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 3,
+        "late": 1,
+        "middle": 0,
+        "start": 11
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 7,
+        "ci95": null,
+        "n_episodes": 15,
+        "order_sensitive_n": 8,
+        "progression": 7,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 0.8823529411764706,
+      "or_ci95": [
+        0.07485474118814951,
+        10.400766877890458
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 15,
+        "order_sensitive_n": 15,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 9
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 1,
+        "middle": 0,
+        "start": 9
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 14,
+        "order_sensitive_n": 14,
+        "progression": 6,
+        "progression_rate": null,
+        "regression": 8
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.1176470588235294,
+      "or_ci95": [
+        0.2680754653150087,
+        4.659639205061376
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 6,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 3,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 2.2,
+      "or_ci95": [
+        0.14602652033582403,
+        33.14466433130931
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 6
+      },
+      "condition_timing": {
+        "early": 3,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.4444444444444444,
+      "or_ci95": [
+        0.11137422121424673,
+        18.73341721575629
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 1,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2857142857142858,
+      "or_ci95": [
+        0.08997025318157566,
+        18.373419725224405
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 190,
+        "ci95": [
+          0.3846591587851993,
+          0.4268649495892076
+        ],
+        "n_episodes": 2266,
+        "order_sensitive_n": 2076,
+        "progression": 842,
+        "progression_rate": 0.4055876685934489,
+        "regression": 1234
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 18,
+        "middle": 7,
+        "start": 928
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 79,
+        "ci95": [
+          0.7427082765399641,
+          0.7981126126329375
+        ],
+        "n_episodes": 959,
+        "order_sensitive_n": 880,
+        "progression": 679,
+        "progression_rate": 0.7715909090909091,
+        "regression": 201
+      },
+      "direction": "BUY",
+      "lift_pp": 0.3660032404974602,
+      "low_n": false,
+      "odds_ratio": 4.941235982357836,
+      "or_ci95": [
+        4.127379461222479,
+        5.915572644274422
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.9024022889224792,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 34,
+        "ci95": [
+          0.3793003996493199,
+          0.44807606790456417
+        ],
+        "n_episodes": 818,
+        "order_sensitive_n": 784,
+        "progression": 324,
+        "progression_rate": 0.413265306122449,
+        "regression": 460
+      },
+      "condition_timing": {
+        "early": 42,
+        "late": 25,
+        "middle": 20,
+        "start": 355
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 18,
+        "ci95": [
+          0.6285347568982643,
+          0.7173876592482723
+        ],
+        "n_episodes": 442,
+        "order_sensitive_n": 424,
+        "progression": 286,
+        "progression_rate": 0.6745283018867925,
+        "regression": 138
+      },
+      "direction": "BUY",
+      "lift_pp": 0.2612629957643435,
+      "low_n": false,
+      "odds_ratio": 2.9355520573167273,
+      "or_ci95": [
+        2.291606988403235,
+        3.7604466755536565
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.632191940368041,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 16,
+        "order_sensitive_n": 16,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 12
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 1,
+        "middle": 1,
+        "start": 8
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 14,
+        "order_sensitive_n": 14,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 10
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.1904761904761905,
+      "or_ci95": [
+        0.2544739020900544,
+        5.569268787292639
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 10,
+        "order_sensitive_n": 9,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 5
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 7,
+        "order_sensitive_n": 7,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.5714285714285714,
+      "or_ci95": [
+        0.241770698533293,
+        10.213759442656343
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1540,
+        "ci95": [
+          0.9913251148943548,
+          0.9999999999999999
+        ],
+        "n_episodes": 1979,
+        "order_sensitive_n": 439,
+        "progression": 439,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 14,
+        "late": 29,
+        "middle": 6,
+        "start": 891
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 508,
+        "ci95": [
+          0.9911857885984265,
+          1.0
+        ],
+        "n_episodes": 940,
+        "order_sensitive_n": 432,
+        "progression": 432,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": false,
+      "odds_ratio": 0.9840728100113766,
+      "or_ci95": [
+        0.019481254218553005,
+        49.709288967721065
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.0,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 29,
+        "order_sensitive_n": 29,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 21
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 1,
+        "middle": 1,
+        "start": 14
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 22,
+        "order_sensitive_n": 22,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 14
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.4827586206896552,
+      "or_ci95": [
+        0.464439374341833,
+        4.733821567874459
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 15,
+        "order_sensitive_n": 15,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "condition_timing": {
+        "early": 8,
+        "late": 1,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 12,
+        "order_sensitive_n": 12,
+        "progression": 8,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.6666666666666667,
+      "or_ci95": [
+        0.3694415974211355,
+        7.518854934495427
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 12,
+        "order_sensitive_n": 12,
+        "progression": 4,
+        "progression_rate": null,
+        "regression": 8
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 3,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 9,
+        "progression": 3,
+        "progression_rate": null,
+        "regression": 6
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.017094017094017,
+      "or_ci95": [
+        0.18024420451720946,
+        5.7393259460371375
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.07328983668888443,
+        13.644456655634297
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 1,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.01513634803340231,
+        66.06613416877298
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2222222222222223,
+      "or_ci95": [
+        0.019989518465610406,
+        74.73052255179533
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 234,
+        "ci95": [
+          0.9668374746205164,
+          1.0
+        ],
+        "n_episodes": 346,
+        "order_sensitive_n": 112,
+        "progression": 112,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 15,
+        "late": 16,
+        "middle": 10,
+        "start": 148
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 86,
+        "ci95": [
+          0.9640439678926562,
+          1.0
+        ],
+        "n_episodes": 189,
+        "order_sensitive_n": 103,
+        "progression": 103,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": false,
+      "odds_ratio": 0.92,
+      "or_ci95": [
+        0.018088824733741658,
+        46.79132074408257
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.0,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 9,
+        "progression": 3,
+        "progression_rate": null,
+        "regression": 6
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 1,
+        "start": 6
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 8,
+        "order_sensitive_n": 8,
+        "progression": 3,
+        "progression_rate": null,
+        "regression": 5
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.1818181818181819,
+      "or_ci95": [
+        0.1827423852264752,
+        7.642968067561833
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.057110731721519585,
+        17.50984394449976
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.38702770939000536,
+          0.539730818358747
+        ],
+        "n_episodes": 160,
+        "order_sensitive_n": 160,
+        "progression": 74,
+        "progression_rate": 0.4625,
+        "regression": 86
+      },
+      "condition_timing": {
+        "early": 17,
+        "late": 5,
+        "middle": 5,
+        "start": 112
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.44967371211564355,
+          0.6133331430301963
+        ],
+        "n_episodes": 139,
+        "order_sensitive_n": 139,
+        "progression": 74,
+        "progression_rate": 0.5323741007194245,
+        "regression": 65
+      },
+      "direction": "SELL",
+      "lift_pp": 0.06987410071942446,
+      "low_n": false,
+      "odds_ratio": 1.3206106870229009,
+      "or_ci95": [
+        0.8386267220526117,
+        2.0796053128506045
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1510791366906474,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.4,
+      "or_ci95": [
+        0.020115917245389314,
+        97.43527854536404
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 3,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.4,
+      "or_ci95": [
+        0.020115917245389314,
+        97.43527854536404
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.3101502855796743,
+          0.5510499315648748
+        ],
+        "n_episodes": 61,
+        "order_sensitive_n": 61,
+        "progression": 26,
+        "progression_rate": 0.4262295081967213,
+        "regression": 35
+      },
+      "condition_timing": {
+        "early": 13,
+        "late": 0,
+        "middle": 2,
+        "start": 40
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": [
+          0.34692885310480803,
+          0.6020868092837061
+        ],
+        "n_episodes": 55,
+        "order_sensitive_n": 55,
+        "progression": 26,
+        "progression_rate": 0.4727272727272727,
+        "regression": 29
+      },
+      "direction": "SELL",
+      "lift_pp": 0.04649776453055143,
+      "low_n": false,
+      "odds_ratio": 1.2033898305084745,
+      "or_ci95": [
+        0.5817304233737807,
+        2.4893782858606546
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.1090909090909091,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 46,
+        "ci95": [
+          0.372904030367518,
+          0.45577527497680353
+        ],
+        "n_episodes": 585,
+        "order_sensitive_n": 539,
+        "progression": 223,
+        "progression_rate": 0.4137291280148423,
+        "regression": 316
+      },
+      "condition_timing": {
+        "early": 16,
+        "late": 21,
+        "middle": 15,
+        "start": 267
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 23,
+        "ci95": [
+          0.5857749767405153,
+          0.6943729413602419
+        ],
+        "n_episodes": 319,
+        "order_sensitive_n": 296,
+        "progression": 190,
+        "progression_rate": 0.6418918918918919,
+        "regression": 106
+      },
+      "direction": "SELL",
+      "lift_pp": 0.2281627638770496,
+      "low_n": false,
+      "odds_ratio": 2.5330371490689103,
+      "or_ci95": [
+        1.8906238914213298,
+        3.393735384217289
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.5514786086534966,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 18,
+        "ci95": null,
+        "n_episodes": 33,
+        "order_sensitive_n": 15,
+        "progression": 15,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 6,
+        "late": 0,
+        "middle": 4,
+        "start": 19
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 14,
+        "ci95": null,
+        "n_episodes": 29,
+        "order_sensitive_n": 15,
+        "progression": 15,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.018634809240536655,
+        53.66301243506593
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 9,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 7
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 1,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 6,
+        "order_sensitive_n": 6,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.6666666666666667,
+      "or_ci95": [
+        0.20268320856837763,
+        13.705021730207424
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 6,
+        "order_sensitive_n": 5,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 1,
+        "start": 5
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 6,
+        "order_sensitive_n": 5,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.10072945983204847,
+        9.927582275010236
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 24,
+        "ci95": [
+          0.3843492802145344,
+          0.6315637455518369
+        ],
+        "n_episodes": 83,
+        "order_sensitive_n": 59,
+        "progression": 30,
+        "progression_rate": 0.5084745762711864,
+        "regression": 29
+      },
+      "condition_timing": {
+        "early": 15,
+        "late": 3,
+        "middle": 9,
+        "start": 23
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 9,
+        "ci95": [
+          0.5806617472399707,
+          0.8430519471866331
+        ],
+        "n_episodes": 50,
+        "order_sensitive_n": 41,
+        "progression": 30,
+        "progression_rate": 0.7317073170731707,
+        "regression": 11
+      },
+      "direction": "SELL",
+      "lift_pp": 0.2232327408019843,
+      "low_n": false,
+      "odds_ratio": 2.5652173913043477,
+      "or_ci95": [
+        1.1005021973622031,
+        5.979397660834043
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.4390243902439024,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 3,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 1,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605191,
+        73.26953126902988
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 5,
+        "order_sensitive_n": 5,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 4
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 4,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 3
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.2857142857142858,
+      "or_ci95": [
+        0.08997025318157566,
+        18.373419725224405
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 6,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 2,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 1,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.040735041060201926,
+        24.548888965696868
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 40,
+        "ci95": [
+          0.4902496270033425,
+          0.746796702790099
+        ],
+        "n_episodes": 91,
+        "order_sensitive_n": 51,
+        "progression": 32,
+        "progression_rate": 0.6274509803921569,
+        "regression": 19
+      },
+      "condition_timing": {
+        "early": 20,
+        "late": 1,
+        "middle": 5,
+        "start": 28
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 20,
+        "ci95": [
+          0.6987161182594804,
+          0.9355065361737359
+        ],
+        "n_episodes": 54,
+        "order_sensitive_n": 34,
+        "progression": 29,
+        "progression_rate": 0.8529411764705882,
+        "regression": 5
+      },
+      "direction": "BUY",
+      "lift_pp": 0.22549019607843135,
+      "low_n": false,
+      "odds_ratio": 3.2181818181818183,
+      "or_ci95": [
+        1.1043774251701068,
+        9.377857586396061
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.359375,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 2,
+        "ci95": null,
+        "n_episodes": 4,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 3
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 3,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605203,
+        73.26953126902981
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 2,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 9,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 1,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 5,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.010819273949528446,
+        92.42764391261066
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 2
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 2,
+        "order_sensitive_n": 2,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 2
+      },
+      "direction": "BUY",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605191,
+        73.26953126902988
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "PAXG"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 156,
+        "ci95": [
+          0.9416539087749995,
+          1.0
+        ],
+        "n_episodes": 218,
+        "order_sensitive_n": 62,
+        "progression": 62,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 17,
+        "late": 7,
+        "middle": 8,
+        "start": 85
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 58,
+        "ci95": [
+          0.938868520215908,
+          1.0
+        ],
+        "n_episodes": 117,
+        "order_sensitive_n": 59,
+        "progression": 59,
+        "progression_rate": 1.0,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": false,
+      "odds_ratio": 0.952,
+      "or_ci95": [
+        0.018588118147170804,
+        48.75716803736495
+      ],
+      "percentage": "0.001",
+      "relative_risk": 1.0,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 7,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 4,
+        "late": 0,
+        "middle": 0,
+        "start": 5
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 7,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 2,
+        "progression": 2,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.013648237987605203,
+        73.26953126902981
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "BTC"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 1,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 1
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 8,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 3,
+        "progression": 3,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 5,
+        "late": 0,
+        "middle": 0,
+        "start": 4
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 6,
+        "ci95": null,
+        "n_episodes": 9,
+        "order_sensitive_n": 3,
+        "progression": 3,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.01513634803340231,
+        66.06613416877298
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 0,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 6,
+        "ci95": null,
+        "n_episodes": 11,
+        "order_sensitive_n": 5,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 1,
+        "middle": 0,
+        "start": 8
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 5,
+        "ci95": null,
+        "n_episodes": 10,
+        "order_sensitive_n": 5,
+        "progression": 5,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": 0.0,
+      "low_n": true,
+      "odds_ratio": 1.0,
+      "or_ci95": [
+        0.01666730158116131,
+        59.997714394889115
+      ],
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 3,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 0,
+        "ci95": null,
+        "n_episodes": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.01",
+      "relative_risk": null,
+      "symbol": "ETH"
+    },
+    {
+      "active_step": 7,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 1,
+        "late": 0,
+        "middle": 0,
+        "start": 0
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "BUY",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.001",
+      "relative_risk": null,
+      "symbol": "SOL"
+    },
+    {
+      "active_step": 1,
+      "baseline": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "condition_timing": {
+        "early": 0,
+        "late": 0,
+        "middle": 0,
+        "start": 1
+      },
+      "conditional": {
+        "ambiguous_excluded": 0,
+        "censored": 1,
+        "ci95": null,
+        "n_episodes": 1,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "direction": "SELL",
+      "lift_pp": null,
+      "low_n": true,
+      "odds_ratio": null,
+      "or_ci95": null,
+      "percentage": "0.1",
+      "relative_risk": null,
+      "symbol": "ZEC"
+    }
+  ],
+  "dataset_version": "phase3a_30d_f7b269d",
+  "eligibility_rules": {
+    "exclude_intrabar_order_ambiguous": true,
+    "order_sensitive_outcome": "P(n+1) before TP/cycle termination",
+    "unit": "episode"
+  },
+  "experiment_id": "FL-VWAP-001",
+  "feature_version": "whole_ladder_vwap_v1",
+  "git_commit": "f7b269dad7663808f9e043af828ee81dfda9feaa",
+  "oos": {
+    "ambiguous_excluded": 0,
+    "censored": 1819,
+    "ci95": [
+      0.43745553307097307,
+      0.45655207165296974
+    ],
+    "n_episodes": 12231,
+    "order_sensitive_n": 10412,
+    "progression": 4654,
+    "progression_rate": 0.4469842489435267,
+    "regression": 5758
+  },
+  "pooled": {
+    "ambiguous_excluded": 0,
+    "censored": 2493,
+    "ci95": [
+      0.42487795977071213,
+      0.44139663471079266
+    ],
+    "n_episodes": 16316,
+    "order_sensitive_n": 13823,
+    "progression": 5987,
+    "progression_rate": 0.43311871518483686,
+    "regression": 7836
+  },
+  "train": {
+    "ambiguous_excluded": 0,
+    "censored": 674,
+    "ci95": [
+      0.37455146941218204,
+      0.40728321363724546
+    ],
+    "n_episodes": 4085,
+    "order_sensitive_n": 3411,
+    "progression": 1333,
+    "progression_rate": 0.39079448841981823,
+    "regression": 2078
+  },
+  "train_fraction": 0.7
+}

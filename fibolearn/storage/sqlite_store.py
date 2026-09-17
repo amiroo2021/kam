@@ -125,6 +125,13 @@ class FiboLearnStore:
             c.execute('create table if not exists backtests(id integer primary key autoincrement, pattern_id integer, symbols_json text not null, result_json text not null, created_at integer not null)')
             c.execute('create table if not exists runtime_state(key text primary key, value_json text not null, updated_at integer not null)')
             c.execute('create table if not exists episodes(id integer primary key autoincrement, episode_key text not null unique, symbol text not null, percentage text not null, direction text not null, cycle_id text not null, active_step integer not null, start_timestamp_ms integer not null, end_timestamp_ms integer not null, terminal_event text not null, observation_count integer not null, raw_observation_ids_json text not null, start_state_json text not null, end_state_json text not null, evolution_json text not null, outcome_json text not null, intrabar_order_ambiguous integer not null default 0, created_at integer not null)')
+            # Ensure older databases gain the ambiguity column before any indexes touch it.
+            try:
+                cols = [r['name'] for r in c.execute('pragma table_info(episodes)').fetchall()]
+                if 'intrabar_order_ambiguous' not in cols:
+                    c.execute('alter table episodes add column intrabar_order_ambiguous integer not null default 0')
+            except Exception:
+                pass
             c.execute('create index if not exists idx_episodes_symbol_pct_dir on episodes(symbol,percentage,direction)')
             c.execute('create index if not exists idx_episodes_intrabar_ambiguous on episodes(intrabar_order_ambiguous)')
             c.execute('create table if not exists dataset_checkpoints(key text primary key, value_json text not null, updated_at integer not null)')

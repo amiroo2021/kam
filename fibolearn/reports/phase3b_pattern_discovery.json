@@ -1,0 +1,1665 @@
+{
+  "patterns": [
+    {
+      "effect_pp": null,
+      "name": "VWAP-BTC-0.1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-BTC-1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-BTC-1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-SOL-1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-SOL-1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ZEC-1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ZEC-1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-PAXG-0.1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-PAXG-0.1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-PAXG-1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-PAXG-1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.3783505154639175,
+      "conditional_rate": 0.5034965034965035,
+      "lift_pp": 0.12514598803258603,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P1",
+      "odds_ratio": 1.6652735918558703,
+      "or_ci95": [
+        1.3693459029041886,
+        2.025153856195957
+      ],
+      "p_value": 2.9545842092198293e-07,
+      "relative_risk": 1.3307673253177341,
+      "sample_size": 715,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.44,
+      "conditional_rate": 0.4835164835164835,
+      "lift_pp": 0.04351648351648352,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P2",
+      "odds_ratio": 1.1894736842105262,
+      "or_ci95": [
+        0.6746773376555687,
+        2.0970730250786342
+      ],
+      "p_value": 0.5467728836767691,
+      "relative_risk": 1.098901098901099,
+      "sample_size": 91,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3397341211225997,
+      "conditional_rate": 0.4880694143167028,
+      "lift_pp": 0.1483352931941031,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P2",
+      "odds_ratio": 1.851132522827019,
+      "or_ci95": [
+        1.4533438354106678,
+        2.357798294922861
+      ],
+      "p_value": 5.311814108349587e-07,
+      "relative_risk": 1.4366217108365555,
+      "sample_size": 461,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.32450331125827814,
+      "conditional_rate": 0.4682926829268293,
+      "lift_pp": 0.14378937166855116,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P3",
+      "odds_ratio": 1.829659504438727,
+      "or_ci95": [
+        1.2710952189411047,
+        2.6336767319223773
+      ],
+      "p_value": 0.0010786166980456227,
+      "relative_risk": 1.4431060228969639,
+      "sample_size": 205,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3853211009174312,
+      "conditional_rate": 0.5405405405405406,
+      "lift_pp": 0.15521943962310936,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P4",
+      "odds_ratio": 1.8644501278772379,
+      "or_ci95": [
+        1.0288077361906147,
+        3.378837616650068
+      ],
+      "p_value": 0.03824613404484396,
+      "relative_risk": 1.4028314028314028,
+      "sample_size": 74,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3942307692307692,
+      "conditional_rate": 0.5183752417794971,
+      "lift_pp": 0.1241444725487279,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P2",
+      "odds_ratio": 1.6525956260346781,
+      "or_ci95": [
+        1.3162950101325959,
+        2.074817789451194
+      ],
+      "p_value": 1.4079251565127608e-05,
+      "relative_risk": 1.3149030523187244,
+      "sample_size": 517,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.40458015267175573,
+      "conditional_rate": 0.46846846846846846,
+      "lift_pp": 0.06388831579671272,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P2",
+      "odds_ratio": 1.2946673996701483,
+      "or_ci95": [
+        0.7786787841114499,
+        2.1525739624219162
+      ],
+      "p_value": 0.31767675388672184,
+      "relative_risk": 1.1579126296107427,
+      "sample_size": 111,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3887147335423197,
+      "conditional_rate": 0.48535564853556484,
+      "lift_pp": 0.09664091499324512,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P3",
+      "odds_ratio": 1.4812773360649074,
+      "or_ci95": [
+        1.0559036885296866,
+        2.0780139042746217
+      ],
+      "p_value": 0.022508702774189458,
+      "relative_risk": 1.2486165474422999,
+      "sample_size": 239,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3333333333333333,
+      "conditional_rate": 0.45348837209302323,
+      "lift_pp": 0.12015503875968991,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P4",
+      "odds_ratio": 1.6528914879792074,
+      "or_ci95": [
+        0.9382073523220419,
+        2.9119898328150553
+      ],
+      "p_value": 0.08028389738151682,
+      "relative_risk": 1.3604651162790697,
+      "sample_size": 86,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.367816091954023,
+      "conditional_rate": 0.45454545454545453,
+      "lift_pp": 0.08672936259143155,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P3",
+      "odds_ratio": 1.4269757639620653,
+      "or_ci95": [
+        0.7471759119977283,
+        2.725274996474071
+      ],
+      "p_value": 0.27914219978390076,
+      "relative_risk": 1.2357954545454546,
+      "sample_size": 66,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.43089430894308944,
+      "conditional_rate": 0.51,
+      "lift_pp": 0.07910569105691057,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P3",
+      "odds_ratio": 1.3709997167941093,
+      "or_ci95": [
+        0.8088114031325104,
+        2.3239536635731377
+      ],
+      "p_value": 0.23892932279248777,
+      "relative_risk": 1.1835849056603773,
+      "sample_size": 100,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": -0.23529411764705882,
+      "name": "VWAP-ETH-0.001-BUY-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 34,
+        "conditional": 24
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.36818181818181817,
+      "conditional_rate": 0.42162162162162165,
+      "lift_pp": 0.05343980343980348,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P2",
+      "odds_ratio": 1.2499072620915965,
+      "or_ci95": [
+        0.8385217691267149,
+        1.8631217713719552
+      ],
+      "p_value": 0.2726228141087219,
+      "relative_risk": 1.1451451451451453,
+      "sample_size": 185,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": -0.35135135135135137,
+      "name": "VWAP-ZEC-0.001-BUY-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 37,
+        "conditional": 24
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.43209876543209874,
+      "conditional_rate": 0.48936170212765956,
+      "lift_pp": 0.05726293669556082,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P2",
+      "odds_ratio": 1.2577647346539496,
+      "or_ci95": [
+        0.800401544054074,
+        1.9764731083930096
+      ],
+      "p_value": 0.31838841718763844,
+      "relative_risk": 1.1325227963525837,
+      "sample_size": 141,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.34444444444444444,
+      "conditional_rate": 0.43283582089552236,
+      "lift_pp": 0.08839137645107792,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P3",
+      "odds_ratio": 1.4473304473304474,
+      "or_ci95": [
+        0.7590654161195605,
+        2.759663896266624
+      ],
+      "p_value": 0.25959659521523376,
+      "relative_risk": 1.2566201251805489,
+      "sample_size": 67,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": -0.3548387096774194,
+      "name": "VWAP-ETH-0.001-SELL-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 31,
+        "conditional": 23
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-BUY-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 13,
+        "conditional": 11
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.2894736842105263,
+      "conditional_rate": 0.3333333333333333,
+      "lift_pp": 0.04385964912280699,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P2",
+      "odds_ratio": 1.2222222222222223,
+      "or_ci95": [
+        0.4545081519854177,
+        3.2866894773358317
+      ],
+      "p_value": 0.6901903825009883,
+      "relative_risk": 1.1515151515151514,
+      "sample_size": 33,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.47659176029962547,
+      "conditional_rate": 0.5914249684741488,
+      "lift_pp": 0.11483320817452336,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P1",
+      "odds_ratio": 1.5888276823557341,
+      "or_ci95": [
+        1.319762144175095,
+        1.9127487595863186
+      ],
+      "p_value": 9.302970035344309e-07,
+      "relative_risk": 1.240946692201161,
+      "sample_size": 793,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3819444444444444,
+      "conditional_rate": 0.4751131221719457,
+      "lift_pp": 0.09316867772750126,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P2",
+      "odds_ratio": 1.4628590293826345,
+      "or_ci95": [
+        1.0262232084324274,
+        2.0852739659972435
+      ],
+      "p_value": 0.034922903026427046,
+      "relative_risk": 1.243932538050185,
+      "sample_size": 221,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-SELL-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 18,
+        "conditional": 15
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.3584905660377358,
+      "conditional_rate": 0.4222222222222222,
+      "lift_pp": 0.0637316561844864,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P3",
+      "odds_ratio": 1.3018867924528301,
+      "or_ci95": [
+        0.581226957008433,
+        2.916088457229844
+      ],
+      "p_value": 0.5187488259631644,
+      "relative_risk": 1.1777777777777778,
+      "sample_size": 45,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-SELL-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 4,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-SELL-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 21,
+        "conditional": 17
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4170403587443946,
+      "conditional_rate": 0.5460122699386503,
+      "lift_pp": 0.12897191119425566,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P1",
+      "odds_ratio": 1.6767397624089293,
+      "or_ci95": [
+        1.1169864308847801,
+        2.517001239322272
+      ],
+      "p_value": 0.012170124609029664,
+      "relative_risk": 1.3092552279174088,
+      "sample_size": 163,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": -0.2727272727272727,
+      "name": "VWAP-ZEC-0.001-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 44,
+        "conditional": 28
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 13,
+        "conditional": 11
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 7,
+        "conditional": 7
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-SELL-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 10,
+        "conditional": 7
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.42391304347826086,
+      "conditional_rate": 0.5137931034482759,
+      "lift_pp": 0.08988005997001502,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P1",
+      "odds_ratio": 1.4345951071924496,
+      "or_ci95": [
+        1.0532700017818513,
+        1.953974876431327
+      ],
+      "p_value": 0.02170913437726952,
+      "relative_risk": 1.2120247568523432,
+      "sample_size": 290,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3508771929824561,
+      "conditional_rate": 0.4,
+      "lift_pp": 0.0491228070175439,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P3",
+      "odds_ratio": 1.2295081967213115,
+      "or_ci95": [
+        0.5655045707870494,
+        2.673170976674819
+      ],
+      "p_value": 0.6002795380708603,
+      "relative_risk": 1.1400000000000001,
+      "sample_size": 50,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3076923076923077,
+      "conditional_rate": 0.40540540540540543,
+      "lift_pp": 0.09771309771309772,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P4",
+      "odds_ratio": 1.5239057239057239,
+      "or_ci95": [
+        0.638532023920579,
+        3.636918068875863
+      ],
+      "p_value": 0.34029812777810287,
+      "relative_risk": 1.3175675675675675,
+      "sample_size": 37,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.3181818181818182,
+      "conditional_rate": 0.325,
+      "lift_pp": 0.006818181818181834,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P2",
+      "odds_ratio": 1.0326018808777429,
+      "or_ci95": [
+        0.4186271521681014,
+        2.547055629024485
+      ],
+      "p_value": 0.9467202517486198,
+      "relative_risk": 1.0214285714285716,
+      "sample_size": 40,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 19,
+        "conditional": 14
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-SELL-P8",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-SELL-P8",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 4,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-SELL-P9",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 4,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-BUY-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 11,
+        "conditional": 7
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4749455337690632,
+      "conditional_rate": 0.5805555555555556,
+      "lift_pp": 0.10561002178649243,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P1",
+      "odds_ratio": 1.5284002084418968,
+      "or_ci95": [
+        1.1576629054433247,
+        2.0178647740904028
+      ],
+      "p_value": 0.002673787609821545,
+      "relative_risk": 1.222362385321101,
+      "sample_size": 360,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-BUY-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 19,
+        "conditional": 17
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-BTC-0.1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 7,
+        "conditional": 7
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-SELL-P8",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-BUY-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 8,
+        "conditional": 8
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4444444444444444,
+      "conditional_rate": 0.5,
+      "lift_pp": 0.05555555555555558,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P1",
+      "odds_ratio": 1.2456140350877194,
+      "or_ci95": [
+        0.6046284312424715,
+        2.566128624185218
+      ],
+      "p_value": 0.5483596922876441,
+      "relative_risk": 1.125,
+      "sample_size": 54,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-0.1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.3745173745173745,
+      "conditional_rate": 0.4532710280373832,
+      "lift_pp": 0.07875365352000868,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P1",
+      "odds_ratio": 1.3829787234042554,
+      "or_ci95": [
+        0.9575566811806178,
+        1.9974067196008598
+      ],
+      "p_value": 0.08305558702749777,
+      "relative_risk": 1.2102803738317758,
+      "sample_size": 214,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.43388429752066116,
+      "conditional_rate": 0.525,
+      "lift_pp": 0.09111570247933887,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P2",
+      "odds_ratio": 1.4397905759162304,
+      "or_ci95": [
+        0.9890693300098613,
+        2.0959065654947793
+      ],
+      "p_value": 0.05622383822420152,
+      "relative_risk": 1.21,
+      "sample_size": 200,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.4274193548387097,
+      "conditional_rate": 0.49038461538461536,
+      "lift_pp": 0.06296526054590568,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P3",
+      "odds_ratio": 1.2864879028736134,
+      "or_ci95": [
+        0.7637177288612458,
+        2.1670979495368528
+      ],
+      "p_value": 0.3417289719499563,
+      "relative_risk": 1.1473149492017416,
+      "sample_size": 104,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 12,
+        "conditional": 9
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.37254901960784315,
+      "conditional_rate": 0.4318181818181818,
+      "lift_pp": 0.05926916221033868,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P4",
+      "odds_ratio": 1.2745098039215685,
+      "or_ci95": [
+        0.564619538402844,
+        2.8769377072694176
+      ],
+      "p_value": 0.5565364140093096,
+      "relative_risk": 1.1590909090909092,
+      "sample_size": 44,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 11,
+        "conditional": 8
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.2391304347826087,
+      "conditional_rate": 0.3055555555555556,
+      "lift_pp": 0.06642512077294688,
+      "name": "whole_ladder_vwap_v1::ZEC::0.01::BUY::P1",
+      "odds_ratio": 1.392156862745098,
+      "or_ci95": [
+        0.5315604976561967,
+        3.6460586123948593
+      ],
+      "p_value": 0.5004863457826728,
+      "relative_risk": 1.277777777777778,
+      "sample_size": 36,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.001-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 21,
+        "conditional": 19
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-SELL-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.44565217391304346,
+      "conditional_rate": 0.5602836879432624,
+      "lift_pp": 0.11463151403021898,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P1",
+      "odds_ratio": 1.582658903089562,
+      "or_ci95": [
+        1.1586851477740043,
+        2.1617686291575784
+      ],
+      "p_value": 0.0037678326203982575,
+      "relative_risk": 1.257221933921467,
+      "sample_size": 282,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-BUY-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 19,
+        "conditional": 16
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-BUY-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 18,
+        "conditional": 13
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.42905405405405406,
+      "conditional_rate": 0.6761363636363636,
+      "lift_pp": 0.2470823095823096,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P0",
+      "odds_ratio": 2.762864450127877,
+      "or_ci95": [
+        1.871451092693418,
+        4.078877615120733
+      ],
+      "p_value": 2.0330911491080066e-07,
+      "relative_risk": 1.5758768790264854,
+      "sample_size": 176,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.4647887323943662,
+      "conditional_rate": 0.5714285714285714,
+      "lift_pp": 0.10663983903420521,
+      "name": "whole_ladder_vwap_v1::ZEC::0.01::BUY::P0",
+      "odds_ratio": 1.5245202558635393,
+      "or_ci95": [
+        0.7573467566611309,
+        3.068821500978791
+      ],
+      "p_value": 0.23259876909342983,
+      "relative_risk": 1.2294372294372293,
+      "sample_size": 56,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.44567219152854515,
+      "conditional_rate": 0.7060702875399361,
+      "lift_pp": 0.2603980960113909,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P0",
+      "odds_ratio": 2.977196990805238,
+      "or_ci95": [
+        2.2149943468690716,
+        4.00168150974685
+      ],
+      "p_value": 1.7970362163261601e-13,
+      "relative_risk": 1.584281678240435,
+      "sample_size": 313,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.001-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.1-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.001-SELL-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-SELL-P4",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 9,
+        "conditional": 8
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.1-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-BUY-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 15,
+        "conditional": 14
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-BUY-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 6,
+        "conditional": 3
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-BUY-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 7,
+        "conditional": 5
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-BUY-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ZEC-0.1-BUY-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.001-BUY-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4055876685934489,
+      "conditional_rate": 0.7715909090909091,
+      "lift_pp": 0.3660032404974602,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P0",
+      "odds_ratio": 4.941235982357836,
+      "or_ci95": [
+        4.127379461222479,
+        5.915572644274422
+      ],
+      "p_value": 4.671344663056177e-74,
+      "relative_risk": 1.9024022889224792,
+      "sample_size": 880,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.413265306122449,
+      "conditional_rate": 0.6745283018867925,
+      "lift_pp": 0.2612629957643435,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P0",
+      "odds_ratio": 2.9355520573167273,
+      "or_ci95": [
+        2.291606988403235,
+        3.7604466755536565
+      ],
+      "p_value": 4.3839797464103734e-18,
+      "relative_risk": 1.632191940368041,
+      "sample_size": 424,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.001-BUY-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 16,
+        "conditional": 14
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 9,
+        "conditional": 7
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 1.0,
+      "conditional_rate": 1.0,
+      "lift_pp": 0.0,
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P0",
+      "odds_ratio": 0.9840728100113766,
+      "or_ci95": [
+        0.019481254218553005,
+        49.709288967721065
+      ],
+      "p_value": 1.0,
+      "relative_risk": 1.0,
+      "sample_size": 432,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 29,
+        "conditional": 22
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 15,
+        "conditional": 12
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-BUY-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 12,
+        "conditional": 9
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 5
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-BUY-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 3
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-BUY-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 1.0,
+      "conditional_rate": 1.0,
+      "lift_pp": 0.0,
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P0",
+      "odds_ratio": 0.92,
+      "or_ci95": [
+        0.018088824733741658,
+        46.79132074408257
+      ],
+      "p_value": 1.0,
+      "relative_risk": 1.0,
+      "sample_size": 103,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 9,
+        "conditional": 8
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 3
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-SOL-0.1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4625,
+      "conditional_rate": 0.5323741007194245,
+      "lift_pp": 0.06987410071942446,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P1",
+      "odds_ratio": 1.3206106870229009,
+      "or_ci95": [
+        0.8386267220526117,
+        2.0796053128506045
+      ],
+      "p_value": 0.22808244457407334,
+      "relative_risk": 1.1510791366906474,
+      "sample_size": 139,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.01-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-SELL-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.4262295081967213,
+      "conditional_rate": 0.4727272727272727,
+      "lift_pp": 0.04649776453055143,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P1",
+      "odds_ratio": 1.2033898305084745,
+      "or_ci95": [
+        0.5817304233737807,
+        2.4893782858606546
+      ],
+      "p_value": 0.61508828425141,
+      "relative_risk": 1.1090909090909091,
+      "sample_size": 55,
+      "status": "CANDIDATE"
+    },
+    {
+      "baseline_rate": 0.4137291280148423,
+      "conditional_rate": 0.6418918918918919,
+      "lift_pp": 0.2281627638770496,
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P0",
+      "odds_ratio": 2.5330371490689103,
+      "or_ci95": [
+        1.8906238914213298,
+        3.393735384217289
+      ],
+      "p_value": 2.825234558843684e-10,
+      "relative_risk": 1.5514786086534966,
+      "sample_size": 296,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.1-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 15,
+        "conditional": 15
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-BTC-0.01-BUY-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-BUY-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 9,
+        "conditional": 6
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-BUY-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 5
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.5084745762711864,
+      "conditional_rate": 0.7317073170731707,
+      "lift_pp": 0.2232327408019843,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P0",
+      "odds_ratio": 2.5652173913043477,
+      "or_ci95": [
+        1.1005021973622031,
+        5.979397660834043
+      ],
+      "p_value": 0.02501660095460991,
+      "relative_risk": 1.4390243902439024,
+      "sample_size": 41,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.001-BUY-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.01-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.001-BUY-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-SOL-0.1-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 4
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.001-BUY-P6",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 0.6274509803921569,
+      "conditional_rate": 0.8529411764705882,
+      "lift_pp": 0.22549019607843135,
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P0",
+      "odds_ratio": 3.2181818181818183,
+      "or_ci95": [
+        1.1043774251701068,
+        9.377857586396061
+      ],
+      "p_value": 0.023665709831958107,
+      "relative_risk": 1.359375,
+      "sample_size": 34,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.01-BUY-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.01-SELL-P2",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.001-SELL-P9",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ZEC-0.01-SELL-P5",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 1
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-PAXG-0.01-BUY-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "baseline_rate": 1.0,
+      "conditional_rate": 1.0,
+      "lift_pp": 0.0,
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P0",
+      "odds_ratio": 0.952,
+      "or_ci95": [
+        0.018588118147170804,
+        48.75716803736495
+      ],
+      "p_value": 1.0,
+      "relative_risk": 1.0,
+      "sample_size": 59,
+      "status": "CANDIDATE"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-BTC-0.01-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 2,
+        "conditional": 2
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-0.001-SELL-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-0.01-SELL-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 1,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-ETH-0.01-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 3,
+        "conditional": 3
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": 0.0,
+      "name": "VWAP-SOL-0.01-SELL-P0",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 5,
+        "conditional": 5
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-0.001-BUY-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ETH-0.01-BUY-P3",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-SOL-0.001-BUY-P7",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    },
+    {
+      "effect_pp": null,
+      "name": "VWAP-ZEC-0.1-SELL-P1",
+      "reason": "insufficient sample size",
+      "sample_size": {
+        "baseline": 0,
+        "conditional": 0
+      },
+      "status": "REJECTED"
+    }
+  ],
+  "tested": 144
+}

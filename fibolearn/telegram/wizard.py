@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
+import json
 from fibolearn.config.defaults import DEFAULT_SYMBOLS, DEFAULT_PERCENTAGES
 from fibolearn.storage.sqlite_store import FiboLearnStore
 from fibolearn.features.context import significant_context_for_ladder, nearest_level
@@ -48,11 +49,13 @@ class FiboLearnWizard:
         if suffix == 'backtests':
             return Screen('Backtests\nAutomatic Research · Test Live Pattern · Test Existing Pattern · Custom Hypothesis · Recent Tests')
         if suffix == 'report':
-            return Screen('Learning Report\n\nDataset Status\nBaselines', [[_b('Dataset Status','fibolearn:report:dataset')], [_b('Baselines','fibolearn:report:baselines')]])
+            return Screen('Learning Report\n\nDataset Status\nBaselines', [[_b('Dataset Status','fibolearn:report:dataset')], [_b('Baselines','fibolearn:report:baselines')], [_b('Phase 3B','fibolearn:report:phase3b')]])
         if suffix == 'report:dataset':
             return self._dataset_status_screen()
         if suffix == 'report:baselines':
             return Screen('Baselines — choose symbol', [[_b(s, f'fibolearn:report:baseline:{s}:0.001:BUY') for s in ('BTC','ETH','SOL')], [_b(s, f'fibolearn:report:baseline:{s}:0.001:BUY') for s in ('ZEC','PAXG')]])
+        if suffix == 'report:phase3b':
+            return Screen('Phase 3B\nResearch only · FL-VWAP-001 · temporal OOS · pattern discovery')
         if suffix.startswith('report:baseline:'):
             _,_,sym,pct,side = suffix.split(':',4)
             return self._baseline_screen(sym,pct,side)
@@ -60,6 +63,13 @@ class FiboLearnWizard:
             return self._data_coverage_screen()
         if suffix == 'ask':
             return Screen('Ask FiboLearn\nQuestions must query stored observations/backtests. If no traceable result exists, FiboLearn reports insufficient evidence.')
+        if suffix.startswith('ask:'):
+            from fibolearn.research.phase3b import question_answer_from_reports
+            question = suffix.split(':', 1)[1]
+            answer = question_answer_from_reports(question)
+            if answer is None:
+                return Screen('Ask FiboLearn\nI could not parse that question into a stored experiment lookup.')
+            return Screen(json.dumps(answer, indent=2, sort_keys=True))
         if suffix == 'settings':
             return Screen('Settings\nSymbols: BTC ETH SOL ZEC PAXG\nDirections: BUY SELL\nResearch: automatic discovery, backtests, cross-symbol, walk-forward\nAlerts: new/validated/strong/degraded patterns')
         return self.open()

@@ -1,0 +1,65 @@
+{
+  "baselines": {
+    "ambiguous_total": 0,
+    "cells": 144,
+    "eligible_total": 16316
+  },
+  "dataset": {
+    "symbol_count": 5,
+    "time_window": "existing 30-day dataset only"
+  },
+  "fl_vwap_001": {
+    "cells": 144,
+    "oos": {
+      "ambiguous_excluded": 0,
+      "censored": 1819,
+      "ci95": [
+        0.43745553307097307,
+        0.45655207165296974
+      ],
+      "n_episodes": 12231,
+      "order_sensitive_n": 10412,
+      "progression": 4654,
+      "progression_rate": 0.4469842489435267,
+      "regression": 5758
+    },
+    "pooled": {
+      "ambiguous_excluded": 0,
+      "censored": 2493,
+      "ci95": [
+        0.42487795977071213,
+        0.44139663471079266
+      ],
+      "n_episodes": 16316,
+      "order_sensitive_n": 13823,
+      "progression": 5987,
+      "progression_rate": 0.43311871518483686,
+      "regression": 7836
+    },
+    "train": {
+      "ambiguous_excluded": 0,
+      "censored": 674,
+      "ci95": [
+        0.37455146941218204,
+        0.40728321363724546
+      ],
+      "n_episodes": 4085,
+      "order_sensitive_n": 3411,
+      "progression": 1333,
+      "progression_rate": 0.39079448841981823,
+      "regression": 2078
+    }
+  },
+  "git_commit": "f7b269dad7663808f9e043af828ee81dfda9feaa",
+  "notes": [
+    "Order-sensitive analyses exclude intrabar_order_ambiguous=true episodes.",
+    "Whole-ladder VWAP is derived from episode observation sequences, not UTC daily VWAP.",
+    "No live GoldenFibo behavior was modified."
+  ],
+  "patterns": {
+    "found": 144,
+    "rejected": 100,
+    "tested": 144,
+    "validated": 0
+  }
+}
