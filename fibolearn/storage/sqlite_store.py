@@ -71,6 +71,21 @@ def _episode_evolution(obs):
     }
 
 
+def _episode_ordering_classification(evolution: Dict[str, Any]) -> str:
+    events = evolution.get('event_ordering') or []
+    ts = [int(ev.get('timestamp_ms')) for ev in events if isinstance(ev, dict) and ev.get('timestamp_ms') is not None]
+    if len(ts) != len(events):
+        return 'other_reason'
+    if len(ts) >= 2 and any(ts[i] > ts[i + 1] for i in range(len(ts) - 1)):
+        return 'true_timestamp_reversal'
+    if len(ts) >= 2 and len(set(ts)) < len(ts):
+        return 'same_candle_ambiguous'
+    return 'definitely_reconstructable'
+
+def _episode_intrabar_order_ambiguous(evolution: Dict[str, Any]) -> bool:
+    return _episode_ordering_classification(evolution) == 'same_candle_ambiguous'
+
+
 class FiboLearnStore:
     DEFAULT_MIN_EPISODES = 30
     DEFAULT_MIN_OOS_EPISODES = 15
@@ -109,9 +124,34 @@ class FiboLearnStore:
             c.execute('create index if not exists idx_patterns_status on patterns(status)')
             c.execute('create table if not exists backtests(id integer primary key autoincrement, pattern_id integer, symbols_json text not null, result_json text not null, created_at integer not null)')
             c.execute('create table if not exists runtime_state(key text primary key, value_json text not null, updated_at integer not null)')
-            c.execute('create table if not exists episodes(id integer primary key autoincrement, episode_key text not null unique, symbol text not null, percentage text not null, direction text not null, cycle_id text not null, active_step integer not null, start_timestamp_ms integer not null, end_timestamp_ms integer not null, terminal_event text not null, observation_count integer not null, raw_observation_ids_json text not null, start_state_json text not null, end_state_json text not null, evolution_json text not null, outcome_json text not null, created_at integer not null)')
+            c.execute('create table if not exists episodes(id integer primary key autoincrement, episode_key text not null unique, symbol text not null, percentage text not null, direction text not null, cycle_id text not null, active_step integer not null, start_timestamp_ms integer not null, end_timestamp_ms integer not null, terminal_event text not null, observation_count integer not null, raw_observation_ids_json text not null, start_state_json text not null, end_state_json text not null, evolution_json text not null, outcome_json text not null, intrabar_order_ambiguous integer not null default 0, created_at integer not null)')
             c.execute('create index if not exists idx_episodes_symbol_pct_dir on episodes(symbol,percentage,direction)')
+            c.execute('create index if not exists idx_episodes_intrabar_ambiguous on episodes(intrabar_order_ambiguous)')
             c.execute('create table if not exists dataset_checkpoints(key text primary key, value_json text not null, updated_at integer not null)')
+            self._migrate_intrabar_ambiguity_flag()
+
+    def _migrate_intrabar_ambiguity_flag(self) -> None:
+        with self._connect() as c:
+            try:
+                cols = [r['name'] for r in c.execute('pragma table_info(episodes)').fetchall()]
+            except Exception:
+                return
+            if 'intrabar_order_ambiguous' not in cols:
+                try:
+                    c.execute('alter table episodes add column intrabar_order_ambiguous integer not null default 0')
+                except Exception:
+                    pass
+            try:
+                c.execute('create index if not exists idx_episodes_intrabar_ambiguous on episodes(intrabar_order_ambiguous)')
+            except Exception:
+                pass
+            try:
+                rows = c.execute('select id,evolution_json from episodes where ifnull(intrabar_order_ambiguous,0)=0').fetchall()
+                for r in rows:
+                    evo = json.loads(r['evolution_json']) if r['evolution_json'] else {}
+                    c.execute('update episodes set intrabar_order_ambiguous=? where id=?', (1 if _episode_intrabar_order_ambiguous(evo) else 0, int(r['id'])))
+            except Exception:
+                pass
 
     def _serialize(self, obj) -> str:
         from fibolearn.backtest.engine import _D as _DD
@@ -368,7 +408,7 @@ class FiboLearnStore:
                 n += 1
         return n
 
-    def episode_rows(self, symbol: str | None = None) -> list[Dict[str, Any]]:
+    def episode_rows(self, symbol: str | None = None, *, include_ambiguous: bool = True) -> list[Dict[str, Any]]:
         q = 'select * from episodes'
         args = []
         if symbol:
@@ -382,18 +422,26 @@ class FiboLearnStore:
             for k in ('raw_observation_ids_json', 'start_state_json', 'end_state_json', 'evolution_json', 'outcome_json'):
                 if k.endswith('_json') and k in d:
                     d[k[:-5]] = json.loads(d.pop(k))
-            out.append(d)
+            d['intrabar_order_ambiguous'] = bool(int(d.pop('intrabar_order_ambiguous', 0) or 0))
+            d['intrabar_order_classification'] = _episode_ordering_classification(d.get('evolution') or {})
+            if include_ambiguous or not d['intrabar_order_ambiguous']:
+                out.append(d)
         return out
 
-    def episode_baselines(self) -> Dict[Tuple, Dict[str, Any]]:
+    def ambiguous_episode_rows(self, symbol: str | None = None) -> list[Dict[str, Any]]:
+        return [e for e in self.episode_rows(symbol, include_ambiguous=True) if e.get('intrabar_order_ambiguous')]
+
+    def episode_baselines(self, *, include_ambiguous: bool = False) -> Dict[Tuple, Dict[str, Any]]:
         obs_counts = {}
         for r in self.dataset_rows():
             key = (r['symbol'], r['percentage'], r['direction']); obs_counts[key] = obs_counts.get(key, 0) + 1
         out = {}
-        for e in self.episode_rows():
+        for e in self.episode_rows(include_ambiguous=include_ambiguous):
             key = (e['symbol'], e['percentage'], e['direction'])
-            b = out.setdefault(key, {'symbol': e['symbol'], 'percentage': e['percentage'], 'direction': e['direction'], 'episodes': 0, 'completed_episodes': 0, 'raw_observations': obs_counts.get(key, 0), 'pn_plus_1_before_tp': 0, 'tp_before_pn_plus_1': 0, 'other_censored': 0, 'durations_ms': [], 'mfes': [], 'maes': []})
+            b = out.setdefault(key, {'symbol': e['symbol'], 'percentage': e['percentage'], 'direction': e['direction'], 'episodes': 0, 'completed_episodes': 0, 'raw_observations': obs_counts.get(key, 0), 'pn_plus_1_before_tp': 0, 'tp_before_pn_plus_1': 0, 'other_censored': 0, 'ambiguous_episodes': 0, 'durations_ms': [], 'mfes': [], 'maes': []})
             b['episodes'] += 1
+            if e.get('intrabar_order_ambiguous'):
+                b['ambiguous_episodes'] += 1
             term = e['terminal_event']
             if term in ('pn_plus_1_before_tp', 'tp_before_pn_plus_1'):
                 b['completed_episodes'] += 1
@@ -413,15 +461,17 @@ class FiboLearnStore:
             b['median_mae'] = statistics.median(b['maes']) if b['maes'] else None
         return out
 
-    def time_dependent_baselines(self, minutes=(1, 3, 5, 10, 15, 30, 60)) -> Dict[Tuple, Dict[int, Dict[str, Any]]]:
+    def time_dependent_baselines(self, minutes=(1, 3, 5, 10, 15, 30, 60), *, include_ambiguous: bool = False) -> Dict[Tuple, Dict[int, Dict[str, Any]]]:
         out = {}
-        for e in self.episode_rows():
+        for e in self.episode_rows(include_ambiguous=include_ambiguous):
             key = (e['symbol'], e['percentage'], e['direction']); out.setdefault(key, {})
             duration_min = (int(e['end_timestamp_ms']) - int(e['start_timestamp_ms'])) / 60000
             for m in minutes:
-                d = out[key].setdefault(int(m), {'eligible_episodes': 0, 'pn_plus_1_before_tp': 0, 'tp_before_pn_plus_1': 0, 'other_censored': 0, 'probability_pn_plus_1_before_tp': None})
+                d = out[key].setdefault(int(m), {'eligible_episodes': 0, 'pn_plus_1_before_tp': 0, 'tp_before_pn_plus_1': 0, 'other_censored': 0, 'ambiguous_episodes': 0, 'probability_pn_plus_1_before_tp': None})
                 if duration_min >= m:
                     d['eligible_episodes'] += 1
+                    if e.get('intrabar_order_ambiguous'):
+                        d['ambiguous_episodes'] += 1
                     if e['terminal_event'] == 'pn_plus_1_before_tp':
                         d['pn_plus_1_before_tp'] += 1
                     elif e['terminal_event'] == 'tp_before_pn_plus_1':
@@ -430,8 +480,9 @@ class FiboLearnStore:
                         d['other_censored'] += 1
         for mset in out.values():
             for d in mset.values():
-                if d['eligible_episodes']:
-                    d['probability_pn_plus_1_before_tp'] = d['pn_plus_1_before_tp'] / d['eligible_episodes']
+                effective = max(1, d['eligible_episodes'] - d.get('ambiguous_episodes', 0))
+                if effective:
+                    d['probability_pn_plus_1_before_tp'] = d['pn_plus_1_before_tp'] / effective
         return out
 
     def dataset_status_by_symbol(self) -> Dict[str, Dict[str, Any]]:
@@ -445,16 +496,19 @@ class FiboLearnStore:
         return out
 
     def data_coverage_matrix(self, symbols=('BTC', 'ETH', 'SOL', 'ZEC', 'PAXG'), percentages=('1', '0.1', '0.01', '0.001'), directions=('BUY', 'SELL'), *, min_completed_episodes: int = DEFAULT_MIN_EPISODES) -> Dict[str, Any]:
-        baselines = self.episode_baselines()
+        baselines = self.episode_baselines(include_ambiguous=True)
         cells: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for sym in symbols:
             for pct in percentages:
                 for side in directions:
                     b = baselines.get((sym, pct, side), {})
-                    completed = int(b.get('completed_episodes', 0))
+                    ambiguous = int(b.get('ambiguous_episodes', 0))
+                    completed = max(0, int(b.get('completed_episodes', 0)) - ambiguous)
+                    completed = completed if completed >= 0 else 0
                     cells[(sym, pct, side)] = {
                         'symbol': sym, 'percentage': pct, 'direction': side,
                         'episodes': int(b.get('episodes', 0)),
+                        'ambiguous_episodes': int(b.get('ambiguous_episodes', 0)),
                         'completed_episodes': completed,
                         'raw_observations': int(b.get('raw_observations', 0)),
                         'pn_plus_1_before_tp': int(b.get('pn_plus_1_before_tp', 0)),
@@ -463,7 +517,7 @@ class FiboLearnStore:
                         'median_duration_ms': b.get('median_duration_ms'),
                         'sufficient': completed >= min_completed_episodes,
                     }
-        return {'cells': cells, 'min_completed_episodes': min_completed_episodes}
+        return {'cells': cells, 'min_completed_episodes': min_completed_episodes, 'ambiguous_episodes_total': sum(v['ambiguous_episodes'] for v in cells.values())}
 
     def research_gate(self, symbol: str, percentage: str, direction: str, *, min_episodes: int = DEFAULT_MIN_EPISODES, min_oos_episodes: int = DEFAULT_MIN_OOS_EPISODES, min_per_symbol_episodes: int = DEFAULT_MIN_PER_SYMBOL_EPISODES) -> Dict[str, Any]:
         baselines = self.episode_baselines()
@@ -827,13 +881,14 @@ class FiboLearnStore:
         active_step = st['active_step']
         obs_ids = st['observation_ids']
         episode_key = f"{symbol}|{pct}|{side}|{cycle_id}|{active_step}"
+        intrabar_ambiguous = _episode_intrabar_order_ambiguous(evolution)
         c.execute(
-            'insert or replace into episodes(episode_key,symbol,percentage,direction,cycle_id,active_step,start_timestamp_ms,end_timestamp_ms,terminal_event,observation_count,raw_observation_ids_json,start_state_json,end_state_json,evolution_json,outcome_json,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'insert or replace into episodes(episode_key,symbol,percentage,direction,cycle_id,active_step,start_timestamp_ms,end_timestamp_ms,terminal_event,observation_count,raw_observation_ids_json,start_state_json,end_state_json,evolution_json,outcome_json,intrabar_order_ambiguous,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (
                 episode_key, symbol, pct, side, cycle_id, active_step,
                 start_ts, end_ts, terminal, len(obs_ids), self._serialize(obs_ids),
                 self._serialize(st['start_sv']), self._serialize(st['end_sv']),
-                self._serialize(evolution), self._serialize(outcome), now_ms,
+                self._serialize(evolution), self._serialize(outcome), int(intrabar_ambiguous), now_ms,
             ),
         )
 

@@ -1,0 +1,1477 @@
+{
+  "ambiguity_policy": {
+    "current_reproducible_audit_same_candle_ambiguous": 55,
+    "current_reproducible_audit_true_timestamp_reversals": 0,
+    "historical_selector_available": false,
+    "historical_stage5_reported_impossible_event_ordering": 26,
+    "policy": "episodes with same-timestamp competing order-sensitive events are marked intrabar_order_ambiguous=true; true timestamp reversals are classified separately; analyses that depend on ordering exclude ambiguous episodes by default.",
+    "reconstruction_bug_evidence": false
+  },
+  "anomaly_audit": {
+    "classification_counts": {
+      "other_reason": 0,
+      "same_timestamp_same_candle_ambiguity": 55,
+      "true_timestamp_reversal_or_impossible_ordering": 0
+    },
+    "episodes": [
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "150",
+        "direction": "BUY",
+        "end_timestamp_ms": 1787184180000,
+        "episode_key": "BTC|0.001|BUY|150|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5820000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787184000000
+          },
+          {
+            "elapsed_ms": 5820000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787184000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787178180000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 7,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "27",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787216700000,
+        "episode_key": "BTC|0.001|SELL|27|7",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 30780000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787184000000
+          },
+          {
+            "elapsed_ms": 30780000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787184000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787153220000,
+        "symbol": "BTC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 6,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "18",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787461680000,
+        "episode_key": "BTC|0.001|SELL|18|6",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 55500000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 55500000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787301300000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "117",
+        "direction": "BUY",
+        "end_timestamp_ms": 1787618520000,
+        "episode_key": "BTC|0.001|BUY|117|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 23880000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787616000000
+          },
+          {
+            "elapsed_ms": 23880000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787616000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787592120000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "7",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787791860000,
+        "episode_key": "BTC|0.001|SELL|7|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 1500000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787788800000
+          },
+          {
+            "elapsed_ms": 1500000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787788800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787787300000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "77",
+        "direction": "BUY",
+        "end_timestamp_ms": 1787877060000,
+        "episode_key": "BTC|0.001|BUY|77|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 20820000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787875200000
+          },
+          {
+            "elapsed_ms": 20820000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787875200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787854380000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 6,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "59",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788525360000,
+        "episode_key": "BTC|0.001|SELL|59|6",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 32280000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 32280000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788447720000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "16",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788658680000,
+        "episode_key": "BTC|0.001|BUY|16|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 15960000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 15960000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788636840000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "20",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788750720000,
+        "episode_key": "BTC|0.001|SELL|20|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 3420000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788739200000
+          },
+          {
+            "elapsed_ms": 3420000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788739200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788735780000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "119",
+        "direction": "SELL",
+        "end_timestamp_ms": 1789337100000,
+        "episode_key": "BTC|0.001|SELL|119|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 12180000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789322520000
+          },
+          {
+            "elapsed_ms": 12180000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789322520000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789310340000,
+        "symbol": "BTC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "5",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787015160000,
+        "episode_key": "ETH|0.001|SELL|5|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 2040000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787011200000
+          },
+          {
+            "elapsed_ms": 2040000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787011200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787009160000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "6",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787808720000,
+        "episode_key": "ETH|0.001|SELL|6|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 9060000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787788800000
+          },
+          {
+            "elapsed_ms": 9060000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787788800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787779740000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "200",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788480960000,
+        "episode_key": "ETH|0.001|BUY|200|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5640000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 5640000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788474360000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 6,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "94",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788525000000,
+        "episode_key": "ETH|0.001|SELL|94|6",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 32280000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 32280000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788447720000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "30",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788654420000,
+        "episode_key": "ETH|0.001|BUY|30|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5580000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 5580000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788647220000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "45",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788912600000,
+        "episode_key": "ETH|0.001|BUY|45|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 18660000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788912000000
+          },
+          {
+            "elapsed_ms": 18660000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788912000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788893340000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "51",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788928980000,
+        "episode_key": "ETH|0.001|SELL|51|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 33180000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788912000000
+          },
+          {
+            "elapsed_ms": 33180000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788912000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788878820000,
+        "symbol": "ETH",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "2",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787248980000,
+        "episode_key": "ETH|0.01|SELL|2|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 11400000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787184000000
+          },
+          {
+            "elapsed_ms": 11400000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787184000000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787172600000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "2",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787375340000,
+        "episode_key": "ETH|0.01|SELL|2|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 7680000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 7680000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787349120000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "1",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787248980000,
+        "episode_key": "ETH|0.1|SELL|1|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 11340000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787184000000
+          },
+          {
+            "elapsed_ms": 11340000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787184000000
+          }
+        ],
+        "percentage": "0.1",
+        "start_timestamp_ms": 1787172660000,
+        "symbol": "ETH",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 6,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "16",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787818080000,
+        "episode_key": "SOL|0.001|SELL|16|6",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5940000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787788800000
+          },
+          {
+            "elapsed_ms": 5940000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787788800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787782860000,
+        "symbol": "SOL",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "378",
+        "direction": "BUY",
+        "end_timestamp_ms": 1787876160000,
+        "episode_key": "SOL|0.001|BUY|378|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 840000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787875200000
+          },
+          {
+            "elapsed_ms": 840000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787875200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787874360000,
+        "symbol": "SOL",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 8,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "16",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787934120000,
+        "episode_key": "SOL|0.001|SELL|16|8",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 27480000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787875200000
+          },
+          {
+            "elapsed_ms": 27480000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787875200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787847720000,
+        "symbol": "SOL",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "120",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788402600000,
+        "episode_key": "SOL|0.001|SELL|120|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 14280000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788393600000
+          },
+          {
+            "elapsed_ms": 14280000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788393600000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788379320000,
+        "symbol": "SOL",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "277",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788511980000,
+        "episode_key": "SOL|0.001|BUY|277|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5220000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 5220000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788474780000,
+        "symbol": "SOL",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "61",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788656520000,
+        "episode_key": "SOL|0.001|BUY|61|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 1320000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 1320000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788651480000,
+        "symbol": "SOL",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "126",
+        "direction": "BUY",
+        "end_timestamp_ms": 1789171320000,
+        "episode_key": "SOL|0.001|BUY|126|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 7320000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789171200000
+          },
+          {
+            "elapsed_ms": 7320000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789171200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789163880000,
+        "symbol": "SOL",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "85",
+        "direction": "SELL",
+        "end_timestamp_ms": 1789171320000,
+        "episode_key": "SOL|0.001|SELL|85|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 3000000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789171200000
+          },
+          {
+            "elapsed_ms": 3000000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789171200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789168200000,
+        "symbol": "SOL",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "1",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788665640000,
+        "episode_key": "SOL|0.01|SELL|1|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 39960000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 39960000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1788612840000,
+        "symbol": "SOL",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 0,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "2",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788026700000,
+        "episode_key": "SOL|0.1|BUY|2|0",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 35760000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787875200000
+          },
+          {
+            "elapsed_ms": 35760000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787875200000
+          }
+        ],
+        "percentage": "0.1",
+        "start_timestamp_ms": 1787839440000,
+        "symbol": "SOL",
+        "terminal_event": "other_terminal"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "763",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787356800000,
+        "episode_key": "ZEC|0.001|SELL|763|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 480000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 480000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787356320000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 5,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "480",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788221760000,
+        "episode_key": "ZEC|0.001|BUY|480|5",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 6180000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788220800000
+          },
+          {
+            "elapsed_ms": 6180000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788220800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788214620000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "54",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788307680000,
+        "episode_key": "ZEC|0.001|SELL|54|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5040000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788307200000
+          },
+          {
+            "elapsed_ms": 5040000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788307200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788302160000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 8,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "351",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788511740000,
+        "episode_key": "ZEC|0.001|SELL|351|8",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 30240000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 30240000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788449760000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "306",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788652800000,
+        "episode_key": "ZEC|0.001|BUY|306|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 180000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 180000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788652620000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "255",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788653820000,
+        "episode_key": "ZEC|0.001|SELL|255|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 3900000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788652800000
+          },
+          {
+            "elapsed_ms": 3900000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788652800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788648900000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 5,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "509",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788926400000,
+        "episode_key": "ZEC|0.001|SELL|509|5",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5940000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788912000000
+          },
+          {
+            "elapsed_ms": 5940000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788912000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788906060000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "678",
+        "direction": "SELL",
+        "end_timestamp_ms": 1789171500000,
+        "episode_key": "ZEC|0.001|SELL|678|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 780000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789171200000
+          },
+          {
+            "elapsed_ms": 780000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789171200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789170420000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "4",
+        "direction": "BUY",
+        "end_timestamp_ms": 1789324440000,
+        "episode_key": "ZEC|0.001|BUY|4|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 60000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789323540000
+          },
+          {
+            "elapsed_ms": 60000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789323540000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789323480000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 6,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "423",
+        "direction": "BUY",
+        "end_timestamp_ms": 1789459620000,
+        "episode_key": "ZEC|0.001|BUY|423|6",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 3360000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789430400000
+          },
+          {
+            "elapsed_ms": 3360000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789430400000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1789427040000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "41",
+        "direction": "BUY",
+        "end_timestamp_ms": 1787356800000,
+        "episode_key": "ZEC|0.01|BUY|41|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 1200000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 1200000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787355600000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 5,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "2",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787363880000,
+        "episode_key": "ZEC|0.01|SELL|2|5",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 13260000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 13260000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787343540000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "1",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787795100000,
+        "episode_key": "ZEC|0.01|SELL|1|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 5820000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787788800000
+          },
+          {
+            "elapsed_ms": 5820000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787788800000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787782980000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "4",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787883720000,
+        "episode_key": "ZEC|0.01|SELL|4|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 29100000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787875200000
+          },
+          {
+            "elapsed_ms": 29100000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787875200000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1787846100000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "8",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788511920000,
+        "episode_key": "ZEC|0.01|SELL|8|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 31020000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 31020000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1788448980000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "11",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788915300000,
+        "episode_key": "ZEC|0.01|BUY|11|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 18720000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788912000000
+          },
+          {
+            "elapsed_ms": 18720000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788912000000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1788893280000,
+        "symbol": "ZEC",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "17",
+        "direction": "BUY",
+        "end_timestamp_ms": 1789483140000,
+        "episode_key": "ZEC|0.01|BUY|17|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 3360000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1789430400000
+          },
+          {
+            "elapsed_ms": 3360000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1789430400000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1789427040000,
+        "symbol": "ZEC",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "3",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787017560000,
+        "episode_key": "PAXG|0.001|SELL|3|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 15060000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787011200000
+          },
+          {
+            "elapsed_ms": 15060000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787011200000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1786996140000,
+        "symbol": "PAXG",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "7",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787508600000,
+        "episode_key": "PAXG|0.001|SELL|7|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 53460000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787356800000
+          },
+          {
+            "elapsed_ms": 53460000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787356800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787303340000,
+        "symbol": "PAXG",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "38",
+        "direction": "SELL",
+        "end_timestamp_ms": 1787705940000,
+        "episode_key": "PAXG|0.001|SELL|38|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 30300000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1787702400000
+          },
+          {
+            "elapsed_ms": 30300000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1787702400000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1787672100000,
+        "symbol": "PAXG",
+        "terminal_event": "tp_before_pn_plus_1"
+      },
+      {
+        "active_step": 2,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "28",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788221580000,
+        "episode_key": "PAXG|0.001|SELL|28|2",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 27060000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788220800000
+          },
+          {
+            "elapsed_ms": 27060000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788220800000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788193740000,
+        "symbol": "PAXG",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 4,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "26",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788397560000,
+        "episode_key": "PAXG|0.001|SELL|26|4",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 38040000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788393600000
+          },
+          {
+            "elapsed_ms": 38040000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788393600000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788355560000,
+        "symbol": "PAXG",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 3,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "79",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788524940000,
+        "episode_key": "PAXG|0.001|BUY|79|3",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 14040000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 14040000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.001",
+        "start_timestamp_ms": 1788465960000,
+        "symbol": "PAXG",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 1,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "2",
+        "direction": "SELL",
+        "end_timestamp_ms": 1788439620000,
+        "episode_key": "PAXG|0.01|SELL|2|1",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 37800000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788393600000
+          },
+          {
+            "elapsed_ms": 37800000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788393600000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1788355800000,
+        "symbol": "PAXG",
+        "terminal_event": "pn_plus_1_before_tp"
+      },
+      {
+        "active_step": 0,
+        "classification": "same-timestamp / same-candle ambiguity",
+        "cycle_id": "4",
+        "direction": "BUY",
+        "end_timestamp_ms": 1788524940000,
+        "episode_key": "PAXG|0.01|BUY|4|0",
+        "ordered_domain_events": [
+          {
+            "elapsed_ms": 40920000,
+            "event": "vwap_crossed_pn",
+            "timestamp_ms": 1788480000000
+          },
+          {
+            "elapsed_ms": 40920000,
+            "event": "poc_crossed_pn",
+            "timestamp_ms": 1788480000000
+          }
+        ],
+        "percentage": "0.01",
+        "start_timestamp_ms": 1788439080000,
+        "symbol": "PAXG",
+        "terminal_event": "other_terminal"
+      }
+    ],
+    "exact_26_episode_keys": null,
+    "note": "These are the same-timestamp paired-event episodes directly observable in the DB; they do not exhibit timestamp reversal."
+  },
+  "explanation_26_vs_55": {
+    "interpretation": "The broader 55-row set is all same-timestamp paired events already persisted in episode.event_ordering. The Stage 5 count of 26 is not reproduced by any timestamp-order reversal in the DB I inspected; it most likely comes from a narrower selector in the Stage 5 script (not recovered here) that excludes many same-timestamp cases, rather than from a genuine timestamp reversal bug.",
+    "observed_same_timestamp_episode_count": 55,
+    "stage5_count": 26,
+    "terminal_event_breakdown_among_same_timestamp": {
+      "other_terminal": 2,
+      "pn_plus_1_before_tp": 19,
+      "tp_before_pn_plus_1": 34
+    }
+  },
+  "preserve_original_stage5_report": true,
+  "reconstruction_bug_exists": false,
+  "source_db": "/root/.hermes/fibolearn/fibolearn.sqlite",
+  "stage5_integrity": {
+    "impossible_event_ordering_reported": 26,
+    "other_stage5_summary": {
+      "active_step_out_of_range": 0,
+      "cycle_id_non_numeric": 0,
+      "impossible_event_ordering": 26
+    }
+  },
+  "stage5_selector": {
+    "exact_code_found": false,
+    "note": "I could not recover the exact Stage 5 selector code from the saved artifacts. The report field impossible_event_ordering=26 is preserved, but the selector itself was not present in the accessible session dump or repo files.",
+    "selector_text": null
+  },
+  "stage6_empty_cells": {
+    "cells": [
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "0.1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "BTC"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "0.1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "BTC"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "BTC"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "BTC"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "ETH"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "ETH"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "0.1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "PAXG"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "0.1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "PAXG"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "PAXG"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "PAXG"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "0.1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "SOL"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "SOL"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "SOL"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "BUY",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "ZEC"
+      },
+      {
+        "completed_episodes": 0,
+        "direction": "SELL",
+        "percentage": "1",
+        "reason": "zero completed episodes in the 30-day window",
+        "symbol": "ZEC"
+      }
+    ],
+    "count": 15
+  }
+}

@@ -69,10 +69,13 @@ class FiboLearnWizard:
             return datetime.fromtimestamp(int(ms)/1000, timezone.utc).isoformat().replace('+00:00','Z') if ms else '—'
         status=self._store.dataset_status_by_symbol()
         lines=['Dataset Status']
+        ambiguous = {k: v for k, v in self._store.episode_baselines(include_ambiguous=True).items()}
         for sym in ('BTC','ETH','SOL','ZEC','PAXG'):
             s=status.get(sym, {'candles':0,'observations':0,'episodes':0,'cycles':0})
-            lines += ['', sym, f"Candles: {s.get('candles',0)}", f"Observations: {s.get('observations',0)}", f"Episodes: {s.get('episodes',0)}", f"Cycles: {s.get('cycles',0)}", f"Historical range: {iso(s.get('first_timestamp_ms'))} → {iso(s.get('last_timestamp_ms'))}"]
+            amb_n = sum(v.get('ambiguous_episodes', 0) for k, v in ambiguous.items() if k[0] == sym)
+            lines += ['', sym, f"Candles: {s.get('candles',0)}", f"Observations: {s.get('observations',0)}", f"Episodes: {s.get('episodes',0)}", f"Ambiguous episodes: {amb_n}", f"Cycles: {s.get('cycles',0)}", f"Historical range: {iso(s.get('first_timestamp_ms'))} → {iso(s.get('last_timestamp_ms'))}"]
         return Screen('\n'.join(lines))
+
 
     def _data_coverage_screen(self) -> Screen:
         matrix = self._store.data_coverage_matrix()
