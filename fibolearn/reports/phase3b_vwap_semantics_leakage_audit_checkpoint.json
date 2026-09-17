@@ -1,0 +1,13 @@
+{
+  "absent_rate": 0.09808946877912395,
+  "classification": "CONFIRMED_LEAKAGE",
+  "elapsed_s": 129.918,
+  "eligible_population": 16316,
+  "peak_rss_kb": 1173924,
+  "pooled_rate": 0.43311871518483686,
+  "present_rate": 0.58398908823838,
+  "report_path": "/root/kam/fibolearn/reports/phase3b_vwap_semantics_leakage_audit.json",
+  "rows_processed": 16316,
+  "rss_kb": 917856,
+  "stage": "complete"
+}

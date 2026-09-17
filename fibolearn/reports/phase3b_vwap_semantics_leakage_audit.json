@@ -1,0 +1,1045 @@
+{
+  "classification": "CONFIRMED_LEAKAGE",
+  "counts": {
+    "absent": {
+      "censored": 1548,
+      "ci95": [
+        0.08954705468098403,
+        0.1073507080298198
+      ],
+      "eligible": 5840,
+      "order_sensitive_n": 4292,
+      "progression": 421,
+      "progression_rate": 0.09808946877912395,
+      "regression": 3871
+    },
+    "eligible_population": 16316,
+    "late_cross": {
+      "censored": 132,
+      "ci95": [
+        0.5705168521275972,
+        0.6130910987998575
+      ],
+      "eligible": 2176,
+      "order_sensitive_n": 2044,
+      "progression": 1210,
+      "progression_rate": 0.5919765166340509,
+      "regression": 834
+    },
+    "late_cross_after_progress": {
+      "censored": 0,
+      "ci95": null,
+      "eligible": 0,
+      "order_sensitive_n": 0,
+      "progression": 0,
+      "progression_rate": null,
+      "regression": 0
+    },
+    "late_cross_before_progress": {
+      "censored": 132,
+      "ci95": [
+        0.5705168521275972,
+        0.6130910987998575
+      ],
+      "eligible": 2176,
+      "order_sensitive_n": 2044,
+      "progression": 1210,
+      "progression_rate": 0.5919765166340509,
+      "regression": 834
+    },
+    "late_cross_no_progress": {
+      "censored": 0,
+      "ci95": null,
+      "eligible": 0,
+      "order_sensitive_n": 0,
+      "progression": 0,
+      "progression_rate": null,
+      "regression": 0
+    },
+    "partition_check": true,
+    "present": {
+      "censored": 945,
+      "ci95": [
+        0.5740615976723792,
+        0.5938489001800445
+      ],
+      "eligible": 10476,
+      "order_sensitive_n": 9531,
+      "progression": 5566,
+      "progression_rate": 0.58398908823838,
+      "regression": 3965
+    },
+    "start_false": {
+      "censored": 1680,
+      "ci95": [
+        0.24680153286525547,
+        0.2683283088645441
+      ],
+      "eligible": 8016,
+      "order_sensitive_n": 6336,
+      "progression": 1631,
+      "progression_rate": 0.2574179292929293,
+      "regression": 4705
+    },
+    "start_true": {
+      "censored": 813,
+      "ci95": [
+        0.5705960429438106,
+        0.592936983839188
+      ],
+      "eligible": 8300,
+      "order_sensitive_n": 7487,
+      "progression": 4356,
+      "progression_rate": 0.5818084680112194,
+      "regression": 3131
+    },
+    "unknown": {
+      "censored": 0,
+      "ci95": null,
+      "eligible": 0,
+      "order_sensitive_n": 0,
+      "progression": 0,
+      "progression_rate": null,
+      "regression": 0
+    }
+  },
+  "cross_symbol_consistency": {
+    "buy_sell_mirror_logic": true,
+    "per_symbol_direction_summary": [
+      {
+        "absent_n": 241,
+        "absent_progression_rate": 0.061611374407582936,
+        "direction": "BUY",
+        "present_n": 571,
+        "present_progression_rate": 0.547486033519553,
+        "symbol": "BTC"
+      },
+      {
+        "absent_n": 146,
+        "absent_progression_rate": 0.0625,
+        "direction": "SELL",
+        "present_n": 437,
+        "present_progression_rate": 0.5691056910569106,
+        "symbol": "BTC"
+      },
+      {
+        "absent_n": 421,
+        "absent_progression_rate": 0.08505154639175258,
+        "direction": "BUY",
+        "present_n": 936,
+        "present_progression_rate": 0.5487404162102957,
+        "symbol": "ETH"
+      },
+      {
+        "absent_n": 263,
+        "absent_progression_rate": 0.10619469026548672,
+        "direction": "SELL",
+        "present_n": 669,
+        "present_progression_rate": 0.56,
+        "symbol": "ETH"
+      },
+      {
+        "absent_n": 55,
+        "absent_progression_rate": 0.14705882352941177,
+        "direction": "BUY",
+        "present_n": 186,
+        "present_progression_rate": 0.5061728395061729,
+        "symbol": "PAXG"
+      },
+      {
+        "absent_n": 50,
+        "absent_progression_rate": 0.0,
+        "direction": "SELL",
+        "present_n": 168,
+        "present_progression_rate": 0.5098039215686274,
+        "symbol": "PAXG"
+      },
+      {
+        "absent_n": 591,
+        "absent_progression_rate": 0.0979020979020979,
+        "direction": "BUY",
+        "present_n": 1215,
+        "present_progression_rate": 0.5775716694772344,
+        "symbol": "SOL"
+      },
+      {
+        "absent_n": 430,
+        "absent_progression_rate": 0.10148514851485149,
+        "direction": "SELL",
+        "present_n": 1002,
+        "present_progression_rate": 0.5565843621399177,
+        "symbol": "SOL"
+      },
+      {
+        "absent_n": 1963,
+        "absent_progression_rate": 0.12744034707158353,
+        "direction": "BUY",
+        "present_n": 2762,
+        "present_progression_rate": 0.614054866591507,
+        "symbol": "ZEC"
+      },
+      {
+        "absent_n": 1680,
+        "absent_progression_rate": 0.03571428571428571,
+        "direction": "SELL",
+        "present_n": 2530,
+        "present_progression_rate": 0.6085871193210185,
+        "symbol": "ZEC"
+      }
+    ],
+    "same_semantics_for_all_symbols": true,
+    "symbol_specific_branching_detected": false
+  },
+  "dataset": {
+    "path": "/root/.hermes/fibolearn/fibolearn.sqlite",
+    "scope": "existing 30-day dataset only"
+  },
+  "evidence": [
+    "The code scans stored observations from episode start to episode end.",
+    "It updates cumulative price*volume and volume using only contemporaneous market observations.",
+    "It compares the cumulative VWAP to Pn and does not read P(n+1), TP, or terminal state to set the condition.",
+    "The reported condition_present bucket is defined by whether the cross ever occurs in the window, so it is inherently future-dependent relative to start_timestamp_ms."
+  ],
+  "feature_outcome_dependency": {
+    "P(n+1)": "Not used.",
+    "Pn": "Used directly as the threshold.",
+    "TP": "Not used.",
+    "active_step": "Legitimate threshold dependence through Pn.",
+    "episode_duration": "Used only for timing fraction.",
+    "filled_ladder_weights": "Not used directly.",
+    "future_step_progression": "Not used in the static formula, but the aggregate condition_present bucket depends on whether a later cross occurs.",
+    "number_of_filled_steps": "Not used directly.",
+    "terminal_classification": "Not used in the formula; but the condition_present statistic is downstream of the full episode path."
+  },
+  "formula": {
+    "code_lines": [
+      "cum_quote += price * volume",
+      "cum_base += volume",
+      "vwap = cum_quote / cum_base if cum_base else price",
+      "cond = vwap >= pn if direction == 'SELL' else vwap <= pn"
+    ],
+    "exact_code_lines": [
+      "cum_quote += price * volume",
+      "cum_base += volume",
+      "vwap = cum_quote / cum_base if cum_base else price",
+      "cond = vwap >= pn if direction == 'SELL' else vwap <= pn"
+    ],
+    "explicitly_not_used": [
+      "P(n+1)",
+      "TP",
+      "terminal_event",
+      "episode_end_state",
+      "future_fill",
+      "future_ladder_state"
+    ],
+    "feature": "whole_ladder_vwap_v1",
+    "inputs": [
+      "market.price",
+      "market.volume",
+      "ladder.pn",
+      "ladder.direction",
+      "timestamp_ms"
+    ],
+    "observations_used": "Contemporaneous market_observations joined to ladder_observations for the same symbol, percentage, direction, and timestamp window between episode start and end.",
+    "provenance": "fibolearn/research/phase3b.py::compute_whole_ladder_vwap_metrics"
+  },
+  "notes": [
+    "No model, threshold, data, pattern status, or GoldenFibo behavior was changed.",
+    "The P0 examples were selected by reservoir sampling, not by outcome.",
+    "This audit intentionally keeps memory bounded and writes incremental checkpoints."
+  ],
+  "p0_audit": {
+    "condition_false_count": 4288,
+    "condition_true_count": 3285,
+    "examples_condition_false": [
+      {
+        "P0": "1199.390544798529400905867932",
+        "P1": "1201.331158700013421476533626",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1043|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 63.747,
+            "cum_quote": 76372.73082,
+            "pn": "1199.390544798529400905867932",
+            "pn_plus_1": "1201.331158700013421476533626",
+            "price": 1198.06,
+            "timestamp_ms": 1788760500000,
+            "volume": 63.747,
+            "vwap": 1198.06
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1788760500000,
+        "timing_bin": null
+      },
+      {
+        "P0": "1217.205000000",
+        "P1": "1020.2612310000000",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0014577259475218659,
+        "cross_timestamp_ms": 1789417620000,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.1|BUY|2|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.1",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 1322.009,
+            "cum_quote": 1610431.70353,
+            "pn": "1217.205000000",
+            "pn_plus_1": "1020.2612310000000",
+            "price": 1218.17,
+            "timestamp_ms": 1789417380000,
+            "volume": 1322.009,
+            "vwap": 1218.17
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 1856.967,
+            "cum_quote": 2261561.18281,
+            "pn": "1217.205000000",
+            "pn_plus_1": "1020.2612310000000",
+            "price": 1217.16,
+            "timestamp_ms": 1789417440000,
+            "volume": 534.958,
+            "vwap": 1217.8790375973294
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 2202.464,
+            "cum_quote": 2682943.14389,
+            "pn": "1217.205000000",
+            "pn_plus_1": "1020.2612310000000",
+            "price": 1219.64,
+            "timestamp_ms": 1789417500000,
+            "volume": 345.497,
+            "vwap": 1218.155276948908
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 2341.493,
+            "cum_quote": 2852368.05416,
+            "pn": "1217.205000000",
+            "pn_plus_1": "1020.2612310000000",
+            "price": 1218.63,
+            "timestamp_ms": 1789417560000,
+            "volume": 139.029,
+            "vwap": 1218.1834642085198
+          },
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 3295.531,
+            "cum_quote": 4009969.14222,
+            "pn": "1217.205000000",
+            "pn_plus_1": "1020.2612310000000",
+            "price": 1213.37,
+            "timestamp_ms": 1789417620000,
+            "volume": 954.038,
+            "vwap": 1216.7899929389223
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789417380000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "1113.033262039482339537139047",
+        "P1": "1111.232374221502457111767956",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|73|0",
+        "eventual_outcome": "regression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 250.255,
+            "cum_quote": 279009.2995,
+            "pn": "1113.033262039482339537139047",
+            "pn_plus_1": "1111.232374221502457111767956",
+            "price": 1114.9,
+            "timestamp_ms": 1789355280000,
+            "volume": 250.255,
+            "vwap": 1114.9
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789355280000,
+        "timing_bin": null
+      },
+      {
+        "P0": "97.64763069393751137009724008",
+        "P1": "97.80562456040030226349405741",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "SELL",
+        "episode_key": "SOL|0.001|SELL|452|0",
+        "eventual_outcome": "regression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 1939.259,
+            "cum_quote": 189329.85616999998,
+            "pn": "97.64763069393751137009724008",
+            "pn_plus_1": "97.80562456040030226349405741",
+            "price": 97.63,
+            "timestamp_ms": 1787686980000,
+            "volume": 1939.259,
+            "vwap": 97.63
+          }
+        ],
+        "symbol": "SOL",
+        "timestamp_ms": 1787686980000,
+        "timing_bin": null
+      },
+      {
+        "P0": "1171.783070526909020261159951",
+        "P1": "1173.679015535021559055942508",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|558|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 112.459,
+            "cum_quote": 131740.09555,
+            "pn": "1171.783070526909020261159951",
+            "pn_plus_1": "1173.679015535021559055942508",
+            "price": 1171.45,
+            "timestamp_ms": 1789151280000,
+            "volume": 112.459,
+            "vwap": 1171.45
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789151280000,
+        "timing_bin": null
+      },
+      {
+        "P0": "795.0681017345652676167482314",
+        "P1": "796.3545219231717942197521300",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1562|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 345.919,
+            "cum_quote": 273708.40875,
+            "pn": "795.0681017345652676167482314",
+            "pn_plus_1": "796.3545219231717942197521300",
+            "price": 791.25,
+            "timestamp_ms": 1787439900000,
+            "volume": 345.919,
+            "vwap": 791.25
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787439900000,
+        "timing_bin": null
+      },
+      {
+        "P0": "4430.639984687940180919302274",
+        "P1": "4423.471209192715093706574843",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "BUY",
+        "episode_key": "PAXG|0.001|BUY|49|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 2.1637,
+            "cum_quote": 9589.237119,
+            "pn": "4430.639984687940180919302274",
+            "pn_plus_1": "4423.471209192715093706574843",
+            "price": 4431.87,
+            "timestamp_ms": 1788404640000,
+            "volume": 2.1637,
+            "vwap": 4431.87
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 2.734,
+            "cum_quote": 12116.73258,
+            "pn": "4430.639984687940180919302274",
+            "pn_plus_1": "4423.471209192715093706574843",
+            "price": 4431.87,
+            "timestamp_ms": 1788404700000,
+            "volume": 0.5703,
+            "vwap": 4431.87
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 2.7356,
+            "cum_quote": 12123.823588,
+            "pn": "4430.639984687940180919302274",
+            "pn_plus_1": "4423.471209192715093706574843",
+            "price": 4431.88,
+            "timestamp_ms": 1788404760000,
+            "volume": 0.0016,
+            "vwap": 4431.870005848808
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 5.071,
+            "cum_quote": 22475.951168,
+            "pn": "4430.639984687940180919302274",
+            "pn_plus_1": "4423.471209192715093706574843",
+            "price": 4432.7,
+            "timestamp_ms": 1788404820000,
+            "volume": 2.3354,
+            "vwap": 4432.252251626898
+          },
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 17.5664,
+            "cum_quote": 77859.187634,
+            "pn": "4430.639984687940180919302274",
+            "pn_plus_1": "4423.471209192715093706574843",
+            "price": 4432.29,
+            "timestamp_ms": 1788404880000,
+            "volume": 12.4954,
+            "vwap": 4432.279102946534
+          }
+        ],
+        "symbol": "PAXG",
+        "timestamp_ms": 1788404640000,
+        "timing_bin": null
+      },
+      {
+        "P0": "810.2688969833488060194170716",
+        "P1": "808.9578819080297476512776547",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|1965|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 1286.134,
+            "cum_quote": 1046552.95848,
+            "pn": "810.2688969833488060194170716",
+            "pn_plus_1": "808.9578819080297476512776547",
+            "price": 813.72,
+            "timestamp_ms": 1787472660000,
+            "volume": 1286.134,
+            "vwap": 813.72
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787472660000,
+        "timing_bin": null
+      },
+      {
+        "P0": "1193.921282772734743892777442",
+        "P1": "1195.853047408261028708395955",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1064|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 1208.045,
+            "cum_quote": 1432922.5767500002,
+            "pn": "1193.921282772734743892777442",
+            "pn_plus_1": "1195.853047408261028708395955",
+            "price": 1186.15,
+            "timestamp_ms": 1788766380000,
+            "volume": 1208.045,
+            "vwap": 1186.15
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1788766380000,
+        "timing_bin": null
+      },
+      {
+        "P0": "800.2163596133870426617209223",
+        "P1": "798.9216095435325824266942579",
+        "TP": null,
+        "condition_at_start": false,
+        "condition_present": false,
+        "cross_fraction_elapsed": null,
+        "cross_timestamp_ms": null,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|1624|0",
+        "eventual_outcome": "regression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": false,
+            "cum_base": 360.544,
+            "cum_quote": 289329.34911999997,
+            "pn": "800.2163596133870426617209223",
+            "pn_plus_1": "798.9216095435325824266942579",
+            "price": 802.48,
+            "timestamp_ms": 1787400420000,
+            "volume": 360.544,
+            "vwap": 802.4799999999999
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787400420000,
+        "timing_bin": null
+      }
+    ],
+    "examples_condition_true": [
+      {
+        "P0": "1139.583070007438950176052425",
+        "P1": "1137.739224600166913954667573",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1789393440000,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|222|0",
+        "eventual_outcome": "regression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 174.576,
+            "cum_quote": 198876.9792,
+            "pn": "1139.583070007438950176052425",
+            "pn_plus_1": "1137.739224600166913954667573",
+            "price": 1139.2,
+            "timestamp_ms": 1789393440000,
+            "volume": 174.576,
+            "vwap": 1139.2
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789393440000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "1159.611850976927392166279595",
+        "P1": "1161.488102951808060686804636",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1789172160000,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|683|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 62.997,
+            "cum_quote": 73097.93897999999,
+            "pn": "1159.611850976927392166279595",
+            "pn_plus_1": "1161.488102951808060686804636",
+            "price": 1160.34,
+            "timestamp_ms": 1789172160000,
+            "volume": 62.997,
+            "vwap": 1160.34
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789172160000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "808.6785880615587601345540978",
+        "P1": "809.9870300170423622084518063",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787476860000,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1822|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 121.286,
+            "cum_quote": 98087.62678,
+            "pn": "808.6785880615587601345540978",
+            "pn_plus_1": "809.9870300170423622084518063",
+            "price": 808.73,
+            "timestamp_ms": 1787476860000,
+            "volume": 121.286,
+            "vwap": 808.73
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787476860000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "2443.265541394939098515073498",
+        "P1": "2439.312337748962087053676110",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787376960000,
+        "direction": "BUY",
+        "episode_key": "ETH|0.001|BUY|411|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 990.4664,
+            "cum_quote": 2419471.7032640004,
+            "pn": "2443.265541394939098515073498",
+            "pn_plus_1": "2439.312337748962087053676110",
+            "price": 2442.76,
+            "timestamp_ms": 1787376960000,
+            "volume": 990.4664,
+            "vwap": 2442.76
+          }
+        ],
+        "symbol": "ETH",
+        "timestamp_ms": 1787376960000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "78809.48765554874439528000000",
+        "P1": "78937.00140657542226371156304",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1788820920000,
+        "direction": "SELL",
+        "episode_key": "BTC|0.001|SELL|8|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 8.35828,
+            "cum_quote": 659085.9842728,
+            "pn": "78809.48765554874439528000000",
+            "pn_plus_1": "78937.00140657542226371156304",
+            "price": 78854.26,
+            "timestamp_ms": 1788820920000,
+            "volume": 8.35828,
+            "vwap": 78854.26
+          }
+        ],
+        "symbol": "BTC",
+        "timestamp_ms": 1788820920000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "767.9008968031958805355916499",
+        "P1": "769.1433604542234514702982371",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787763960000,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1365|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 37.323,
+            "cum_quote": 28662.944310000003,
+            "pn": "767.9008968031958805355916499",
+            "pn_plus_1": "769.1433604542234514702982371",
+            "price": 767.97,
+            "timestamp_ms": 1787763960000,
+            "volume": 37.323,
+            "vwap": 767.97
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787763960000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "1214.029319508546381231091275",
+        "P1": "1212.065020069581553186259370",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1789558200000,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|573|0",
+        "eventual_outcome": "regression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 51.517,
+            "cum_quote": 62518.97052,
+            "pn": "1214.029319508546381231091275",
+            "pn_plus_1": "1212.065020069581553186259370",
+            "price": 1213.56,
+            "timestamp_ms": 1789558200000,
+            "volume": 51.517,
+            "vwap": 1213.56
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1789558200000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "819.6673198244257478719456111",
+        "P1": "818.3410981009498270118888031",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787484000000,
+        "direction": "BUY",
+        "episode_key": "ZEC|0.001|BUY|2028|0",
+        "eventual_outcome": "censored",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 75.416,
+            "cum_quote": 61791.34544,
+            "pn": "819.6673198244257478719456111",
+            "pn_plus_1": "818.3410981009498270118888031",
+            "price": 819.34,
+            "timestamp_ms": 1787484000000,
+            "volume": 75.416,
+            "vwap": 819.34
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787484000000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "775.0569674631581901464197409",
+        "P1": "776.3110096365135800980766480",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787753760000,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1278|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 39.154,
+            "cum_quote": 30408.17102,
+            "pn": "775.0569674631581901464197409",
+            "pn_plus_1": "776.3110096365135800980766480",
+            "price": 776.63,
+            "timestamp_ms": 1787753760000,
+            "volume": 39.154,
+            "vwap": 776.63
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787753760000,
+        "timing_bin": "early"
+      },
+      {
+        "P0": "770.6637794304091062751561509",
+        "P1": "771.9107134255275082091093536",
+        "TP": null,
+        "condition_at_start": true,
+        "condition_present": true,
+        "cross_fraction_elapsed": 0.0,
+        "cross_timestamp_ms": 1787751180000,
+        "direction": "SELL",
+        "episode_key": "ZEC|0.001|SELL|1267|0",
+        "eventual_outcome": "progression",
+        "percentage": "0.001",
+        "sample_provenance": [
+          {
+            "active_step": 0,
+            "cond": true,
+            "cum_base": 200.128,
+            "cum_quote": 154702.94655999998,
+            "pn": "770.6637794304091062751561509",
+            "pn_plus_1": "771.9107134255275082091093536",
+            "price": 773.02,
+            "timestamp_ms": 1787751180000,
+            "volume": 200.128,
+            "vwap": 773.02
+          }
+        ],
+        "symbol": "ZEC",
+        "timestamp_ms": 1787751180000,
+        "timing_bin": "early"
+      }
+    ]
+  },
+  "p0_semantics": {
+    "later_cross_definition": "condition_present becomes true when cumulative VWAP first crosses the favorable side of P0 at some later observation.",
+    "note": "P0 is the active ladder starting level at episode start. The favorable VWAP side can be true immediately at start or become true later if the cumulative VWAP crosses during the episode.",
+    "start_condition_definition": "condition_at_start uses only the first observation in the episode window."
+  },
+  "prediction_timestamp": {
+    "risk_set_logic": "For time-varying VWAP-cross, only outcomes after the cross should count. The Phase 3B condition_present bucket is not risk-set restricted and therefore is downstream of the episode window.",
+    "static_start_of_episode": "start_timestamp_ms",
+    "time_varying_cross": "cross_timestamp_ms"
+  },
+  "report_comparison": {
+    "discrepancy_pooled": 0.0,
+    "recomputed_pooled_progression_rate": 0.43311871518483686,
+    "reported_absent_rate": 0.09808946877912395,
+    "reported_pooled_progression_rate": 0.43311871518483686,
+    "reported_present_rate": 0.58398908823838
+  },
+  "static_vs_time_varying": {
+    "A_start_of_episode": {
+      "start_false": {
+        "censored": 1680,
+        "ci95": [
+          0.24680153286525547,
+          0.2683283088645441
+        ],
+        "eligible": 8016,
+        "order_sensitive_n": 6336,
+        "progression": 1631,
+        "progression_rate": 0.2574179292929293,
+        "regression": 4705
+      },
+      "start_true": {
+        "censored": 813,
+        "ci95": [
+          0.5705960429438106,
+          0.592936983839188
+        ],
+        "eligible": 8300,
+        "order_sensitive_n": 7487,
+        "progression": 4356,
+        "progression_rate": 0.5818084680112194,
+        "regression": 3131
+      }
+    },
+    "B_time_varying_cross": {
+      "late_cross": {
+        "censored": 132,
+        "ci95": [
+          0.5705168521275972,
+          0.6130910987998575
+        ],
+        "eligible": 2176,
+        "order_sensitive_n": 2044,
+        "progression": 1210,
+        "progression_rate": 0.5919765166340509,
+        "regression": 834
+      },
+      "late_cross_after_progress": {
+        "censored": 0,
+        "ci95": null,
+        "eligible": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      },
+      "late_cross_before_progress": {
+        "censored": 132,
+        "ci95": [
+          0.5705168521275972,
+          0.6130910987998575
+        ],
+        "eligible": 2176,
+        "order_sensitive_n": 2044,
+        "progression": 1210,
+        "progression_rate": 0.5919765166340509,
+        "regression": 834
+      },
+      "late_cross_no_progress": {
+        "censored": 0,
+        "ci95": null,
+        "eligible": 0,
+        "order_sensitive_n": 0,
+        "progression": 0,
+        "progression_rate": null,
+        "regression": 0
+      }
+    },
+    "interpretation": "The start-of-episode feature is clean. The Phase 3B condition_present / absent split is time-varying and therefore not a pure start-time predictor."
+  }
+}

@@ -1,0 +1,240 @@
+{
+  "git_commit": "fef0046d7ea5d783afe3e38ed6f943987d969e7f",
+  "invalidated": [
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P4",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P4",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P4",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P2",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P3",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P4",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.01::BUY::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.01::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ZEC::0.001::SELL::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::ETH::0.001::SELL::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P1",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::SOL::0.001::SELL::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::SELL::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::PAXG::0.001::BUY::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    },
+    {
+      "name": "whole_ladder_vwap_v1::BTC::0.001::SELL::P0",
+      "reason": "Derived from future-dependent condition_present in FL-VWAP-001",
+      "status": "INVALIDATED_LEAKAGE"
+    }
+  ],
+  "invalidated_original_candidates": 44,
+  "start_of_episode": {
+    "cells": 123,
+    "patterns": 123
+  },
+  "status_breakdown": {
+    "CANDIDATE": 79,
+    "HISTORICAL_ASSOCIATION": 0,
+    "INVALIDATED_LEAKAGE": 44,
+    "OOS_RESULT": 2
+  },
+  "time_varying_cross": {
+    "cells": 123,
+    "patterns": 123
+  }
+}

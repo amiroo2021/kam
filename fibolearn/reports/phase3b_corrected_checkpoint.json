@@ -1,0 +1,13 @@
+{
+  "files": [
+    "phase3b_fl_vwap_002_start.json",
+    "phase3b_fl_vwap_002_cross.json",
+    "phase3b_corrected_pattern_discovery.json",
+    "phase3b_corrected_oos.json",
+    "phase3b_corrected_summary.json"
+  ],
+  "peak_rss_kb": 815168,
+  "rows": 16316,
+  "rss_kb": 224848,
+  "stage": "complete"
+}

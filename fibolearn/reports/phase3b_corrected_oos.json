@@ -1,0 +1,51 @@
+{
+  "cross": {
+    "oos": {
+      "ci95": null,
+      "eligible": 0,
+      "order_sensitive_n": 0,
+      "progression": 0,
+      "progression_rate": null,
+      "regression": 0
+    },
+    "train": {
+      "ci95": null,
+      "eligible": 0,
+      "order_sensitive_n": 0,
+      "progression": 0,
+      "progression_rate": null,
+      "regression": 0
+    }
+  },
+  "start": {
+    "oos": {
+      "censored": 1863,
+      "ci95": [
+        0.4304964423913027,
+        0.4503967013370217
+      ],
+      "eligible": 11422,
+      "order_sensitive_n": 9559,
+      "progression": 4210,
+      "progression_rate": 0.440422638351292,
+      "regression": 5349
+    },
+    "train": {
+      "censored": 630,
+      "ci95": [
+        0.40202795066612496,
+        0.4316116108396255
+      ],
+      "eligible": 4894,
+      "order_sensitive_n": 4264,
+      "progression": 1777,
+      "progression_rate": 0.41674484052532834,
+      "regression": 2487
+    }
+  },
+  "temporal_split": {
+    "oos_n": 11422,
+    "train_fraction": 0.7,
+    "train_n": 4894
+  }
+}
