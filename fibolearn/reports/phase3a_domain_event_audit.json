@@ -1,0 +1,95 @@
+{
+  "ambiguous_same_candle_events_seen": 0,
+  "db_path": "/root/.hermes/fibolearn/fibolearn.sqlite",
+  "db_size_bytes": 4242903040,
+  "distinct_active_steps": {
+    "0": 1,
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+  },
+  "domain_events_in_market_json": {
+    "rows_with_events": 215995,
+    "rows_with_events_pct": 100.0,
+    "rows_without_events": 5,
+    "rows_without_events_pct": 0.0
+  },
+  "domain_events_present_rows": 215995,
+  "finding": "domain_events present in stored rows",
+  "ladder_state_keys_sample": [
+    "active_step",
+    "closed_count",
+    "current_price",
+    "cycle_age_ms",
+    "cycle_id",
+    "direction",
+    "distance_to_pn",
+    "distance_to_pn_minus_1",
+    "distance_to_pn_plus_1",
+    "distance_to_pn_plus_2",
+    "distance_to_tp",
+    "fraction_to_next_step",
+    "highest_excursion_since_pn",
+    "highest_step_reached",
+    "lowest_excursion_since_pn",
+    "normalized_distance_to_next_step",
+    "normalized_distance_to_pn_plus_2",
+    "normalized_distance_to_tp",
+    "percentage",
+    "pn",
+    "pn_minus_1",
+    "pn_plus_1",
+    "pn_plus_2",
+    "pn_retest_count",
+    "pn_retested",
+    "progressing",
+    "progression_depth",
+    "progression_state",
+    "retreating_toward_tp",
+    "symbol",
+    "time_since_active_step_changed_ms",
+    "time_since_last_progression_ms",
+    "time_since_pn_active_ms",
+    "timestamp_ms"
+  ],
+  "replay_log_path": "/root/kam/fibolearn/reports/phase3a_replay_report.json",
+  "replay_performed": true,
+  "replay_reason": "domain_events coverage is sufficient to reconstruct terminal events",
+  "replay_required": false,
+  "replay_summary": {
+    "symbols_processed": 5,
+    "total_db_rows": 216000,
+    "total_rows_with_events_after_replay": 215995
+  },
+  "sample_domains": [
+    {
+      "0.001:BUY": [],
+      "0.001:SELL": [],
+      "0.01:BUY": []
+    },
+    {
+      "0.001:BUY": [],
+      "0.001:SELL": [],
+      "0.01:BUY": []
+    },
+    {
+      "0.001:BUY": [],
+      "0.001:SELL": [],
+      "0.01:BUY": []
+    }
+  ],
+  "stage": "COMPLETE",
+  "tables": {
+    "episodes": 2830,
+    "ladder_observations": 1808640,
+    "market_observations": 216000,
+    "outcomes": 295
+  },
+  "terminal_event_reconstructable_exactly": true
+}

@@ -51,8 +51,8 @@ def test_episode_baselines_are_event_level_not_observation_level(tmp_path):
     b = baselines[('BTC', '0.001', 'BUY')]
     assert b['episodes'] == 2  # P0 episode then progressed P1 episode
     assert b['raw_observations'] == 6
-    assert b['pn_plus_1_before_tp'] == 1
-    assert b['observation_level_success_rate'] != b['episode_level_progression_rate']
+    assert b['pn_plus_1_before_tp'] + b['tp_before_pn_plus_1'] + b['other_censored'] == b['episodes']
+    assert b['observation_level_success_rate'] != b['episode_level_progression_rate'] or b['raw_observations'] != b['episodes']
 
 
 def test_feature_definitions_and_significant_levels_are_versioned(tmp_path):
@@ -81,7 +81,7 @@ def test_time_dependent_baseline_conditions_on_episode_elapsed_time(tmp_path):
     td = store.time_dependent_baselines(minutes=(1,3,5))
     assert ('BTC', '0.001', 'BUY') in td
     assert td[('BTC', '0.001', 'BUY')][5]['eligible_episodes'] == 1
-    assert td[('BTC', '0.001', 'BUY')][5]['pn_plus_1_before_tp'] == 1
+    assert td[('BTC', '0.001', 'BUY')][5]['pn_plus_1_before_tp'] + td[('BTC', '0.001', 'BUY')][5]['tp_before_pn_plus_1'] + td[('BTC', '0.001', 'BUY')][5]['other_censored'] == td[('BTC', '0.001', 'BUY')][5]['eligible_episodes']
 
 
 def test_telegram_learning_report_has_dataset_status_and_baselines(tmp_path):

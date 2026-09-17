@@ -56,6 +56,8 @@ class FiboLearnWizard:
         if suffix.startswith('report:baseline:'):
             _,_,sym,pct,side = suffix.split(':',4)
             return self._baseline_screen(sym,pct,side)
+        if suffix == 'report:coverage':
+            return self._data_coverage_screen()
         if suffix == 'ask':
             return Screen('Ask FiboLearn\nQuestions must query stored observations/backtests. If no traceable result exists, FiboLearn reports insufficient evidence.')
         if suffix == 'settings':
@@ -70,6 +72,24 @@ class FiboLearnWizard:
         for sym in ('BTC','ETH','SOL','ZEC','PAXG'):
             s=status.get(sym, {'candles':0,'observations':0,'episodes':0,'cycles':0})
             lines += ['', sym, f"Candles: {s.get('candles',0)}", f"Observations: {s.get('observations',0)}", f"Episodes: {s.get('episodes',0)}", f"Cycles: {s.get('cycles',0)}", f"Historical range: {iso(s.get('first_timestamp_ms'))} → {iso(s.get('last_timestamp_ms'))}"]
+        return Screen('\n'.join(lines))
+
+    def _data_coverage_screen(self) -> Screen:
+        matrix = self._store.data_coverage_matrix()
+        cells = matrix['cells']
+        header = ['Symbol'.ljust(8), 'Side'.ljust(5), '1%'.rjust(7), '0.1%'.rjust(7), '0.01%'.rjust(7), '0.001%'.rjust(7)]
+        lines = ['Data Coverage (completed episodes; * = insufficient data)', '', ' '.join(header)]
+        for sym in ('BTC', 'ETH', 'SOL', 'ZEC', 'PAXG'):
+            for side in ('BUY', 'SELL'):
+                row = [sym.ljust(8), side.ljust(5)]
+                for pct in ('1', '0.1', '0.01', '0.001'):
+                    cell = cells[(sym, pct, side)]
+                    n = cell['completed_episodes']
+                    marker = '*' if not cell['sufficient'] else ''
+                    row.append(f"{n}{marker}".rjust(7))
+                lines.append(' '.join(row))
+        lines.append('')
+        lines.append(f"Threshold (min completed episodes): {matrix['min_completed_episodes']}; '*' marks insufficient cells.")
         return Screen('\n'.join(lines))
 
     def _baseline_screen(self, sym: str, pct: str, side: str) -> Screen:

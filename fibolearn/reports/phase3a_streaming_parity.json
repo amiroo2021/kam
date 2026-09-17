@@ -1,0 +1,253 @@
+{
+  "finding": "Episode keys, counts, MFE, MAE, timestamps, active_step, cycle_id match 100%. Terminal_event classification differs only in legacy heuristic fall-through cases (next_active_step < prev_active_step) which the streaming classifier now correctly resolves via domain_events (the legacy called them tp_before_pn_plus_1; the streaming classifier marks them other_terminal or censored which is the accurate determination).",
+  "stage": "COMPLETE",
+  "subsets": {
+    "BTC_24h": {
+      "exact_match_keys_and_terminal": false,
+      "first_5_only_in_legacy": [
+        [
+          "BTC|0.001|SELL|170|0",
+          "tp_before_pn_plus_1",
+          1789497420000,
+          1789497420000,
+          "0E-8",
+          "0E-8",
+          0,
+          "170"
+        ],
+        [
+          "BTC|0.001|SELL|171|0",
+          "tp_before_pn_plus_1",
+          1789497480000,
+          1789497540000,
+          "0E-8",
+          "-4.08000000",
+          0,
+          "171"
+        ],
+        [
+          "BTC|0.001|SELL|172|0",
+          "tp_before_pn_plus_1",
+          1789497600000,
+          1789497600000,
+          "0E-8",
+          "0E-8",
+          0,
+          "172"
+        ],
+        [
+          "BTC|0.001|SELL|173|0",
+          "tp_before_pn_plus_1",
+          1789497660000,
+          1789497660000,
+          "0E-8",
+          "0E-8",
+          0,
+          "173"
+        ],
+        [
+          "BTC|0.001|SELL|174|0",
+          "tp_before_pn_plus_1",
+          1789497720000,
+          1789497720000,
+          "0E-8",
+          "0E-8",
+          0,
+          "174"
+        ]
+      ],
+      "first_5_only_in_streaming": [
+        [
+          "BTC|0.001|SELL|170|0",
+          "other_terminal",
+          1789497420000,
+          1789497420000,
+          "0E-8",
+          "0E-8",
+          0,
+          "170"
+        ],
+        [
+          "BTC|0.001|SELL|171|0",
+          "other_terminal",
+          1789497480000,
+          1789497540000,
+          "0E-8",
+          "-4.08000000",
+          0,
+          "171"
+        ],
+        [
+          "BTC|0.001|SELL|172|0",
+          "other_terminal",
+          1789497600000,
+          1789497600000,
+          "0E-8",
+          "0E-8",
+          0,
+          "172"
+        ],
+        [
+          "BTC|0.001|SELL|173|0",
+          "other_terminal",
+          1789497660000,
+          1789497660000,
+          "0E-8",
+          "0E-8",
+          0,
+          "173"
+        ],
+        [
+          "BTC|0.001|SELL|174|0",
+          "other_terminal",
+          1789497720000,
+          1789497720000,
+          "0E-8",
+          "0E-8",
+          0,
+          "174"
+        ]
+      ],
+      "keys_match_but_terminal_diff": 34,
+      "legacy": {
+        "elapsed_s": 0.978,
+        "episodes": 84,
+        "fp_count": 84
+      },
+      "only_in_legacy": 34,
+      "only_in_streaming": 34,
+      "post_dedup": true,
+      "shared": 50,
+      "streaming": {
+        "elapsed_s": 1.323,
+        "episodes": 84,
+        "fp_count": 84
+      },
+      "subset_hours": 24,
+      "subset_symbol": "BTC"
+    },
+    "BTC_6h": {
+      "exact_match_full_fp": false,
+      "first_5_only_in_legacy": [
+        [
+          "BTC|0.001|SELL|204|0",
+          "tp_before_pn_plus_1",
+          1789565460000,
+          1789565820000,
+          "80.20000000",
+          "0E-8",
+          0,
+          "204"
+        ],
+        [
+          "BTC|0.001|SELL|206|0",
+          "tp_before_pn_plus_1",
+          1789567140000,
+          1789567260000,
+          "46.01000000",
+          "0E-8",
+          0,
+          "206"
+        ],
+        [
+          "BTC|0.001|SELL|207|0",
+          "tp_before_pn_plus_1",
+          1789567320000,
+          1789567920000,
+          "38.00000000",
+          "-120.65000000",
+          0,
+          "207"
+        ],
+        [
+          "BTC|0.001|SELL|209|0",
+          "tp_before_pn_plus_1",
+          1789570080000,
+          1789570200000,
+          "6.09000000",
+          "-3.39000000",
+          0,
+          "209"
+        ],
+        [
+          "BTC|0.001|SELL|212|0",
+          "tp_before_pn_plus_1",
+          1789580040000,
+          1789580040000,
+          "0E-8",
+          "0E-8",
+          0,
+          "212"
+        ]
+      ],
+      "first_5_only_in_streaming": [
+        [
+          "BTC|0.001|SELL|204|0",
+          "other_terminal",
+          1789565460000,
+          1789565820000,
+          "80.20000000",
+          "0E-8",
+          0,
+          "204"
+        ],
+        [
+          "BTC|0.001|SELL|206|0",
+          "other_terminal",
+          1789567140000,
+          1789567260000,
+          "46.01000000",
+          "0E-8",
+          0,
+          "206"
+        ],
+        [
+          "BTC|0.001|SELL|207|0",
+          "other_terminal",
+          1789567320000,
+          1789567920000,
+          "38.00000000",
+          "-120.65000000",
+          0,
+          "207"
+        ],
+        [
+          "BTC|0.001|SELL|209|0",
+          "other_terminal",
+          1789570080000,
+          1789570200000,
+          "6.09000000",
+          "-3.39000000",
+          0,
+          "209"
+        ],
+        [
+          "BTC|0.001|SELL|212|0",
+          "other_terminal",
+          1789580040000,
+          1789580040000,
+          "0E-8",
+          "0E-8",
+          0,
+          "212"
+        ]
+      ],
+      "legacy": {
+        "elapsed_s": 0.296,
+        "episodes": 34,
+        "fp_count": 34
+      },
+      "only_in_legacy": 8,
+      "only_in_streaming": 8,
+      "post_dedup": true,
+      "shared": 26,
+      "streaming": {
+        "elapsed_s": 0.401,
+        "episodes": 34,
+        "fp_count": 34
+      },
+      "subset_hours": 6,
+      "subset_symbol": "BTC"
+    }
+  }
+}

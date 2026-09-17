@@ -1,0 +1,43 @@
+{
+  "db": "/root/.hermes/fibolearn/fibolearn.sqlite",
+  "ended_at": "2026-09-16T20:52:51Z",
+  "started_at": "2026-09-16T20:51:52Z",
+  "symbols": {
+    "ETH": {
+      "elapsed_s": 14.927,
+      "ended_at": "2026-09-16T20:52:07Z",
+      "events_added": 43199,
+      "first_ts": 1786989840000,
+      "last_ts": 1789581780000,
+      "rows": 43199,
+      "symbol": "ETH"
+    },
+    "PAXG": {
+      "elapsed_s": 13.814,
+      "ended_at": "2026-09-16T20:52:20Z",
+      "events_added": 43199,
+      "first_ts": 1786990260000,
+      "last_ts": 1789582200000,
+      "rows": 43199,
+      "symbol": "PAXG"
+    },
+    "SOL": {
+      "elapsed_s": 15.71,
+      "ended_at": "2026-09-16T20:52:36Z",
+      "events_added": 43199,
+      "first_ts": 1786989960000,
+      "last_ts": 1789581900000,
+      "rows": 43199,
+      "symbol": "SOL"
+    },
+    "ZEC": {
+      "elapsed_s": 15.203,
+      "ended_at": "2026-09-16T20:52:51Z",
+      "events_added": 43199,
+      "first_ts": 1786990140000,
+      "last_ts": 1789582080000,
+      "rows": 43199,
+      "symbol": "ZEC"
+    }
+  }
+}

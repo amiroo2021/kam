@@ -1,0 +1,79 @@
+{
+  "symbols": {
+    "BTC": {
+      "censored_episodes": 8,
+      "completed_episodes": 1175,
+      "elapsed_s": 11099.257,
+      "episodes_emitted": 3674,
+      "episodes_in_db": 1405,
+      "finished_at": 1789608254,
+      "ladder_rows": 345600,
+      "market_rows": 43200,
+      "page_size": 2000,
+      "peak_rss_kb": 0,
+      "previous_episode_count": 504,
+      "status": "PASS",
+      "symbol": "BTC"
+    },
+    "ETH": {
+      "censored_episodes": 8,
+      "completed_episodes": 1999,
+      "elapsed_s": 10864.519,
+      "episodes_emitted": 6476,
+      "episodes_in_db": 2299,
+      "finished_at": 1789619139,
+      "ladder_rows": 345600,
+      "market_rows": 43200,
+      "page_size": 2000,
+      "peak_rss_kb": 0,
+      "previous_episode_count": 428,
+      "status": "PASS",
+      "symbol": "ETH"
+    },
+    "PAXG": {
+      "censored_episodes": 8,
+      "completed_episodes": 390,
+      "elapsed_s": 10248.986,
+      "episodes_emitted": 1508,
+      "episodes_in_db": 467,
+      "finished_at": 1789650594,
+      "ladder_rows": 345600,
+      "market_rows": 43200,
+      "page_size": 2000,
+      "peak_rss_kb": 0,
+      "previous_episode_count": 97,
+      "status": "PASS",
+      "symbol": "PAXG"
+    },
+    "SOL": {
+      "censored_episodes": 8,
+      "completed_episodes": 3143,
+      "elapsed_s": 10910.042,
+      "episodes_emitted": 8778,
+      "episodes_in_db": 3248,
+      "finished_at": 1789630058,
+      "ladder_rows": 345600,
+      "market_rows": 43200,
+      "page_size": 2000,
+      "peak_rss_kb": 0,
+      "previous_episode_count": 450,
+      "status": "PASS",
+      "symbol": "SOL"
+    },
+    "ZEC": {
+      "censored_episodes": 8,
+      "completed_episodes": 7169,
+      "elapsed_s": 10271.385,
+      "episodes_emitted": 26970,
+      "episodes_in_db": 8952,
+      "finished_at": 1789640338,
+      "ladder_rows": 345600,
+      "market_rows": 43200,
+      "page_size": 2000,
+      "peak_rss_kb": 0,
+      "previous_episode_count": 1351,
+      "status": "PASS",
+      "symbol": "ZEC"
+    }
+  }
+}

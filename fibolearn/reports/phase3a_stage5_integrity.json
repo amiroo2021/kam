@@ -1,0 +1,94 @@
+{
+  "duplicate_episode_keys": {
+    "count_groups": 0,
+    "sample_groups": []
+  },
+  "duplicate_ladder_observations": {
+    "count_groups": 0,
+    "sample_groups": []
+  },
+  "duplicate_market_observations": {
+    "count_groups": 0,
+    "sample_groups": []
+  },
+  "episode_counts_by_symbol": {
+    "BTC": 1405,
+    "ETH": 2299,
+    "PAXG": 467,
+    "SOL": 3248,
+    "ZEC": 8952
+  },
+  "episode_time_order": {
+    "end_before_start": 0,
+    "same_start_end": 6969
+  },
+  "expected_synchronized_states": {
+    "0.001% BUY": {
+      "episodes": 8658,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "0.001% SELL": {
+      "episodes": 7212,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "0.01% BUY": {
+      "episodes": 284,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "0.01% SELL": {
+      "episodes": 182,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "0.1% BUY": {
+      "episodes": 15,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "0.1% SELL": {
+      "episodes": 10,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "1% BUY": {
+      "episodes": 5,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    },
+    "1% SELL": {
+      "episodes": 5,
+      "ladder_rows": 216000,
+      "market_rows": 216000
+    }
+  },
+  "legacy_episode_symbols_present": [
+    "BTC",
+    "ETH",
+    "PAXG",
+    "SOL",
+    "ZEC"
+  ],
+  "missing_timestamps": {
+    "episodes_missing_ts": 0,
+    "ladder_missing_ts": 0,
+    "market_missing_ts": 0
+  },
+  "orphans": {
+    "episodes_without_terminal_event": 0,
+    "ladder_without_market": 0,
+    "outcomes_without_episode": 295
+  },
+  "stale_legacy_episodes": {
+    "count": 0,
+    "definition": "rows in episodes for symbols not present in stage4 checkpoint set (BTC,ETH,SOL,ZEC,PAXG)",
+    "sample": []
+  },
+  "transition_checks": {
+    "active_step_out_of_range": 0,
+    "cycle_id_non_numeric": 0,
+    "impossible_event_ordering": 26
+  }
+}

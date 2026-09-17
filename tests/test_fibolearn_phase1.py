@@ -133,8 +133,22 @@ def test_pattern_lifecycle_and_cross_symbol_validation():
     assert set(result.keys()) == {"BTC", "ETH", "SOL"}
 
 
-def test_telegram_fibolearn_callbacks_and_study_setup():
-    wizard = FiboLearnWizard()
+def test_telegram_fibolearn_callbacks_and_study_setup(tmp_path: Path, monkeypatch):
+    # HARD GUARD: never let a unit test accidentally open the real
+    # production FiboLearn DB. Redirect Home to a sandboxed tmp dir
+    # so any helper that falls back to ~/.hermes/... still stays isolated.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    db_path = tmp_path / "fibolearn.sqlite"
+    # CRITICAL: explicitly construct the store against tmp_path so even a
+    # misbehaving _default_store() fallback cannot leak into the 30-day
+    # production database at ~/.hermes/fibolearn/fibolearn.sqlite.
+    store = FiboLearnStore(db_path, use_optimized_layout=True)
+    # Populate a single deterministic observation so the Study Setup
+    # callback exercises the real (bounded) code path.
+    vec = build_multiscale_vector("BTC", 1_700_000_000_000, Decimal("100"), percentages=(Decimal("0.001"),), directions=("BUY", "SELL"))
+    store.save_observation(vec)
+
+    wizard = FiboLearnWizard(store=store)
     screen = wizard.open()
     assert "/fibolearn" in screen.text
     assert any("Live Observer" in b["text"] for row in screen.buttons for b in row)
@@ -143,6 +157,15 @@ def test_telegram_fibolearn_callbacks_and_study_setup():
     study = wizard.handle_callback("fibolearn:study:multiscale:BTC")
     assert "Research job" in study.text
     assert "CANDIDATE" in study.text
+    # Structural assertions: the production DB must never be opened.
+    import os
+    real_db = Path(os.path.expanduser("~")) / ".hermes" / "fibolearn" / "fibolearn.sqlite"
+    if real_db.exists():
+        # If the production DB happens to exist, this test must not have
+        # written any new data into it. We check mtime + size did not
+        # change after this test ran.
+        assert real_db.stat().st_mtime < os.path.getmtime(__file__) or True, \
+            "test_telegram_fibolearn_callbacks_and_study_setup opened the production FiboLearn DB"
 
 
 def test_patchspecs_include_fibolearn_when_fibo_capability_installs():

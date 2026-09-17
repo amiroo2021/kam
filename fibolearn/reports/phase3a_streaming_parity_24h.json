@@ -1,0 +1,124 @@
+{
+  "exact_match_keys_and_terminal": false,
+  "first_5_only_in_legacy": [
+    [
+      "BTC|0.001|SELL|170|0",
+      "tp_before_pn_plus_1",
+      1789497420000,
+      1789497420000,
+      "0E-8",
+      "0E-8",
+      0,
+      "170"
+    ],
+    [
+      "BTC|0.001|SELL|171|0",
+      "tp_before_pn_plus_1",
+      1789497480000,
+      1789497540000,
+      "0E-8",
+      "-4.08000000",
+      0,
+      "171"
+    ],
+    [
+      "BTC|0.001|SELL|172|0",
+      "tp_before_pn_plus_1",
+      1789497600000,
+      1789497600000,
+      "0E-8",
+      "0E-8",
+      0,
+      "172"
+    ],
+    [
+      "BTC|0.001|SELL|173|0",
+      "tp_before_pn_plus_1",
+      1789497660000,
+      1789497660000,
+      "0E-8",
+      "0E-8",
+      0,
+      "173"
+    ],
+    [
+      "BTC|0.001|SELL|174|0",
+      "tp_before_pn_plus_1",
+      1789497720000,
+      1789497720000,
+      "0E-8",
+      "0E-8",
+      0,
+      "174"
+    ]
+  ],
+  "first_5_only_in_streaming": [
+    [
+      "BTC|0.001|SELL|170|0",
+      "other_terminal",
+      1789497420000,
+      1789497420000,
+      "0E-8",
+      "0E-8",
+      0,
+      "170"
+    ],
+    [
+      "BTC|0.001|SELL|171|0",
+      "other_terminal",
+      1789497480000,
+      1789497540000,
+      "0E-8",
+      "-4.08000000",
+      0,
+      "171"
+    ],
+    [
+      "BTC|0.001|SELL|172|0",
+      "other_terminal",
+      1789497600000,
+      1789497600000,
+      "0E-8",
+      "0E-8",
+      0,
+      "172"
+    ],
+    [
+      "BTC|0.001|SELL|173|0",
+      "other_terminal",
+      1789497660000,
+      1789497660000,
+      "0E-8",
+      "0E-8",
+      0,
+      "173"
+    ],
+    [
+      "BTC|0.001|SELL|174|0",
+      "other_terminal",
+      1789497720000,
+      1789497720000,
+      "0E-8",
+      "0E-8",
+      0,
+      "174"
+    ]
+  ],
+  "keys_match_but_terminal_diff": 34,
+  "legacy": {
+    "elapsed_s": 0.978,
+    "episodes": 84,
+    "fp_count": 84
+  },
+  "only_in_legacy": 34,
+  "only_in_streaming": 34,
+  "post_dedup": true,
+  "shared": 50,
+  "streaming": {
+    "elapsed_s": 1.323,
+    "episodes": 84,
+    "fp_count": 84
+  },
+  "subset_hours": 24,
+  "subset_symbol": "BTC"
+}
