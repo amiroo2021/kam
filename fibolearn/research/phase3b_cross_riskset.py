@@ -151,21 +151,157 @@ def classify_cross_eligibility(row: Dict[str, Any]) -> Dict[str, Any]:
     return {'status': 'valid', **c}
 
 
+def reconstruct_state_at_landmark(episode: Dict[str, Any], landmark_timestamp_ms: int) -> Dict[str, Any]:
+    """Pure landmark reconstructor using primitive episode history only."""
+    start = episode.get('episode_start_timestamp_ms')
+    start_ts = int(start) if start is not None else None
+    end_raw = episode.get('tp_or_terminal_timestamp_ms')
+    end_ts = int(end_raw) if end_raw is not None else None
+    episode_started_state = True if start_ts is not None and start_ts <= landmark_timestamp_ms else False if start_ts is not None else None
+    coverage_state = None if start_ts is None or end_ts is None else bool(start_ts <= landmark_timestamp_ms <= end_ts)
+
+    evo = episode.get('evolution_json') if isinstance(episode.get('evolution_json'), dict) else {}
+    out = episode.get('outcome_json') if isinstance(episode.get('outcome_json'), dict) else {}
+    evs = list((evo or {}).get('event_ordering') or [])
+    if not evs and isinstance(out, dict):
+        evs = list(out.get('event_ordering') or [])
+
+    by_ts = defaultdict(list)
+    for ev in evs:
+        if isinstance(ev, dict) and ev.get('timestamp_ms') is not None:
+            by_ts[int(ev['timestamp_ms'])].append(ev.get('event'))
+
+    ambiguous = any(len(names) > 1 for names in by_ts.values())
+    first_pn = None
+    first_tp = None
+    first_vwap = None
+    for ts in sorted(by_ts):
+        names = by_ts[ts]
+        if first_pn is None and any(n in ('reached_pn_plus_1', 'progression') for n in names):
+            first_pn = ts
+        if first_tp is None and any(n in ('tp_cycle_closed', 'tp_before_pn_plus_1', 'tp_hit', 'cycle_closed') for n in names):
+            first_tp = ts
+        if first_vwap is None and any(n in ('vwap_crossed_pn', 'vwap_crossed_pn_since_start') for n in names):
+            first_vwap = ts
+
+    # Direct primitive timestamps are allowed when present on the row.
+    if first_vwap is None and episode.get('cross_timestamp_ms') is not None:
+        first_vwap = int(episode['cross_timestamp_ms'])
+    if first_vwap is None and episode.get('time_to_vwap_cross_ms') is not None and start_ts is not None:
+        first_vwap = start_ts + int(episode['time_to_vwap_cross_ms'])
+    if first_pn is None and episode.get('pn_plus_1_timestamp_ms') is not None:
+        first_pn = int(episode['pn_plus_1_timestamp_ms'])
+    if first_tp is None and episode.get('tp_or_terminal_timestamp_ms') is not None:
+        first_tp = int(episode['tp_or_terminal_timestamp_ms'])
+
+    if coverage_state is True:
+        alive = False if first_tp is not None and first_tp <= landmark_timestamp_ms else True
+    elif coverage_state is False:
+        alive = None
+    else:
+        alive = None
+
+    def tri_state(first_ts: int | None) -> bool | None:
+        if coverage_state is None:
+            return None
+        if first_ts is None:
+            return False
+        return True if first_ts <= landmark_timestamp_ms else False
+
+    pn_state = tri_state(first_pn)
+    tp_state = tri_state(first_tp)
+    vwap_state = tri_state(first_vwap)
+
+    provenance = {
+        'events_considered': sorted(by_ts.items()),
+        'used_time_to_vwap_cross_ms': episode.get('time_to_vwap_cross_ms') is not None and start_ts is not None and first_vwap == (start_ts + int(episode['time_to_vwap_cross_ms'])),
+    }
+    return {
+        'episode_started': episode_started_state,
+        'coverage_through_landmark': coverage_state,
+        'alive_at_landmark': alive,
+        'pn_plus_1_reached_by_landmark': pn_state,
+        'tp_reached_by_landmark': tp_state,
+        'favorable_vwap_crossed_by_landmark': vwap_state,
+        'first_pn_plus_1_timestamp_ms': first_pn,
+        'first_tp_timestamp_ms': first_tp,
+        'first_vwap_cross_timestamp_ms': first_vwap,
+        'same_candle_ambiguity_at_landmark': ambiguous,
+        'landmark_timestamp_ms': landmark_timestamp_ms,
+        'provenance': provenance,
+    }
+
+
+def eligibility_from_state_at_T(state: Dict[str, Any]) -> Dict[str, Any]:
+    violations = []
+    if state.get('episode_started') is not True:
+        violations.append('start_gt_landmark')
+    if state.get('coverage_through_landmark') is not True:
+        violations.append('coverage_through_landmark')
+    if state.get('alive_at_landmark') is not True:
+        violations.append('alive_at_landmark')
+    if state.get('pn_plus_1_reached_by_landmark') is not False:
+        violations.append('outcome_le_landmark' if state.get('pn_plus_1_reached_by_landmark') is True else 'pn_plus_1_unknown')
+    if state.get('tp_reached_by_landmark') is not False:
+        violations.append('terminal_le_landmark' if state.get('tp_reached_by_landmark') is True else 'terminal_unknown')
+    if state.get('favorable_vwap_crossed_by_landmark') is not False:
+        violations.append('cross_le_landmark' if state.get('favorable_vwap_crossed_by_landmark') is True else 'cross_unknown')
+    eligible = len(violations) == 0
+    return {'eligible': eligible, 'reason': 'ok' if eligible else 'violations', 'violations': violations}
+
+
+def classify_post_landmark_outcome(state: Dict[str, Any], *, primitive_events_after_landmark: list[dict]) -> Dict[str, Any]:
+    names_by_ts = defaultdict(list)
+    for ev in primitive_events_after_landmark:
+        if isinstance(ev, dict) and ev.get('timestamp_ms') is not None:
+            names_by_ts[int(ev['timestamp_ms'])].append(ev.get('event'))
+    if any(len(v) > 1 for v in names_by_ts.values()):
+        return {'post_landmark_outcome': 'SAME_CANDLE_AMBIGUOUS', 'detail': names_by_ts}
+    if not names_by_ts:
+        return {'post_landmark_outcome': 'CENSORED'}
+    p = None
+    t = None
+    for ts in sorted(names_by_ts):
+        names = names_by_ts[ts]
+        if p is None and any(n in ('reached_pn_plus_1', 'progression') for n in names):
+            p = ts
+        if t is None and any(n in ('tp_cycle_closed', 'tp_before_pn_plus_1', 'tp_hit', 'cycle_closed') for n in names):
+            t = ts
+    if p is None and t is None:
+        return {'post_landmark_outcome': 'CENSORED'}
+    if p is not None and t is not None:
+        return {'post_landmark_outcome': 'PN_PLUS_1_BEFORE_TP' if p < t else 'TP_BEFORE_PN_PLUS_1' if t < p else 'SAME_CANDLE_AMBIGUOUS'}
+    if p is not None:
+        return {'post_landmark_outcome': 'PN_PLUS_1_BEFORE_TP'}
+    return {'post_landmark_outcome': 'TP_BEFORE_PN_PLUS_1'}
+
+
+def control_eligible_at_landmark(control_row: Dict[str, Any], landmark_ms: int) -> Dict[str, Any]:
+    violations = []
+    unit = control_row.get('time_coordinate_unit')
+    landmark_unit = control_row.get('landmark_coordinate_unit')
+    if unit is not None and landmark_unit is not None and unit != landmark_unit:
+        violations.append('time_coordinate_mismatch')
+    state = reconstruct_state_at_landmark(control_row, landmark_ms)
+    elig = eligibility_from_state_at_T(state)
+    violations.extend(elig.get('violations', []))
+    eligible = not violations
+    return {'eligible': eligible, 'violations': violations, 'landmark_ms': landmark_ms, 'state': state}
+
+
+
+
 def landmark_outcome_after_cross(treated_row: Dict[str, Any], control_row: Dict[str, Any]) -> Dict[str, Any]:
     if treated_row.get('cross_timestamp_ms') is None:
         return {'control_landmark_ms': None, 'control_post_outcome': None, 'status': 'missing_timestamp'}
     landmark = int(control_row['episode_start_timestamp_ms']) + int(treated_row['cross_elapsed_ms'])
-    outcome_ts = control_row.get('pn_plus_1_timestamp_ms')
-    terminal_ts = control_row.get('tp_or_terminal_timestamp_ms')
-    if outcome_ts is not None and int(outcome_ts) <= landmark:
-        return {'control_landmark_ms': landmark, 'control_post_outcome': None, 'status': 'outcome_before_landmark'}
-    if terminal_ts is not None and int(terminal_ts) <= landmark:
-        return {'control_landmark_ms': landmark, 'control_post_outcome': None, 'status': 'terminal_before_landmark'}
-    if control_row.get('post_cross_outcome') == 'progression':
-        return {'control_landmark_ms': landmark, 'control_post_outcome': 'progression', 'status': 'ok'}
-    if control_row.get('post_cross_outcome') == 'regression':
-        return {'control_landmark_ms': landmark, 'control_post_outcome': 'regression', 'status': 'ok'}
-    return {'control_landmark_ms': landmark, 'control_post_outcome': None, 'status': 'censored'}
+    state = reconstruct_state_at_landmark(control_row, landmark)
+    elig = eligibility_from_state_at_T(state)
+    if not elig['eligible']:
+        return {'control_landmark_ms': landmark, 'control_post_outcome': None, 'status': 'ineligible', 'state': state, 'eligibility': elig}
+    # future label only after eligibility is frozen
+    future_events = []
+    return {'control_landmark_ms': landmark, 'control_post_outcome': classify_post_landmark_outcome(state, primitive_events_after_landmark=future_events)['post_landmark_outcome'], 'status': 'ok', 'state': state, 'eligibility': elig}
 
 
 def temporal_split_by_cycle(rows: list[Dict[str, Any]], train_fraction: float = TRAIN_FRACTION):
@@ -224,15 +360,18 @@ def match_controls_for_cross(treated_rows: list[Dict[str, Any]], control_rows: l
     for key in groups:
         groups[key] = sorted(groups[key], key=lambda r: (r['episode_start_timestamp_ms'], r['episode_key']))
     for t in treated_rows:
+        t_partition = t.get('partition') or t.get('temporal_partition')
         key = (t['symbol'], t['percentage'], t['direction'], t['active_step'])
         candidates = []
         for c in groups.get(key, []):
+            if t_partition is not None and c.get('partition') is not None and c.get('partition') != t_partition:
+                continue
             if c['episode_key'] == t['episode_key']:
                 continue
             control_landmark = int(c['episode_start_timestamp_ms']) + int(t['cross_elapsed_ms'])
-            if c.get('cross_timestamp_ms') is not None and int(c['cross_timestamp_ms']) <= control_landmark:
-                continue
-            if int(c['tp_or_terminal_timestamp_ms']) <= control_landmark:
+            state = reconstruct_state_at_landmark(c, control_landmark)
+            elig = eligibility_from_state_at_T(state)
+            if not elig['eligible']:
                 continue
             candidates.append(c)
         scored = []
@@ -247,12 +386,22 @@ def match_controls_for_cross(treated_rows: list[Dict[str, Any]], control_rows: l
         for c in selected:
             reuse[c['episode_key']] += 1
         matched_controls = []
+        eligible = True
+        violations = Counter()
         for c in selected:
             lm = landmark_outcome_after_cross(t, c)
+            if lm.get('status') != 'ok':
+                eligible = False
+                for v in lm.get('violations', []):
+                    violations[v] += 1
+                continue
+            assert lm.get('control_landmark_ms') is not None
+            assert int(c['episode_start_timestamp_ms']) + int(t['cross_elapsed_ms']) == int(lm['control_landmark_ms'])
             matched_controls.append({**c, **lm})
-        # The matched set exposes the first control's post-landmark outcome for tests/reporting.
+        if not eligible or not matched_controls:
+            continue
         control_post = matched_controls[0].get('control_post_outcome') if matched_controls else None
-        matched_sets.append({'treated': t, 'controls': matched_controls, 'treated_weight': 1.0, 'control_weight_each': w, 'control_landmark_ms': int(t['episode_start_timestamp_ms']) + int(t['cross_elapsed_ms']), 'control_post_outcome': control_post})
+        matched_sets.append({'treated': t, 'controls': matched_controls, 'treated_weight': 1.0, 'control_weight_each': w, 'control_landmark_ms': matched_controls[0]['control_landmark_ms'], 'control_post_outcome': control_post, 'control_violations': dict(violations)})
     control_weights = Counter()
     for m in matched_sets:
         for c in m['controls']:
@@ -475,9 +624,10 @@ def run_cross_riskset(report_dir: Path = REPORT_DIR) -> Dict[str, Any]:
         'cross_population': {'treated_unique': len(new_valid), 'control_unique': len(set(matched['control_weights'])) if 'matched' in locals() else 0},
     }
 
-    atomic_write_json(report_dir / 'phase3b_fl_vwap_002_cross_riskset_verification.json', report_verification)
-    atomic_write_json(report_dir / 'phase3b_fl_vwap_002_cross_riskset_train_oos.json', {'train': train_res, 'oos': oos_res, 'temporal_split': {'train_n': len(train), 'oos_n': len(oos), 'train_fraction': TRAIN_FRACTION}})
-    atomic_write_json(report_dir / 'phase3b_fl_vwap_002_cross_riskset_patterns.json', {'patterns': patterns})
+    atomic_write_json(report_dir / 'fl_vwap_003_riskset_integrity.json', report_verification)
+    atomic_write_json(report_dir / 'fl_vwap_003_riskset_results.json', {'pooled': report_verification['pooled'], 'train': train_res, 'oos': oos_res, 'p0_audit': p0_audit, 'btc_sell_0_001': btc_sell})
+    atomic_write_json(report_dir / 'fl_vwap_003_riskset_train_oos.json', {'train': train_res, 'oos': oos_res, 'temporal_split': {'train_n': len(train), 'oos_n': len(oos), 'train_fraction': TRAIN_FRACTION}})
+    atomic_write_json(report_dir / 'fl_vwap_003_riskset_patterns.json', {'patterns': patterns})
     atomic_write_json(CHECKPOINT, {'stage': 'complete', 'rows': len(rows), 'valid_cross': len(valid), 'rss_kb': rss_kb(), 'peak_rss_kb': peak_rss_kb()})
     return report_verification
 
