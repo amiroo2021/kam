@@ -1,0 +1,8 @@
+{
+  "status": "INVALIDATED_OUTCOME_CONDITIONED_TREATED_SELECTION",
+  "invalidated_results_commit": "1db8503",
+  "forensic_verdict": "TREATED_SELECTION_CONDITIONS_ON_PROGRESSION",
+  "forensic_report": "fibolearn/reports/fl_vwap_005_treated_100pct_forensic_audit.json",
+  "reason": "valid_cross required terminal_event == 'pn_plus_1_before_tp' before matching/outcome estimation, so treated eligibility was conditioned on the future outcome.",
+  "state_of_result": "treated 1210/1210 progression was mechanically selected; RR/OR/CI/effect estimates from 1db8503 are invalid; they must not be used as evidence for FL-VWAP; raw validation outcomes have now been exposed; this historical dataset is no longer pristine unseen validation data for a corrected FL-VWAP hypothesis"
+}

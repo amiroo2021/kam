@@ -1,0 +1,37 @@
+{
+  "status": "prospective_treated_constructor_defined",
+  "stages": [
+    "detect_cross_at_T",
+    "determine_treated_eligibility_at_T",
+    "freeze_treated_identity",
+    "match_controls_using_frozen_landmark_methodology",
+    "determine_post_landmark_competing_outcome"
+  ],
+  "treated_eligibility_rules": {
+    "allowed": [
+      "cross timestamp reconstructable",
+      "cross occurs after episode start",
+      "coverage sufficient through T",
+      "episode alive immediately before/at T",
+      "P(n+1) has not occurred at or before T",
+      "TP has not occurred at or before T",
+      "cross ordering at T is not unresolved by same-candle ambiguity"
+    ],
+    "disallowed": [
+      "terminal_event",
+      "terminal_timestamp after T",
+      "future P(n+1)",
+      "future TP",
+      "post-cross outcome",
+      "eventual progression status",
+      "eventual regression status"
+    ]
+  },
+  "future_independence_tests_required": [
+    "Fixture A: cross at T -> P(n+1) first",
+    "Fixture B: cross at T -> TP first",
+    "Fixture C: cross at T -> censored",
+    "Fixture D: cross at T -> P(n+1) and TP same candle"
+  ],
+  "note": "This artifact describes the corrected prospective semantics only; it is not a validation result."
+}

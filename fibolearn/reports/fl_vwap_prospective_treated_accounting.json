@@ -1,0 +1,20 @@
+{
+  "status": "development_accounting_only",
+  "raw_favorable_crosses": null,
+  "timestamp_reconstructable": null,
+  "coverage_sufficient": null,
+  "alive_at_T": null,
+  "pn_plus_1_not_reached_by_T": null,
+  "tp_not_reached_by_T": null,
+  "ambiguity_exclusions": null,
+  "prospective_treated_count": null,
+  "matched_treated_count": null,
+  "diagnostic_outcomes": {
+    "PN_PLUS_1_FIRST": null,
+    "TP_FIRST": null,
+    "CENSORED": null,
+    "SAME_CANDLE_AMBIGUOUS": null,
+    "OTHER_UNKNOWN": null
+  },
+  "note": "This file is intentionally an accounting placeholder until a corrected prospective run is performed on outcome-unseen data."
+}

@@ -1,0 +1,16 @@
+{
+  "status": "prospective_integrity_placeholder",
+  "bounded_matcher_from_commit": "e780a1c",
+  "required_checks": {
+    "deterministic_matching": null,
+    "bounded_memory": null,
+    "g7_landmark_formula_violations": null,
+    "selected_absent_from_g7": null,
+    "matcher_g7_mismatches": null,
+    "audit_g7_mismatches": null,
+    "outcome_g7_mismatches": null,
+    "all_eligibility_invariants": null,
+    "future_independence": null
+  },
+  "note": "This file is a placeholder artifact for the corrected prospective semantics task; it does not report a new validation result."
+}

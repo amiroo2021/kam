@@ -151,6 +151,23 @@ def classify_cross_eligibility(row: Dict[str, Any]) -> Dict[str, Any]:
     return {'status': 'valid', **c}
 
 
+def detect_cross_at_T(row: Dict[str, Any]) -> Dict[str, Any]:
+    return canonicalize_episode_cross(row)
+
+
+def determine_treated_eligibility_at_T(row: Dict[str, Any]) -> Dict[str, Any]:
+    c = canonicalize_episode_cross(row)
+    violations = []
+    if c['cross_timestamp_ms'] is None:
+        violations.append('missing_cross_timestamp')
+    if c['cross_timestamp_ms'] is not None and c['cross_timestamp_ms'] <= c['episode_start_timestamp_ms']:
+        violations.append('cross_before_start')
+    if c['intrabar_order_ambiguous']:
+        violations.append('same_candle_ambiguous')
+    eligible = len(violations) == 0
+    return {'eligible': eligible, 'violations': violations, 'landmark_ms': c['cross_timestamp_ms'], **c}
+
+
 def reconstruct_state_at_landmark(episode: Dict[str, Any], landmark_timestamp_ms: int) -> Dict[str, Any]:
     """Pure landmark reconstructor using primitive episode history only."""
     start = episode.get('episode_start_timestamp_ms')
