@@ -14,15 +14,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# GoldenFibo package currently lives outside Hermes' install tree.
-_GF_ROOT = Path("/root/golden_fibo")
+# GoldenFibo legacy engine lives in the repo checkout.
+_GF_LEGACY_ROOT = Path("/root/kam/GoldenFibo/reference/legacy_research")
+if str(_GF_LEGACY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GF_LEGACY_ROOT))
+
+# GoldenFibo marketdata/cache code lives in the modern package tree.
+_GF_ROOT = Path("/root/kam/GoldenFibo")
 if str(_GF_ROOT) not in sys.path:
     sys.path.insert(0, str(_GF_ROOT))
 
 from golden_fibo.constants import Side  # noqa: E402
 from golden_fibo.historical_replay import levels_p0_to_pn, replay_ohlc, iso  # noqa: E402
 from golden_fibo.ladder import ladder_step  # noqa: E402
+from goldenfibo.marketdata.kline_cache import CachePolicy, KlineCache, fetch_range_cached  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
+
+_BACKTEST_CACHE = KlineCache(Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite"))
+_BACKTEST_TIMEFRAME = "1m"
+_BACKTEST_REFRESH_TAIL_MS = 0
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +80,112 @@ class BacktestWizard:
 
     def _state(self, key: Tuple[Any, ...]) -> State:
         return self._states.setdefault(key, State())
+
+    @staticmethod
+    def _progress_bar(pct: float, *, width: int = 16) -> str:
+        pct = max(0.0, min(100.0, float(pct)))
+        filled = int(round((pct / 100.0) * width))
+        filled = max(0, min(width, filled))
+        return "[" + ("█" * filled) + ("░" * (width - filled)) + f"] {pct:5.1f}%"
+
+    @staticmethod
+    def _progress_text(phase: str, pct: float, detail: str = "") -> str:
+        labels = {
+            "loading_cache": "Checking Historical Cache",
+            "downloading_gaps": "Downloading Gaps",
+            "cache_ready": "Historical Data Ready",
+            "backtest": "Running Backtest",
+        }
+        label = labels.get(phase, phase.replace("_", " ").title())
+        bar = BacktestWizard._progress_bar(pct)
+        suffix = f"\n{detail}" if detail else ""
+        return f"⏳ {label}\n{bar}{suffix}"
+
+    @staticmethod
+    def _progress_from_cache(stats: Dict[str, Any]) -> Tuple[str, float, str]:
+        bars_total = int(stats.get("bars_total") or 0)
+        bars_from_cache = int(stats.get("bars_from_cache") or 0)
+        bars_downloaded = int(stats.get("bars_downloaded") or 0)
+        bars_done = bars_from_cache + bars_downloaded
+        pct = 100.0 if bars_total <= 0 else min(100.0, 100.0 * bars_done / bars_total)
+        detail = ""
+        cache_path = stats.get("path")
+        if bars_total > 0:
+            if bars_downloaded > 0:
+                detail = f"Final candles: {bars_total:,}\nFrom cache: {bars_from_cache:,}\nDownloaded: {bars_downloaded:,}"
+            else:
+                detail = f"{bars_from_cache:,} candles loaded from cache\nDownloaded: 0"
+        elif bars_from_cache > 0 or bars_downloaded > 0:
+            detail = f"{bars_done:,} candles loaded from cache"
+            if bars_downloaded > 0:
+                detail += f"\nDownloaded: {bars_downloaded:,}"
+        if cache_path:
+            detail += ("\n" if detail else "") + f"Cache: {cache_path}"
+        return ("cache_ready", pct, detail)
+
+    @staticmethod
+    def _progress_from_payload(payload: Dict[str, Any]) -> Tuple[str, float, str]:
+        stats = dict(payload.get("stats") or {})
+        phase = str(payload.get("stage") or "download")
+        requested = int(payload.get("requested_candles") or stats.get("requested_candles") or 0)
+        cached = int(payload.get("cached_candles") or stats.get("bars_from_cache") or 0)
+        downloaded = int(payload.get("download_done") or payload.get("downloaded_candles") or stats.get("bars_downloaded") or 0)
+        download_total = int(payload.get("download_total") or payload.get("missing_candles") or stats.get("download_total") or stats.get("gaps_remaining") or 0)
+        final_candles = int(payload.get("final_candles") or stats.get("bars_total") or 0)
+        backtest_done = int(payload.get("backtest_done") or 0)
+        backtest_total = int(payload.get("backtest_total") or 0)
+        cache_path = stats.get("path")
+
+        if phase == "loading_cache":
+            if requested > 0:
+                pct = min(100.0, 100.0 * cached / requested)
+                detail = f"{cached:,} / {requested:,} cached"
+                if requested > cached:
+                    detail += f"\nMissing: {requested - cached:,}"
+            else:
+                pct = 0.0
+                detail = "Preparing historical request..."
+            if cache_path:
+                detail += f"\nCache: {cache_path}"
+            return phase, pct, detail
+
+        if phase == "downloading_gaps":
+            if download_total <= 0:
+                detail = "Preparing missing ranges..."
+                if cache_path:
+                    detail += f"\nCache: {cache_path}"
+                return phase, 0.0, detail
+            pct = min(100.0, 100.0 * downloaded / download_total)
+            detail = f"{downloaded:,} / {download_total:,} missing candles"
+            if cached > 0:
+                detail += f"\nCached: {cached:,}"
+            if cache_path:
+                detail += f"\nCache: {cache_path}"
+            return phase, pct, detail
+
+        if phase == "cache_ready":
+            pct = 100.0
+            if final_candles > 0:
+                detail = f"Final candles: {final_candles:,}"
+                if cached > 0 or downloaded > 0:
+                    detail += f"\nFrom cache: {cached:,}\nDownloaded: {downloaded:,}"
+            else:
+                detail = "Historical Data Ready"
+            if cache_path:
+                detail += f"\nCache: {cache_path}"
+            return phase, pct, detail
+
+        if phase == "backtest":
+            if backtest_total > 0:
+                pct = min(100.0, 100.0 * backtest_done / backtest_total)
+                detail = f"{backtest_done:,} / {backtest_total:,} candles"
+            else:
+                pct = 0.0
+                detail = "Running backtest..."
+            return phase, pct, detail
+
+        pct = 100.0 if final_candles else 0.0
+        return phase, pct, str(payload.get("detail") or "")
 
     def reset(self, key: Tuple[Any, ...]) -> None:
         self._states.pop(key, None)
@@ -238,15 +354,50 @@ class BacktestWizard:
             return Screen(f"Run {st.ladder.upper()} backtest?\n{st.symbol} {st.market}\nPercentage: {st.percentage:g}\nStart: {start}", [[_button("▶️ Run backtest", "run")], self._nav("day")], "confirm_run")
         return None
 
-    def _run_backtest(self, st: State) -> Screen:
+    def _run_backtest(self, st: State, *, on_progress=None) -> Screen:
         start_dt = datetime(st.year or 2026, st.month or 1, st.day or 1, 0, 1, tzinfo=timezone.utc)
         sides = [Side.BUY, Side.SELL] if st.ladder == "both" else ([Side.BUY] if st.ladder == "buy" else [Side.SELL])
-        candles = _fetch_klines(st.symbol, st.market, int(start_dt.timestamp()*1000))
+        total_sides = max(1, len(sides))
+        if on_progress:
+            on_progress(
+                {
+                    "stage": "download",
+                    "pct": 0.0,
+                    "bars_done": 0,
+                    "bars_est": 1,
+                    "stats": {"path": str(_BACKTEST_CACHE.path), "bars_total": 0},
+                    "detail": "Loading cached candles",
+                }
+            )
+        candles = _fetch_klines(st.symbol, st.market, int(start_dt.timestamp() * 1000), on_progress=on_progress)
         if not candles:
             return Screen("No Binance candles returned for that request.", [self._nav("symbol")], "error")
-        parts=[f"Backtest complete: {st.symbol} {st.market}\nPercentage: {st.percentage:g}\nData: {iso(int(candles[0][0]))} → {iso(int(candles[-1][0]))}\nCandles: {len(candles):,}\n"]
+        stats = _BACKTEST_CACHE.stats_for(st.symbol, _BACKTEST_TIMEFRAME, market="futures" if st.market == "futures" else "spot")
+        if on_progress:
+            on_progress(
+                {
+                    "stage": "backtest",
+                    "pct": 0.0,
+                    "bars_done": 0,
+                    "bars_est": total_sides,
+                    "stats": stats,
+                    "detail": "Running replay",
+                }
+            )
+        parts=[f"Backtest complete: {st.symbol} {st.market}\nPercentage: {st.percentage:g}\nData: {iso(int(candles[0][0]))} → {iso(int(candles[-1][0]))}\nCandles: {len(candles):,}\nCache: {stats['path']}\nCached bars: {stats['bars']}\n"]
         attachments=[]
-        for side in sides:
+        for idx, side in enumerate(sides, start=1):
+            if on_progress:
+                on_progress(
+                    {
+                        "stage": "backtest",
+                        "pct": min(100.0, 100.0 * idx / total_sides),
+                        "bars_done": idx,
+                        "bars_est": total_sides,
+                        "stats": stats,
+                        "detail": f"Running {idx}/{total_sides} sides",
+                    }
+                )
             result = _summarize_side(candles, side, st.symbol, st.market, st.percentage)
             parts.append(result["text"])
             attachments.append(result["svg"])
@@ -265,23 +416,36 @@ def _fetch_json(base: str, path: str, params: Dict[str, Any]):
         return json.loads(resp.read().decode())
 
 
-def _fetch_klines(symbol: str, market: str, start_ms: int):
-    base = _FUTURES if market == "futures" else _SPOT
-    path = "/fapi/v1/klines" if market == "futures" else "/api/v3/klines"
-    limit = _LIMIT_FUTURES if market == "futures" else _LIMIT_SPOT
-    end = int(datetime.now(timezone.utc).timestamp()*1000)
-    out=[]; t=start_ms
-    while t <= end:
-        data=_fetch_json(base,path,{"symbol":symbol,"interval":"1m","startTime":t,"endTime":end,"limit":limit})
-        if not data: break
-        out.extend(data)
-        last=int(data[-1][0]); nt=last+60000
-        if nt<=t: break
-        t=nt
-        if len(data)<limit: break
-        time.sleep(0.015)
-    by={int(k[0]):k for k in out if start_ms<=int(k[0])<=end}
-    return [by[k] for k in sorted(by)]
+def _fetch_klines(symbol: str, market: str, start_ms: int, *, on_progress=None):
+    end = int(datetime.now(timezone.utc).timestamp() * 1000)
+    source_market = "futures" if market == "futures" else "spot"
+    if on_progress:
+        on_progress(
+            {
+                "stage": "download",
+                "bars_done": 0,
+                "bars_est": max(1, (end - int(start_ms)) // 60_000),
+                "stats": {"path": str(_BACKTEST_CACHE.path), "bars_total": 0},
+                "detail": "Loading cached candles",
+            }
+        )
+    base_url = _FUTURES if source_market == "futures" else _SPOT
+    result = fetch_range_cached(
+        symbol,
+        _BACKTEST_TIMEFRAME,
+        int(start_ms),
+        end,
+        cache=_BACKTEST_CACHE,
+        policy=CachePolicy.AUTO,
+        refresh_tail_ms=_BACKTEST_REFRESH_TAIL_MS,
+        base_url=base_url,
+        fetch=None,
+        sleep_s=0.015,
+        closed_only_before_ms=end,
+        market=source_market,
+        on_progress=on_progress,
+    )
+    return result.klines
 
 
 def _vwap(candles, ts):
@@ -580,11 +744,41 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
         try: await query.answer()
         except Exception: pass
         msg=getattr(query,"message",None); key=_chat_key_from_message(msg)
-        if suffix == "restart": screen=_WIZARD.open(key)
+        if suffix == "restart":
+            screen=_WIZARD.open(key)
         elif suffix == "run":
-            try: await query.edit_message_text("⏳ Running Binance backtest… this can take a minute.", reply_markup=None)
+            try: await query.edit_message_text(_WIZARD._progress_text("loading_cache", 0.0, ""), reply_markup=None)
             except Exception: pass
-            screen=await asyncio.to_thread(_WIZARD.handle_callback,key,suffix)
+            from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
+            loop = asyncio.get_running_loop()
+            progress_lock = asyncio.Lock()
+            def progress_cb(payload: dict):
+                phase, pct, detail = _WIZARD._progress_from_payload(payload)
+                stats = dict(payload.get("stats") or {})
+                log_payload = {
+                    "phase": phase,
+                    "percent": round(pct, 3),
+                    "bars_done": payload.get("bars_done"),
+                    "bars_est": payload.get("bars_est"),
+                    "bars_from_cache": stats.get("bars_from_cache"),
+                    "bars_downloaded": stats.get("bars_downloaded"),
+                    "bars_total": stats.get("bars_total"),
+                    "requested_candles": payload.get("requested_candles") or stats.get("requested_candles"),
+                    "download_total": payload.get("download_total") or payload.get("missing_candles") or stats.get("download_total"),
+                    "download_done": payload.get("download_done") or payload.get("downloaded_candles") or stats.get("bars_downloaded"),
+                    "text": _WIZARD._progress_text(phase, pct, detail),
+                }
+                logger.info("backtest progress payload=%s", log_payload)
+                text = log_payload["text"]
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Working…", callback_data="backtest:run")]])
+                async def _update():
+                    async with progress_lock:
+                        try:
+                            await query.edit_message_text(text, reply_markup=kb)
+                        except Exception:
+                            pass
+                asyncio.run_coroutine_threadsafe(_update(), loop)
+            screen = await asyncio.to_thread(_WIZARD._run_backtest, _WIZARD._state(key), on_progress=progress_cb)
         else:
             screen=await asyncio.to_thread(_WIZARD.handle_callback,key,suffix)
         from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
@@ -613,6 +807,20 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
                 if callable(doc): await doc(chat_id=cid,file_path=path,caption=Path(path).name,metadata=_metadata_from_message(msg))
     except Exception as exc:
         logger.error("backtest callback failed: %s", exc, exc_info=True)
+        try:
+            msg = getattr(query, "message", None)
+            cid = _chat_id_from_message(msg)
+            error_text = f"Backtest failed:\n{type(exc).__name__}: {exc}"
+            if getattr(query, "edit_message_text", None):
+                try:
+                    await query.edit_message_text(error_text, reply_markup=None)
+                    return
+                except Exception:
+                    pass
+            if cid:
+                await _send_screen(adapter, cid, Screen(error_text, [ _WIZARD._screen_ladder().buttons[-1] ], "error"), metadata=_metadata_from_message(msg))
+        except Exception:
+            pass
 
 async def handle_backtest_text(adapter: Any, msg: Any) -> bool:
     key=_chat_key_from_message(msg); screen=await asyncio.to_thread(_WIZARD.handle_text,key,getattr(msg,"text","") or "")

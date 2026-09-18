@@ -8,6 +8,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import urllib.parse
+import urllib.request
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -20,6 +23,8 @@ from .binance_klines_range import (
     iter_klines_pages,
 )
 from .binance_public import BINANCE_SPOT_REST
+
+BINANCE_USDM_REST = "https://fapi.binance.com"
 from .timeframes import interval_ms, validate_interval
 
 FetchFn = Callable[[str], list]
@@ -155,6 +160,49 @@ class KlineCache:
                 ON candles (source, market, symbol, timeframe, open_time)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS availability (
+                    source TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    first_available_open_time INTEGER,
+                    last_available_open_time INTEGER,
+                    PRIMARY KEY (source, market, symbol, timeframe)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_availability_key
+                ON availability (source, market, symbol, timeframe)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS availability_checks (
+                    source TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    checked_at_ms INTEGER NOT NULL,
+                    checked_start_ms INTEGER NOT NULL,
+                    checked_end_ms INTEGER NOT NULL,
+                    observed_first_open_time INTEGER,
+                    observed_last_open_time INTEGER,
+                    response_status TEXT NOT NULL,
+                    response_note TEXT NOT NULL,
+                    PRIMARY KEY (source, market, symbol, timeframe, checked_start_ms, checked_end_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_availability_checks_key
+                ON availability_checks (source, market, symbol, timeframe, checked_at_ms)
+                """
+            )
 
     def stats_for(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> Dict:
         symbol = symbol.upper().replace("/", "")
@@ -170,6 +218,14 @@ class KlineCache:
                 """,
                 (SOURCE, market, symbol, timeframe),
             ).fetchone()
+            avail = conn.execute(
+                """
+                SELECT first_available_open_time, last_available_open_time
+                FROM availability
+                WHERE source=? AND market=? AND symbol=? AND timeframe=?
+                """,
+                (SOURCE, market, symbol, timeframe),
+            ).fetchone()
         n = int(row["n"] or 0)
         return {
             "path": str(self.path),
@@ -180,8 +236,155 @@ class KlineCache:
             "bars": n,
             "first_open_time": row["first_ot"],
             "last_open_time": row["last_ot"],
+            "first_available_open_time": avail["first_available_open_time"] if avail else None,
+            "last_available_open_time": avail["last_available_open_time"] if avail else None,
             "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
         }
+
+    def get_availability(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> Dict:
+        symbol = symbol.upper().replace("/", "")
+        timeframe = validate_interval(timeframe)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT first_available_open_time, last_available_open_time
+                FROM availability
+                WHERE source=? AND market=? AND symbol=? AND timeframe=?
+                """,
+                (SOURCE, market, symbol, timeframe),
+            ).fetchone()
+        if row is None:
+            return {
+                "source": SOURCE,
+                "market": market,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "first_available_open_time": None,
+                "last_available_open_time": None,
+            }
+        return {
+            "source": SOURCE,
+            "market": market,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "first_available_open_time": row["first_available_open_time"],
+            "last_available_open_time": row["last_available_open_time"],
+        }
+
+    def set_availability(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        market: str = MARKET_SPOT,
+        first_available_open_time: Optional[int] = None,
+        last_available_open_time: Optional[int] = None,
+    ) -> None:
+        symbol = symbol.upper().replace("/", "")
+        timeframe = validate_interval(timeframe)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO availability (
+                    source, market, symbol, timeframe,
+                    first_available_open_time, last_available_open_time
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(source, market, symbol, timeframe) DO UPDATE SET
+                    first_available_open_time=excluded.first_available_open_time,
+                    last_available_open_time=excluded.last_available_open_time
+                """,
+                (SOURCE, market, symbol, timeframe, first_available_open_time, last_available_open_time),
+            )
+
+    def record_availability_check(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        market: str = MARKET_SPOT,
+        checked_start_ms: int,
+        checked_end_ms: int,
+        observed_first_open_time: Optional[int],
+        observed_last_open_time: Optional[int],
+        response_status: str,
+        response_note: str,
+    ) -> None:
+        symbol = symbol.upper().replace("/", "")
+        timeframe = validate_interval(timeframe)
+        now_ms = int(time.time() * 1000)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO availability_checks (
+                    source, market, symbol, timeframe,
+                    checked_at_ms, checked_start_ms, checked_end_ms,
+                    observed_first_open_time, observed_last_open_time,
+                    response_status, response_note
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    SOURCE,
+                    market,
+                    symbol,
+                    timeframe,
+                    now_ms,
+                    int(checked_start_ms),
+                    int(checked_end_ms),
+                    observed_first_open_time,
+                    observed_last_open_time,
+                    response_status,
+                    response_note,
+                ),
+            )
+
+    def discover_first_available_open_time(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        market: str = MARKET_SPOT,
+        fetch: Optional[FetchFn] = None,
+        base_url: str | None = None,
+        max_years_back: int = 10,
+    ) -> Optional[int]:
+        symbol = symbol.upper().replace("/", "")
+        timeframe = validate_interval(timeframe)
+        current = self.get_availability(symbol, timeframe, market=market).get("first_available_open_time")
+        if current is not None:
+            return int(current)
+        base_url = base_url or (BINANCE_USDM_REST if market == "futures" else BINANCE_SPOT_REST)
+        step = interval_ms(timeframe)
+        now_ms = int(time.time() * 1000)
+
+        def _fetch_json(url: str):
+            if fetch is not None:
+                return fetch(url)
+            req = urllib.request.Request(url, headers={"User-Agent": "GoldenFibo/availability/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+
+        # Binance klines return the first candle at/after startTime. A single
+        # request from time 0 is usually enough to get the earliest available
+        # candle cheaply and deterministically. If the symbol is truly absent,
+        # Binance returns an empty list.
+        qs = (
+            f"symbol={urllib.parse.quote(symbol)}&interval={urllib.parse.quote(timeframe)}"
+            f"&startTime=0&endTime={now_ms}&limit=1"
+        )
+        url = f"{base_url}/fapi/v1/klines?{qs}" if market == "futures" else f"{base_url}/api/v3/klines?{qs}"
+        try:
+            data = _fetch_json(url)
+        except Exception as exc:
+            self.record_availability_check(symbol, timeframe, market=market, checked_start_ms=0, checked_end_ms=now_ms, observed_first_open_time=None, observed_last_open_time=None, response_status="error", response_note=str(exc))
+            return None
+        if isinstance(data, list) and data:
+            first = int(data[0][0])
+            last = int(data[-1][0])
+            self.record_availability_check(symbol, timeframe, market=market, checked_start_ms=0, checked_end_ms=now_ms, observed_first_open_time=first, observed_last_open_time=last, response_status="ok", response_note="direct_earliest_probe")
+            self.set_availability(symbol, timeframe, market=market, first_available_open_time=first, last_available_open_time=last)
+            return first
+        self.record_availability_check(symbol, timeframe, market=market, checked_start_ms=0, checked_end_ms=now_ms, observed_first_open_time=None, observed_last_open_time=None, response_status="empty", response_note="direct_earliest_probe_empty")
+        return None
 
     def clear(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> int:
         symbol = symbol.upper().replace("/", "")
@@ -380,7 +583,10 @@ def fetch_range_cached(
     written to cache. Forming candles are never stored as final.
     """
     policy = CachePolicy(policy)
-    base_url = base_url or BINANCE_SPOT_REST
+    if base_url is None:
+        base_url = BINANCE_USDM_REST if market == "futures" else BINANCE_SPOT_REST
+    elif market == "futures" and base_url == BINANCE_SPOT_REST:
+        base_url = BINANCE_USDM_REST
     interval = validate_interval(interval)
     symbol = symbol.upper().replace("/", "")
     step = interval_ms(interval)
@@ -393,11 +599,19 @@ def fetch_range_cached(
         # last closed open = floor((closed_only-1)/step)*step but end_ms already hist fence
         closed_end = min(end_ms, int(closed_only_before_ms))
 
+    requested_candles = max(0, (int(end_ms) - int(start_ms)) // step)
+
     def emit(stage: str, **extra):
         if on_progress:
             d = {"stage": stage, "stats": stats.as_dict()}
             d.update(extra)
             on_progress(d)
+
+    missing_total = 0
+    download_done = 0
+    download_total = 0
+    cached_candles = 0
+    final_candles = 0
 
     def _fetch_url(url: str, retries: int = 5) -> list:
         from .binance_klines_range import _default_fetch
@@ -442,9 +656,15 @@ def fetch_range_cached(
                     cache.upsert_klines(symbol, interval, store_rows, market=market)
             emit(
                 "downloading_gaps",
+                requested_candles=requested_candles,
+                cached_candles=stats.bars_from_cache,
+                missing_candles=missing_total,
+                download_total=missing_total,
+                download_done=stats.bars_downloaded,
+                final_candles=stats.bars_total,
                 bars_done=stats.bars_from_cache + stats.bars_downloaded,
                 pages=stats.rest_pages,
-                pct=min(99.0, 100.0 * (stats.bars_from_cache + stats.bars_downloaded) / max(1, (end_ms - start_ms) // step)),
+                pct=min(99.0, 100.0 * stats.bars_downloaded / max(1, missing_total)),
                 range_start=a,
                 range_end=b,
                 last_open_ms=int(page[-1][0]) if page else None,
@@ -478,18 +698,42 @@ def fetch_range_cached(
     # AUTO
     t_read = time.perf_counter()
     emit("loading_cache")
-    cached = cache.read_range(symbol, interval, start_ms, closed_end, market=market)
+    initial_cached = cache.read_range(symbol, interval, start_ms, closed_end, market=market)
+    avail = cache.get_availability(symbol, interval, market=market)
+    first_available = avail.get("first_available_open_time")
+    last_available = avail.get("last_available_open_time")
+    if first_available is None and (not initial_cached or int(initial_cached[0][0]) > int(start_ms)):
+        first_available = cache.discover_first_available_open_time(symbol, interval, market=market, fetch=fetch, base_url=base_url)
+        avail = cache.get_availability(symbol, interval, market=market)
+        first_available = avail.get("first_available_open_time") if first_available is None else first_available
+        last_available = avail.get("last_available_open_time") if last_available is None else last_available
+    effective_start = max(int(start_ms), int(first_available) if first_available is not None else int(start_ms))
+    effective_end = int(closed_end)
+    cached = cache.read_range(symbol, interval, effective_start, effective_end, market=market)
     stats.cache_read_ms = (time.perf_counter() - t_read) * 1000
     before_ots = {int(k[0]) for k in cached}
     stats.bars_from_cache = len(cached)
-    emit("loading_cache", bars_done=len(cached), bars_est=(closed_end - start_ms) // step)
+    missing = cache.find_missing_ranges(symbol, interval, effective_start, effective_end, market=market)
+    missing_total = sum(max(0, (b - a) // step) for a, b in missing)
+    available_expected = max(0, (effective_end - effective_start) // step)
+    stats.bars_total = available_expected
+    emit(
+        "loading_cache",
+        requested_candles=requested_candles,
+        effective_available_start=effective_start,
+        first_available_open_time=first_available,
+        cached_candles=len(cached),
+        missing_candles=missing_total,
+        unavailable_candles=max(0, (effective_start - int(start_ms)) // step),
+        bars_done=len(cached),
+        bars_est=available_expected,
+    )
 
-    missing = cache.find_missing_ranges(symbol, interval, start_ms, closed_end, market=market)
-    refresh_from = max(start_ms, closed_end - max(0, int(refresh_tail_ms)))
+    refresh_from = max(effective_start, effective_end - max(0, int(refresh_tail_ms)))
     download_ranges = list(missing)
-    if refresh_tail_ms > 0 and refresh_from < closed_end:
-        download_ranges.append((refresh_from, closed_end))
-        stats.refresh_window_ms = closed_end - refresh_from
+    if refresh_tail_ms > 0 and refresh_from < effective_end:
+        download_ranges.append((refresh_from, effective_end))
+        stats.refresh_window_ms = effective_end - refresh_from
 
     # Split huge ranges into ~3-day chunks so one failure does not lose everything
     chunk_ms = 3 * 24 * 60 * 60 * 1000
@@ -509,10 +753,10 @@ def fetch_range_cached(
             stats.gaps_filled += 1
 
     t_read2 = time.perf_counter()
-    kl = cache.read_range(symbol, interval, start_ms, min(end_ms, closed_end), market=market)
+    kl = cache.read_range(symbol, interval, effective_start, effective_end, market=market)
     stats.cache_read_ms += (time.perf_counter() - t_read2) * 1000
     # Keep half-open [start, end)
-    kl = [k for k in kl if start_ms <= int(k[0]) < end_ms]
+    kl = [k for k in kl if effective_start <= int(k[0]) < effective_end]
     if closed_only_before_ms is not None:
         kl = [k for k in kl if int(k[0]) + step <= int(closed_only_before_ms)]
 
@@ -521,14 +765,14 @@ def fetch_range_cached(
     stats.bars_downloaded = sum(1 for ot in final_ots if ot not in before_ots or ot >= refresh_from)
     stats.bars_total = len(kl)
 
-    still_missing = cache.find_missing_ranges(symbol, interval, start_ms, closed_end, market=market)
+    still_missing = cache.find_missing_ranges(symbol, interval, effective_start, effective_end, market=market)
     stats.gaps_remaining = sum(max(0, (b - a) // step) for a, b in still_missing)
     if still_missing:
         stats.notes.append(
             f"exchange gaps remain (not fabricated): {len(still_missing)} ranges, ~{stats.gaps_remaining} bars"
         )
 
-    v = validate_klines_sequence(kl, timeframe=interval, start_ms=None, end_ms=end_ms)
+    v = validate_klines_sequence(kl, timeframe=interval, start_ms=None, end_ms=effective_end)
     if v["dupes"] or v["out_of_order"]:
         stats.notes.append(f"validation issues: {v}")
     emit("cache_ready", bars_total=len(kl), validation=v)
