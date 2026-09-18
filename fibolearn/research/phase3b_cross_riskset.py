@@ -409,6 +409,57 @@ def match_controls_for_cross(treated_rows: list[Dict[str, Any]], control_rows: l
     return {'matched_sets': matched_sets, 'control_reuse': dict(reuse), 'control_weights': dict(control_weights)}
 
 
+def stream_match_controls_for_cross(treated_rows: list[Dict[str, Any]], control_rows: list[Dict[str, Any]], k: int = K_MATCH, seed: str = 'fl-vwap-002-cross'):
+    """Yield matched assignments one at a time in frozen deterministic order."""
+    groups = defaultdict(list)
+    for c in control_rows:
+        groups[(c['symbol'], c['percentage'], c['direction'], c['active_step'])].append(c)
+    for key in groups:
+        groups[key] = sorted(groups[key], key=lambda r: (r['episode_start_timestamp_ms'], r['episode_key']))
+    for t in treated_rows:
+        t_partition = t.get('partition') or t.get('temporal_partition')
+        key = (t['symbol'], t['percentage'], t['direction'], t['active_step'])
+        candidates = []
+        for c in groups.get(key, []):
+            if t_partition is not None and c.get('partition') is not None and c.get('partition') != t_partition:
+                continue
+            if c['episode_key'] == t['episode_key']:
+                continue
+            control_landmark = int(c['episode_start_timestamp_ms']) + int(t['cross_elapsed_ms'])
+            state = reconstruct_state_at_landmark(c, control_landmark)
+            elig = eligibility_from_state_at_T(state)
+            if not elig['eligible']:
+                continue
+            candidates.append(c)
+        scored = []
+        for c in candidates:
+            h = hashlib.sha256(f"{seed}|{t['episode_key']}|{c['episode_key']}".encode()).hexdigest()
+            scored.append((h, c))
+        scored.sort(key=lambda x: x[0])
+        selected = [c for _, c in scored[:k]]
+        if not selected:
+            continue
+        w = 1.0 / len(selected)
+        for c in selected:
+            control_landmark_ms = int(c['episode_start_timestamp_ms']) + int(t['cross_elapsed_ms'])
+            yield {
+                'treated_episode_key': t['episode_key'],
+                'treated_symbol': t['symbol'],
+                'treated_percentage': t['percentage'],
+                'treated_direction': t['direction'],
+                'treated_active_step': int(t['active_step']),
+                'control_episode_key': c['episode_key'],
+                'control_landmark_ms': control_landmark_ms,
+                'control_weight': w,
+                'treated_elapsed_T_ms': int(t['cross_elapsed_ms']),
+                'treated_partition': t_partition,
+                'control_partition': c.get('partition') or c.get('temporal_partition'),
+                'selection_rank': scored.index((next(h for h, cc in scored if cc['episode_key'] == c['episode_key']), c)) if False else None,
+                'treated_episode': t,
+                'control_episode': c,
+            }
+
+
 def _pairwise_rates(matched_sets: list[Dict[str, Any]]) -> Dict[str, Any]:
     treated_prog = treated_reg = 0.0
     ctrl_prog = ctrl_reg = 0.0

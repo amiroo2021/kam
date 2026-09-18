@@ -1,0 +1,12 @@
+{
+  "note": "run this script separately for old vs optimized if you need isolated peaks",
+  "old_peak_rss_kb": 337780,
+  "optimized_peak_rss_kb": 337780,
+  "smoke_stratum": {
+    "active_step": 1,
+    "direction": "BUY",
+    "percentage": "0.001",
+    "symbol": "ETH"
+  },
+  "validation_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60"
+}

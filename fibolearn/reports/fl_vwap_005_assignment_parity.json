@@ -1,0 +1,19 @@
+{
+  "candidate_control_count": 290,
+  "deterministic_repeat_pass": true,
+  "input_episode_count": 368,
+  "landmark_mismatches": 0,
+  "new_only_assignments": 0,
+  "new_selected_assignment_count": 387,
+  "old_only_assignments": 0,
+  "old_selected_assignment_count": 387,
+  "smoke_stratum": {
+    "active_step": 1,
+    "direction": "BUY",
+    "percentage": "0.001",
+    "symbol": "ETH"
+  },
+  "treated_count": 78,
+  "validation_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "weight_mismatches": 0
+}
