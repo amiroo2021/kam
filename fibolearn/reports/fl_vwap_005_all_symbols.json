@@ -1,0 +1,38 @@
+{
+  "absolute_difference_pp": 91.05960264900716,
+  "ci95": [
+    1521.6623693186027,
+    395764.670353
+  ],
+  "ci_accounts_for_repeated_control_dependence": false,
+  "control_ambiguous_weight": 121.73333333333416,
+  "control_assignments": 1169.0000000001105,
+  "control_censored_weight": 0.3333333333333333,
+  "effective_control_n": 1046.9333333334055,
+  "eligible_treated_crosses": 1210,
+  "fingerprint_forensic_report_path": "/root/kam/fibolearn/reports/fl_vwap_005_fingerprint_forensic_audit.json",
+  "freeze_commit": "6d40e12621446067ea4a63e804b5804162133b7e",
+  "frozen_methodology_commit": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+  "matched_treated_n": 1210,
+  "odds_ratio": 24540.175345378902,
+  "pre_outcome_execution_commit": "e780a1c",
+  "preregistration_path": "/root/kam/fibolearn/reports/fl_vwap_005_preregistration.json",
+  "relative_risk": 11.185185185185867,
+  "resolved_treated_n": 1210.0,
+  "resolved_weighted_control_denominator": 1046.9333333334055,
+  "reuse": {
+    "max": 21,
+    "median": 3.0,
+    "p90": 7.0,
+    "p95": 9.0
+  },
+  "treated_ambiguous": 0.0,
+  "treated_censored": 0.0,
+  "treated_progression_denominator": 1210.0,
+  "treated_progression_numerator": 1210.0,
+  "treated_progression_pct": 1.0,
+  "unique_controls": 1470,
+  "validation_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "weighted_control_progression_numerator": 93.60000000000073,
+  "weighted_control_progression_pct": 0.08940397350992832
+}

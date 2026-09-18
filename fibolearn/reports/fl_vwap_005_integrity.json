@@ -1,0 +1,17 @@
+{
+  "audit_g7_landmark_mismatches": 0,
+  "cell_mismatch": 0,
+  "future_independence": "PASS",
+  "g7_landmark_formula_violations": 0,
+  "insufficient_coverage": 0,
+  "matcher_g7_landmark_mismatches": 0,
+  "not_alive_at_landmark": 0,
+  "outcome_at_or_before_landmark": 0,
+  "outcome_g7_landmark_mismatches": 0,
+  "partition_mismatch": 0,
+  "pn_plus_1_at_or_before_landmark": 0,
+  "selected_assignments_absent_from_G7": 0,
+  "start_after_landmark": 0,
+  "tp_at_or_before_landmark": 0,
+  "vwap_cross_at_or_before_landmark": 0
+}

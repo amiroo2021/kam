@@ -1,0 +1,10 @@
+{
+  "fingerprint_forensic_report_path": "/root/kam/fibolearn/reports/fl_vwap_005_fingerprint_forensic_audit.json",
+  "freeze_commit": "6d40e12621446067ea4a63e804b5804162133b7e",
+  "frozen_methodology_commit": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+  "note": "Outcome-revealing run; NAIVE/APPROXIMATE CI; repeated-control dependence not modeled",
+  "pre_outcome_execution_commit": "e780a1c",
+  "preregistration_path": "/root/kam/fibolearn/reports/fl_vwap_005_preregistration.json",
+  "validation_fingerprint": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+  "validation_verdict": "VALIDATION_SUPPORTED_HISTORICAL_ASSOCIATION"
+}
