@@ -1,0 +1,57 @@
+{
+  "boundary_tests": {
+    "<T_boundary": "PASS",
+    "==T_progression": "PASS",
+    "==T_TP": "PASS",
+    ">T_progression": "PASS",
+    ">T_TP": "PASS",
+    "same_candle_ambiguity": "PASS"
+  },
+  "btc_buy_other_terminal": {
+    "episode_key": "BTC|0.001|BUY|1|0",
+    "prospective_result": "other_terminal",
+    "PASS": true
+  },
+  "btc_sell_tp_first": {
+    "episode_key": "BTC|0.001|SELL|1|2",
+    "prospective_result": "TP_FIRST",
+    "PASS": true
+  },
+  "clean_pn_first": {
+    "episode_key": "BTC|0.001|SELL|27|3",
+    "prospective_result": "PN_PLUS_1_FIRST",
+    "PASS": true
+  },
+  "focused_pytest": {
+    "target": "tests/test_fl_vwap_005_outcome_resolver.py",
+    "result": "5 passed"
+  },
+  "root_cause": "event timestamps at T were incorrectly eligible as post-landmark outcomes; strict >T gate fixes the prospective temporal-selection bug",
+  "synthetic_fallback_count": 0,
+  "terminal_event_independence": "PASS",
+  "three_real_cases": [
+    {
+      "episode_key": "BTC|0.001|SELL|1|2",
+      "source": "REAL",
+      "result": "TP_FIRST"
+    },
+    {
+      "episode_key": "BTC|0.001|BUY|1|0",
+      "source": "REAL",
+      "result": "other_terminal"
+    },
+    {
+      "episode_key": "BTC|0.001|SELL|27|3",
+      "source": "REAL",
+      "result": "PN_PLUS_1_FIRST"
+    }
+  ],
+  "production_builder_changed": false,
+  "prospective_logic_changed": true,
+  "no_30_case_run": true,
+  "no_16_371_run": true,
+  "no_2_176_2_047_rerun": true,
+  "no_fl_vwap_006": true,
+  "no_effects_rates": true,
+  "commit_hash": null
+}
