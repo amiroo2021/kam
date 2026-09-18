@@ -261,7 +261,7 @@ def resolve_post_landmark_outcome_from_primitives(episode: Dict[str, Any], landm
                 prev_cycle, prev_step = cur_cycle, cur_step
             if saw_post_landmark_row:
                 return 'CENSORED'
-            return 'REAL_TRANSITION_NOT_RECONSTRUCTED'
+            return 'CENSORED'
     except Exception:
         pass
     finally:

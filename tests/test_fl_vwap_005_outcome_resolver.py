@@ -156,6 +156,11 @@ def test_resolver_missing_primitives_returns_other_unknown():
     assert resolve_post_landmark_outcome_from_primitives(ep, 1500) == 'OTHER_UNKNOWN'
 
 
+def test_resolver_no_post_t_primitives_returns_censored():
+    ep = _load_episode('BTC|0.001|SELL|218|0')
+    assert resolve_post_landmark_outcome_from_primitives(ep, int(ep['start_timestamp_ms'])) == 'CENSORED'
+
+
 def test_canonical_outcome_label_map_equivalences():
     assert canonical_outcome_label('pn_plus_1_before_tp') == 'PN_PLUS_1_FIRST'
     assert canonical_outcome_label('PN_PLUS_1_FIRST') == 'PN_PLUS_1_FIRST'

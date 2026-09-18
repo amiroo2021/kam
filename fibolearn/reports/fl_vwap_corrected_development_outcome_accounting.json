@@ -1,0 +1,50 @@
+{
+  "checkpoint_commits": {
+    "focused_semantic_verification": "e3b10e13234fe8c7917318ac28f2c22611521dd2",
+    "strict_time_resolver_fix": "779356f05d9bbeb86375d561f23df48bdf0322ce"
+  },
+  "deterministic_accounting": "PASS",
+  "expected_total": 2047,
+  "insufficient_primitive_coverage_count": 0,
+  "notes": "No eligibility, landmark, matcher, or builder rerun performed.",
+  "old_vs_new_count_comparison": {
+    "new": {
+      "CENSORED": 9,
+      "OTHER_TERMINAL": 258,
+      "OTHER_UNKNOWN": 0,
+      "PN_PLUS_1_FIRST": 779,
+      "SAME_CANDLE_AMBIGUOUS": 0,
+      "TP_FIRST": 1001
+    },
+    "old": {
+      "CENSORED": 132,
+      "OTHER_UNKNOWN": 2044,
+      "PN_PLUS_1_FIRST": 0,
+      "TP_FIRST": 0
+    }
+  },
+  "other_unknown_reason_buckets": {},
+  "other_unknown_reason_samples": {},
+  "outcome_counts": {
+    "CENSORED": 9,
+    "OTHER_TERMINAL": 258,
+    "OTHER_UNKNOWN": 0,
+    "PN_PLUS_1_FIRST": 779,
+    "SAME_CANDLE_AMBIGUOUS": 0,
+    "TP_FIRST": 1001
+  },
+  "outcome_counts_sum": 2047,
+  "peak_rss_kb": 27420,
+  "real_primitive_source_count": 2047,
+  "scope": "development-only prospective outcome accounting on frozen matched treated population; not effect estimation",
+  "synthetic_fallback_count": 0,
+  "terminal_event_independence": "PASS",
+  "upstream_population_counts": {
+    "matched_treated": 2047,
+    "prospective_eligible_treated": 2176,
+    "raw_favorable_crosses": 2176,
+    "treated_with_eligible_control": 2047
+  },
+  "upstream_population_unchanged": true,
+  "verdict": "DEVELOPMENT_PROSPECTIVE_OUTCOME_ACCOUNTING_VERIFIED"
+}

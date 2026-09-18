@@ -1,0 +1,50 @@
+{
+  "chronology_from_T": [
+    {
+      "active_step": 0,
+      "cycle_changed_vs_landmark": false,
+      "cycle_id": "218",
+      "domain_events": [],
+      "ladder_id": 80640,
+      "market_id": 10080,
+      "ownership_status": "same family / same symbol-percentage-direction",
+      "pn_plus_1_hit_status": false,
+      "step_changed_vs_landmark": false,
+      "timestamp_ms": 1789581660000,
+      "tp_hit_status": false
+    }
+  ],
+  "code_bug_proven": false,
+  "code_change_warranted": false,
+  "dataset_boundary_or_gap_involved": true,
+  "exact_proposed_fix_if_proven": null,
+  "first_semantic_divergence": "NO_POST_T_PRIMITIVE_ROW",
+  "historical_terminal_event": "censored",
+  "identity": "BTC|0.001|SELL|218|0",
+  "independent_prospective_classification": "CENSORED",
+  "landmark": {
+    "Pn": null,
+    "Pn_plus_1": null,
+    "T": 1789581660000,
+    "TP": null,
+    "active_step": 0,
+    "cycle_id": "218",
+    "ladder_row": {
+      "ladder_id": 80640
+    },
+    "market_row": {
+      "market_id": 10080,
+      "timestamp_ms": 1789581660000
+    }
+  },
+  "notes": "This case is censored by primitive coverage ending at T; no post-T primitive transition exists to reconstruct.",
+  "peak_rss_kb": 21044,
+  "primitive_coverage_complete": false,
+  "real_transition_occurred": "NO",
+  "resolver_classification_reason": "REAL_TRANSITION_NOT_RECONSTRUCTED",
+  "resolver_outcome": "REAL_TRANSITION_NOT_RECONSTRUCTED",
+  "resolver_outcome_if_terminal_mutated": "REAL_TRANSITION_NOT_RECONSTRUCTED",
+  "root_classification": "MISSING_PRIMITIVE_COVERAGE",
+  "terminal_event_independence": "PASS",
+  "transition_ownership_resolved": "NO"
+}
