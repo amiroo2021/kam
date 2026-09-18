@@ -1,0 +1,523 @@
+{
+  "OTHER_TERMINAL_NORMALIZATION": "PASS",
+  "REAL_primitive_source_count": 10,
+  "availability_classification": "SUFFICIENT_OTHER_TERMINAL_CASES",
+  "btc_buy_case": null,
+  "btc_buy_case_found": true,
+  "canonical_exact_matches": 10,
+  "deterministic_repeat": "PASS",
+  "other_terminal_cases": [
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "10",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|10|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "11",
+          "domain_events": [],
+          "ladder_id": 362983,
+          "market_id": 2173,
+          "timestamp_ms": 1789107240000
+        }
+      ],
+      "landmark_T": 1789107180000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "114",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|114|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "114",
+          "domain_events": [],
+          "ladder_id": 274991,
+          "market_id": 34374,
+          "timestamp_ms": 1788447300000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "115",
+          "domain_events": [],
+          "ladder_id": 274999,
+          "market_id": 34375,
+          "timestamp_ms": 1788447360000
+        }
+      ],
+      "landmark_T": 1788447240000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "123",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|123|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "123",
+          "domain_events": [],
+          "ladder_id": 275071,
+          "market_id": 34384,
+          "timestamp_ms": 1788447900000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "124",
+          "domain_events": [],
+          "ladder_id": 275079,
+          "market_id": 34385,
+          "timestamp_ms": 1788447960000
+        }
+      ],
+      "landmark_T": 1788447840000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "127",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|127|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "127",
+          "domain_events": [],
+          "ladder_id": 275303,
+          "market_id": 34413,
+          "timestamp_ms": 1788449640000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "127",
+          "domain_events": [],
+          "ladder_id": 275311,
+          "market_id": 34414,
+          "timestamp_ms": 1788449700000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "127",
+          "domain_events": [],
+          "ladder_id": 275319,
+          "market_id": 34415,
+          "timestamp_ms": 1788449760000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "127",
+          "domain_events": [],
+          "ladder_id": 275327,
+          "market_id": 34416,
+          "timestamp_ms": 1788449820000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "127",
+          "domain_events": [
+            "tp_hit",
+            "cycle_closed",
+            "cycle_started",
+            "step_filled",
+            "p0_reset"
+          ],
+          "ladder_id": 275335,
+          "market_id": 34417,
+          "timestamp_ms": 1788449880000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "128",
+          "domain_events": [],
+          "ladder_id": 275343,
+          "market_id": 34418,
+          "timestamp_ms": 1788449940000
+        }
+      ],
+      "landmark_T": 1788449580000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "12",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|12|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364031,
+          "market_id": 2304,
+          "timestamp_ms": 1789115100000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364039,
+          "market_id": 2305,
+          "timestamp_ms": 1789115160000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364047,
+          "market_id": 2306,
+          "timestamp_ms": 1789115220000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364055,
+          "market_id": 2307,
+          "timestamp_ms": 1789115280000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364063,
+          "market_id": 2308,
+          "timestamp_ms": 1789115340000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "12",
+          "domain_events": [],
+          "ladder_id": 364071,
+          "market_id": 2309,
+          "timestamp_ms": 1789115400000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "13",
+          "domain_events": [],
+          "ladder_id": 364079,
+          "market_id": 2310,
+          "timestamp_ms": 1789115460000
+        }
+      ],
+      "landmark_T": 1789115040000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "133",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|133|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "133",
+          "domain_events": [],
+          "ladder_id": 275479,
+          "market_id": 34435,
+          "timestamp_ms": 1788450960000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "133",
+          "domain_events": [
+            "tp_hit",
+            "cycle_closed",
+            "cycle_started",
+            "step_filled",
+            "p0_reset"
+          ],
+          "ladder_id": 275487,
+          "market_id": 34436,
+          "timestamp_ms": 1788451020000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "133",
+          "domain_events": [],
+          "ladder_id": 275495,
+          "market_id": 34437,
+          "timestamp_ms": 1788451080000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "134",
+          "domain_events": [],
+          "ladder_id": 275503,
+          "market_id": 34438,
+          "timestamp_ms": 1788451140000
+        }
+      ],
+      "landmark_T": 1788450900000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "137",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|137|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276255,
+          "market_id": 34532,
+          "timestamp_ms": 1788456780000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276263,
+          "market_id": 34533,
+          "timestamp_ms": 1788456840000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276271,
+          "market_id": 34534,
+          "timestamp_ms": 1788456900000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276279,
+          "market_id": 34535,
+          "timestamp_ms": 1788456960000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [
+            "tp_hit",
+            "cycle_closed",
+            "cycle_started",
+            "step_filled",
+            "p0_reset"
+          ],
+          "ladder_id": 276287,
+          "market_id": 34536,
+          "timestamp_ms": 1788457020000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276295,
+          "market_id": 34537,
+          "timestamp_ms": 1788457080000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276303,
+          "market_id": 34538,
+          "timestamp_ms": 1788457140000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "137",
+          "domain_events": [],
+          "ladder_id": 276311,
+          "market_id": 34539,
+          "timestamp_ms": 1788457200000
+        }
+      ],
+      "landmark_T": 1788456720000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "139",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|139|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "139",
+          "domain_events": [
+            "tp_hit",
+            "cycle_closed",
+            "cycle_started",
+            "step_filled",
+            "p0_reset"
+          ],
+          "ladder_id": 276503,
+          "market_id": 34563,
+          "timestamp_ms": 1788458640000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "139",
+          "domain_events": [],
+          "ladder_id": 276511,
+          "market_id": 34564,
+          "timestamp_ms": 1788458700000
+        },
+        {
+          "active_step": 0,
+          "cycle_id": "140",
+          "domain_events": [],
+          "ladder_id": 276519,
+          "market_id": 34565,
+          "timestamp_ms": 1788458760000
+        }
+      ],
+      "landmark_T": 1788458580000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "14",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|14|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "15",
+          "domain_events": [],
+          "ladder_id": 365991,
+          "market_id": 2549,
+          "timestamp_ms": 1789129800000
+        }
+      ],
+      "landmark_T": 1789129740000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    },
+    {
+      "active_step": 0,
+      "canonical_exact_match": true,
+      "cycle_id": "150",
+      "direction": "BUY",
+      "episode_key": "BTC|0.001|BUY|150|0",
+      "expected_canonical": "OTHER_TERMINAL",
+      "expected_raw": "OTHER_TERMINAL",
+      "first_post_T": [
+        {
+          "active_step": 0,
+          "cycle_id": "151",
+          "domain_events": [],
+          "ladder_id": 277375,
+          "market_id": 34672,
+          "timestamp_ms": 1788465180000
+        }
+      ],
+      "landmark_T": 1788465120000,
+      "percentage": "0.001",
+      "primitive_source": "REAL",
+      "raw_exact_match": false,
+      "resolver_canonical": "OTHER_TERMINAL",
+      "resolver_raw": "other_terminal",
+      "symbol": "BTC",
+      "synthetic_fallback": false,
+      "terminal_event_independence": true
+    }
+  ],
+  "other_terminal_cases_tested": 10,
+  "peak_rss_kb": 46780,
+  "prospective_other_terminal_candidates_found": 20,
+  "raw_exact_matches": 0,
+  "synthetic_fallback_count": 0,
+  "terminal_event_independence": "PASS",
+  "unexplained_mismatches": [],
+  "unrecognized_labels_count": 0
+}

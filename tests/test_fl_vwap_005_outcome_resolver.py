@@ -7,6 +7,38 @@ from pathlib import Path
 from fibolearn.research.phase3b_cross_riskset import connect, iter_episodes, resolve_post_landmark_outcome_from_primitives
 
 
+_CANONICAL_OUTCOME_LABELS = {
+    'PN_PLUS_1_FIRST': 'PN_PLUS_1_FIRST',
+    'pn_plus_1_before_tp': 'PN_PLUS_1_FIRST',
+    'TP_FIRST': 'TP_FIRST',
+    'tp_before_pn_plus_1': 'TP_FIRST',
+    'OTHER_TERMINAL': 'OTHER_TERMINAL',
+    'other_terminal': 'OTHER_TERMINAL',
+    'CENSORED': 'CENSORED',
+    'censored': 'CENSORED',
+    'SAME_CANDLE_AMBIGUOUS': 'SAME_CANDLE_AMBIGUOUS',
+    'same_candle_ambiguous': 'SAME_CANDLE_AMBIGUOUS',
+    'OTHER_UNKNOWN': 'OTHER_UNKNOWN',
+    'other_unknown': 'OTHER_UNKNOWN',
+}
+
+
+def canonical_outcome_label(label: str) -> str:
+    if label not in _CANONICAL_OUTCOME_LABELS:
+        raise KeyError(label)
+    return _CANONICAL_OUTCOME_LABELS[label]
+
+
+def maybe_canonical_outcome_label(label: str):
+    return _CANONICAL_OUTCOME_LABELS.get(label)
+
+
+def canonical_exact_match(expected_raw: str, resolver_raw: str) -> bool:
+    expected = canonical_outcome_label(expected_raw)
+    resolver = canonical_outcome_label(resolver_raw)
+    return expected == resolver
+
+
 def _load_episode(episode_key: str):
     con = connect()
     con.row_factory = sqlite3.Row
@@ -122,3 +154,35 @@ def test_resolver_missing_primitives_returns_other_unknown():
         'outcome_json': json.dumps({}),
     }
     assert resolve_post_landmark_outcome_from_primitives(ep, 1500) == 'OTHER_UNKNOWN'
+
+
+def test_canonical_outcome_label_map_equivalences():
+    assert canonical_outcome_label('pn_plus_1_before_tp') == 'PN_PLUS_1_FIRST'
+    assert canonical_outcome_label('PN_PLUS_1_FIRST') == 'PN_PLUS_1_FIRST'
+    assert canonical_outcome_label('tp_before_pn_plus_1') == 'TP_FIRST'
+    assert canonical_outcome_label('TP_FIRST') == 'TP_FIRST'
+    assert canonical_outcome_label('other_terminal') == 'OTHER_TERMINAL'
+    assert canonical_outcome_label('OTHER_TERMINAL') == 'OTHER_TERMINAL'
+    assert canonical_outcome_label('censored') == 'CENSORED'
+    assert canonical_outcome_label('CENSORED') == 'CENSORED'
+    assert canonical_outcome_label('same_candle_ambiguous') == 'SAME_CANDLE_AMBIGUOUS'
+    assert canonical_outcome_label('SAME_CANDLE_AMBIGUOUS') == 'SAME_CANDLE_AMBIGUOUS'
+    assert canonical_outcome_label('other_unknown') == 'OTHER_UNKNOWN'
+    assert canonical_outcome_label('OTHER_UNKNOWN') == 'OTHER_UNKNOWN'
+
+
+def test_canonical_outcome_label_surfaces_unknown_labels():
+    assert maybe_canonical_outcome_label('definitely_not_a_label') is None
+    try:
+        canonical_outcome_label('definitely_not_a_label')
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('unknown label must not be coerced silently')
+
+
+def test_canonical_exact_match_uses_canonical_labels():
+    assert canonical_exact_match('other_terminal', 'OTHER_TERMINAL')
+    assert canonical_exact_match('pn_plus_1_before_tp', 'PN_PLUS_1_FIRST')
+    assert canonical_exact_match('tp_before_pn_plus_1', 'TP_FIRST')
+    assert canonical_exact_match('censored', 'CENSORED')

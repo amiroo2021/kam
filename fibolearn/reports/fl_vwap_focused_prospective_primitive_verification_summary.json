@@ -1,0 +1,56 @@
+{
+  "REAL_primitive_source_count": 40,
+  "canonical_label_map": {
+    "CENSORED": "CENSORED",
+    "OTHER_TERMINAL": "OTHER_TERMINAL",
+    "OTHER_UNKNOWN": "OTHER_UNKNOWN",
+    "PN_PLUS_1_FIRST": "PN_PLUS_1_FIRST",
+    "SAME_CANDLE_AMBIGUOUS": "SAME_CANDLE_AMBIGUOUS",
+    "TP_FIRST": "TP_FIRST",
+    "censored": "CENSORED",
+    "other_terminal": "OTHER_TERMINAL",
+    "other_unknown": "OTHER_UNKNOWN",
+    "pn_plus_1_before_tp": "PN_PLUS_1_FIRST",
+    "same_candle_ambiguous": "SAME_CANDLE_AMBIGUOUS",
+    "tp_before_pn_plus_1": "TP_FIRST"
+  },
+  "categories": {
+    "CENSORED": {
+      "canonical_matches": 10,
+      "raw_matches": 10
+    },
+    "OTHER_TERMINAL": {
+      "canonical_matches": 10,
+      "raw_matches": 0
+    },
+    "PN_PLUS_1_FIRST": {
+      "canonical_matches": 10,
+      "raw_matches": 10
+    },
+    "TP_FIRST": {
+      "canonical_matches": 10,
+      "raw_matches": 10
+    }
+  },
+  "deterministic_repeat": "PASS",
+  "files_source": [
+    "fibolearn/reports/fl_vwap_other_terminal_prospective_verification.json"
+  ],
+  "notes": "These are four bounded category-specific verification samples, not a population estimate and not independent random observations.",
+  "preserved_evidence": {
+    "CENSORED_10_10_preserved": true,
+    "OTHER_TERMINAL_added": true,
+    "PN_first_10_10_preserved": true,
+    "TP_first_10_10_preserved": true
+  },
+  "synthetic_fallback_count": 0,
+  "terminal_event_independence": "PASS",
+  "total_canonical_matches": 40,
+  "total_raw_matches": 30,
+  "unexplained_semantic_mismatches": [],
+  "unrecognized_labels_count": 0,
+  "verdict": {
+    "FOCUSED_PROSPECTIVE_PRIMITIVE_VERIFIED": "YES",
+    "scope": "bounded primitive-semantic verification across PN_PLUS_1_FIRST, TP_FIRST, CENSORED, OTHER_TERMINAL"
+  }
+}
