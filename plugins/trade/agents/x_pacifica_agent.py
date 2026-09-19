@@ -3343,7 +3343,7 @@ def _aggregate_open_orders(orders: List[Dict[str, Any]]) -> List[CanonicalOrderG
         if total_size <= 0:
             continue
         vwap = bucket["notional"] / total_size
-        canonical_side = "long" if bucket["raw_side"] == "bid" else "short"
+        canonical_side = "buy" if bucket["raw_side"] == "bid" else "sell"
 
         # Per-market precision. We look up the market once per group;
         # a cache miss or transient failure falls back to the universal

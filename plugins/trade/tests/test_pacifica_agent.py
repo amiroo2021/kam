@@ -176,5 +176,20 @@ class TestPacificaLadderOrientation(unittest.TestCase):
         )
 
 
+class TestPacificaCancelOrderGroupSide(unittest.TestCase):
+    def test_cancel_group_keeps_canonical_buy_sell_side(self) -> None:
+        group = pacifica.CanonicalOrderGroup(
+            symbol="ETH",
+            side="buy",
+            order_count=173,
+            total_size="42.9872",
+            vwap="3066.7",
+            min_price="2667.2",
+            max_price="3242.5",
+        )
+        # This is the contract the wizard expects: buy/sell, not bid/ask.
+        self.assertEqual(group.side, "buy")
+
+
 if __name__ == "__main__":
     unittest.main()
