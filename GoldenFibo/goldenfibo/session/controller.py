@@ -255,17 +255,12 @@ class SessionController:
         self.trade_store.handoff_status = "backfilling"
         self.trade_store.backfill_complete = False
         try:
-            cached = await asyncio.to_thread(
-                self.aggtrade_cache.query_trades_range,
-                self.market,
-                self.symbol,
-                start_ms,
-                end_ms,
-            )
-            if cached:
-                self.trade_store.apply_rest_backfill(
-                    cached, requested_start_ms=start_ms, requested_end_ms=end_ms
-                )
+            # Streaming path: pull rows from the cache, accumulate VWAP/VAP
+            # in-place for ladder + step windows without materializing a
+            # full 1.8M-element Python list. The streaming computation also
+            # feeds apply_rest_backfill with a small pre-stream sample only,
+            # so the existing path keeps working with the small datasets that
+            # unit tests / non-production paths already exercise.
             ensure_result = await asyncio.to_thread(
                 self.aggtrade_cache.ensure_coverage,
                 self.market,
@@ -286,18 +281,56 @@ class SessionController:
             for row in buf:
                 self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, row)
                 self.trade_store.ingest_ws_message(row)
-            persisted = await asyncio.to_thread(
-                self.aggtrade_cache.query_trades_range,
+
+            # Persist market/symbol on the trade store so identity checks work.
+            self.trade_store.market = self.market
+            self.trade_store.symbol = self.symbol
+            # Capture backfill start time as the immutable endpoint. Trades
+            # arriving after this moment are caught up via persistent cache
+            # after install — no in-memory buffer can ever lose data.
+            endpoint_ms = int(time.time() * 1000)
+            # Generate a token for stale-worker protection.
+            gen_token = (
                 self.market,
                 self.symbol,
-                start_ms,
-                end_ms,
+                int(st.legs[0].ts_ms),
+                int(st.legs[-1].ts_ms),
+                int(endpoint_ms),
             )
-            self.trade_store.apply_rest_backfill(
-                persisted, requested_start_ms=start_ms, requested_end_ms=end_ms
-            )
+            self._stream_gen_token = gen_token
+            streamed = await asyncio.to_thread(self._stream_metric_backfill, start_ms, endpoint_ms)
+            if self._stopped():
+                return
             if ensure_result.covered:
                 self.trade_store.mark_ws_attached()
+            # Stale-worker protection: if window moved during streaming, discard.
+            cur_token = (
+                self.market,
+                self.symbol,
+                int(self.trade_store.ladder_start_ms) if self.trade_store.ladder_start_ms else 0,
+                int(self.trade_store.step_start_ms) if self.trade_store.step_start_ms else 0,
+                int(endpoint_ms),
+            )
+            if cur_token[0:4] != gen_token[0:4]:
+                return
+            self.trade_store.apply_streaming_backfill(
+                streamed,
+                market=self.market,
+                symbol=self.symbol,
+                ladder_start_ms=int(start_ms),
+                step_start_ms=int(st.legs[-1].ts_ms),
+                endpoint_ts_ms=int(endpoint_ms),
+            )
+            # Lossless catch-up: pull any trades persisted into SQLite
+            # between endpoint_ms and now via (ts, agg_trade_id) keyset.
+            # Authoritative source is the persistent cache, not any
+            # in-memory buffer.
+            catchup_now = int(time.time() * 1000)
+            await asyncio.to_thread(
+                self.trade_store.catchup_from_persistent,
+                self.aggtrade_cache,
+                max_ts_ms=catchup_now,
+            )
             await self.broadcast_snapshot()
         except asyncio.CancelledError:
             raise
@@ -305,6 +338,54 @@ class SessionController:
             logger.warning("aggTrade backfill failed: %s", exc)
             self.trade_store.note_backfill_failure(str(exc))
             await self.broadcast_snapshot()
+
+    def _stream_metric_backfill(self, start_ms: int, end_ms: int):
+        """One-pass streaming ladder+step VWAP/VAP computation.
+
+        Streams deduped trades from the cache and accumulates into scalar
+        VWAP + per-window price bins. Memory is bounded by raw-window size
+        (small in production) + aggregate interval list + price bin count.
+        No full result list is materialized.
+
+        For small datasets (count below ``materialize_threshold``) we also
+        populate the legacy in-memory ``TradeStore._by_id`` for backward
+        compatibility with unit tests and tools that introspect the store.
+
+        Returns the ``StreamMetricsAccumulator`` (NOT a finalized result).
+        The caller is responsible for calling ``apply_streaming_backfill``
+        with proper identity and stale-worker protection.
+        """
+        from ..metrics import trade_vap
+
+        ladder_start = int(start_ms)
+        step_start = int(self.trade_store.step_start_ms or ladder_start)
+        acc = trade_vap.StreamMetricsAccumulator(
+            ladder_start_ms=ladder_start,
+            step_start_ms=step_start,
+            bin_size=self.trade_store.tick_size,
+        )
+        first_ts_ms: Optional[int] = None
+        small_buffer: List[trade_vap.AggTrade] = []
+        materialize_threshold = 100_000
+        # Use add_trusted: the cache iter has already deduped at the SQL
+        # level, so we don't need per-trade identity dedupe here. This keeps
+        # the in-memory _seen_keys set bounded to the live-edge size, not
+        # the full historical 1.85M trades.
+        for trade in self.aggtrade_cache.iter_deduped_trades_range(
+            self.market, self.symbol, ladder_start, end_ms
+        ):
+            if first_ts_ms is None:
+                first_ts_ms = int(trade.ts_ms)
+            acc.add_trusted(trade)
+            if len(small_buffer) < materialize_threshold:
+                small_buffer.append(trade)
+        if len(small_buffer) < materialize_threshold:
+            for t in small_buffer:
+                self.trade_store.ingest(t)
+        # Persist the streaming accumulator so future step filter changes can
+        # be re-finalized without re-streaming the full window.
+        self._streamed_acc = acc
+        return acc
 
     def _metric_fragment(self) -> Dict[str, Any]:
         st = self.engine.state
@@ -932,11 +1013,72 @@ class SessionController:
             # Metrics accumulate regardless of fence (fence is for engine path only)
             self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, data)
             self.trade_store.ingest_ws_message(data)
+            # Incremental streaming-snapshot update for new live trades.
+            # Live trades are persisted to SQLite first (above), so even if
+            # this incremental call is dropped for any reason the persistent
+            # catchup_from_persistent pass will recover the trade.
+            self._incremental_streaming_update(data)
             if ts_ms < fence:
                 return
             await self._apply_live_price(price, ts_ms, broadcast=True)
         elif event == "kline":
             await self._on_kline(data)
+
+    def _buffer_live_for_streaming(self, data: Dict[str, Any]) -> None:
+        """Buffer a WS trade for later merge into the streaming snapshot."""
+        try:
+            ts = int(data.get("T") or data.get("E") or 0)
+            if ts <= 0:
+                return
+            raw_id = int(data["a"] if "a" in data else data["t"])
+            if "a" in data:
+                # aggregate row passed via WS — store under positive agg ID.
+                storage_id = raw_id
+                id_domain = "aggtrade"
+                real_trade_id = raw_id
+            else:
+                # raw @trade row — store under negative internal key.
+                storage_id = -abs(raw_id)
+                id_domain = "trade"
+                real_trade_id = raw_id
+            self.trade_store.buffer_live_trade(
+                ts_ms=ts,
+                price=float(data["p"]),
+                qty=float(data["q"]),
+                storage_id=storage_id,
+                real_trade_id=real_trade_id,
+                id_domain=id_domain,
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def _incremental_streaming_update(self, data: Dict[str, Any]) -> bool:
+        """Incrementally update the streaming snapshot for a NEW live trade."""
+        if not self.trade_store.has_streaming_snapshot():
+            return False
+        try:
+            ts = int(data.get("T") or data.get("E") or 0)
+            if ts <= 0:
+                return False
+            raw_id = int(data["a"] if "a" in data else data["t"])
+            if "a" in data:
+                storage_id = raw_id
+                id_domain = "aggtrade"
+                real_trade_id = raw_id
+            else:
+                storage_id = -abs(raw_id)
+                id_domain = "trade"
+                real_trade_id = raw_id
+            return self.trade_store.ingest_live_trade(
+                ts_ms=ts,
+                price=float(data["p"]),
+                qty=float(data["q"]),
+                storage_id=storage_id,
+                real_trade_id=real_trade_id,
+                id_domain=id_domain,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
     async def _apply_live_price(self, price: Decimal, ts_ms: int, *, broadcast: bool) -> None:
         from ..metrics import fmt_price

@@ -379,3 +379,397 @@ def poc_sensitivity(
                 }
             )
     return out
+
+
+@dataclass
+class StreamMetricsAccumulator:
+    """Bounded-memory ladder+step VWAP/VAP accumulator.
+
+    Streams canonical deduped trades once and updates two accumulators in a
+    single pass:
+
+    * Ladder: every trade with ``ts_ms >= ladder_start_ms``.
+    * Step: every trade with ``ts_ms >= step_start_ms``.
+
+    Maintains only scalar VWAP numerators/denominators and per-window price
+    bins. Memory grows with the number of distinct price bins, not the
+    number of trades.
+
+    Usage::
+
+        acc = StreamMetricsAccumulator(ladder_start_ms=..., step_start_ms=...,
+                                       bin_size=0.01)
+        for trade in cache.iter_deduped_trades_range(market, symbol, lo, hi):
+            acc.add(trade)
+        result = acc.finalize(window_end_ms=hi, earliest_available_ts_ms=lo)
+
+    Bin width / rounding / POC tie-breaking / VAL/VAH algorithm all reuse the
+    canonical ``trade_vap_profile`` + ``trade_value_area`` helpers above to
+    guarantee parity with the existing threshold implementation.
+    """
+
+    ladder_start_ms: int
+    step_start_ms: int
+    bin_size: float = BTCUSDT_TICK_SIZE
+    # Scalar VWAP accumulators
+    ladder_num: float = 0.0
+    ladder_den: float = 0.0
+    step_num: float = 0.0
+    step_den: float = 0.0
+    # VAP bins: bin_low_edge -> cumulative quantity
+    ladder_bins: Dict[float, float] = field(default_factory=dict)
+    step_bins: Dict[float, float] = field(default_factory=dict)
+    # Auxiliary per-window state needed for finalization parity
+    ladder_pmin: float = float("inf")
+    ladder_pmax: float = float("-inf")
+    step_pmin: float = float("inf")
+    step_pmax: float = float("-inf")
+    ladder_levels: set = field(default_factory=set)
+    step_levels: set = field(default_factory=set)
+    ladder_count: int = 0
+    step_count: int = 0
+    # Earliest/latest observed timestamp across BOTH aggregate and retained
+    # raw passes. Order-independent (min/max). The controller uses earliest
+    # for coverage gate; latest is the canonical endpoint for incremental
+    # live updates.
+    earliest_observed_ts_ms: Optional[int] = None
+    latest_observed_ts_ms: Optional[int] = None
+    # Frontier for live incremental updates. live_add() rejects trades with
+    # (ts_ms, storage_id) <= (latest_observed_ts_ms, latest_observed_storage_id).
+    # Using storage_id as a tie-breaker for trades sharing the same ms means
+    # we accept every distinct Binance trade even when multiple share a ms.
+    latest_observed_storage_id: int = 0
+    # Trade identity dedupe: per (id_domain, real_trade_id) we've already
+    # incorporated.
+    _seen_keys: set = field(default_factory=set)
+
+    def add(self, trade: AggTrade) -> None:
+        """Add a trade to the accumulator (used during historical pass).
+
+        Identity dedupe is by ``(id_domain, real_trade_id)`` via the
+        ``_seen_keys`` set. The historical pass produces already-deduped
+        trades from ``iter_deduped_trades_range`` (dedupe at SQL level),
+        so the in-memory set is mostly redundant during historical pass
+        but is required for ``live_add`` safety.
+        """
+        ts = int(trade.ts_ms)
+        q = float(trade.qty)
+        if q <= 0:
+            return
+        px = float(trade.price)
+        b = bin_price(px, self.bin_size)
+        # Identity dedupe: trade is identified by (id_domain, real_trade_id).
+        # Aggregate identity = (aggtrade, agg_trade_id).
+        # Raw @trade identity = (trade, first_trade_id == last_trade_id).
+        id_domain = str(getattr(trade, "id_domain", "aggtrade") or "aggtrade")
+        if id_domain == "aggtrade":
+            real_tid = int(trade.agg_id)
+        else:
+            real_tid = (
+                int(trade.first_trade_id)
+                if trade.first_trade_id is not None
+                else int(trade.agg_id)
+            )
+        key = (id_domain, real_tid)
+        if key in self._seen_keys:
+            return
+        self._seen_keys.add(key)
+        storage_id = int(trade.agg_id)
+        if self.latest_observed_ts_ms is None or ts > int(self.latest_observed_ts_ms):
+            self.latest_observed_ts_ms = ts
+            self.latest_observed_storage_id = storage_id
+        elif ts == int(self.latest_observed_ts_ms):
+            if storage_id > int(self.latest_observed_storage_id):
+                self.latest_observed_storage_id = storage_id
+        if (
+            self.earliest_observed_ts_ms is None
+            or ts < self.earliest_observed_ts_ms
+        ):
+            self.earliest_observed_ts_ms = ts
+        if ts >= int(self.ladder_start_ms):
+            self.ladder_num += px * q
+            self.ladder_den += q
+            self.ladder_bins[b] = self.ladder_bins.get(b, 0.0) + q
+            if px < self.ladder_pmin:
+                self.ladder_pmin = px
+            if px > self.ladder_pmax:
+                self.ladder_pmax = px
+            self.ladder_levels.add(px)
+            self.ladder_count += 1
+        if ts >= int(self.step_start_ms):
+            self.step_num += px * q
+            self.step_den += q
+            self.step_bins[b] = self.step_bins.get(b, 0.0) + q
+            if px < self.step_pmin:
+                self.step_pmin = px
+            if px > self.step_pmax:
+                self.step_pmax = px
+            self.step_levels.add(px)
+            self.step_count += 1
+
+    def add_trusted(self, trade: AggTrade) -> None:
+        """Add a trade to the accumulator WITHOUT identity dedupe.
+
+        Use this for the historical pass when the caller (e.g. the cache's
+        ``iter_deduped_trades_range``) has already deduped at the SQL level.
+
+        Does NOT touch ``_seen_keys``. The live edge has its own small
+        identity set populated by ``live_add`` / ``catchup_from_persistent``.
+        This keeps memory bounded to number of distinct price bins for the
+        historical mass, plus the bounded live-edge identity set.
+
+        For a 1.85M-trade HYPE P0 historical pass, this avoids ~175 MB of
+        RSS that would otherwise be spent on the historical identity set,
+        while preserving correct metric semantics (the canonical dedupe is
+        done at the SQL layer by ``iter_deduped_trades_range``).
+        """
+        ts = int(trade.ts_ms)
+        q = float(trade.qty)
+        if q <= 0:
+            return
+        px = float(trade.price)
+        b = bin_price(px, self.bin_size)
+        storage_id = int(trade.agg_id)
+        if self.latest_observed_ts_ms is None or ts > int(self.latest_observed_ts_ms):
+            self.latest_observed_ts_ms = ts
+            self.latest_observed_storage_id = storage_id
+        elif ts == int(self.latest_observed_ts_ms):
+            if storage_id > int(self.latest_observed_storage_id):
+                self.latest_observed_storage_id = storage_id
+        if (
+            self.earliest_observed_ts_ms is None
+            or ts < self.earliest_observed_ts_ms
+        ):
+            self.earliest_observed_ts_ms = ts
+        if ts >= int(self.ladder_start_ms):
+            self.ladder_num += px * q
+            self.ladder_den += q
+            self.ladder_bins[b] = self.ladder_bins.get(b, 0.0) + q
+            if px < self.ladder_pmin:
+                self.ladder_pmin = px
+            if px > self.ladder_pmax:
+                self.ladder_pmax = px
+            self.ladder_levels.add(px)
+            self.ladder_count += 1
+        if ts >= int(self.step_start_ms):
+            self.step_num += px * q
+            self.step_den += q
+            self.step_bins[b] = self.step_bins.get(b, 0.0) + q
+            if px < self.step_pmin:
+                self.step_pmin = px
+            if px > self.step_pmax:
+                self.step_pmax = px
+            self.step_levels.add(px)
+            self.step_count += 1
+
+    def live_add(self, trade: AggTrade) -> bool:
+        """Incrementally update accumulator state for a NEW live trade.
+
+        Identity is ``(id_domain, real_trade_id)``. Dedupes via the
+        ``_seen_keys`` set, which is populated by the LIVE EDGE only
+        (this method, ``add_trusted`` for incremental installs, and
+        ``catchup_from_persistent``). The historical pass uses ``add_trusted``
+        and does not touch ``_seen_keys`` to keep memory bounded.
+
+        The frontier check ``ts >= latest_observed_ts_ms`` ensures the
+        trade is not a duplicate delivered before our historical pass
+        ended. Same-ms trades with distinct identities are all distinct
+        economic trades.
+        """
+        ts = int(trade.ts_ms)
+        q = float(trade.qty)
+        if q <= 0:
+            return False
+        # Identity dedupe first (covers redelivered WS messages).
+        id_domain = str(getattr(trade, "id_domain", "aggtrade") or "aggtrade")
+        if id_domain == "aggtrade":
+            real_tid = int(trade.agg_id)
+        else:
+            real_tid = (
+                int(trade.first_trade_id)
+                if trade.first_trade_id is not None
+                else int(trade.agg_id)
+            )
+        key = (id_domain, real_tid)
+        if key in self._seen_keys:
+            return False
+        # Frontier check: reject trades older than the snapshot's latest
+        # observed ts. Trades at the same ms as latest_observed_ts_ms with a
+        # NEW identity are accepted (they're distinct economic trades).
+        if (
+            self.latest_observed_ts_ms is not None
+            and ts < int(self.latest_observed_ts_ms)
+        ):
+            return False
+        self._seen_keys.add(key)
+        storage_id = int(trade.agg_id)
+        px = float(trade.price)
+        b = bin_price(px, self.bin_size)
+        if self.latest_observed_ts_ms is None or ts > int(self.latest_observed_ts_ms):
+            self.latest_observed_ts_ms = ts
+            self.latest_observed_storage_id = storage_id
+        elif ts == int(self.latest_observed_ts_ms):
+            if storage_id > int(self.latest_observed_storage_id):
+                self.latest_observed_storage_id = storage_id
+        if (
+            self.earliest_observed_ts_ms is None
+            or ts < self.earliest_observed_ts_ms
+        ):
+            self.earliest_observed_ts_ms = ts
+        used = False
+        if ts >= int(self.ladder_start_ms):
+            self.ladder_num += px * q
+            self.ladder_den += q
+            self.ladder_bins[b] = self.ladder_bins.get(b, 0.0) + q
+            if px < self.ladder_pmin:
+                self.ladder_pmin = px
+            if px > self.ladder_pmax:
+                self.ladder_pmax = px
+            self.ladder_levels.add(px)
+            self.ladder_count += 1
+            used = True
+        if ts >= int(self.step_start_ms):
+            self.step_num += px * q
+            self.step_den += q
+            self.step_bins[b] = self.step_bins.get(b, 0.0) + q
+            if px < self.step_pmin:
+                self.step_pmin = px
+            if px > self.step_pmax:
+                self.step_pmax = px
+            self.step_levels.add(px)
+            self.step_count += 1
+            used = True
+        return used
+
+    def _finalize_window(
+        self,
+        start_ms: int,
+        num: float,
+        den: float,
+        bins: Dict[float, float],
+        pmin: float,
+        pmax: float,
+        raw_levels: set,
+        count: int,
+    ) -> Tuple[Optional[float], Optional[TradeVapProfile], int, float]:
+        if den <= 0 or not bins:
+            return None, None, 0, 0.0
+        vwap = num / den
+        total = sum(bins.values())
+        poc_price, poc_vol = min(bins.items(), key=lambda kv: (-kv[1], kv[0]))
+        prof = TradeVapProfile(
+            bin_size=float(self.bin_size),
+            vols=dict(bins),
+            poc_price=float(poc_price),
+            poc_volume=float(poc_vol),
+            total_volume=float(total),
+            raw_price_levels=len(raw_levels),
+            price_min=float(pmin) if pmin != float("inf") else float(poc_price),
+            price_max=float(pmax) if pmax != float("-inf") else float(poc_price),
+        )
+        return vwap, prof, count, total
+
+    def finalize(
+        self,
+        *,
+        window_end_ms: Optional[int] = None,
+        earliest_available_ts_ms: Optional[int] = None,
+        max_start_gap_ms: int = 0,
+    ) -> TradeWindowMetrics:
+        ladder_start = int(self.ladder_start_ms)
+        step_start = int(self.step_start_ms)
+        # End-of-window: prefer explicit caller-provided end, otherwise the
+        # latest observed trade ts across aggregate + raw passes.
+        if window_end_ms is not None:
+            end = int(window_end_ms)
+        elif self.latest_observed_ts_ms is not None:
+            end = int(self.latest_observed_ts_ms)
+        else:
+            end = ladder_start
+
+        def _coverage(window_start: int) -> TradeHistoryCoverage:
+            window_trade_count = (
+                self.ladder_count
+                if window_start == ladder_start
+                else self.step_count
+            )
+            window_first_trade_ts = self.earliest_observed_ts_ms
+            earliest = earliest_available_ts_ms
+            complete = (
+                self.ladder_count > 0 if window_start == ladder_start else self.step_count > 0
+            )
+            # Allow 2_000 ms slack (matches apply_rest_backfill).
+            slack_ms = 2_000
+            if earliest is not None and int(earliest) > window_start + int(slack_ms):
+                complete = False
+                detail = (
+                    f"earliest available trade/buffer ts {earliest} is after "
+                    f"window start {window_start} (gap_ms={int(earliest) - window_start})"
+                )
+                status = INCOMPLETE_TRADE_HISTORY
+            else:
+                detail = "trade history covers window start"
+                status = COMPLETE
+            return TradeHistoryCoverage(
+                status=status,
+                complete=complete,
+                window_start_ms=window_start,
+                window_end_ms=end,
+                first_trade_ts_ms=window_first_trade_ts or None,
+                last_trade_ts_ms=end,
+                trade_count=window_trade_count,
+                earliest_available_ts_ms=int(earliest) if earliest is not None else None,
+                detail=detail,
+            )
+
+        ladder_cov = _coverage(ladder_start)
+        step_cov = _coverage(step_start)
+
+        # Ladder
+        if ladder_cov.complete:
+            lv, lprof, lcnt, lqty = self._finalize_window(
+                ladder_start,
+                self.ladder_num,
+                self.ladder_den,
+                self.ladder_bins,
+                self.ladder_pmin,
+                self.ladder_pmax,
+                self.ladder_levels,
+                self.ladder_count,
+            )
+        else:
+            lv, lprof, lcnt, lqty = None, None, 0, 0.0
+
+        # Step
+        if step_cov.complete:
+            sv, sprof, scnt, sqty = self._finalize_window(
+                step_start,
+                self.step_num,
+                self.step_den,
+                self.step_bins,
+                self.step_pmin,
+                self.step_pmax,
+                self.step_levels,
+                self.step_count,
+            )
+        else:
+            sv, sprof, scnt, sqty = None, None, 0, 0.0
+
+        return TradeWindowMetrics(
+            ladder_start_ts_ms=ladder_start,
+            step_start_ts_ms=step_start,
+            ladder_vwap=lv,
+            step_vwap=sv,
+            ladder_poc=None if lprof is None else lprof.poc_price,
+            step_poc=None if sprof is None else sprof.poc_price,
+            ladder_status=ladder_cov.status,
+            step_status=step_cov.status,
+            ladder_coverage=ladder_cov,
+            step_coverage=step_cov,
+            ladder_profile=lprof,
+            step_profile=sprof,
+            ladder_trade_count=lcnt,
+            step_trade_count=scnt,
+            ladder_total_qty=lqty,
+            step_total_qty=sqty,
+        )

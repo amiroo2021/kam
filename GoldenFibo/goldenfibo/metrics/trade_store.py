@@ -9,13 +9,14 @@ GoldenFiboEngine geometry is independent. Binance is one trade source adapter.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .trade_vap import (
     COMPLETE,
     INCOMPLETE_TRADE_HISTORY,
     BTCUSDT_TICK_SIZE,
     AggTrade,
+    StreamMetricsAccumulator,
     TradeVapProfile,
     TradeWindowMetrics,
     assess_trade_history_coverage,
@@ -24,7 +25,6 @@ from .trade_vap import (
     trade_value_area,
     trade_vwap,
 )
-
 SOURCE_AGGTRADE = "AGGTRADE"
 SOURCE_OHLC = "OHLC_APPROXIMATION"
 STATUS_LOADING = "loading"
@@ -107,8 +107,16 @@ class TradeMetricStore:
     and prunes older trades.
     """
 
-    def __init__(self, *, tick_size: float = BTCUSDT_TICK_SIZE) -> None:
+    def __init__(
+        self,
+        *,
+        tick_size: float = BTCUSDT_TICK_SIZE,
+        market: str = "futures",
+        symbol: str = "",
+    ) -> None:
         self.tick_size = float(tick_size)
+        self.market = str(market)
+        self.symbol = str(symbol)
         self._by_id: Dict[int, AggTrade] = {}
         self.ladder_start_ms: Optional[int] = None
         self.step_start_ms: Optional[int] = None
@@ -120,6 +128,13 @@ class TradeMetricStore:
         self._ws_attached: bool = False
         self._strict_id_gaps: bool = True
         self.detail: str = ""
+        # Streaming lifecycle
+        self._streamed_acc: Optional[StreamMetricsAccumulator] = None
+        self._streamed_result: Optional[TradeWindowMetrics] = None
+        self._streamed_identity: Optional[Tuple[str, str, int, int, int]] = None
+        self._live_buffer: List[Dict[str, Any]] = []
+        self._live_buffer_cap: int = 5_000
+        self._step_dirty: bool = False
 
     # --- identity / size ---
     def __len__(self) -> int:
@@ -141,6 +156,7 @@ class TradeMetricStore:
         self._ws_attached = False
         self._strict_id_gaps = True
         self.detail = ""
+        self.invalidate_streamed()
 
     # --- windows (engine-driven) ---
     def set_windows(
@@ -168,6 +184,17 @@ class TradeMetricStore:
             self.detail = "new P0 — coverage reset"
             self._gap_count = 0
             self._known_gaps.clear()
+            # Streaming snapshot is for a previous ladder window.
+            self.invalidate_streamed()
+
+        if (
+            new_step is not None
+            and self.step_start_ms is not None
+            and new_step > self.step_start_ms
+        ):
+            # Step activation only — ladder accumulator stays intact; only
+            # the step portion becomes stale.
+            self.mark_step_dirty()
 
         if self.ladder_start_ms is None and new_ladder is not None:
             self.handoff_status = "backfilling" if not self.backfill_complete else self.handoff_status
@@ -223,6 +250,385 @@ class TradeMetricStore:
 
     def mark_ws_attached(self) -> None:
         self._ws_attached = True
+
+    # --- streaming lifecycle ---
+    def streamed_identity(self) -> Optional[Tuple[str, str, int, int, int]]:
+        """Return (market, symbol, ladder_start, step_start, endpoint) of the
+        currently installed streamed snapshot, or ``None`` if no snapshot."""
+        return getattr(self, "_streamed_identity", None)
+
+    def has_streaming_snapshot(self) -> bool:
+        return self._streamed_acc is not None
+
+    def is_step_dirty(self) -> bool:
+        """True if the streaming snapshot is stale for the current step window
+        but still valid for the ladder window. Set when only the step_start
+        has advanced since the snapshot was installed."""
+        return bool(getattr(self, "_step_dirty", False))
+
+    def invalidate_streamed(self) -> None:
+        """Drop the streaming snapshot. ``compute()`` falls back to OHLC."""
+        self._streamed_acc = None
+        self._streamed_result = None
+        self._streamed_identity = None
+        self._step_dirty = False
+        self._live_buffer.clear()
+
+    def mark_step_dirty(self) -> None:
+        """Mark the streaming snapshot as stale for the current step window.
+        The ladder portion remains valid; compute() will return AGGTRADE for
+        ladder and OHLC for step until a fresh step-only backfill reinstalls
+        step identity."""
+        self._step_dirty = True
+
+    def clear_step_dirty(self) -> None:
+        self._step_dirty = False
+
+    def apply_streaming_backfill(
+        self,
+        accumulator,
+        *,
+        market: str,
+        symbol: str,
+        ladder_start_ms: int,
+        step_start_ms: int,
+        endpoint_ts_ms: int,
+        preserve_ladder_accumulator: bool = False,
+    ) -> None:
+        """Atomically install a streaming ladder+step accumulator snapshot.
+
+        Caller must supply the exact window identity the snapshot was built
+        for. Subsequent ``compute()`` calls will return streamed metrics
+        only while ``streamed_identity() == (market, symbol, ladder_start,
+        step_start, endpoint)``.
+
+        Live trades with ``ts > endpoint_ts_ms`` that arrived during backfill
+        are stored separately in ``_live_buffer`` and must be merged via
+        ``merge_live_buffer`` before they contribute to streamed metrics.
+        Live trades with ``ts <= endpoint_ts_ms`` are dropped (already
+        covered by the historical pass).
+
+        ``preserve_ladder_accumulator=True`` keeps the existing ladder
+        accumulator's bins/counts and replaces only the step portion with
+        the supplied accumulator's step bins/counts. Used for step-only
+        reinstalls after a step activation.
+        """
+        if not isinstance(accumulator, StreamMetricsAccumulator):
+            raise TypeError("apply_streaming_backfill requires a StreamMetricsAccumulator")
+        identity = (
+            str(market),
+            str(symbol),
+            int(ladder_start_ms),
+            int(step_start_ms),
+            int(endpoint_ts_ms),
+        )
+        current = (
+            str(self.market),
+            str(self.symbol),
+            int(self.ladder_start_ms) if self.ladder_start_ms is not None else None,
+            int(self.step_start_ms) if self.step_start_ms is not None else None,
+            None,
+        )
+        if (
+            current[0] != identity[0]
+            or current[1] != identity[1]
+            or current[2] is None
+            or current[3] is None
+        ):
+            return
+        if int(current[2]) != int(identity[2]) or int(current[3]) != int(identity[3]):
+            return
+
+        if preserve_ladder_accumulator and self._streamed_acc is not None:
+            # Replace step portion only; ladder portion stays intact.
+            new_acc = StreamMetricsAccumulator(
+                ladder_start_ms=accumulator.ladder_start_ms,
+                step_start_ms=accumulator.step_start_ms,
+                bin_size=accumulator.bin_size,
+            )
+            # Copy ladder fields from the existing accumulator.
+            old = self._streamed_acc
+            new_acc.ladder_num = old.ladder_num
+            new_acc.ladder_den = old.ladder_den
+            new_acc.ladder_bins = dict(old.ladder_bins)
+            new_acc.ladder_pmin = old.ladder_pmin
+            new_acc.ladder_pmax = old.ladder_pmax
+            new_acc.ladder_levels = set(old.ladder_levels)
+            new_acc.ladder_count = old.ladder_count
+            # Copy step fields from the new (bounded) accumulator.
+            new_acc.step_num = accumulator.step_num
+            new_acc.step_den = accumulator.step_den
+            new_acc.step_bins = dict(accumulator.step_bins)
+            new_acc.step_pmin = accumulator.step_pmin
+            new_acc.step_pmax = accumulator.step_pmax
+            new_acc.step_levels = set(accumulator.step_levels)
+            new_acc.step_count = accumulator.step_count
+            # Carry over identity dedupe set from the bounded accumulator
+            # (it was populated by the re-stream).
+            new_acc._seen_keys = set(accumulator._seen_keys)
+            # Earliest/latest observed across old + new.
+            new_acc.earliest_observed_ts_ms = (
+                old.earliest_observed_ts_ms
+                if old.earliest_observed_ts_ms is not None
+                else accumulator.earliest_observed_ts_ms
+            )
+            if (
+                accumulator.earliest_observed_ts_ms is not None
+                and (
+                    new_acc.earliest_observed_ts_ms is None
+                    or accumulator.earliest_observed_ts_ms < new_acc.earliest_observed_ts_ms
+                )
+            ):
+                new_acc.earliest_observed_ts_ms = accumulator.earliest_observed_ts_ms
+            new_acc.latest_observed_ts_ms = (
+                accumulator.latest_observed_ts_ms
+                if accumulator.latest_observed_ts_ms is not None
+                else old.latest_observed_ts_ms
+            )
+            if (
+                accumulator.latest_observed_ts_ms is not None
+                and (
+                    new_acc.latest_observed_ts_ms is None
+                    or accumulator.latest_observed_ts_ms > new_acc.latest_observed_ts_ms
+                )
+            ):
+                new_acc.latest_observed_ts_ms = accumulator.latest_observed_ts_ms
+            new_acc.latest_observed_storage_id = (
+                accumulator.latest_observed_storage_id
+                if accumulator.latest_observed_storage_id
+                > (old.latest_observed_storage_id or 0)
+                else old.latest_observed_storage_id
+            )
+            accumulator = new_acc
+
+        self._streamed_acc = accumulator
+        result = accumulator.finalize(window_end_ms=int(endpoint_ts_ms))
+        self._streamed_result = result
+        self._streamed_identity = identity
+        self._step_dirty = False
+        self.ladder_start_ms = int(ladder_start_ms)
+        self.step_start_ms = int(step_start_ms)
+        self.coverage_floor_ms = int(ladder_start_ms)
+        ladder_cov_ok = bool(result.ladder_coverage.complete)
+        step_cov_ok = bool(result.step_coverage.complete)
+        if ladder_cov_ok and step_cov_ok:
+            self.handoff_status = "live_ready"
+            self.detail = "Streaming backfill covers P0 + step start"
+        else:
+            self.handoff_status = "incomplete"
+            self.detail = (
+                "Streaming backfill incomplete: "
+                f"ladder_ok={ladder_cov_ok} step_ok={step_cov_ok}"
+            )
+        self.backfill_complete = True
+        self._gap_count = 0
+        self._known_gaps.clear()
+
+    def merge_live_buffer(self) -> None:
+        """Compatibility stub. The authoritative live trade source is the
+        persistent SQLite cache via ``catchup_from_persistent``; the legacy
+        in-memory buffer is no longer authoritative. This method is kept
+        for backward compatibility and is a no-op for the streaming path.
+        """
+        # Live trades arriving during backfill are persisted into SQLite
+        # by the controller immediately. After the streaming backfill
+        # installs, the controller calls catchup_from_persistent() which
+        # pulls any trades persisted after the backfill endpoint from
+        # SQLite via (ts, agg_trade_id) keyset continuation. No in-memory
+        # buffer overflow can lose data.
+        self._live_buffer.clear()
+
+    def catchup_from_persistent(
+        self,
+        aggtrade_cache,
+        *,
+        max_ts_ms: int,
+    ) -> int:
+        """Catch up the streaming accumulator with any trades persisted into
+        SQLite between the backfill endpoint and now. Uses the (ts,
+        storage_id) frontier stored in the accumulator to skip trades
+        already incorporated. No buffer overflow possible because the
+        authoritative source is the persistent cache.
+
+        Returns the number of trades incorporated.
+        """
+        acc = self._streamed_acc
+        if acc is None:
+            return 0
+        frontier_ts = acc.latest_observed_ts_ms
+        frontier_id = acc.latest_observed_storage_id
+        if frontier_ts is None:
+            return 0
+        n = 0
+        for trade in aggtrade_cache.iter_after_frontier(
+            self.market,
+            self.symbol,
+            int(frontier_ts),
+            int(frontier_id),
+            max_ts_ms=int(max_ts_ms),
+        ):
+            if acc.live_add(trade):
+                n += 1
+        # Refresh the materialized snapshot.
+        if self._streamed_identity is not None:
+            try:
+                self._streamed_result = acc.finalize(
+                    window_end_ms=int(self._streamed_identity[4])
+                )
+            except Exception:
+                pass
+        return n
+
+    def reconcile_step_window(
+        self,
+        aggtrade_cache,
+        *,
+        new_step_start_ms: int,
+        endpoint_ts_ms: int,
+    ) -> bool:
+        """Re-stream the new step window from the persistent cache and
+        reinstall the streaming snapshot with refreshed step fields. Ladder
+        accumulator fields are preserved. Returns True on success.
+
+        Used to bring the step portion of a streaming snapshot back into
+        AGGTRADE state after a step activation marked it dirty. The
+        re-stream operates on `[new_step_start_ms, endpoint_ts_ms]` only —
+        bounded, no full historical rescan.
+        """
+        if self._streamed_acc is None:
+            return False
+        ladder_start = int(self.ladder_start_ms) if self.ladder_start_ms is not None else int(new_step_start_ms)
+        old_acc = self._streamed_acc
+        new_acc = StreamMetricsAccumulator(
+            ladder_start_ms=ladder_start,
+            step_start_ms=int(new_step_start_ms),
+            bin_size=old_acc.bin_size,
+        )
+        # Carry ladder fields from the existing accumulator.
+        new_acc.ladder_num = old_acc.ladder_num
+        new_acc.ladder_den = old_acc.ladder_den
+        new_acc.ladder_bins = dict(old_acc.ladder_bins)
+        new_acc.ladder_pmin = old_acc.ladder_pmin
+        new_acc.ladder_pmax = old_acc.ladder_pmax
+        new_acc.ladder_levels = set(old_acc.ladder_levels)
+        new_acc.ladder_count = old_acc.ladder_count
+        new_acc.earliest_observed_ts_ms = old_acc.earliest_observed_ts_ms
+        new_acc.latest_observed_ts_ms = old_acc.latest_observed_ts_ms
+        new_acc.latest_observed_storage_id = old_acc.latest_observed_storage_id
+        # Stream step window through the cache iter and feed the new acc.
+        # Note: do NOT carry over _seen_keys from old_acc. The step window
+        # is being re-built; trades that were in the historical ladder pass
+        # but also fall in the step window MUST be counted in the step
+        # accumulators. The dedupe is by the new acc's _seen_keys which
+        # starts empty, so the re-stream correctly populates both the
+        # aggregate identities that fall in [new_step_start, endpoint] AND
+        # the new raw identities. Use add_trusted to skip identity dedupe
+        # entirely (the SQL iter is already canonical).
+        for trade in aggtrade_cache.iter_deduped_trades_range(
+            self.market, self.symbol, int(new_step_start_ms), int(endpoint_ts_ms)
+        ):
+            new_acc.add_trusted(trade)
+        # Install the refreshed snapshot (preserves ladder).
+        self.apply_streaming_backfill(
+            new_acc,
+            market=self.market,
+            symbol=self.symbol,
+            ladder_start_ms=ladder_start,
+            step_start_ms=int(new_step_start_ms),
+            endpoint_ts_ms=int(endpoint_ts_ms),
+            preserve_ladder_accumulator=True,
+        )
+        return True
+
+    def buffer_live_trade(
+        self,
+        *,
+        ts_ms: int,
+        price: float,
+        qty: float,
+        storage_id: int,
+        real_trade_id: int,
+        id_domain: str,
+    ) -> None:
+        """Buffer a WS trade that arrived during streaming backfill."""
+        if len(self._live_buffer) >= self._live_buffer_cap:
+            # Drop oldest to keep memory bounded.
+            self._live_buffer = self._live_buffer[-self._live_buffer_cap // 2:]
+        self._live_buffer.append(
+            {
+                "ts_ms": int(ts_ms),
+                "price": float(price),
+                "qty": float(qty),
+                "storage_id": int(storage_id),
+                "real_trade_id": int(real_trade_id),
+                "id_domain": str(id_domain),
+            }
+        )
+
+    def ingest_live_trade(
+        self,
+        *,
+        ts_ms: int,
+        price: float,
+        qty: float,
+        storage_id: int,
+        real_trade_id: int,
+        id_domain: str,
+    ) -> bool:
+        """Incrementally update the streaming snapshot for a NEW live trade.
+
+        Returns True if the trade was incorporated. False if:
+          - no streaming snapshot is installed
+          - the trade is at or before the snapshot's endpoint
+          - the trade does not fall inside the current window identity
+        """
+        acc = self._streamed_acc
+        if acc is None:
+            return False
+        try:
+            agg = AggTrade(
+                agg_id=int(storage_id),
+                price=float(price),
+                qty=float(qty),
+                ts_ms=int(ts_ms),
+                first_trade_id=int(real_trade_id),
+                last_trade_id=int(real_trade_id),
+                id_domain=str(id_domain),
+            )
+        except (TypeError, ValueError):
+            return False
+        result = acc.live_add(agg)
+        if result:
+            try:
+                self._streamed_result = acc.finalize(
+                    window_end_ms=int(self._streamed_identity[4])
+                )
+            except Exception:
+                pass
+        return bool(result)
+
+    def _validate_streamed_identity(self, *, allow_step_mismatch: bool = False) -> bool:
+        """True iff the persisted streaming snapshot still matches current state.
+
+        ``allow_step_mismatch=True`` is used for the partial-validity case
+        after a step activation: the ladder window identity is still valid,
+        only the step window is stale (and ``is_step_dirty()`` flags it).
+        """
+        ident = self._streamed_identity
+        if ident is None:
+            return False
+        if ident[0] != str(self.market):
+            return False
+        if ident[1] != str(self.symbol):
+            return False
+        if self.ladder_start_ms is None or self.step_start_ms is None:
+            return False
+        if int(ident[2]) != int(self.ladder_start_ms):
+            return False
+        if not allow_step_mismatch:
+            if int(ident[3]) != int(self.step_start_ms):
+                return False
+        return True
 
     # --- REST handoff ---
     def apply_rest_backfill(
@@ -320,6 +726,84 @@ class TradeMetricStore:
         return True, STATUS_COMPLETE, self.detail or "complete"
 
     def compute(self, *, now_ms: Optional[int] = None) -> MetricDisplay:
+        # Streaming-backed fast path: validate window identity strictly,
+        # but tolerate step mismatch when step_dirty is set (only ladder
+        # is valid in that case; step falls back to OHLC).
+        allow_step = self.is_step_dirty()
+        if (
+            getattr(self, "_streamed_result", None) is not None
+            and self._validate_streamed_identity(allow_step_mismatch=allow_step)
+            and not self._by_id
+        ):
+            acc = self._streamed_acc
+            try:
+                if acc is not None and self._streamed_identity is not None:
+                    self._streamed_result = acc.finalize(
+                        window_end_ms=int(self._streamed_identity[4])
+                    )
+            except Exception:
+                pass
+            result = self._streamed_result
+            if result is None:
+                pass  # fall through to legacy path
+            else:
+
+                def _profile_top_bins(prof):
+                    if prof is None:
+                        return []
+                    items = sorted(prof.vols.items(), key=lambda kv: (-kv[1], kv[0]))
+                    return items[:5]
+
+                ladder_ok = bool(result.ladder_coverage.complete)
+                # If step was marked dirty (new step activation since install),
+                # step metrics must come from OHLC, not from the stale snapshot.
+                if self.is_step_dirty():
+                    step_ok = False
+                else:
+                    step_ok = bool(result.step_coverage.complete)
+                source = SOURCE_AGGTRADE if ladder_ok and step_ok else SOURCE_OHLC
+                if ladder_ok != step_ok:
+                    source = "MIXED"
+                ladder_val = ladder_vah = None
+                if ladder_ok and result.ladder_profile is not None:
+                    ladder_val, ladder_vah = trade_value_area(
+                        result.ladder_profile, value_area_pct=0.70
+                    )
+                return MetricDisplay(
+                    source=source,
+                    ladder_metric_source=SOURCE_AGGTRADE if ladder_ok else SOURCE_OHLC,
+                    step_metric_source=SOURCE_AGGTRADE if step_ok else SOURCE_OHLC,
+                    ladder_aggtrade_status=result.ladder_coverage.status,
+                    step_aggtrade_status=(
+                        result.step_coverage.status if not self.is_step_dirty()
+                        else STATUS_LOADING
+                    ),
+                    ladder_vwap=result.ladder_vwap,
+                    step_vwap=result.step_vwap if step_ok else None,
+                    ladder_poc=result.ladder_poc,
+                    step_poc=result.step_poc if step_ok else None,
+                    ladder_val=ladder_val,
+                    ladder_vah=ladder_vah,
+                    ladder_status=result.ladder_coverage.status,
+                    step_status=(
+                        result.step_coverage.status if not self.is_step_dirty()
+                        else STATUS_LOADING
+                    ),
+                    ladder_trade_count=result.ladder_trade_count,
+                    step_trade_count=result.step_trade_count if step_ok else 0,
+                    ladder_total_qty=result.ladder_total_qty,
+                    step_total_qty=result.step_total_qty if step_ok else 0.0,
+                    handoff_status=self.handoff_status,
+                    gap_count=self._gap_count,
+                    top_ladder_bins=_profile_top_bins(result.ladder_profile),
+                    top_step_bins=(
+                        []
+                        if self.is_step_dirty()
+                        else _profile_top_bins(result.step_profile)
+                    ),
+                    detail=result.ladder_coverage.detail,
+                )
+
         if self.ladder_start_ms is None:
             return MetricDisplay(
                 source=SOURCE_AGGTRADE,
@@ -331,6 +815,27 @@ class TradeMetricStore:
                 step_status=STATUS_LOADING,
                 handoff_status=self.handoff_status,
                 detail="no P0 window yet",
+            )
+
+        # If streaming snapshot was invalidated (no _streamed_acc) and the
+        # legacy _by_id is empty too, fall back to OHLC rather than report
+        # AGGTRADE from an empty store. This happens after a step/P0
+        # transition invalidates the snapshot before a fresh backfill.
+        if (
+            getattr(self, "_streamed_acc", None) is None
+            and not self._by_id
+            and not getattr(self, "_streamed_result", None)
+        ):
+            return MetricDisplay(
+                source=SOURCE_OHLC,
+                ladder_metric_source=SOURCE_OHLC,
+                step_metric_source=SOURCE_OHLC,
+                ladder_aggtrade_status=STATUS_LOADING,
+                step_aggtrade_status=STATUS_LOADING,
+                ladder_status=STATUS_LOADING,
+                step_status=STATUS_LOADING,
+                handoff_status=self.handoff_status or "backfilling",
+                detail="OHLC approximation (no actual-trade data)",
             )
 
         ladder_start = int(self.ladder_start_ms)

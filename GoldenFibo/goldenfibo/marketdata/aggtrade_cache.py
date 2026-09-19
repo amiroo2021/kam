@@ -454,6 +454,282 @@ class AggTradeCache:
         out.sort(key=lambda t: (t.ts_ms, t.agg_id))
         return out
 
+    def iter_deduped_trades_range(
+        self,
+        market: str,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        chunk_size: int = 50_000,
+    ):
+        """Yield canonical deduped trades for the window without materializing.
+
+        REST/archive aggregate rows take precedence over an overlapping raw
+        ``@trade`` row that covers the same underlying real trade ID.
+
+        Implementation:
+
+        1. Stream aggregate rows in timestamp chunks of ``chunk_size`` via
+           keyset iteration on ``(timestamp_ms, agg_trade_id)``.
+        2. Yield each aggregate row as-is.
+        3. After aggregate streaming is complete, collect the small set of raw
+           ``@trade`` rows for the window and filter them in memory using the
+           merged aggregate intervals — raw populations are far smaller than
+           aggregate populations in practice.
+
+        Memory bound: one chunk of aggregates + raw window + interval list.
+        """
+        market_n = self._normalize_market(market)
+        symbol_n = self._normalize_symbol(symbol)
+        lo = int(start_ms)
+        hi = int(end_ms)
+
+        intervals: List[Tuple[int, int]] = []
+
+        # Pass 1: stream aggregate rows by (ts, id) keyset and yield.
+        with self._connect() as conn:
+            cur_ts = lo
+            cur_id = -(2**63)
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT agg_trade_id, price, quantity, timestamp_ms,
+                           first_trade_id, last_trade_id
+                    FROM agg_trades
+                    WHERE market=? AND symbol=? AND id_domain='aggtrade'
+                      AND timestamp_ms BETWEEN ? AND ?
+                      AND (timestamp_ms > ? OR (timestamp_ms = ? AND agg_trade_id > ?))
+                    ORDER BY timestamp_ms ASC, agg_trade_id ASC
+                    LIMIT ?
+                    """,
+                    (market_n, symbol_n, lo, hi, cur_ts, cur_ts, cur_id, int(chunk_size)),
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    f = int(r["first_trade_id"])
+                    l = int(r["last_trade_id"])
+                    if l < f:
+                        f, l = l, f
+                    if intervals and intervals[-1][1] >= f - 1:
+                        prev_f, prev_l = intervals[-1]
+                        intervals[-1] = (prev_f, max(prev_l, l))
+                    else:
+                        intervals.append((f, l))
+                    yield AggTrade(
+                        agg_id=int(r["agg_trade_id"]),
+                        price=float(r["price"]),
+                        qty=float(r["quantity"]),
+                        ts_ms=int(r["timestamp_ms"]),
+                        first_trade_id=int(r["first_trade_id"]),
+                        last_trade_id=int(r["last_trade_id"]),
+                        id_domain="aggtrade",
+                    )
+                last = rows[-1]
+                cur_ts = int(last["timestamp_ms"])
+                cur_id = int(last["agg_trade_id"])
+                if len(rows) < int(chunk_size):
+                    break
+
+        # No aggregates → no coverage intervals, but we still need to
+        # yield raw rows. The covered() helper handles empty intervals.
+        if intervals:
+            intervals.sort(key=lambda iv: iv[0])
+
+        def covered(raw_tid: int) -> bool:
+            if not intervals:
+                return False
+            lo_i, hi_i = 0, len(intervals) - 1
+            while lo_i <= hi_i:
+                mid = (lo_i + hi_i) // 2
+                iv_f, iv_l = intervals[mid]
+                if raw_tid < iv_f:
+                    hi_i = mid - 1
+                elif raw_tid > iv_l:
+                    lo_i = mid + 1
+                else:
+                    return True
+            return False
+
+        # Pass 2: stream raw rows (population is much smaller than aggregates).
+        with self._connect() as conn:
+            cur_ts = lo
+            cur_id = -(2**63)
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT agg_trade_id, price, quantity, timestamp_ms,
+                           first_trade_id, last_trade_id
+                    FROM agg_trades
+                    WHERE market=? AND symbol=? AND id_domain='trade'
+                      AND timestamp_ms BETWEEN ? AND ?
+                      AND (timestamp_ms > ? OR (timestamp_ms = ? AND agg_trade_id > ?))
+                    ORDER BY timestamp_ms ASC, agg_trade_id ASC
+                    LIMIT ?
+                    """,
+                    (market_n, symbol_n, lo, hi, cur_ts, cur_ts, cur_id, int(chunk_size)),
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    raw_tid = int(r["first_trade_id"])
+                    if covered(raw_tid):
+                        continue
+                    yield AggTrade(
+                        agg_id=int(r["agg_trade_id"]),
+                        price=float(r["price"]),
+                        qty=float(r["quantity"]),
+                        ts_ms=int(r["timestamp_ms"]),
+                        first_trade_id=raw_tid,
+                        last_trade_id=raw_tid,
+                        id_domain="trade",
+                    )
+                last = rows[-1]
+                cur_ts = int(last["timestamp_ms"])
+                cur_id = int(last["agg_trade_id"])
+                if len(rows) < int(chunk_size):
+                    break
+
+    def iter_after_frontier(
+        self,
+        market: str,
+        symbol: str,
+        frontier_ts_ms: int,
+        frontier_storage_id: int,
+        *,
+        max_ts_ms: Optional[int] = None,
+        chunk_size: int = 50_000,
+    ):
+        """Yield deduped canonical trades strictly after the (ts, agg_trade_id) frontier.
+
+        Used by the controller's post-install catch-up to retrieve any trades
+        that were persisted into SQLite between the backfill endpoint and
+        install time. Aggregate rows are matched on
+        ``(ts, agg_trade_id)``; raw rows are matched on
+        ``(ts, first_trade_id)`` to avoid the negative-keyspace collision.
+
+        Yielded trades are guaranteed distinct from any trades already in the
+        accumulator up to ``(frontier_ts_ms, frontier_storage_id)`` exclusive
+        (strict less-than on (ts, storage_id)).
+        """
+        market_n = self._normalize_market(market)
+        symbol_n = self._normalize_symbol(symbol)
+        frontier_ts = int(frontier_ts_ms)
+        frontier_id = int(frontier_storage_id)
+        max_ts = int(max_ts_ms) if max_ts_ms is not None else 9_999_999_999_999
+
+        intervals: List[Tuple[int, int]] = []
+
+        # Aggregate pass.
+        with self._connect() as conn:
+            cur_ts = frontier_ts
+            cur_id = frontier_id
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT agg_trade_id, price, quantity, timestamp_ms,
+                           first_trade_id, last_trade_id
+                    FROM agg_trades
+                    WHERE market=? AND symbol=? AND id_domain='aggtrade'
+                      AND timestamp_ms <= ?
+                      AND (timestamp_ms > ? OR (timestamp_ms = ? AND agg_trade_id > ?))
+                    ORDER BY timestamp_ms ASC, agg_trade_id ASC
+                    LIMIT ?
+                    """,
+                    (market_n, symbol_n, max_ts, cur_ts, cur_ts, cur_id, int(chunk_size)),
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    f = int(r["first_trade_id"])
+                    l = int(r["last_trade_id"])
+                    if l < f:
+                        f, l = l, f
+                    if intervals and intervals[-1][1] >= f - 1:
+                        prev_f, prev_l = intervals[-1]
+                        intervals[-1] = (prev_f, max(prev_l, l))
+                    else:
+                        intervals.append((f, l))
+                    yield AggTrade(
+                        agg_id=int(r["agg_trade_id"]),
+                        price=float(r["price"]),
+                        qty=float(r["quantity"]),
+                        ts_ms=int(r["timestamp_ms"]),
+                        first_trade_id=int(r["first_trade_id"]),
+                        last_trade_id=int(r["last_trade_id"]),
+                        id_domain="aggtrade",
+                    )
+                last = rows[-1]
+                cur_ts = int(last["timestamp_ms"])
+                cur_id = int(last["agg_trade_id"])
+                if len(rows) < int(chunk_size):
+                    break
+
+        if intervals:
+            intervals.sort(key=lambda iv: iv[0])
+
+            def covered(raw_tid: int) -> bool:
+                lo_i, hi_i = 0, len(intervals) - 1
+                while lo_i <= hi_i:
+                    mid = (lo_i + hi_i) // 2
+                    iv_f, iv_l = intervals[mid]
+                    if raw_tid < iv_f:
+                        hi_i = mid - 1
+                    elif raw_tid > iv_l:
+                        lo_i = mid + 1
+                    else:
+                        return True
+                return False
+        else:
+            def covered(raw_tid: int) -> bool:  # noqa: F811
+                return False
+
+        # Raw pass: use (ts, first_trade_id) as the keyset (positive space,
+        # always increasing within a symbol). frontier_id is the historical
+        # aggregate's agg_trade_id; for the raw continuation we use it as a
+        # lower-bound hint only — but the strongest constraint is
+        # ts >= frontier_ts. We also exclude raw rows whose real_trade_id is
+        # covered by an aggregate interval built from the post-frontier
+        # aggregates above.
+        with self._connect() as conn:
+            cur_ts = frontier_ts
+            cur_raw_id = -(2**63)
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT agg_trade_id, price, quantity, timestamp_ms,
+                           first_trade_id, last_trade_id
+                    FROM agg_trades
+                    WHERE market=? AND symbol=? AND id_domain='trade'
+                      AND timestamp_ms <= ?
+                      AND (timestamp_ms > ? OR (timestamp_ms = ? AND first_trade_id > ?))
+                    ORDER BY timestamp_ms ASC, first_trade_id ASC
+                    LIMIT ?
+                    """,
+                    (market_n, symbol_n, max_ts, cur_ts, cur_ts, cur_raw_id, int(chunk_size)),
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    raw_tid = int(r["first_trade_id"])
+                    if covered(raw_tid):
+                        continue
+                    yield AggTrade(
+                        agg_id=int(r["agg_trade_id"]),
+                        price=float(r["price"]),
+                        qty=float(r["quantity"]),
+                        ts_ms=int(r["timestamp_ms"]),
+                        first_trade_id=raw_tid,
+                        last_trade_id=raw_tid,
+                        id_domain="trade",
+                    )
+                last = rows[-1]
+                cur_ts = int(last["timestamp_ms"])
+                cur_raw_id = int(last["first_trade_id"])
+                if len(rows) < int(chunk_size):
+                    break
+
     def query_trades_minmax(
         self,
         market: str,
