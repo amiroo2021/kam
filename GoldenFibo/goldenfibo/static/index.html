@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GoldenFibo</title>
+  <title>backtest-web</title>
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">GoldenFibo</div>
+    <div class="brand">backtest-web</div>
     <div class="modes">
       <button type="button" class="mode" data-mode="LIVE">LIVE</button>
       <button type="button" class="mode active" data-mode="REPLAY_TO_LIVE">REPLAY→LIVE</button>
@@ -19,6 +19,12 @@
   </header>
   <section class="controls">
     <label>Symbol <input id="symbol" value="BTCUSDT" /></label>
+    <label>Market
+      <select id="market">
+        <option value="spot" selected>Spot</option>
+        <option value="futures">Futures</option>
+      </select>
+    </label>
     <label>TF
       <select id="timeframe">
         <option value="1m" selected>1m</option>
@@ -59,9 +65,9 @@
     <span id="progressText"></span>
   </div>
   <p class="hint" id="histNote"></p>
-  <main id="chart" aria-label="GoldenFibo chart"></main>
+  <main id="chart" aria-label="backtest-web chart"></main>
   <footer class="footer">
-    Backend owns GoldenFibo state · JS renders only · public Binance · no orders ·
+    Backend owns backtest-web state · JS renders only · public Binance · no orders ·
     LEGACY OHLC hist ≠ tick-perfect aggTrade
   </footer>
   <script src="/static/app.js"></script>

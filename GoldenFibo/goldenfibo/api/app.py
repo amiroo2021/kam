@@ -1,4 +1,4 @@
-"""FastAPI app — GoldenFibo LIVE / BACKTEST / REPLAY_TO_LIVE."""
+"""FastAPI app — backtest-web LIVE / BACKTEST / REPLAY_TO_LIVE."""
 
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 async def lifespan(app: FastAPI):
     session = get_session()
     await session.start()
-    logger.info("GoldenFibo default LIVE session starting symbol=%s", session.symbol)
+    logger.info("backtest-web default LIVE session starting symbol=%s", session.symbol)
     yield
     await session.stop()
 
 
-app = FastAPI(title="GoldenFibo", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="backtest-web", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
@@ -84,13 +84,21 @@ async def api_session_start(body: Optional[dict] = Body(None)) -> JSONResponse:
             mode=mode,
             symbol=b.get("symbol"),
             timeframe=b.get("timeframe"),
+            market=b.get("market"),
             side=Side(str(side).upper()) if side else None,
             percentage=Decimal(str(pct)) if pct is not None else None,
             start_time=b.get("start_time"),
             end_time=b.get("end_time"),
         )
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        msg = str(exc)
+        if "HTTP Error 400" in msg and b.get("market") in {"spot", "SPOT"}:
+            sym = b.get("symbol") or "this symbol"
+            msg = f"Market data unavailable for {sym} on Binance Spot."
+        elif "HTTP Error 400" in msg and b.get("market") in {"futures", "FUTURES"}:
+            sym = b.get("symbol") or "this symbol"
+            msg = f"Market data unavailable for {sym} on Binance Futures."
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
     return JSONResponse(snap)
 
 
@@ -104,14 +112,14 @@ async def api_session_stop() -> JSONResponse:
 @app.get("/api/cache/stats")
 async def api_cache_stats(symbol: str = "BTCUSDT", timeframe: str = "1m") -> JSONResponse:
     s = get_session()
-    return JSONResponse(s.kline_cache.stats_for(symbol, timeframe))
+    return JSONResponse(s.kline_cache.stats_for(symbol, timeframe, market=s.market))
 
 
 @app.post("/api/cache/clear")
 async def api_cache_clear(body: Optional[dict] = Body(None)) -> JSONResponse:
     b = body or {}
     s = get_session()
-    n = s.kline_cache.clear(str(b.get("symbol") or s.symbol), str(b.get("timeframe") or s.timeframe))
+    n = s.kline_cache.clear(str(b.get("symbol") or s.symbol), str(b.get("timeframe") or s.timeframe), market=str(b.get("market") or s.market))
     return JSONResponse({"cleared": n, "symbol": b.get("symbol") or s.symbol, "timeframe": b.get("timeframe") or s.timeframe})
 
 
@@ -128,8 +136,8 @@ async def api_cache_validate(body: Optional[dict] = Body(None)) -> JSONResponse:
         st = s.kline_cache.stats_for(symbol, tf)
         start_ms = st.get("first_open_time") or 0
         end_ms = (st.get("last_open_time") or 0) + 1
-    rows = s.kline_cache.read_range(symbol, tf, int(start_ms), int(end_ms))
-    return JSONResponse({"stats": s.kline_cache.stats_for(symbol, tf), "validation": validate_klines_sequence(rows, timeframe=tf)})
+    rows = s.kline_cache.read_range(symbol, tf, int(start_ms), int(end_ms), market=str(b.get("market") or s.market))
+    return JSONResponse({"stats": s.kline_cache.stats_for(symbol, tf, market=str(b.get("market") or s.market)), "validation": validate_klines_sequence(rows, timeframe=tf)})
 
 
 @app.post("/api/session")
@@ -138,6 +146,7 @@ async def api_session_legacy(
     percentage: Optional[str] = Query(None),
     symbol: Optional[str] = Query(None),
     timeframe: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
 ) -> JSONResponse:
     """Legacy LIVE reconfigure."""
     s = get_session()
@@ -146,6 +155,7 @@ async def api_session_legacy(
         percentage=Decimal(percentage) if percentage else None,
         symbol=symbol,
         timeframe=timeframe,
+        market=market,
     )
     return JSONResponse(s.snapshot_dict())
 
@@ -175,6 +185,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         mode=mode,
                         symbol=raw.get("symbol"),
                         timeframe=raw.get("timeframe"),
+                        market=raw.get("market"),
                         side=Side(str(side).upper()) if side else None,
                         percentage=Decimal(str(pct)) if pct is not None else None,
                         start_time=raw.get("start_time"),

@@ -37,6 +37,20 @@ CHART_CANDLE_LIMIT = 2500  # browser chart window; engine reconstructs full hist
 logger = logging.getLogger("goldenfibo.controller")
 
 
+def _normalize_market(market: Optional[str]) -> str:
+    m = str(market or "spot").lower()
+    if m in {"futures", "future", "usdm"}:
+        return "futures"
+    return "spot"
+
+
+def _canonical_symbol(symbol: str, market: str) -> str:
+    s = symbol.upper().replace("/", "")
+    if market == "futures" and not s.endswith("USDT"):
+        return s + "USDT"
+    return s
+
+
 class SessionController:
     """Backend-owned multi-mode session. One engine object for REPLAY→LIVE handoff."""
 
@@ -45,10 +59,12 @@ class SessionController:
         self.phase = SessionPhase.IDLE
         self.symbol = "BTCUSDT"
         self.timeframe = "1m"
+        self.market = "spot"
         self.side = Side.BUY
         self.percentage = Decimal("0.001")
         self.ohlc_mode = OhlcResolveMode.LEGACY
         self.run_id = ""
+        self.symbol = _canonical_symbol(self.symbol, self.market)
         self.engine = GoldenFiboEngine(
             EngineConfig(side=self.side, percentage=self.percentage, symbol=self.symbol)
         )
@@ -159,6 +175,7 @@ class SessionController:
             {
                 "phase": self.phase.value,
                 "run_id": self.run_id,
+                "market": self.market,
                 "progress": dict(self.progress),
                 "ambiguity_count": self.ambiguity_count,
                 "bars_processed": self.bars_processed,
@@ -312,6 +329,7 @@ class SessionController:
         symbol: Optional[str] = None,
         timeframe: Optional[str] = None,
         side: Optional[Side] = None,
+        market: Optional[str] = None,
         percentage: Optional[Decimal] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
@@ -344,6 +362,8 @@ class SessionController:
             self.symbol = symbol.upper().replace("/", "")
         if timeframe:
             self.timeframe = validate_interval(timeframe)
+        if market is not None:
+            self.market = _normalize_market(market)
         if side is not None:
             self.side = side
         if percentage is not None:
@@ -351,6 +371,7 @@ class SessionController:
         self.mode = mode
         self.run_id = uuid.uuid4().hex[:12]
         self.phase = SessionPhase.LOADING
+        self.symbol = _canonical_symbol(self.symbol, self.market)
         self.engine = GoldenFiboEngine(
             EngineConfig(side=self.side, percentage=self.percentage, symbol=self.symbol)
         )
@@ -391,6 +412,7 @@ class SessionController:
             else (Decimal(str(pct)) if pct is not None else None),
             symbol=kwargs.get("symbol"),
             timeframe=kwargs.get("timeframe"),
+            market=kwargs.get("market"),
         )
         await self.broadcast_snapshot()
 
@@ -451,7 +473,7 @@ class SessionController:
 
         def do_fetch():
             return fetch_range_cached(
-                self.symbol,
+                _canonical_symbol(self.symbol, self.market),
                 self.timeframe,
                 start_ms,
                 end_ms,
@@ -460,6 +482,7 @@ class SessionController:
                 closed_only_before_ms=closed_only_before_ms,
                 fetch=getattr(self.kline_source, "fetch", None),
                 base_url=getattr(self.kline_source, "base_url", None) or "https://api.binance.com",
+                market=self.market,
                 on_progress=on_progress,
             )
 
@@ -609,7 +632,7 @@ class SessionController:
             start = now - self.history_limit_live * step
             klines = await asyncio.to_thread(
                 lambda: self.kline_source.fetch_range(
-                    symbol=self.symbol,
+                    symbol=_canonical_symbol(self.symbol, self.market),
                     interval=self.timeframe,
                     start_ms=start,
                     end_ms=now + step,
@@ -778,7 +801,7 @@ class SessionController:
         except ImportError:
             self.feed_status = "no_websockets_pkg"
             return
-        url = bn.combined_stream_url(self.symbol, self.timeframe)
+        url = bn.combined_stream_url(_canonical_symbol(self.symbol, self.market), self.timeframe, market=self.market)
         backoff = 1.0
         while not self._stop.is_set():
             try:

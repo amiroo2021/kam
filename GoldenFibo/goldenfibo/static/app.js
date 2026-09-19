@@ -1,4 +1,4 @@
-/* GoldenFibo chart client — RENDERS backend state only. No ladder math. */
+/* backtest-web chart client — RENDERS backend state only. No ladder math. */
 (function () {
   const el = document.getElementById("chart");
   const statusEl = document.getElementById("connStatus");
@@ -13,6 +13,7 @@
   const progressFill = document.getElementById("progressFill");
   const progressText = document.getElementById("progressText");
   const histNote = document.getElementById("histNote");
+  const marketEl = document.getElementById("market");
   let currentMode = "REPLAY_TO_LIVE"; // form default; server may run LIVE separately
   let serverMode = "LIVE";
   let lastPhase = "";
@@ -516,6 +517,7 @@
     if (msg.side) document.getElementById("side").value = msg.side;
     if (msg.percentage) document.getElementById("percentage").value = msg.percentage;
     if (msg.symbol) document.getElementById("symbol").value = msg.symbol;
+    if (msg.market && marketEl) marketEl.value = msg.market;
   }
 
   function connect() {
@@ -649,6 +651,7 @@
       op: "start",
       mode: currentMode,
       symbol: document.getElementById("symbol").value.trim(),
+      market: (marketEl && marketEl.value) || "spot",
       timeframe: document.getElementById("timeframe").value,
       side: document.getElementById("side").value,
       percentage: document.getElementById("percentage").value,

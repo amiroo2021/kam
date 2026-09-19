@@ -71,12 +71,13 @@ def test_state_endpoint(client):
     assert body["v"] == 1
     assert body["p0"] == "2500.00"
     assert body["type"] == "state_snapshot"
+    assert body.get("market") in (None, 'spot', 'futures')
 
 
 def test_index_serves_html(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "GoldenFibo" in r.text
+    assert "backtest-web" in r.text
     assert "lightweight-charts" in r.text
 
 
@@ -91,3 +92,25 @@ def test_ws_snapshot_on_connect(client):
         msg2 = ws.receive_json()
         assert msg2["p0"] == msg["p0"]
         assert msg2["cycle_id"] == msg["cycle_id"]
+
+
+def test_state_endpoint_includes_market(client):
+    r = client.get('/api/state')
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get('market') in ('spot', 'futures', None)
+
+
+def test_session_start_accepts_market(client):
+    r = client.post('/api/session/start', json={
+        'mode': 'LIVE',
+        'symbol': 'BTCUSDT',
+        'timeframe': '1m',
+        'market': 'futures',
+        'side': 'BUY',
+        'percentage': '0.001',
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body['symbol'] == 'BTCUSDT'
+    assert body.get('market') in ('spot', 'futures', None)

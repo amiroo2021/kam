@@ -63,11 +63,12 @@ def kline_stream_url(symbol: str, interval: str = "1m", *, ws_base: str = BINANC
     return f"{ws_base}/{s}@kline_{interval}"
 
 
-def combined_stream_url(symbol: str, interval: str = "1m") -> str:
+def combined_stream_url(symbol: str, interval: str = "1m", *, market: str = "spot") -> str:
     """Multiplex aggTrade + kline on one connection."""
     s = symbol.lower().replace("/", "")
+    base = "wss://stream.binance.com:9443/stream?streams=" if market == "spot" else "wss://fstream.binance.com/stream?streams="
     streams = f"{s}@aggTrade/{s}@kline_{interval}"
-    return f"wss://stream.binance.com:9443/stream?streams={streams}"
+    return f"{base}{streams}"
 
 
 def parse_combined_message(raw: str) -> Optional[Dict[str, Any]]:
