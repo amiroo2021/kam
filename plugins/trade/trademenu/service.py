@@ -964,8 +964,6 @@ class TradeMenuService:
             n = 0
         if n <= 0:
             return {"success": False, "error": {"code": "INVALID_ORDER_COUNT", "message": "Order count must be positive."}}
-        if n > 200:
-            return {"success": False, "error": {"code": "INVALID_ORDER_COUNT", "message": "Order count too large (max 200)."}}
         tv = _dec(total_size)
         sp = _dec(start_price)
         ep = _dec(end_price)

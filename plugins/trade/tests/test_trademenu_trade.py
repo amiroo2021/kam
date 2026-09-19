@@ -294,6 +294,31 @@ class TradePreviewApiTests(unittest.TestCase):
         self.assertEqual(ladders[0]["distribution"], "half_gaussian")
         self.assertEqual(int(ladders[0]["order_count"]), 8)
 
+    def test_preview_ladder_allows_more_than_200_orders(self) -> None:
+        csrf = self._csrf()
+        r = self.client.post(
+            "/api/trade/preview_ladder",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "exchange": "hyperliquid",
+                "account": "FLEX",
+                "symbol": "BTCUSD",
+                "side": "buy",
+                "distribution": "uniform",
+                "order_count": 201,
+                "total_size": "20.1",
+                "start_price": "75000",
+                "end_price": "74000",
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["success"], body)
+        self.assertEqual(body["requested_order_count"], 201)
+        self.assertEqual(body["order_count"], 201)
+        self.assertEqual(len(body["children"]), 201)
+        self.assertEqual(body["summary"], "BUY BTC LADDER · uniform · 201 orders · VWAP 74500")
+
     def test_invalid_buy_ladder_direction(self) -> None:
         csrf = self._csrf()
         r = self.client.post(
