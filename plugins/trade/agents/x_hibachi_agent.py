@@ -387,6 +387,7 @@ def capabilities() -> List[str]:
         "ladder",
         "set_tp",
         "set_sl",
+        "close_position",
         "resolve_instrument",
         # Phase 2.4: catalog + public mark price.
         "list_instruments",
@@ -445,6 +446,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _set_position_trigger(account, request, operation="set_tp")
         if operation == "set_sl":
             return _set_position_trigger(account, request, operation="set_sl")
+        if operation == "close_position":
+            return _close_position(account, request)
         if operation == "resolve_instrument":
             return _resolve_instrument(account, request)
         if operation == "list_instruments":
@@ -3538,6 +3541,126 @@ def _set_position_trigger(account: str, request: Dict[str, Any], *, operation: s
     if verified:
         return make_success(operation=operation, exchange=name, account=credentials["account"], position_action=action)
     return make_failure(operation=operation, exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="TP/SL submission could not be verified.", position_action=action)
+
+
+def _build_hibachi_close_position_payload(
+    *,
+    credentials: Dict[str, Any],
+    descriptor: Mapping[str, Any],
+    current_side: str,
+    current_size: Decimal,
+    market_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    contract_id = _require_contract_id(descriptor)
+    underlying_decimals = _require_non_negative_int(descriptor.get("underlying_decimals"), field="underlying_decimals")
+    settlement_decimals = _require_non_negative_int(descriptor.get("settlement_decimals"), field="settlement_decimals")
+    nonce = _next_hibachi_nonce()
+    max_fees_percent = _hibachi_max_fees_percent(market_payload)
+    closing_side = "sell" if current_side == "long" else "buy"
+    native_side = _SIDE_TO_HIBACHI_ORDER[closing_side]
+    signature = _sign_hibachi_place_order(
+        private_key=str(credentials.get("private_key") or ""),
+        nonce=nonce,
+        contract_id=contract_id,
+        quantity=current_size,
+        price=None,
+        side=closing_side,
+        underlying_decimals=underlying_decimals,
+        settlement_decimals=settlement_decimals,
+        max_fees_percent=max_fees_percent,
+    )
+    account_id = _require_non_negative_int(credentials.get("account_id"), field="account_id")
+    return {
+        "accountId": account_id,
+        "nonce": nonce,
+        "symbol": str(descriptor.get("symbol") or "").strip(),
+        "quantity": _decimal_text(current_size),
+        "orderType": "MARKET",
+        "side": native_side,
+        "maxFeesPercent": _decimal_text(max_fees_percent),
+        "signature": signature,
+        "orderFlags": "REDUCE_ONLY",
+    }
+
+
+def _close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    requested_symbol = str(request.get("symbol") or "").strip()
+    if not requested_symbol:
+        return make_failure(operation="close_position", exchange=name, account=account, code="MISSING_SYMBOL", message="Symbol is required.")
+    context, failure = _find_hibachi_position_context(account, requested_symbol, operation="close_position")
+    if failure is not None:
+        return failure
+    assert context is not None
+    credentials = context["credentials"]
+    descriptor = context["descriptor"]
+    market_payload = context["market_payload"]
+    current_side = str(context["current_side"] or "")
+    current_size = context["current_size"]
+    canonical_symbol = context["canonical_symbol"]
+    current_position = context.get("current_position")
+    current_size_text = getattr(current_position, "size", _decimal_text(current_size)) if current_position is not None else _decimal_text(current_size)
+
+    # Best-effort pre-cleanup: remove any same-side orders / protections that
+    # could interfere with a full flatten.
+    try:
+        _cancel_order_group(account, {"symbol": requested_symbol, "side": "sell" if current_side == "long" else "buy"})
+    except Exception:
+        pass
+
+    try:
+        payload = _build_hibachi_close_position_payload(
+            credentials=credentials,
+            descriptor=descriptor,
+            current_side=current_side,
+            current_size=current_size,
+            market_payload=market_payload,
+        )
+        response_payload = _submit_single_order(credentials, payload)
+        submitted_oid = _parse_optional_int(response_payload.get("orderId")) if isinstance(response_payload, Mapping) else None
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="close_position",
+            exchange=name,
+            account=credentials["account"],
+            code="ORDER_SUBMISSION_FAILED",
+            message=_redact(sanitize_error_message(str(exc))),
+            position_action=_position_action_result(
+                operation="close_position",
+                symbol=canonical_symbol,
+                verified=False,
+                removed=True,
+                current_side=current_side,
+                current_size=current_size_text,
+                status="failed",
+            ),
+        )
+
+    # Verify by re-reading the live position state; a successful close means
+    # the symbol is gone or the size is zero.
+    verified = False
+    verified_oid = submitted_oid
+    for _ in range(4):
+        followup, followup_failure = _find_hibachi_position_context(account, requested_symbol, operation="close_position")
+        if followup is None:
+            verified = True
+            break
+        if followup_failure is not None:
+            break
+        time.sleep(0.5)
+    action = _position_action_result(
+        operation="close_position",
+        symbol=canonical_symbol,
+        verified=verified,
+        removed=True,
+        status=("success" if verified else "failed"),
+        exchange_order_id=verified_oid,
+        current_side=current_side,
+        current_size=current_size_text,
+        message="Position closed." if verified else "Close order submitted but the position is still visible.",
+    )
+    if verified:
+        return make_success(operation="close_position", exchange=name, account=credentials["account"], position_action=action)
+    return make_failure(operation="close_position", exchange=name, account=credentials["account"], code="VERIFICATION_FAILED", message="Close could not be verified.", position_action=action)
 
 
 def _normalize_positions_from_account_info(
