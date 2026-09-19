@@ -341,40 +341,118 @@ class AggTradeCache:
         start_ms: int,
         end_ms: int,
     ) -> List[AggTrade]:
+        """Return canonical trade rows for a metric window.
+
+        REST/archive aggregate rows and live WS raw trade rows may coexist in
+        the cache. When both representations cover the same economic trade we
+        must keep the aggregate and drop the raw row, never the other way
+        around. The filter is determined by underlying raw trade IDs:
+
+          aggregate row: first_trade_id .. last_trade_id
+          raw trade row: first_trade_id == last_trade_id == real Binance raw ID
+
+        The previous implementation used a correlated SQL EXISTS for every
+        raw row, which degenerated into a per-row scan over the aggregate
+        population (millions of rows). The new algorithm:
+
+          1. Fetch aggregate rows for the window by timestamp.
+          2. Fetch raw trade rows for the window by timestamp.
+          3. Build merged [first_trade_id, last_trade_id] intervals from the
+             aggregate rows and binary-search each raw trade's ID against
+             those intervals in O(log A).
+
+        All three retrievals use the existing timestamp index. No correlated
+        subquery, no per-row containment scan.
+        """
         market_n = self._normalize_market(market)
         symbol_n = self._normalize_symbol(symbol)
+        lo = int(start_ms)
+        hi = int(end_ms)
         with self._connect() as conn:
-            rows = conn.execute(
+            aggregate_rows = conn.execute(
                 """
-                SELECT agg_trade_id, price, quantity, timestamp_ms, first_trade_id, last_trade_id, id_domain
-                FROM agg_trades AS t
-                WHERE market=? AND symbol=? AND timestamp_ms BETWEEN ? AND ?
-                  AND NOT (
-                    t.id_domain='trade'
-                    AND EXISTS (
-                      SELECT 1 FROM agg_trades AS a
-                      WHERE a.market=t.market AND a.symbol=t.symbol
-                        AND a.id_domain='aggtrade'
-                        AND a.first_trade_id <= t.first_trade_id
-                        AND a.last_trade_id >= t.last_trade_id
-                    )
-                  )
-                ORDER BY timestamp_ms, agg_trade_id
+                SELECT agg_trade_id, price, quantity, timestamp_ms,
+                       first_trade_id, last_trade_id
+                FROM agg_trades
+                WHERE market=? AND symbol=? AND id_domain='aggtrade'
+                  AND timestamp_ms BETWEEN ? AND ?
                 """,
-                (market_n, symbol_n, int(start_ms), int(end_ms)),
+                (market_n, symbol_n, lo, hi),
             ).fetchall()
-        return [
-            AggTrade(
-                agg_id=int(r["agg_trade_id"]),
-                price=float(r["price"]),
-                qty=float(r["quantity"]),
-                ts_ms=int(r["timestamp_ms"]),
-                first_trade_id=int(r["first_trade_id"]),
-                last_trade_id=int(r["last_trade_id"]),
-                id_domain=str(r["id_domain"] or "aggtrade"),
+            raw_rows = conn.execute(
+                """
+                SELECT agg_trade_id, price, quantity, timestamp_ms,
+                       first_trade_id, last_trade_id
+                FROM agg_trades
+                WHERE market=? AND symbol=? AND id_domain='trade'
+                  AND timestamp_ms BETWEEN ? AND ?
+                """,
+                (market_n, symbol_n, lo, hi),
+                # Use a small chunked iterator instead of materializing the
+                # full result set in a single fetchall() to keep peak memory
+                # bounded for large metric windows.
             )
-            for r in rows
-        ]
+            raw_rows_iter = raw_rows  # keep handle alive
+
+        intervals: List[Tuple[int, int]] = []
+        for r in aggregate_rows:
+            f = int(r["first_trade_id"])
+            l = int(r["last_trade_id"])
+            if l < f:
+                f, l = l, f
+            if intervals and intervals[-1][1] >= f - 1:
+                prev_f, prev_l = intervals[-1]
+                intervals[-1] = (prev_f, max(prev_l, l))
+            else:
+                intervals.append((f, l))
+        intervals.sort(key=lambda iv: iv[0])
+
+        def covered(raw_tid: int) -> bool:
+            if not intervals:
+                return False
+            lo_i, hi_i = 0, len(intervals) - 1
+            while lo_i <= hi_i:
+                mid = (lo_i + hi_i) // 2
+                iv_f, iv_l = intervals[mid]
+                if raw_tid < iv_f:
+                    hi_i = mid - 1
+                elif raw_tid > iv_l:
+                    lo_i = mid + 1
+                else:
+                    return True
+            return False
+
+        out: List[AggTrade] = []
+        for r in aggregate_rows:
+            out.append(
+                AggTrade(
+                    agg_id=int(r["agg_trade_id"]),
+                    price=float(r["price"]),
+                    qty=float(r["quantity"]),
+                    ts_ms=int(r["timestamp_ms"]),
+                    first_trade_id=int(r["first_trade_id"]),
+                    last_trade_id=int(r["last_trade_id"]),
+                    id_domain="aggtrade",
+                )
+            )
+        for r in raw_rows_iter:
+            raw_tid = int(r["first_trade_id"])
+            if covered(raw_tid):
+                continue
+            out.append(
+                AggTrade(
+                    agg_id=int(r["agg_trade_id"]),
+                    price=float(r["price"]),
+                    qty=float(r["quantity"]),
+                    ts_ms=int(r["timestamp_ms"]),
+                    first_trade_id=raw_tid,
+                    last_trade_id=raw_tid,
+                    id_domain="trade",
+                )
+            )
+
+        out.sort(key=lambda t: (t.ts_ms, t.agg_id))
+        return out
 
     def query_trades_minmax(
         self,

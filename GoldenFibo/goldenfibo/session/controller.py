@@ -255,7 +255,13 @@ class SessionController:
         self.trade_store.handoff_status = "backfilling"
         self.trade_store.backfill_complete = False
         try:
-            cached = self.aggtrade_cache.query_trades_range(self.market, self.symbol, start_ms, end_ms)
+            cached = await asyncio.to_thread(
+                self.aggtrade_cache.query_trades_range,
+                self.market,
+                self.symbol,
+                start_ms,
+                end_ms,
+            )
             if cached:
                 self.trade_store.apply_rest_backfill(
                     cached, requested_start_ms=start_ms, requested_end_ms=end_ms
@@ -280,7 +286,13 @@ class SessionController:
             for row in buf:
                 self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, row)
                 self.trade_store.ingest_ws_message(row)
-            persisted = self.aggtrade_cache.query_trades_range(self.market, self.symbol, start_ms, end_ms)
+            persisted = await asyncio.to_thread(
+                self.aggtrade_cache.query_trades_range,
+                self.market,
+                self.symbol,
+                start_ms,
+                end_ms,
+            )
             self.trade_store.apply_rest_backfill(
                 persisted, requested_start_ms=start_ms, requested_end_ms=end_ms
             )
