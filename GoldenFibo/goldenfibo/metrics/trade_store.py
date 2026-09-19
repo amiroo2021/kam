@@ -34,9 +34,13 @@ STATUS_INCOMPLETE = INCOMPLETE_TRADE_HISTORY
 
 @dataclass
 class MetricDisplay:
-    """Authoritative metric fields for chart/API (null values when not authoritative)."""
+    """Displayed metric fields plus per-window source/status metadata."""
 
     source: str
+    ladder_metric_source: str = SOURCE_OHLC
+    step_metric_source: str = SOURCE_OHLC
+    ladder_aggtrade_status: str = STATUS_LOADING
+    step_aggtrade_status: str = STATUS_LOADING
     ladder_vwap: Optional[float] = None
     step_vwap: Optional[float] = None
     ladder_poc: Optional[float] = None
@@ -70,6 +74,10 @@ class MetricDisplay:
 
         return {
             "metric_source": self.source,
+            "ladder_metric_source": self.ladder_metric_source,
+            "step_metric_source": self.step_metric_source,
+            "ladder_aggtrade_status": self.ladder_aggtrade_status,
+            "step_aggtrade_status": self.step_aggtrade_status,
             "ladder_vwap": status_or_value(self.ladder_status, self.ladder_vwap),
             "active_step_vwap": status_or_value(self.step_status, self.step_vwap),
             "ladder_poc": status_or_value(self.ladder_status, self.ladder_poc),
@@ -309,6 +317,10 @@ class TradeMetricStore:
         if self.ladder_start_ms is None:
             return MetricDisplay(
                 source=SOURCE_AGGTRADE,
+                ladder_metric_source=SOURCE_OHLC,
+                step_metric_source=SOURCE_OHLC,
+                ladder_aggtrade_status=STATUS_LOADING,
+                step_aggtrade_status=STATUS_LOADING,
                 ladder_status=STATUS_LOADING,
                 step_status=STATUS_LOADING,
                 handoff_status=self.handoff_status,
@@ -348,7 +360,11 @@ class TradeMetricStore:
                 scnt = sum(1 for t in trades if int(t.ts_ms) >= step_start)
 
         return MetricDisplay(
-            source=SOURCE_AGGTRADE,
+            source=SOURCE_AGGTRADE if (ladder_ok or step_ok) else SOURCE_OHLC,
+            ladder_metric_source=SOURCE_AGGTRADE if ladder_ok else SOURCE_OHLC,
+            step_metric_source=SOURCE_AGGTRADE if step_ok else SOURCE_OHLC,
+            ladder_aggtrade_status=ladder_st,
+            step_aggtrade_status=step_st,
             ladder_vwap=lv,
             step_vwap=sv,
             ladder_poc=lp,

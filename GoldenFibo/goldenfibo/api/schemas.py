@@ -167,8 +167,11 @@ def build_state_payload(
     ladder_ts = st.legs[0].ts_ms if st.legs else None
     step_ts = st.legs[-1].ts_ms if st.legs else None
 
-    if prefer_aggtrade and metric_display is not None:
+    if metric_display is not None and prefer_aggtrade:
         md = metric_display
+        if md.source == SOURCE_AGGTRADE and (md.ladder_metric_source == SOURCE_OHLC or md.step_metric_source == SOURCE_OHLC):
+            # Controller already selected OHLC fallback for some windows; keep those values visible.
+            pass
     else:
         md = ohlc_metric_display(bars, ladder_ts=ladder_ts, step_ts=step_ts)
 

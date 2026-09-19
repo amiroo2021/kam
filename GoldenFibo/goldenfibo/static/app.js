@@ -339,17 +339,19 @@
     if (!Number.isFinite(t0)) return;
 
     const src = msg.metric_source || "OHLC_APPROXIMATION";
+    const ladderSrc = msg.ladder_metric_source || src;
+    const stepSrc = msg.step_metric_source || src;
     const ladderSt = msg.ladder_metric_status || (msg.ladder_poc != null ? "COMPLETE" : "loading");
     const stepSt = msg.step_metric_status || (msg.active_step_poc != null ? "COMPLETE" : "loading");
 
     const specs = [
-      { key: "ladder_vwap", title: "L-VWAP", color: "#f2c500", dashed: false, status: ladderSt },
-      { key: "active_step_vwap", title: "S-VWAP", color: "#f2c500", dashed: true, status: stepSt },
-      { key: "ladder_poc", title: "L-POC", color: "#eceff1", dashed: false, status: ladderSt },
-      { key: "active_step_poc", title: "S-POC", color: "#eceff1", dashed: true, status: stepSt },
+      { key: "ladder_vwap", title: `L-VWAP · ${ladderSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#f2c500", dashed: false, status: ladderSt },
+      { key: "active_step_vwap", title: `S-VWAP · ${stepSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#f2c500", dashed: true, status: stepSt },
+      { key: "ladder_poc", title: `L-POC · ${ladderSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#eceff1", dashed: false, status: ladderSt },
+      { key: "active_step_poc", title: `S-POC · ${stepSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#eceff1", dashed: true, status: stepSt },
       // Single VAH/VAL = whole ladder P0→now (same profile as L-POC); never step VA
-      { key: "ladder_val", title: "VAL", color: "#7e57c2", dashed: true, status: ladderSt },
-      { key: "ladder_vah", title: "VAH", color: "#7e57c2", dashed: true, status: ladderSt },
+      { key: "ladder_val", title: `VAL · ${ladderSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#7e57c2", dashed: true, status: ladderSt },
+      { key: "ladder_vah", title: `VAH · ${ladderSrc === "AGGTRADE" ? "AGG" : "OHLC"}`, color: "#7e57c2", dashed: true, status: ladderSt },
     ];
 
     // Dedupe equal L/S VWAP and L/S POC for readability
@@ -436,8 +438,8 @@
     if (msg.ambiguity_count != null && hudAmb) hudAmb.textContent = String(msg.ambiguity_count);
     if (msg.note_historical && histNote) {
       const src = msg.metric_source ? ` · metrics ${msg.metric_source}` : "";
-      const ls = msg.ladder_metric_status ? ` · L-POC ${msg.ladder_metric_status === "COMPLETE" ? format2(msg.ladder_poc) : msg.ladder_metric_status}` : "";
-      const ss = msg.step_metric_status ? ` · S-POC ${msg.step_metric_status === "COMPLETE" ? format2(msg.active_step_poc) : msg.step_metric_status}` : "";
+      const ls = msg.ladder_metric_source ? ` · L-POC ${msg.ladder_metric_source === "AGGTRADE" ? format2(msg.ladder_poc) : format2(msg.ladder_poc)} (${msg.ladder_metric_source === "AGGTRADE" ? "AGG" : "OHLC"})` : "";
+      const ss = msg.step_metric_source ? ` · S-POC ${msg.step_metric_source === "AGGTRADE" ? format2(msg.active_step_poc) : format2(msg.active_step_poc)} (${msg.step_metric_source === "AGGTRADE" ? "AGG" : "OHLC"})` : "";
       histNote.textContent = msg.note_historical + src + ls + ss;
     }
   }

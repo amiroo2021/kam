@@ -140,7 +140,6 @@ class SessionController:
 
     def snapshot_dict(self) -> Dict[str, Any]:
         prefer = self._prefer_aggtrade_metrics()
-        md = self.trade_store.compute(now_ms=int(time.time() * 1000)) if prefer else None
         payload = schemas.build_state_payload(
             mode=self.mode.value,
             symbol=self.symbol,
@@ -162,8 +161,8 @@ class SessionController:
                 SessionPhase.CATCHING_UP,
             )
             or self.feed_status in ("live", "seeded", "buffering"),
-            metric_display=md,
-            prefer_aggtrade=prefer,
+            metric_display=None,
+            prefer_aggtrade=False,
         )
         payload.update(
             {
@@ -189,6 +188,8 @@ class SessionController:
                 ),
             }
         )
+        if prefer:
+            payload.update(self._metric_fragment())
         return payload
 
     def _prefer_aggtrade_metrics(self) -> bool:
@@ -277,21 +278,48 @@ class SessionController:
             await self.broadcast_snapshot()
 
     def _metric_fragment(self) -> Dict[str, Any]:
-        from ..metrics import fmt_metric
-
+        st = self.engine.state
+        ohlc_md = schemas.ohlc_metric_display(
+            self.bars,
+            ladder_ts=st.legs[0].ts_ms if st.legs else None,
+            step_ts=st.legs[-1].ts_ms if st.legs else None,
+        )
+        ohlc_fields = ohlc_md.as_payload_fields()
         if not self._prefer_aggtrade_metrics():
-            st = self.engine.state
-            md = schemas.ohlc_metric_display(
-                self.bars,
-                ladder_ts=st.legs[0].ts_ms if st.legs else None,
-                step_ts=st.legs[-1].ts_ms if st.legs else None,
-            )
-            fields = md.as_payload_fields()
-            fields["ladder_val"] = fmt_metric(md.ladder_val)
-            fields["ladder_vah"] = fmt_metric(md.ladder_vah)
-            return fields
-        md = self.trade_store.compute(now_ms=int(time.time() * 1000))
-        return md.as_payload_fields()
+            # Historical / BACKTEST / REPLAY: use canonical OHLC display exactly as before.
+            return ohlc_fields
+
+        live_md = self.trade_store.compute(now_ms=int(time.time() * 1000))
+        live_fields = live_md.as_payload_fields()
+
+        def choose(key: str, source_key: str, status_key: str, agg_status_key: str):
+            # Prefer complete aggTrade; otherwise preserve visible OHLC approximation.
+            if live_fields.get(status_key) == "COMPLETE" and live_fields.get(key) is not None:
+                ohlc_fields[key] = live_fields[key]
+                ohlc_fields[source_key] = "AGGTRADE"
+                ohlc_fields[status_key] = "COMPLETE"
+                ohlc_fields[agg_status_key] = live_fields.get(agg_status_key, "COMPLETE")
+            else:
+                ohlc_fields[source_key] = "OHLC_APPROXIMATION"
+                ohlc_fields[status_key] = "COMPLETE"
+                ohlc_fields[agg_status_key] = live_fields.get(agg_status_key, "INCOMPLETE_TRADE_HISTORY")
+
+        # Ladder window: VWAP/POC/VAL/VAH. Step window: VWAP/POC only.
+        choose("ladder_vwap", "ladder_metric_source", "ladder_metric_status", "ladder_aggtrade_status")
+        choose("ladder_poc", "ladder_metric_source", "ladder_metric_status", "ladder_aggtrade_status")
+        choose("ladder_val", "ladder_metric_source", "ladder_metric_status", "ladder_aggtrade_status")
+        choose("ladder_vah", "ladder_metric_source", "ladder_metric_status", "ladder_aggtrade_status")
+        choose("active_step_vwap", "step_metric_source", "step_metric_status", "step_aggtrade_status")
+        choose("active_step_poc", "step_metric_source", "step_metric_status", "step_aggtrade_status")
+        ohlc_fields["metric_source"] = "OHLC_APPROXIMATION" if ohlc_fields.get("ladder_metric_source") == "OHLC_APPROXIMATION" and ohlc_fields.get("step_metric_source") == "OHLC_APPROXIMATION" else "AGGTRADE"
+        ohlc_fields["metrics_handoff_status"] = live_fields.get("metrics_handoff_status", self.trade_store.handoff_status)
+        ohlc_fields["metrics_gap_count"] = live_fields.get("metrics_gap_count", 0)
+        ohlc_fields["ladder_trade_count"] = live_fields.get("ladder_trade_count", 0)
+        ohlc_fields["step_trade_count"] = live_fields.get("step_trade_count", 0)
+        ohlc_fields["ladder_total_qty"] = live_fields.get("ladder_total_qty", 0.0)
+        ohlc_fields["step_total_qty"] = live_fields.get("step_total_qty", 0.0)
+        ohlc_fields["metrics_detail"] = live_fields.get("metrics_detail", ohlc_fields.get("metrics_detail", "OHLC approximation"))
+        return ohlc_fields
 
     async def stop(self) -> None:
         self._stop.set()
