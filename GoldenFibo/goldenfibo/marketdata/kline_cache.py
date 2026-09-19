@@ -29,7 +29,7 @@ from .timeframes import interval_ms, validate_interval
 
 FetchFn = Callable[[str], list]
 
-DEFAULT_CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "binance_klines.sqlite"
+DEFAULT_CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "backtest_klines.sqlite"
 SOURCE = "binance"
 MARKET_SPOT = "spot"
 
