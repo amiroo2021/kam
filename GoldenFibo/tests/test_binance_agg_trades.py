@@ -3,6 +3,40 @@
 from __future__ import annotations
 
 from goldenfibo.marketdata.binance_agg_trades import fetch_agg_trades_range, parse_agg_trade_row
+from goldenfibo.marketdata.binance_agg_trades import BINANCE_SPOT_REST, BINANCE_USDM_REST
+from goldenfibo.marketdata.binance_agg_trades import fetch_agg_trades_page
+
+
+def test_fetch_agg_trades_range_uses_spot_endpoint_by_default(monkeypatch):
+    seen = {}
+    def fake_page(symbol, **kwargs):
+        seen.update(kwargs)
+        return []
+    out = fetch_agg_trades_range("BTCUSDT", 1, 2, fetch_page=fake_page, pause_s=0.0)
+    assert out == []
+    assert seen["base_url"] == BINANCE_SPOT_REST
+    assert seen["path"] == "/api/v3/aggTrades"
+
+
+def test_fetch_agg_trades_range_uses_usdm_futures_endpoint(monkeypatch):
+    seen = {}
+    def fake_page(symbol, **kwargs):
+        seen.update(kwargs)
+        return []
+    out = fetch_agg_trades_range("HYPEUSDT", 1, 2, market="futures", fetch_page=fake_page, pause_s=0.0)
+    assert out == []
+    assert seen["base_url"] == BINANCE_USDM_REST
+    assert seen["path"] == "/fapi/v1/aggTrades"
+
+
+def test_fetch_agg_trades_range_does_not_silently_fallback_to_spot_for_futures(monkeypatch):
+    seen = {}
+    def fake_page(symbol, **kwargs):
+        seen.update(kwargs)
+        return []
+    fetch_agg_trades_range("HYPEUSDT", 1, 2, market="futures", fetch_page=fake_page, pause_s=0.0)
+    assert seen["base_url"] != BINANCE_SPOT_REST
+    assert seen["path"] != "/api/v3/aggTrades"
 from goldenfibo.metrics.trade_vap import AggTrade
 
 

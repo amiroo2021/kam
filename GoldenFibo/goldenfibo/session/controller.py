@@ -16,6 +16,7 @@ from ..engine.engine import GoldenFiboEngine
 from ..engine.events import DomainEvent, MarketEvent, MarketEventKind
 from ..live.price_path import apply_price_to_engine
 from ..marketdata import binance_public as bn
+from ..marketdata.aggtrade_cache import AggTradeCache
 from ..marketdata.symbols import canonical_binance_symbol
 from ..marketdata.binance_klines_range import inclusive_open_range_fetch_end
 from ..marketdata.kline_cache import CachePolicy, CachedBinanceKlineSource, KlineCache, fetch_range_cached
@@ -28,6 +29,7 @@ from ..marketdata.timeframes import (
 )
 from ..metrics import OhlcvBar, bar_from_binance_kline
 from ..metrics.trade_store import TradeMetricStore
+from ..marketdata.aggtrade_cache import AggTradeCache
 from ..marketdata.binance_agg_trades import fetch_agg_trades_range
 from .event_log import EventLog
 from .runner import apply_ohlc_page, new_engine_for_run, run_ohlc_on_engine
@@ -92,6 +94,7 @@ class SessionController:
         self.cache_stats: Dict[str, Any] = {}
         self.history_limit_live = 300
         self.trade_store = TradeMetricStore(tick_size=0.01)
+        self.aggtrade_cache = AggTradeCache()
         self._trade_backfill_task: Optional[asyncio.Task] = None
         self._last_metric_broadcast_ms: int = 0
         self._metric_broadcast_min_interval_ms: int = 500
@@ -99,8 +102,9 @@ class SessionController:
         self._agg_trade_buffer: List[Dict[str, Any]] = []
         # Explicit enable for LIVE AGGTRADE metrics (avoids REST in unit tests)
         self._aggtrade_metrics_enabled: bool = False
-        # Injectable fetch for tests
+        # Injectable fetches for tests
         self._agg_trades_fetch = fetch_agg_trades_range
+        self._agg_archive_fetch = self.aggtrade_cache.fetch_archive_range
 
     def register_client(self, ws: Any) -> None:
         self._clients.add(ws)
@@ -250,11 +254,20 @@ class SessionController:
         self.trade_store.handoff_status = "backfilling"
         self.trade_store.backfill_complete = False
         try:
-            trades = await asyncio.to_thread(
-                self._agg_trades_fetch,
+            cached = self.aggtrade_cache.query_trades_range(self.market, self.symbol, start_ms, end_ms)
+            if cached:
+                self.trade_store.apply_rest_backfill(
+                    cached, requested_start_ms=start_ms, requested_end_ms=end_ms
+                )
+            ensure_result = await asyncio.to_thread(
+                self.aggtrade_cache.ensure_coverage,
+                self.market,
                 self.symbol,
                 start_ms,
                 end_ms,
+                rest_fetcher=self._agg_trades_fetch,
+                archive_fetcher=self._agg_archive_fetch,
+                now_ms=end_ms,
                 pause_s=0.03,
             )
             if self._stopped():
@@ -264,11 +277,14 @@ class SessionController:
                 buf = list(self._agg_trade_buffer)
                 self._agg_trade_buffer.clear()
             for row in buf:
+                self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, row)
                 self.trade_store.ingest_ws_message(row)
+            persisted = self.aggtrade_cache.query_trades_range(self.market, self.symbol, start_ms, end_ms)
             self.trade_store.apply_rest_backfill(
-                trades, requested_start_ms=start_ms, requested_end_ms=end_ms
+                persisted, requested_start_ms=start_ms, requested_end_ms=end_ms
             )
-            self.trade_store.mark_ws_attached()
+            if ensure_result.covered:
+                self.trade_store.mark_ws_attached()
             await self.broadcast_snapshot()
         except asyncio.CancelledError:
             raise
@@ -311,7 +327,9 @@ class SessionController:
         choose("ladder_vah", "ladder_metric_source", "ladder_metric_status", "ladder_aggtrade_status")
         choose("active_step_vwap", "step_metric_source", "step_metric_status", "step_aggtrade_status")
         choose("active_step_poc", "step_metric_source", "step_metric_status", "step_aggtrade_status")
-        ohlc_fields["metric_source"] = "OHLC_APPROXIMATION" if ohlc_fields.get("ladder_metric_source") == "OHLC_APPROXIMATION" and ohlc_fields.get("step_metric_source") == "OHLC_APPROXIMATION" else "AGGTRADE"
+        ladder_src = ohlc_fields.get("ladder_metric_source")
+        step_src = ohlc_fields.get("step_metric_source")
+        ohlc_fields["metric_source"] = ladder_src if ladder_src == step_src else "MIXED"
         ohlc_fields["metrics_handoff_status"] = live_fields.get("metrics_handoff_status", self.trade_store.handoff_status)
         ohlc_fields["metrics_gap_count"] = live_fields.get("metrics_gap_count", 0)
         ohlc_fields["ladder_trade_count"] = live_fields.get("ladder_trade_count", 0)
@@ -659,6 +677,7 @@ class SessionController:
                     interval=self.timeframe,
                     start_ms=start,
                     end_ms=now + step,
+                    market=self.market,
                 )
             )
             async with self._lock:
@@ -863,14 +882,17 @@ class SessionController:
                         self._agg_trade_buffer = self._agg_trade_buffer[-30_000:]
                 # Also feed store if windows already set (live seed backfill overlap)
                 if self.trade_store.ladder_start_ms is not None:
+                    self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, data)
                     self.trade_store.ingest_ws_message(data)
                 return
             if not self._live_enabled:
                 if self.trade_store.ladder_start_ms is not None:
+                    self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, data)
                     self.trade_store.ingest_ws_message(data)
                 return
             fence = self.fence_ms or 0
             # Metrics accumulate regardless of fence (fence is for engine path only)
+            self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, data)
             self.trade_store.ingest_ws_message(data)
             if ts_ms < fence:
                 return

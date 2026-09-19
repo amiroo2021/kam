@@ -23,10 +23,21 @@ BINANCE_SPOT_REST = "https://api.binance.com"
 BINANCE_USDM_REST = "https://fapi.binance.com"
 
 
-def _get_json(url: str, *, timeout: float = 30.0) -> object:
+def _get_json(url: str, *, timeout: float = 30.0, max_attempts: int = 8, pause_s: float = 1.0) -> object:
     req = urllib.request.Request(url, headers={"User-Agent": "GoldenFibo/0.2"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 public HTTPS
-        return json.loads(resp.read().decode())
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 public HTTPS
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code != 429 or attempt >= max_attempts:
+                raise
+            time.sleep(pause_s * attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unreachable")
 
 
 def parse_agg_trade_row(row: object) -> AggTrade:
@@ -81,19 +92,19 @@ def fetch_agg_trades_range(
     start_ms: int,
     end_ms: int,
     *,
-    base_url: str = BINANCE_SPOT_REST,
-    path: str = "/api/v3/aggTrades",
+    market: str = "spot",
+    base_url: str | None = None,
+    path: str | None = None,
     limit: int = 1000,
     max_pages: int = 50_000,
     pause_s: float = 0.05,
     timeout: float = 30.0,
     fetch_page: Optional[Callable[..., List[AggTrade]]] = None,
 ) -> List[AggTrade]:
-    """Download all spot aggTrades with T in [start_ms, end_ms] (inclusive).
+    """Download all aggTrades with T in [start_ms, end_ms] (inclusive).
 
-    Strategy:
-      1. First page with startTime=start_ms (and endTime if needed).
-      2. Continue with fromId = last.agg_id + 1 until past end_ms or empty.
+    Spot uses /api/v3/aggTrades; USD-M futures uses /fapi/v1/aggTrades.
+    Pagination continues with fromId = last.agg_id + 1 until past end_ms or empty.
 
     Raises on transport/API errors — does not invent trades.
     """
@@ -101,6 +112,18 @@ def fetch_agg_trades_range(
     end_ms = int(end_ms)
     if end_ms < start_ms:
         return []
+    market_n = str(market or "spot").lower()
+    if market_n in {"futures", "future", "usdm"}:
+        base_url = base_url or BINANCE_USDM_REST
+        path = path or "/fapi/v1/aggTrades"
+        # USD-M futures aggTrades are limited to a recent 2-day search window.
+        two_days_ms = 2 * 24 * 60 * 60 * 1000
+        floor_ms = max(0, end_ms - two_days_ms)
+        if start_ms < floor_ms:
+            start_ms = floor_ms
+    else:
+        base_url = base_url or BINANCE_SPOT_REST
+        path = path or "/api/v3/aggTrades"
     page_fn = fetch_page or fetch_agg_trades_page
     out: List[AggTrade] = []
     seen_ids: set[int] = set()

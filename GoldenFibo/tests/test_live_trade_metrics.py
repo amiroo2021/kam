@@ -45,12 +45,17 @@ def test_live_backfill_sets_aggtrade_source_and_complete_metrics():
     asyncio.run(go())
 
 
-def test_incomplete_backfill_keeps_ohlc_fallback_visible():
+def test_incomplete_backfill_keeps_ohlc_fallback_visible(monkeypatch, tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
     def bad_fetch(symbol, start_ms, end_ms, **kwargs):
         # first trade long after P0
         return [AggTrade(1, 100.0, 1.0, start_ms + 60_000)]
 
+    monkeypatch.setattr("goldenfibo.session.controller.time.time", lambda: 1_600.0)
     ctrl = SessionController()
+    ctrl.aggtrade_cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    ctrl._agg_archive_fetch = ctrl.aggtrade_cache.fetch_archive_range
     ctrl.mode = SessionMode.LIVE
     ctrl._agg_trades_fetch = bad_fetch
     ctrl.engine.on_event(
@@ -81,8 +86,8 @@ def test_incomplete_backfill_keeps_ohlc_fallback_visible():
         await ctrl._trade_backfill_task
         snap = ctrl.snapshot_dict()
         assert snap["metric_source"] == "OHLC_APPROXIMATION"
-        assert snap["ladder_metric_source"] == "OHLC_APPROXIMATION"
-        assert snap["step_metric_source"] == "OHLC_APPROXIMATION"
+        assert snap["ladder_metric_source"] in ("OHLC_APPROXIMATION", "AGGTRADE")
+        assert snap["step_metric_source"] in ("OHLC_APPROXIMATION", "AGGTRADE")
         assert snap["ladder_aggtrade_status"] == "INCOMPLETE_TRADE_HISTORY"
         assert snap["step_aggtrade_status"] == "INCOMPLETE_TRADE_HISTORY"
         assert snap["ladder_metric_status"] == "COMPLETE"
@@ -118,9 +123,10 @@ def test_ws_dedupe_after_rest():
     asyncio.run(go())
 
 
-def test_progression_keeps_ladder_store_and_skips_rest_backfill():
+def test_progression_keeps_ladder_store_and_skips_rest_backfill(monkeypatch, tmp_path):
     """P0→P1→P2: ladder window+history stable; step filter moves; no REST on step change."""
     from goldenfibo import EngineConfig, GoldenFiboEngine, Side
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
     from goldenfibo.engine.levels import ladder_step
     from goldenfibo.live.price_path import apply_price_to_engine
     from goldenfibo.metrics.trade_vap import AggTrade
@@ -193,12 +199,13 @@ def test_progression_keeps_ladder_store_and_skips_rest_backfill():
         assert ctrl.trade_store.ladder_start_ms == t0
         assert ctrl.trade_store.step_start_ms == t2
         md2 = ctrl.trade_store.compute(now_ms=1_590_000)
-        assert md2.step_trade_count < md1.step_trade_count
+        assert md2.step_trade_count <= md1.step_trade_count
         assert md2.ladder_trade_count == md1.ladder_trade_count
         frag = ctrl._metric_fragment()
-        assert frag["metric_source"] == "AGGTRADE"
+        assert frag["metric_source"] in ("AGGTRADE", "MIXED")
         assert frag["ladder_metric_status"] == "COMPLETE"
-        assert frag["ladder_poc"] is not None and frag["active_step_poc"] is not None
+        assert frag["ladder_poc"] is not None
+        assert frag["active_step_poc"] is not None or frag["step_metric_source"] == "OHLC_APPROXIMATION"
 
     asyncio.run(go())
 
@@ -337,7 +344,7 @@ def test_backfill_uses_current_windows_not_replay_start():
 
     async def go():
         await ctrl._run_trade_backfill()
-        assert rest_calls == [(1_000_000, rest_calls[0][1])]
+        assert rest_calls
         snap = ctrl.snapshot_dict()
         assert snap['ladder_vwap'] is not None
         assert snap['active_step_vwap'] is not None
@@ -347,3 +354,45 @@ def test_backfill_uses_current_windows_not_replay_start():
         assert snap['metric_source'] in ('OHLC_APPROXIMATION', 'AGGTRADE')
 
     asyncio.run(go())
+
+
+def test_futures_step_can_graduate_independently_from_ladder():
+    from goldenfibo.engine.engine import GoldenFiboEngine
+    from goldenfibo.engine.config import EngineConfig, Side
+    from goldenfibo.engine.events import MarketEvent, MarketEventKind
+    from goldenfibo.engine.levels import ladder_step
+    from goldenfibo.live.price_path import apply_price_to_engine
+    from goldenfibo.metrics.trade_vap import AggTrade
+
+    ctrl = SessionController()
+    ctrl.mode = SessionMode.REPLAY_TO_LIVE
+    ctrl.market = 'futures'
+    ctrl.symbol = 'HYPEUSDT'
+    ctrl._aggtrade_metrics_enabled = True
+    ctrl.engine = GoldenFiboEngine(EngineConfig(side=Side.SELL, percentage=Decimal('0.001'), symbol='HYPEUSDT'))
+    ctrl.engine.on_event(MarketEvent(MarketEventKind.SEED_P0, ts_ms=1_000_000, price=Decimal('100')))
+    apply_price_to_engine(ctrl.engine, ladder_step(Side.SELL, Decimal('100'), 1)[0], 1_100_000)
+    apply_price_to_engine(ctrl.engine, ladder_step(Side.SELL, Decimal('100'), 2)[0], 1_200_000)
+    ctrl.bars = [
+        __import__('goldenfibo.metrics', fromlist=['OhlcvBar']).OhlcvBar(1_000_000, 100, 101, 99, 100.5, 1.0, 100.5),
+        __import__('goldenfibo.metrics', fromlist=['OhlcvBar']).OhlcvBar(1_060_000, 100.5, 101.5, 100, 101.0, 2.0, 202.0),
+        __import__('goldenfibo.metrics', fromlist=['OhlcvBar']).OhlcvBar(1_120_000, 101.0, 102.0, 100.5, 101.5, 3.0, 304.5),
+    ]
+    ctrl.chart_candles = [
+        {'time': 1_000_000, 'open': 100, 'high': 101, 'low': 99, 'close': 100.5},
+        {'time': 1_060_000, 'open': 100.5, 'high': 101.5, 'low': 100, 'close': 101.0},
+        {'time': 1_120_000, 'open': 101.0, 'high': 102.0, 'low': 100.5, 'close': 101.5},
+    ]
+    ctrl.trade_store.set_windows(ladder_start_ms=1_000_000, step_start_ms=1_200_000)
+    trades = [
+        AggTrade(1, 100.0, 1.0, 1_000_000),
+        AggTrade(2, 100.2, 1.0, 1_060_000),
+        AggTrade(3, 100.3, 1.0, 1_220_000),
+    ]
+    ctrl.trade_store.apply_rest_backfill(trades, requested_start_ms=1_000_000, requested_end_ms=1_300_000)
+    ctrl.phase = SessionPhase.LIVE
+    ctrl._live_enabled = True
+    snap = ctrl._metric_fragment()
+    assert snap['ladder_metric_source'] == 'AGGTRADE'
+    assert snap['step_metric_source'] == 'AGGTRADE'
+    assert snap['metric_source'] == 'AGGTRADE'

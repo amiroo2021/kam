@@ -824,6 +824,7 @@ class CachedBinanceKlineSource:
         on_page: Optional[Callable[[dict], None]] = None,
         policy: Optional[CachePolicy | str] = None,
         on_progress: Optional[Callable[[dict], None]] = None,
+        market: str = MARKET_SPOT,
     ) -> List[list]:
         result = fetch_range_cached(
             symbol,
@@ -837,6 +838,7 @@ class CachedBinanceKlineSource:
             base_url=self.base_url,
             fetch=self.fetch,
             on_progress=on_progress or on_page,
+            market=market,
         )
         self.last_stats = result.stats
         return result.klines

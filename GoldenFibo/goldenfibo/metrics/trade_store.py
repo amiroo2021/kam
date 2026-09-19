@@ -359,10 +359,15 @@ class TradeMetricStore:
                 sqty = sprof.total_volume
                 scnt = sum(1 for t in trades if int(t.ts_ms) >= step_start)
 
+        global_source = SOURCE_AGGTRADE if ladder_ok and step_ok else SOURCE_OHLC
+        if ladder_ok != step_ok:
+            global_source = "MIXED"
+        ladder_metric_source = SOURCE_AGGTRADE if ladder_ok else SOURCE_OHLC
+        step_metric_source = SOURCE_AGGTRADE if step_ok else SOURCE_OHLC
         return MetricDisplay(
-            source=SOURCE_AGGTRADE if (ladder_ok or step_ok) else SOURCE_OHLC,
-            ladder_metric_source=SOURCE_AGGTRADE if ladder_ok else SOURCE_OHLC,
-            step_metric_source=SOURCE_AGGTRADE if step_ok else SOURCE_OHLC,
+            source=global_source,
+            ladder_metric_source=ladder_metric_source,
+            step_metric_source=step_metric_source,
             ladder_aggtrade_status=ladder_st,
             step_aggtrade_status=step_st,
             ladder_vwap=lv,
