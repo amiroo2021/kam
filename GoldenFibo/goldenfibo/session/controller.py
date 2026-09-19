@@ -31,6 +31,10 @@ from ..metrics import OhlcvBar, bar_from_binance_kline
 from ..metrics.trade_store import TradeMetricStore
 from ..marketdata.aggtrade_cache import AggTradeCache
 from ..marketdata.binance_agg_trades import fetch_agg_trades_range
+from ..metrics.backfill_scheduler import (
+    DesiredWindow,
+    LatestWinsScheduler,
+)
 from .event_log import EventLog
 from .runner import apply_ohlc_page, new_engine_for_run, run_ohlc_on_engine
 from .types import SessionMode, SessionPhase
@@ -106,6 +110,14 @@ class SessionController:
         # Injectable fetches for tests
         self._agg_trades_fetch = fetch_agg_trades_range
         self._agg_archive_fetch = self.aggtrade_cache.fetch_archive_range
+        # Latest-wins/coalescing backfill scheduler. Built lazily on first
+        # use so that ``self._stream_backfill_for_request`` (a bound method)
+        # is available when the worker closure is constructed.
+        self._backfill_scheduler: Optional[LatestWinsScheduler] = None
+        # Counter for tracked number of streaming backfill requests via
+        # the scheduler (kept for compatibility with existing tests that
+        # read controller state).
+        self._stream_gen_token: Optional[Tuple[Any, ...]] = None
 
     def register_client(self, ws: Any) -> None:
         self._clients.add(ws)
@@ -211,12 +223,45 @@ class SessionController:
             return True
         return False
 
-    def _sync_trade_windows_from_engine(self, *, schedule_backfill: bool = False) -> bool:
-        """Update trade-store windows from engine legs.
+    def _current_engine_window(self) -> Optional[DesiredWindow]:
+        return self._build_desired_window_from_engine(kind="full")
 
-        Returns True if ladder P0 start advanced (new cycle).
-        REST backfill is scheduled only when ``schedule_backfill`` is True or
-        when a mid-session TP advances P0 while LIVE metrics are preferred.
+    def _installed_streamed_window(self) -> Optional[DesiredWindow]:
+        identity = self.trade_store.streamed_identity()
+        if identity is None:
+            return None
+        market, symbol, ladder_start_ms, step_start_ms, endpoint_ts_ms = identity
+        return DesiredWindow(
+            market=str(market),
+            symbol=str(symbol),
+            ladder_start_ms=int(ladder_start_ms),
+            step_start_ms=int(step_start_ms),
+            endpoint_ts_ms=int(endpoint_ts_ms),
+            session_id=str(self.run_id) if self.run_id else "unknown",
+        )
+
+    def _request_kind_for_window(self, latest: Optional[DesiredWindow], installed: Optional[DesiredWindow]) -> Optional[str]:
+        if latest is None:
+            return None
+        if installed is not None:
+            same_session = latest.session_id == installed.session_id
+            same_market = latest.market == installed.market
+            same_symbol = latest.symbol == installed.symbol
+            same_ladder = latest.ladder_start_ms == installed.ladder_start_ms
+            same_step = latest.step_start_ms == installed.step_start_ms
+            if same_session and same_market and same_symbol and same_ladder and same_step:
+                return None
+            if same_session and same_market and same_symbol and same_ladder:
+                return "step"
+        return "full"
+
+    def _sync_trade_windows_from_engine(self, *, schedule_backfill: bool = False) -> bool:
+        """Update trade-store windows from engine legs and request backfill.
+
+        FULL is requested when the current installed streamed identity is
+        absent or diverges in market, symbol, ladder, or session. STEP_ONLY
+        is requested only when the same session/market/symbol/ladder is
+        installed and only step_start moved forward.
         """
         st = self.engine.state
         if not st.legs:
@@ -224,120 +269,354 @@ class SessionController:
         ladder = int(st.legs[0].ts_ms)
         step = int(st.legs[-1].ts_ms)
         prev_ladder = self.trade_store.ladder_start_ms
+        prev_step = self.trade_store.step_start_ms
         new_p0 = prev_ladder is None or ladder > int(prev_ladder)
+        new_step = prev_step is None or step > int(prev_step)
         self.trade_store.set_windows(ladder_start_ms=ladder, step_start_ms=step)
         if not self._prefer_aggtrade_metrics():
             return new_p0
-        if schedule_backfill and new_p0:
-            self._schedule_trade_backfill()
-        elif new_p0 and prev_ladder is not None:
-            # TP / new cycle while already live — must re-backfill new P0 window
-            self._schedule_trade_backfill()
+        latest = self._current_engine_window()
+        installed = self._installed_streamed_window()
+        kind = self._request_kind_for_window(latest, installed)
+        if kind is None:
+            return new_p0
+        if schedule_backfill and kind == "full":
+            self._request_backfill_now(kind="full")
+            return new_p0
+        if kind == "step" and new_step:
+            self._request_backfill_now(kind="step")
+            return new_p0
+        if kind == "full" and (new_p0 or installed is None or not self.trade_store.has_streaming_snapshot()):
+            self._request_backfill_now(kind="full")
+            return new_p0
         return new_p0
 
-    def _schedule_trade_backfill(self) -> None:
-        if self._trade_backfill_task and not self._trade_backfill_task.done():
-            self._trade_backfill_task.cancel()
-        self._trade_backfill_task = asyncio.create_task(
-            self._run_trade_backfill(), name="gf-aggtrade-backfill"
+    async def _drive_scheduled_backfill(self, request: DesiredWindow, *, kind: str) -> None:
+        scheduler = self._get_backfill_scheduler()
+        await scheduler.request_window(request, kind=kind)
+        await scheduler.wait_idle()
+
+    def _request_backfill_now(self, *, kind: str) -> None:
+        """Liveness helper: ask the scheduler to rebuild for current window.
+
+        The controller keeps a task handle so existing run paths can wait
+        for backfill convergence in tests and during startup.
+        """
+        request = self._build_desired_window_from_engine(kind=kind)
+        if request is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            asyncio.run(self._stream_backfill_for_request(request))
+            return
+        self._trade_backfill_task = loop.create_task(
+            self._drive_scheduled_backfill(request, kind=kind),
+            name="gf-trade-backfill",
         )
 
+    async def _request_backfill_now_async(self, *, kind: str) -> None:
+        """Async variant of ``_request_backfill_now``.
+
+        Used from live price paths where a coroutine is already
+        running and we can simply ``await`` the scheduler.
+        """
+        request = self._build_desired_window_from_engine(kind=kind)
+        if request is None:
+            return
+        scheduler = self._get_backfill_scheduler()
+        await scheduler.request_window(request, kind=kind)
+
+    def _schedule_trade_backfill(self) -> None:
+        """Schedule a backfill for the current engine window.
+
+        Delegates to the latest-wins scheduler. The scheduler enforces:
+
+        - At most one worker in flight at any time (coalescing all
+          intermediate window changes into the latest pending request).
+        - P0 transitions supersede any pending step-only work.
+        - Step-only transitions preserve the existing valid ladder
+          accumulator.
+
+        This method is fire-and-forget; it does not block the caller.
+        The full orchestrator (gen_token check, apply_streaming_backfill,
+        catchup_from_persistent) lives inside the worker coroutine and
+        runs on a thread via ``asyncio.to_thread``. Stale-worker
+        rejection (invariant #1) is preserved there.
+        """
+        request = self._build_desired_window_from_engine(kind="full")
+        if request is None:
+            return
+        scheduler = self._get_backfill_scheduler()
+        # Fire-and-forget: launch the coroutine on the running loop.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # No loop: caller is sync. Fall back to a direct worker call.
+            asyncio.run(self._stream_backfill_for_request(request))
+            return
+        loop.create_task(scheduler.request_window(request, kind="full"))
+
     async def _run_trade_backfill(self) -> None:
+        """Worker coroutine invoked by the latest-wins scheduler.
+
+        Each invocation is tied to a captured DesiredWindow (see
+        ``self._build_desired_window_from_engine``). The worker streams
+        the current ladder/step window from the persistent cache up to
+        the captured endpoint and atomically installs. After every
+        worker outcome (success, stale, or failure) the liveness
+        invariant requires the controller to call
+        ``scheduler.reevaluate_after_worker(...)``.
+
+        Strict stale-worker protection (invariant #1) lives here:
+        ``apply_streaming_backfill`` will silently no-op if the
+        trade_store's installed identity no longer matches the
+        request; we then drop the accumulator without re-using it.
+        """
+        # Backwards-compat: if invoked directly (not via the scheduler),
+        # derive a DesiredWindow from the engine state, run, then exit.
         st = self.engine.state
         if not st.legs:
             return
-        start_ms = int(st.legs[0].ts_ms)
-        end_ms = int(time.time() * 1000)
+        request = self._build_desired_window_from_engine(kind="full")
+        if request is None:
+            return
+        await self._stream_backfill_for_request(request)
+
+    def _build_desired_window_from_engine(
+        self, *, kind: str = "full"
+    ) -> Optional[DesiredWindow]:
+        """Build a DesiredWindow from the current engine state.
+
+        Returns ``None`` if the engine has no legs yet (no cycle seeded).
+        Uses ``self.run_id`` as the session id; this is set during
+        ``start_run`` and changes on every new session, ensuring
+        inv11 (session invalidation works correctly).
+        """
+        st = self.engine.state
+        if not st.legs:
+            return None
+        ladder = int(st.legs[0].ts_ms)
+        step = int(st.legs[-1].ts_ms)
+        endpoint_ms = int(time.time() * 1000)
+        return DesiredWindow(
+            market=str(self.market),
+            symbol=str(self.symbol),
+            ladder_start_ms=ladder,
+            step_start_ms=step,
+            endpoint_ts_ms=endpoint_ms,
+            session_id=str(self.run_id) if self.run_id else "unknown",
+        )
+
+    def _get_backfill_scheduler(self) -> LatestWinsScheduler:
+        """Lazily build the latest-wins scheduler."""
+        sched = self._backfill_scheduler
+        if sched is not None:
+            return sched
+        sched = LatestWinsScheduler(
+            worker_fn=self._scheduler_worker_fn,
+            on_idle=self._scheduler_on_idle,
+        )
+        self._backfill_scheduler = sched
+        return sched
+
+    async def _scheduler_worker_fn(self, request: DesiredWindow) -> None:
+        """Bound worker coroutine invoked by the scheduler.
+
+        Runs ensure_coverage, the streaming pass, install (or
+        stale-rejection), and the persistent catch-up — exactly the
+        same logic as the legacy ``_run_trade_backfill`` but driven
+        by a captured ``DesiredWindow`` rather than the live engine
+        state.
+        """
+        try:
+            await self._stream_backfill_for_request(request)
+        except Exception as exc:
+            logger.warning("backfill worker failed: %s", exc)
+
+    async def _scheduler_on_idle(self) -> None:
+        """Called by the scheduler when it has no work to do.
+
+        Triggers a metric fragment broadcast so the UI sees the latest
+        state when churn stops. This keeps the displayed source in
+        sync with what the trade_store holds.
+        """
+        # No-op in tests; in production the broadcast is owned by the
+        # session loop. We only touch this from the liveness invariant
+        # path; broadcast happens via _apply_live_price on the next
+        # tick.
+        return None
+
+    async def _stream_backfill_for_request(self, request: DesiredWindow) -> None:
+        """Run the streaming backfill for a captured DesiredWindow.
+
+        - Lazily ensures coverage from the cache (REST 2-day window +
+          archive; existing semantics — invariant preserved).
+        - Streams deduped trades via iter_deduped_trades_range over
+          ``[request.ladder_start_ms, request.endpoint_ts_ms]`` (full)
+          or ``[request.step_start_ms, request.endpoint_ts_ms]``
+          (step-only). The persistent cache is the authoritative
+          source; no in-memory live buffer is reintroduced.
+        - Captures a ``gen_token`` from the captured request (NOT
+          the live engine state — that would defeat the whole
+          point of scheduling).
+        - Calls ``apply_streaming_backfill`` which enforces a strict
+          5-tuple identity check and silently rejects any
+          window-mismatched accumulator. Stale rejection is the
+          source of the liveness loop.
+        - On stale reject, drops the accumulator without
+          ``catchup_from_persistent`` (because that would smear the
+          wrong-window trades in).
+        - Calls ``scheduler.reevaluate_after_worker(...)`` once to
+          satisfy the liveness invariant (max 1 worker, latest wins,
+          coalescing preserved).
+        """
+        if self._stopped():
+            return
+        ladder_start_ms = int(request.ladder_start_ms)
+        step_start_ms = int(request.step_start_ms)
+        endpoint_ms = int(request.endpoint_ts_ms)
+        installed_identity = self._installed_streamed_window()
+        full_rebuild = (
+            ladder_start_ms == step_start_ms
+            or self.trade_store._streamed_acc is None
+            or installed_identity is None
+            or installed_identity.session_id != request.session_id
+            or installed_identity.market != request.market
+            or installed_identity.symbol != request.symbol
+            or installed_identity.ladder_start_ms != ladder_start_ms
+        )
+        start_ms = ladder_start_ms if full_rebuild else step_start_ms
+        # Capture identity used for stale-worker protection. This is
+        # the captured-request identity, NOT the live engine state.
+        # The apply_streaming_backfill method enforces strict
+        # 5-tuple matching against trade_store.{market,symbol,
+        # ladder_start_ms,step_start_ms}.
+        gen_token = (
+            str(request.market),
+            str(request.symbol),
+            ladder_start_ms,
+            step_start_ms,
+            endpoint_ms,
+        )
+        self._stream_gen_token = gen_token
+        # Pre-sync trade_store windows so apply_streaming_backfill has
+        # something to match against. Existing full-rebuild code path
+        # uses set_windows here; step-only path leaves ladder_start
+        # unchanged.
+        self.trade_store.market = request.market
+        self.trade_store.symbol = request.symbol
         self.trade_store.set_windows(
-            ladder_start_ms=start_ms,
-            step_start_ms=int(st.legs[-1].ts_ms),
+            ladder_start_ms=ladder_start_ms,
+            step_start_ms=step_start_ms,
         )
         self.trade_store.handoff_status = "backfilling"
         self.trade_store.backfill_complete = False
         try:
-            # Streaming path: pull rows from the cache, accumulate VWAP/VAP
-            # in-place for ladder + step windows without materializing a
-            # full 1.8M-element Python list. The streaming computation also
-            # feeds apply_rest_backfill with a small pre-stream sample only,
-            # so the existing path keeps working with the small datasets that
-            # unit tests / non-production paths already exercise.
             ensure_result = await asyncio.to_thread(
                 self.aggtrade_cache.ensure_coverage,
-                self.market,
-                self.symbol,
+                request.market,
+                request.symbol,
                 start_ms,
-                end_ms,
+                endpoint_ms,
                 rest_fetcher=self._agg_trades_fetch,
                 archive_fetcher=self._agg_archive_fetch,
-                now_ms=end_ms,
+                now_ms=endpoint_ms,
                 pause_s=0.03,
             )
             if self._stopped():
                 return
-            # Merge any WS buffer trades collected during backfill
-            async with self._lock:
-                buf = list(self._agg_trade_buffer)
-                self._agg_trade_buffer.clear()
-            for row in buf:
-                self.aggtrade_cache.ingest_ws_message(self.market, self.symbol, row)
-                self.trade_store.ingest_ws_message(row)
-
-            # Persist market/symbol on the trade store so identity checks work.
-            self.trade_store.market = self.market
-            self.trade_store.symbol = self.symbol
-            # Capture backfill start time as the immutable endpoint. Trades
-            # arriving after this moment are caught up via persistent cache
-            # after install — no in-memory buffer can ever lose data.
-            endpoint_ms = int(time.time() * 1000)
-            # Generate a token for stale-worker protection.
-            gen_token = (
-                self.market,
-                self.symbol,
-                int(st.legs[0].ts_ms),
-                int(st.legs[-1].ts_ms),
-                int(endpoint_ms),
-            )
-            self._stream_gen_token = gen_token
-            streamed = await asyncio.to_thread(self._stream_metric_backfill, start_ms, endpoint_ms)
-            if self._stopped():
-                return
             if ensure_result.covered:
                 self.trade_store.mark_ws_attached()
-            # Stale-worker protection: if window moved during streaming, discard.
-            cur_token = (
-                self.market,
-                self.symbol,
-                int(self.trade_store.ladder_start_ms) if self.trade_store.ladder_start_ms else 0,
-                int(self.trade_store.step_start_ms) if self.trade_store.step_start_ms else 0,
-                int(endpoint_ms),
-            )
-            if cur_token[0:4] != gen_token[0:4]:
-                return
-            self.trade_store.apply_streaming_backfill(
-                streamed,
-                market=self.market,
-                symbol=self.symbol,
-                ladder_start_ms=int(start_ms),
-                step_start_ms=int(st.legs[-1].ts_ms),
-                endpoint_ts_ms=int(endpoint_ms),
-            )
-            # Lossless catch-up: pull any trades persisted into SQLite
-            # between endpoint_ms and now via (ts, agg_trade_id) keyset.
-            # Authoritative source is the persistent cache, not any
-            # in-memory buffer.
+            latest_before_install = self._current_engine_window()
+            installed_before_install = self._installed_streamed_window()
+            # Streaming pass: ladder+step or step-only depending on the
+            # request kind. The streaming internal pass already dedupes
+            # via the cache iterator; _stream_metric_backfill runs the
+            # full-ladder variant. Step-only re-stream delegates to
+            # trade_store.reconcile_step_window which preserves the
+            # installed ladder accumulator.
+            if full_rebuild:
+                # Treat as full rebuild (the original cycle anchor).
+                streamed = await asyncio.to_thread(
+                    self._stream_metric_backfill,
+                    ladder_start_ms,
+                    endpoint_ms,
+                )
+                if self._stopped():
+                    return
+                latest_now = self._current_engine_window()
+                if latest_now is None or latest_now.session_id != request.session_id:
+                    return
+                if (
+                    latest_before_install is not None
+                    and latest_now is not None
+                    and latest_before_install.same_identity(latest_now)
+                    is False
+                    and latest_now.same_identity(request) is False
+                ):
+                    return
+                self.trade_store.apply_streaming_backfill(
+                    streamed,
+                    market=request.market,
+                    symbol=request.symbol,
+                    ladder_start_ms=start_ms,
+                    step_start_ms=step_start_ms,
+                    endpoint_ts_ms=endpoint_ms,
+                )
+            else:
+                # Step-only re-stream: preserves the valid ladder
+                # accumulator. reconcile_step_window returns False if
+                # no snapshot is installed yet (worker should fall back
+                # to a full rebuild by re-requesting via the
+                # scheduler's reevaluate path).
+                latest_now = self._current_engine_window()
+                if latest_now is None or latest_now.session_id != request.session_id:
+                    return
+                if (
+                    latest_now.market != request.market
+                    or latest_now.symbol != request.symbol
+                    or latest_now.ladder_start_ms != request.ladder_start_ms
+                    or latest_now.step_start_ms != request.step_start_ms
+                ):
+                    return
+                ok = await asyncio.to_thread(
+                    self.trade_store.reconcile_step_window,
+                    self.aggtrade_cache,
+                    new_step_start_ms=step_start_ms,
+                    endpoint_ts_ms=endpoint_ms,
+                )
+                if not ok:
+                    pass
+            # Lossless catch-up: pull anything persisted into SQLite
+            # between endpoint_ms and now via (ts, storage_id) keyset.
+            # The persistent cache is the authoritative source; no
+            # in-memory buffer is reintroduced.
             catchup_now = int(time.time() * 1000)
             await asyncio.to_thread(
                 self.trade_store.catchup_from_persistent,
                 self.aggtrade_cache,
                 max_ts_ms=catchup_now,
             )
-            await self.broadcast_snapshot()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("aggTrade backfill failed: %s", exc)
-            self.trade_store.note_backfill_failure(str(exc))
-            await self.broadcast_snapshot()
+            logger.warning("aggTrade backfill worker failed: %s", exc)
+            try:
+                self.trade_store.note_backfill_failure(str(exc))
+            except Exception:
+                pass
+        finally:
+            scheduler = self._backfill_scheduler
+            if scheduler is not None:
+                await scheduler.reevaluate_after_worker(
+                    latest_window_provider=self._current_engine_window,
+                    installed_window_provider=self._installed_streamed_window,
+                )
 
     def _stream_metric_backfill(self, start_ms: int, end_ms: int):
         """One-pass streaming ladder+step VWAP/VAP computation.
@@ -482,6 +761,11 @@ class SessionController:
         if self._trade_backfill_task and not self._trade_backfill_task.done():
             self._trade_backfill_task.cancel()
             self._trade_backfill_task = None
+        if self._backfill_scheduler is not None:
+            try:
+                await self._backfill_scheduler.invalidate_session(self.run_id or "")
+            except Exception:
+                logger.exception("failed to invalidate old backfill session")
         self.ambiguity_count = 0
         self.bars_processed = 0
         self.fence_ms = None
@@ -492,6 +776,7 @@ class SessionController:
         self._p0_seeded = False
         self._live_enabled = False
         self._buffering = False
+        self._stream_gen_token = None
 
         if symbol:
             self.symbol = canonical_binance_symbol(symbol)
