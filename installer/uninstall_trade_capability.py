@@ -26,6 +26,7 @@ from capabilities import capability_dir
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRADE_REL_PATHS = [
     Path("plugins") / "trade" / "wizard.py",
+    Path("plugins") / "trade" / "backtest_wizard.py",
 ]
 
 

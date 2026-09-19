@@ -269,6 +269,12 @@ TRADE_ADAPTER_SENTINELS = {
     "text": "from plugins.trade.wizard import handle_trade_text",
     "namespace": 'data.startswith("trade:")',
 }
+BACKTEST_ADAPTER_SENTINELS = {
+    "command": "from plugins.trade.backtest_wizard import handle_backtest_command",
+    "callback": "from plugins.trade.backtest_wizard import handle_backtest_callback",
+    "text": "from plugins.trade.backtest_wizard import handle_backtest_text",
+    "namespace": 'data.startswith("backtest:")',
+}
 FIBO_ADAPTER_SENTINELS = {
     "command": "from plugins.trade.fibo_wizard import handle_fibo_command",
     "callback": "from plugins.trade.fibo_wizard import handle_fibo_callback",

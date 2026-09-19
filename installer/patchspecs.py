@@ -47,7 +47,24 @@ if data.startswith("trade:"):
         except Exception:
             pass
         return
+if data.startswith("backtest:"):
+    try:
+        from plugins.trade.backtest_wizard import handle_backtest_callback
+
+        await handle_backtest_callback(self, query, data)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] /backtest callback dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
 '''
+
 
 _FIBO_CALLBACK_BLOCK = '''\
 if data.startswith("fibo:"):
@@ -145,6 +162,19 @@ if first_token:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[%s] /trade command dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+            # Fall through to normal dispatch rather than swallow.
+    if cmd_body == "backtest":
+        try:
+            from plugins.trade.backtest_wizard import handle_backtest_command
+
+            handled = await handle_backtest_command(self, msg)
+            if handled:
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[%s] /backtest command dispatch failed: %s",
                 self.name, exc, exc_info=True,
             )
             # Fall through to normal dispatch rather than swallow.
@@ -658,7 +688,7 @@ def _command_anchor_pair(adapter_text: str) -> tuple[str, str]:
 
 
 def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
-    """Telegram adapter seams for /trade only (command + callback + text)."""
+    """Telegram adapter seams for /trade and /backtest (command + callback + text)."""
     adapter_text = _read_adapter_text(hermes_root)
     cb_before, cb_after = _callback_anchor_pair(adapter_text)
     text_before, text_after = _text_anchor_pair(adapter_text)

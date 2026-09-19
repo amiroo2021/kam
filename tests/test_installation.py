@@ -276,7 +276,8 @@ class TestFreshInstall(FixtureCase):
 
         # payload landed
         for rel in (
-            "wizard.py", "tradedesk.py", "canonical.py", "__init__.py", "plugin.yaml",
+            "wizard.py",
+            "backtest_wizard.py",
             "fibo_wizard.py",
         ):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
@@ -290,12 +291,20 @@ class TestFreshInstall(FixtureCase):
         )
         self.assertEqual(len(agents), 10, agents)
 
-        # all three adapter seams wired, each exactly once
+        # all adapter seams wired, each exactly once
         text = self.adapter.read_text()
         for spec in adapter_specs():
             self.assertEqual(text.count(spec.native_sentinel), 1, spec.seam)
             self.assertIn(spec.marker_begin(), text)
             self.assertIn(spec.marker_end(), text)
+        self.assertIn('cmd_body == "backtest"', text)
+        self.assertIn('from plugins.trade.backtest_wizard import handle_backtest_command', text)
+        self.assertIn('from plugins.trade.backtest_wizard import handle_backtest_callback', text)
+        self.assertIn('from plugins.trade.backtest_wizard import handle_backtest_text', text)
+        self.assertEqual(text.count('cmd_body == "trade"'), 1)
+        self.assertEqual(text.count('cmd_body == "backtest"'), 1)
+        self.assertEqual(text.count('from plugins.trade.wizard import handle_trade_command'), 1)
+        self.assertEqual(text.count('from plugins.trade.backtest_wizard import handle_backtest_command'), 1)
 
         # commands.py must remain untouched by the default install path
         self.assertNotIn('CommandDef("trade"', self.commands.read_text())

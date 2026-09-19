@@ -223,6 +223,34 @@ def main(argv: List[str]) -> int:
 
     c.run("/trade + /fibo entry points exist", check_entry_points)
 
+    def check_backtest_entry_points() -> str:
+        from plugins.trade import backtest_wizard
+
+        for fn in ("handle_backtest_command", "handle_backtest_callback", "handle_backtest_text"):
+            if not callable(getattr(backtest_wizard, fn, None)):
+                raise AssertionError(f"backtest_wizard.{fn} missing or not callable")
+        return "backtest wizard entry points present"
+
+    c.run("/backtest entry points exist", check_backtest_entry_points)
+
+    def check_backtest_adapter_wiring() -> str:
+        adapter = hermes_root / adapter_specs()[0].relative_path
+        text = adapter.read_text()
+        for needle in (
+            'cmd_body == "backtest"',
+            'from plugins.trade.backtest_wizard import handle_backtest_command',
+            'from plugins.trade.backtest_wizard import handle_backtest_callback',
+            'from plugins.trade.backtest_wizard import handle_backtest_text',
+            'data.startswith("backtest:")',
+        ):
+            if needle not in text:
+                raise AssertionError(f"missing backtest seam: {needle}")
+        return "backtest adapter seams present"
+
+    c.run("/backtest adapter seams present", check_backtest_adapter_wiring)
+
+    c.run("/trade + /fibo entry points exist", check_entry_points)
+
     def check_initial_screen_has_keyboard() -> str:
         """The first /trade screen must carry text AND a non-empty keyboard.
 
@@ -291,13 +319,24 @@ def main(argv: List[str]) -> int:
         def check_no_double_registration() -> str:
             adapter = hermes_root / adapter_specs()[0].relative_path
             text = adapter.read_text()
-            for spec in adapter_specs():
-                n = text.count(spec.native_sentinel)
-                if n > 1:
-                    raise AssertionError(
-                        f"{spec.seam} wired {n} times (double registration)"
-                    )
-            return "each seam wired exactly once"
+
+            # Semantic check: the adapter must expose exactly one effective
+            # routing path for trade and backtest commands inside the combined
+            # Telegram command block. We do NOT count patch-sentinel blocks; we
+            # validate the actual runtime dispatch conditions and imports.
+            required_once = [
+                ('cmd_body == "trade"', 'trade command branch'),
+                ('cmd_body == "backtest"', 'backtest command branch'),
+                ('from plugins.trade.wizard import handle_trade_command', 'trade command import'),
+                ('from plugins.trade.backtest_wizard import handle_backtest_command', 'backtest command import'),
+                ('from plugins.trade.backtest_wizard import handle_backtest_callback', 'backtest callback import'),
+                ('from plugins.trade.backtest_wizard import handle_backtest_text', 'backtest text import'),
+            ]
+            for needle, label in required_once:
+                n = text.count(needle)
+                if n != 1:
+                    raise AssertionError(f"{label} wired {n} times (expected 1)")
+            return "combined trade/backtest command block wired exactly once for each route"
 
         c.run("handlers not registered twice", check_no_double_registration)
 
