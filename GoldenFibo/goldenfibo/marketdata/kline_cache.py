@@ -23,6 +23,7 @@ from .binance_klines_range import (
     iter_klines_pages,
 )
 from .binance_public import BINANCE_SPOT_REST
+from .symbols import canonical_binance_symbol
 
 BINANCE_USDM_REST = "https://fapi.binance.com"
 from .timeframes import interval_ms, validate_interval
@@ -205,7 +206,7 @@ class KlineCache:
             )
 
     def stats_for(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> Dict:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         with self._connect() as conn:
             row = conn.execute(
@@ -242,7 +243,7 @@ class KlineCache:
         }
 
     def get_availability(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> Dict:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         with self._connect() as conn:
             row = conn.execute(
@@ -280,7 +281,7 @@ class KlineCache:
         first_available_open_time: Optional[int] = None,
         last_available_open_time: Optional[int] = None,
     ) -> None:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         with self._connect() as conn:
             conn.execute(
@@ -309,7 +310,7 @@ class KlineCache:
         response_status: str,
         response_note: str,
     ) -> None:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         now_ms = int(time.time() * 1000)
         with self._connect() as conn:
@@ -347,7 +348,7 @@ class KlineCache:
         base_url: str | None = None,
         max_years_back: int = 10,
     ) -> Optional[int]:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         current = self.get_availability(symbol, timeframe, market=market).get("first_available_open_time")
         if current is not None:
@@ -387,7 +388,7 @@ class KlineCache:
         return None
 
     def clear(self, symbol: str, timeframe: str, *, market: str = MARKET_SPOT) -> int:
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         with self._connect() as conn:
             cur = conn.execute(
@@ -406,7 +407,7 @@ class KlineCache:
         market: str = MARKET_SPOT,
     ) -> List[list]:
         """Return cached klines in half-open [start_ms, end_ms) ordered by open_time."""
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         with self._connect() as conn:
             rows = conn.execute(
@@ -432,7 +433,7 @@ class KlineCache:
     ) -> int:
         if not klines:
             return 0
-        symbol = symbol.upper().replace("/", "")
+        symbol = canonical_binance_symbol(symbol)
         timeframe = validate_interval(timeframe)
         rows = []
         for k in klines:
@@ -588,7 +589,7 @@ def fetch_range_cached(
     elif market == "futures" and base_url == BINANCE_SPOT_REST:
         base_url = BINANCE_USDM_REST
     interval = validate_interval(interval)
-    symbol = symbol.upper().replace("/", "")
+    symbol = canonical_binance_symbol(symbol)
     step = interval_ms(interval)
     stats = CacheStats(policy=policy.value, refresh_window_ms=refresh_tail_ms if policy is CachePolicy.AUTO else 0)
     cache = cache or KlineCache()

@@ -11,6 +11,7 @@ from goldenfibo import EngineConfig, GoldenFiboEngine, MarketEvent, MarketEventK
 import goldenfibo.api.app as app_mod
 from goldenfibo.api.app import app
 from goldenfibo.api.session import LiveSession
+from goldenfibo.marketdata.symbols import canonical_binance_symbol
 
 
 @pytest.fixture()
@@ -114,3 +115,32 @@ def test_session_start_accepts_market(client):
     body = r.json()
     assert body['symbol'] == 'BTCUSDT'
     assert body.get('market') in ('spot', 'futures', None)
+
+
+
+def test_canonical_symbol_resolution_general():
+    assert canonical_binance_symbol('BTC') == 'BTCUSDT'
+    assert canonical_binance_symbol('ETH') == 'ETHUSDT'
+    assert canonical_binance_symbol('BTCUSDT') == 'BTCUSDT'
+    assert canonical_binance_symbol('BTC') == 'BTCUSDT'
+    assert canonical_binance_symbol('HYPE') == 'HYPEUSDT'
+    assert canonical_binance_symbol('HYPEUSDT') == 'HYPEUSDT'
+
+
+def test_new_run_clears_stale_last_price(client):
+    # First run seeds a non-BTC price.
+    r1 = client.post('/api/session/start', json={
+        'mode': 'REPLAY_TO_LIVE', 'symbol': 'HYPE', 'market': 'futures',
+        'timeframe': '1m', 'side': 'SELL', 'percentage': '0.001',
+        'start_time': '2026-09-01T00:00:00Z',
+    })
+    assert r1.status_code == 200
+    # Second genuinely new run should not inherit that price.
+    r2 = client.post('/api/session/start', json={
+        'mode': 'REPLAY_TO_LIVE', 'symbol': 'BTC', 'market': 'spot',
+        'timeframe': '1m', 'side': 'SELL', 'percentage': '0.001',
+        'start_time': '2026-09-01T00:00:00Z',
+    })
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body.get('price') is None or body.get('price') == '—'

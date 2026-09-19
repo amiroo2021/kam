@@ -16,6 +16,7 @@ from ..engine.engine import GoldenFiboEngine
 from ..engine.events import DomainEvent, MarketEvent, MarketEventKind
 from ..live.price_path import apply_price_to_engine
 from ..marketdata import binance_public as bn
+from ..marketdata.symbols import canonical_binance_symbol
 from ..marketdata.binance_klines_range import inclusive_open_range_fetch_end
 from ..marketdata.kline_cache import CachePolicy, CachedBinanceKlineSource, KlineCache, fetch_range_cached
 from ..marketdata.timeframes import (
@@ -44,13 +45,6 @@ def _normalize_market(market: Optional[str]) -> str:
     return "spot"
 
 
-def _canonical_symbol(symbol: str, market: str) -> str:
-    s = symbol.upper().replace("/", "")
-    if market == "futures" and not s.endswith("USDT"):
-        return s + "USDT"
-    return s
-
-
 class SessionController:
     """Backend-owned multi-mode session. One engine object for REPLAY→LIVE handoff."""
 
@@ -64,7 +58,7 @@ class SessionController:
         self.percentage = Decimal("0.001")
         self.ohlc_mode = OhlcResolveMode.LEGACY
         self.run_id = ""
-        self.symbol = _canonical_symbol(self.symbol, self.market)
+        self.symbol = canonical_binance_symbol(self.symbol)
         self.engine = GoldenFiboEngine(
             EngineConfig(side=self.side, percentage=self.percentage, symbol=self.symbol)
         )
@@ -344,6 +338,7 @@ class SessionController:
         self._agg_trade_buffer.clear()
         self.trade_store.clear()
         self._aggtrade_metrics_enabled = False
+        self.last_price = None
         if self._trade_backfill_task and not self._trade_backfill_task.done():
             self._trade_backfill_task.cancel()
             self._trade_backfill_task = None
@@ -359,7 +354,7 @@ class SessionController:
         self._buffering = False
 
         if symbol:
-            self.symbol = symbol.upper().replace("/", "")
+            self.symbol = canonical_binance_symbol(symbol)
         if timeframe:
             self.timeframe = validate_interval(timeframe)
         if market is not None:
@@ -371,7 +366,7 @@ class SessionController:
         self.mode = mode
         self.run_id = uuid.uuid4().hex[:12]
         self.phase = SessionPhase.LOADING
-        self.symbol = _canonical_symbol(self.symbol, self.market)
+        self.symbol = canonical_binance_symbol(self.symbol)
         self.engine = GoldenFiboEngine(
             EngineConfig(side=self.side, percentage=self.percentage, symbol=self.symbol)
         )
@@ -473,7 +468,7 @@ class SessionController:
 
         def do_fetch():
             return fetch_range_cached(
-                _canonical_symbol(self.symbol, self.market),
+                canonical_binance_symbol(self.symbol),
                 self.timeframe,
                 start_ms,
                 end_ms,
@@ -632,7 +627,7 @@ class SessionController:
             start = now - self.history_limit_live * step
             klines = await asyncio.to_thread(
                 lambda: self.kline_source.fetch_range(
-                    symbol=_canonical_symbol(self.symbol, self.market),
+                    symbol=canonical_binance_symbol(self.symbol),
                     interval=self.timeframe,
                     start_ms=start,
                     end_ms=now + step,
@@ -801,7 +796,7 @@ class SessionController:
         except ImportError:
             self.feed_status = "no_websockets_pkg"
             return
-        url = bn.combined_stream_url(_canonical_symbol(self.symbol, self.market), self.timeframe, market=self.market)
+        url = bn.combined_stream_url(canonical_binance_symbol(self.symbol), self.timeframe, market=self.market)
         backoff = 1.0
         while not self._stop.is_set():
             try:
