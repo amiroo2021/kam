@@ -16,7 +16,7 @@ from .config import TradeMenuConfig, TradeMenuConfigError, load_config
 from .marketdata import SUPPORTED_TFS, fetch_candles
 from .service import TradeMenuService
 
-logger = logging.getLogger("trademenu")
+logger = logging.getLogger("trade-web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -28,13 +28,13 @@ def create_app(
         cfg = config or load_config()
     except TradeMenuConfigError:
         # Fail-closed app: only health-style error page, no data APIs.
-        app = FastAPI(title="TradeMenu", version="0.2.0")
+        app = FastAPI(title="trade-web", version="0.2.0")
 
         @app.get("/")
         async def locked_root() -> HTMLResponse:
             return HTMLResponse(
                 "<!doctype html><html><body style='font-family:sans-serif;background:#0b0e11;color:#eee;padding:40px'>"
-                "<h1>TradeMenu unavailable</h1>"
+                "<h1>trade-web unavailable</h1>"
                 "<p>TRADE_WEB_PASSWORD is not configured. Refusing to start unprotected.</p>"
                 "</body></html>",
                 status_code=503,
@@ -50,7 +50,7 @@ def create_app(
     limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)
     svc = service or TradeMenuService(session_secret=cfg.session_secret)
 
-    app = FastAPI(title="TradeMenu", version="0.2.0")
+    app = FastAPI(title="trade-web", version="0.2.0")
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -133,12 +133,12 @@ def create_app(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TradeMenu Login</title>
+  <title>trade-web Login</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body class="login-body">
   <form class="login-card" method="post" action="/login" autocomplete="current-password">
-    <h1>TradeMenu</h1>
+    <h1>trade-web</h1>
     {err_html}
     <label>Password
       <input type="password" name="password" required autofocus />
@@ -161,7 +161,7 @@ def create_app(
             resp = HTMLResponse(html_body)
             resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
             return resp
-        return HTMLResponse("<h1>TradeMenu</h1><p>Static UI missing.</p>", status_code=500)
+        return HTMLResponse("<h1>trade-web</h1><p>Static UI missing.</p>", status_code=500)
 
     @app.get("/", response_class=HTMLResponse)
     async def root(request: Request) -> Response:
@@ -183,7 +183,7 @@ def create_app(
             return _login_page(gate.message)
         if not sessions.password_ok(password):
             limiter.record_failure(key)
-            logger.info("TradeMenu login failure from %s", key)
+            logger.info("trade-web login failure from %s", key)
             return _login_page("Invalid password.")
         limiter.record_success(key)
         token, csrf = sessions.issue()
@@ -200,7 +200,7 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"ok": True, "service": "trademenu", "phase": 2}
+        return {"ok": True, "service": "trade-web", "phase": 2}
 
     @app.get("/api/session")
     async def api_session(request: Request) -> Response:

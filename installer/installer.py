@@ -379,7 +379,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
         failed.append("shared")
     for cap in caps:
         if cap == "trade":
-            ok = verify_trade(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
+            ok = verify_trade(
+                argv=[],
+                hermes_root=hermes_root,
+                hermes_home=hermes_home,
+                systemd_dir=systemd_dir,
+            )
         elif cap == "fibo":
             ok = verify_fibo(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
         else:
@@ -439,8 +444,11 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     for cap in reversed(caps):
         if cap == "trade":
             res = uninstall_trade(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                argv=[],
+                hermes_root=hermes_root,
+                hermes_home=hermes_home,
                 dry_run=dry_run,
+                systemd_dir=systemd_dir,
             )
         elif cap == "fibo":
             res = uninstall_fibo(

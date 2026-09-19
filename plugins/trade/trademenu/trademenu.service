@@ -1,18 +1,14 @@
-[Unit]
-Description=TradeMenu Phase 1 read-only web UI
-After=network.target
-# Independent from GoldenFibo :8000 and Hermes gateway
-
-[Service]
-Type=simple
-WorkingDirectory=/root/kam
-Environment=PYTHONPATH=/root/kam
-Environment=HERMES_HOME=/root/.hermes
-# Use Hermes venv which has fastapi/uvicorn
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m plugins.trade.trademenu
-Restart=on-failure
-RestartSec=3
-# Do not escalate to restarting sibling services
-
-[Install]
-WantedBy=multi-user.target
+# DEPRECATED local template.
+# Source of truth for the installed unit is:
+#   installer/systemd/trade-web.service
+# Installed as:
+#   /etc/systemd/system/trade-web.service
+#
+# Do not use this file as a runtime unit. It no longer hardcodes /root/kam.
+# After ./install.sh --trade, both Telegram /trade and the web UI load
+# plugins from $HERMES_ROOT/plugins/trade with:
+#   WorkingDirectory=$HERMES_ROOT
+#   Environment=PYTHONPATH=$HERMES_ROOT
+#   Environment=HERMES_HOME=$HERMES_HOME
+#   ExecStart=$HERMES_ROOT/venv/bin/python -m plugins.trade.trademenu
+# Bind remains 0.0.0.0:8001 (see plugins.trade.trademenu.config).

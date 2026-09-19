@@ -1249,6 +1249,30 @@ def main(argv: List[str]) -> int:
         telegram_menu_record = ensure_telegram_menu_capacity(hermes_root, hermes_home, python_exe, args.dry_run)
         say()
 
+        from trade_web_unit import install_trade_web_unit, password_status
+
+        step("Install trade-web systemd unit")
+        pw_ok, pw_len = password_status(hermes_home)
+        if pw_ok:
+            ok(f"TRADE_WEB_PASSWORD present (len={pw_len})")
+        else:
+            warn(
+                "TRADE_WEB_PASSWORD missing — set it in $HERMES_HOME/.env "
+                "(operator-supplied only; installer will not invent one)"
+            )
+        trade_web_record = install_trade_web_unit(
+            hermes_root=hermes_root,
+            hermes_home=hermes_home,
+            systemd_dir=Path(args.systemd_dir),
+            dry_run=args.dry_run,
+            start=True,
+        )
+        for action in trade_web_record.get("actions") or []:
+            ok(str(action))
+        if not trade_web_record.get("ok", True) and trade_web_record.get("error"):
+            raise K.InstallError(f"trade-web unit install failed: {trade_web_record.get('error')}")
+        say()
+
         deps = {"action": "skipped"} if args.skip_deps else install_dependencies(
             python_exe, args.dry_run
         )
@@ -1279,6 +1303,7 @@ def main(argv: List[str]) -> int:
             "dependencies": deps,
             "config": config_record,
             "telegram_command_menu": telegram_menu_record,
+            "trade_web_unit": trade_web_record,
         }
 
         if not args.dry_run:

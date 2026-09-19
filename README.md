@@ -1,9 +1,10 @@
-# KAM — `/trade` + `/fibo` add-on for Hermes
+# KAM — `/trade` + `/fibo` + trade-web add-on for Hermes
 
 KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
 
 - `/trade`: the Telegram trading console wizard backed by a pluggable set of exchange agents
 - `/fibo`: the Telegram Fibo control wizard (lightweight UI skeleton; future iterations will reuse the shared exchange-agent layer)
+- **trade-web**: password-gated web UI on `http://<server-ip>:8001/` (same TradeDesk + agents as Telegram)
 
 **There is no enable flag.** If the add-on is installed, `/trade` and/or `/fibo` is enabled. If you remove it, the commands are gone.
 
@@ -18,7 +19,9 @@ KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https:/
 | Python 3.10+ | Uses the same interpreter your Hermes gateway runs |
 | `git` | For clone and upgrade |
 | Exchange credentials | Only for the exchanges you actually want to use — see [Credentials](#credentials) |
-| root / sudo | Required to write into the Hermes tree and restart the service |
+| `TRADE_WEB_PASSWORD` in `$HERMES_HOME/.env` | Required for trade-web on :8001; operator-supplied only (never auto-generated) |
+| root / sudo | Required to write into the Hermes tree and manage systemd units |
+| Firewall | Allow TCP 8001 from clients that should reach trade-web |
 
 ---
 
@@ -27,21 +30,39 @@ KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https:/
 ```bash
 git clone https://github.com/amiroo2021/kam.git
 cd kam
-sudo ./install.sh --hermes-root /path/to/hermes
+# Set TRADE_WEB_PASSWORD in $HERMES_HOME/.env before or after install (required for a healthy :8001)
+sudo ./install.sh --trade --hermes-root /usr/local/lib/hermes-agent
+sudo ./verify.sh --trade --hermes-root /usr/local/lib/hermes-agent
 ```
 
 If Hermes is in a standard location you may omit `--hermes-root` and let it auto-detect. If several installations are found, the installer stops and asks you to choose one explicitly.
 
-After installation and a gateway restart, send `/trade` or `/fibo` in Telegram.
+After installation:
+
+- Telegram: send `/trade` (gateway restart may be required unless `--no-restart`)
+- Web: open `http://<server-public-ip>:8001/` (login at `/login`)
+- Both UIs load code from `$HERMES_ROOT/plugins/trade` (not the git checkout)
+- systemd unit: `trade-web.service` (legacy `trademenu.service` is disabled/removed)
 
 ### Options
 
 | Flag | Effect |
 |---|---|
 | `--hermes-root PATH` | Target a specific Hermes installation |
+| `--hermes-home PATH` | Persistent state dir (default `~/.hermes`) |
 | `--dry-run` | Show everything that would happen; change nothing |
 | `--no-restart` | Install and verify, but leave the gateway alone |
 | `--skip-deps` | Do not touch pip (useful when deps are already managed) |
+| `--trade` / `--fibo` | Capability selection (default no-flag = trade) |
+
+### Fresh server checklist
+
+1. Hermes installed and Telegram connected
+2. Clone KAM and run `./install.sh --trade --hermes-root …`
+3. Put exchange credentials + `TRADE_WEB_PASSWORD` in `$HERMES_HOME/.env` (do not commit)
+4. `systemctl enable --now trade-web` if password was added after install
+5. Open `http://192.34.66.78:8001/` (example public IP) — bind is `0.0.0.0:8001`
+6. `./verify.sh --trade --hermes-root …` must PASS
 
 ---
 
@@ -50,20 +71,20 @@ After installation and a gateway restart, send `/trade` or `/fibo` in Telegram.
 Always safe. Detects paths, lists planned file operations, shows the intended patches, runs source-side checks, and installs nothing.
 
 ```bash
-sudo ./install.sh --dry-run --hermes-root /path/to/hermes
+sudo ./install.sh --trade --dry-run --hermes-root /path/to/hermes
 ```
 
 ---
 
 ## Verify
 
-Offline and read-only. Never contacts an exchange, never places or cancels an order, never queries a balance or position, never sends a Telegram message.
+Offline and read-only for exchange APIs. Never places or cancels an order. trade-web checks include unit file contract, password presence (length only), and live `GET /api/health` when the unit is active.
 
 ```bash
-./verify.sh --hermes-root /path/to/hermes
+./verify.sh --trade --hermes-root /path/to/hermes
 ```
 
-Prints `KAM /trade installation: PASS` or `FAIL` with the exact failed checks, and exits non-zero on failure.
+Prints PASS or FAIL with the exact failed checks, and exits non-zero on failure. Missing `TRADE_WEB_PASSWORD` is a hard FAIL with guidance to set it in `$HERMES_HOME/.env`.
 
 ---
 
@@ -71,7 +92,7 @@ Prints `KAM /trade installation: PASS` or `FAIL` with the exact failed checks, a
 
 ```bash
 git pull
-sudo ./install.sh --hermes-root /path/to/hermes
+sudo ./install.sh --trade --hermes-root /path/to/hermes
 ```
 
 The installer is idempotent. Re-running it will not duplicate handlers, imports, patch blocks, service units, or dependency entries, and will not reset your configuration or remove credentials. Unchanged components are reported as already installed.
@@ -81,10 +102,10 @@ The installer is idempotent. Re-running it will not duplicate handlers, imports,
 ## Uninstall
 
 ```bash
-sudo ./uninstall.sh --hermes-root /path/to/hermes
+sudo ./uninstall.sh --trade --hermes-root /path/to/hermes
 ```
 
-Removes only add-on-owned files and only the marked KAM blocks from shared Hermes files. It never deletes your `.env`, your credentials, unrelated plugins, or shared dependencies. Backups are preserved unless you pass `--purge-backups`. Supports `--dry-run` and `--no-restart`.
+Removes only add-on-owned files and only the marked KAM blocks from shared Hermes files. Stops/disables `trade-web.service` and any legacy `trademenu.service`. It never deletes your `.env`, your credentials, unrelated plugins, or shared dependencies. Backups are preserved unless you pass `--purge-backups`. Supports `--dry-run` and `--no-restart`.
 
 ---
 

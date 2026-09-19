@@ -14,7 +14,7 @@ from ..ladder_math import build_ladder_children, ladder_vwap, quantize_to_increm
 from .formatting import format_money, format_pnl, format_price, format_size
 from .preview_plans import PreviewPlanStore
 
-logger = logging.getLogger("trademenu")
+logger = logging.getLogger("trade-web")
 
 # Short in-process TTL so Positions + Orders share one agent fetch and
 # rapid UI polls do not re-hit multi-dex Hyperliquid open-order fanout.

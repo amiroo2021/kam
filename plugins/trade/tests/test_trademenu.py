@@ -202,7 +202,7 @@ class TradeMenuApiTests(unittest.TestCase):
     def test_unauthenticated_root_shows_login(self) -> None:
         r = self.client.get("/")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("TradeMenu", r.text)
+        self.assertIn("trade-web", r.text)
         self.assertIn("Password", r.text)
         self.assertIn("unit-test-hint", r.text)
 
