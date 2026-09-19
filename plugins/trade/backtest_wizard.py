@@ -25,8 +25,7 @@ if str(_GF_ROOT) not in sys.path:
     sys.path.insert(0, str(_GF_ROOT))
 
 from golden_fibo.constants import Side  # noqa: E402
-from golden_fibo.historical_replay import levels_p0_to_pn, replay_ohlc, iso  # noqa: E402
-from golden_fibo.ladder import ladder_step  # noqa: E402
+from goldenfibo.backtest import run_finite_backtest  # noqa: E402
 from goldenfibo.marketdata.kline_cache import CachePolicy, KlineCache, fetch_range_cached  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
 
@@ -384,7 +383,9 @@ class BacktestWizard:
                     "detail": "Running replay",
                 }
             )
-        parts=[f"Backtest complete: {st.symbol} {st.market}\nPercentage: {st.percentage:g}\nData: {iso(int(candles[0][0]))} → {iso(int(candles[-1][0]))}\nCandles: {len(candles):,}\nCache: {stats['path']}\nCached bars: {stats['bars']}\n"]
+        start_iso = datetime.fromtimestamp(int(candles[0][0]) / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        end_iso = datetime.fromtimestamp(int(candles[-1][0]) / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        parts=[f"Backtest complete: {st.symbol} {st.market}\nPercentage: {st.percentage:g}\nData: {start_iso} → {end_iso}\nCandles: {len(candles):,}\nCache: {stats['path']}\nCached bars: {stats['bars']}\n"]
         attachments=[]
         for idx, side in enumerate(sides, start=1):
             if on_progress:
@@ -569,25 +570,47 @@ def _fmt(x: float) -> str:
 
 
 def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: float):
-    state=replay_ohlc(candles, side=side, percentage=percentage)
-    n=state.highest_filled
-    pn,_=ladder_step(side,state.p0,n, percentage=percentage)
-    pn1,_=ladder_step(side,state.p0,min(n+1,20), percentage=percentage)
-    pn2,_=ladder_step(side,state.p0,min(n+2,20), percentage=percentage)
-    pnm1,_=ladder_step(side,state.p0,n-1, percentage=percentage) if n>=1 else (state.shared_tp,None)
-    active_ladder_start_ts=_active_ladder_start_ts(state)
-    active_step_start_ts=_active_step_start_ts(state)
-    ladder_vwap=_vwap(candles,active_ladder_start_ts)
-    step_vwap=_vwap(candles,active_step_start_ts)
-    ladder_poc=_poc(candles,active_ladder_start_ts)
-    step_poc=_poc(candles,active_step_start_ts)
-    ladder_value_area=_value_area(candles,active_ladder_start_ts)
-    last=float(candles[-1][4])
-    levels=levels_p0_to_pn(state,min(n+2,20), percentage=percentage)
-    jpg=_draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last, ladder_value_area=ladder_value_area)
-    label="BUY" if side is Side.BUY else "SELL"
-    lines=[f"{label} ladder", f"Cycle: {state.cycle}  Completed: {len(state.closed)}", f"P0: {_fmt(state.p0)}", f"Current step: P{n} = {_fmt(pn)}", f"TP/P(n-1): {_fmt(pnm1)}", f"Next P{n+1}: {_fmt(pn1)}", f"P{n+2}: {_fmt(pn2)}", f"Ladder VWAP: {_fmt(ladder_vwap)}", f"Step VWAP: {_fmt(step_vwap)}", f"Ladder POC: {_fmt(ladder_poc)}", f"Ladder Value Area: {_fmt(ladder_value_area['val'])} → {_fmt(ladder_value_area['vah'])}", f"Step POC: {_fmt(step_poc)}", f"Last close: {_fmt(last)}"]
-    return {"text":"\n".join(lines), "svg":jpg}
+    result = run_finite_backtest(
+        candles,
+        side=side,
+        percentage=percentage,
+        symbol=symbol,
+        timeframe=_BACKTEST_TIMEFRAME,
+    )
+    payload = result.state_payload
+    n = int(payload.get("n") or 0)
+    p0 = payload.get("p0")
+    pn = payload.get("current_p")
+    pnm1 = payload.get("shared_tp") if n >= 1 else payload.get("shared_tp")
+    pn1 = payload.get("next_p")
+    pn2 = payload.get("further_p")
+    ladder_vwap = payload.get("ladder_vwap")
+    step_vwap = payload.get("step_vwap")
+    ladder_poc = payload.get("ladder_poc")
+    step_poc = payload.get("step_poc")
+    ladder_val = payload.get("ladder_val")
+    ladder_vah = payload.get("ladder_vah")
+    last = float(candles[-1][4])
+    label = "BUY" if side is Side.BUY else "SELL"
+    lines = [
+        f"{label} ladder",
+        f"Cycle: {payload.get('cycle_id')}  Completed: {payload.get('closed_count')}",
+        f"P0: {_fmt(float(p0)) if p0 is not None else 'nan'}",
+        f"Current step: P{n} = {_fmt(float(pn)) if pn is not None else 'nan'}",
+        f"TP/P(n-1): {_fmt(float(pnm1)) if pnm1 is not None else 'nan'}",
+        f"Next P{n+1}: {_fmt(float(pn1)) if pn1 is not None else 'nan'}",
+        f"P{n+2}: {_fmt(float(pn2)) if pn2 is not None else 'nan'}",
+        f"Ladder VWAP: {_fmt(float(ladder_vwap)) if ladder_vwap is not None else 'nan'}",
+        f"Step VWAP: {_fmt(float(step_vwap)) if step_vwap is not None else 'nan'}",
+        f"Ladder POC: {_fmt(float(ladder_poc)) if ladder_poc is not None else 'nan'}",
+        f"Ladder Value Area: {_fmt(float(ladder_val)) if ladder_val is not None else 'nan'} → {_fmt(float(ladder_vah)) if ladder_vah is not None else 'nan'}",
+        f"Step POC: {_fmt(float(step_poc)) if step_poc is not None else 'nan'}",
+        f"Last close: {_fmt(last)}",
+    ]
+    # Rebuild the chart summary locally; formatting only, values come from canonical payload.
+    levels = payload.get("levels") or []
+    jpg = _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last, ladder_value_area={"val": ladder_val, "vah": ladder_vah})
+    return {"text": "\n".join(lines), "svg": jpg}
 
 
 def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, current, *, ladder_value_area=None):
