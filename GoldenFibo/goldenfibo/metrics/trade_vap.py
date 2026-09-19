@@ -27,6 +27,9 @@ class AggTrade:
     price: float
     qty: float
     ts_ms: int
+    first_trade_id: Optional[int] = None
+    last_trade_id: Optional[int] = None
+    id_domain: str = "aggtrade"
 
 
 @dataclass(frozen=True)

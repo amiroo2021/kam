@@ -19,8 +19,11 @@ def _fake_fetch(symbol, start_ms, end_ms, **kwargs):
     ]
 
 
-def test_live_backfill_sets_aggtrade_source_and_complete_metrics():
+def test_live_backfill_sets_aggtrade_source_and_complete_metrics(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
     ctrl = SessionController()
+    ctrl.aggtrade_cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    ctrl._agg_archive_fetch = ctrl.aggtrade_cache.fetch_archive_range
     ctrl.mode = SessionMode.LIVE
     ctrl._agg_trades_fetch = _fake_fetch
     ctrl.phase = SessionPhase.LOADING
@@ -99,8 +102,11 @@ def test_incomplete_backfill_keeps_ohlc_fallback_visible(monkeypatch, tmp_path):
     asyncio.run(go())
 
 
-def test_ws_dedupe_after_rest():
+def test_ws_dedupe_after_rest(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
     ctrl = SessionController()
+    ctrl.aggtrade_cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    ctrl._agg_archive_fetch = ctrl.aggtrade_cache.fetch_archive_range
     ctrl.mode = SessionMode.LIVE
     ctrl._agg_trades_fetch = _fake_fetch
     ctrl.engine.on_event(
@@ -144,6 +150,8 @@ def test_progression_keeps_ladder_store_and_skips_rest_backfill(monkeypatch, tmp
         return [t for t in out if start_ms <= t.ts_ms <= end_ms]
 
     ctrl = SessionController()
+    ctrl.aggtrade_cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    ctrl._agg_archive_fetch = ctrl.aggtrade_cache.fetch_archive_range
     ctrl.mode = SessionMode.LIVE
     ctrl.engine = GoldenFiboEngine(EngineConfig(side=Side.BUY, percentage=Decimal("0.001"), symbol="BTCUSDT"))
     ctrl._agg_trades_fetch = fake_fetch
@@ -210,9 +218,12 @@ def test_progression_keeps_ladder_store_and_skips_rest_backfill(monkeypatch, tmp
     asyncio.run(go())
 
 
-def test_snapshot_api_identifies_aggtrade_source_fields():
+def test_snapshot_api_identifies_aggtrade_source_fields(tmp_path):
     """Chart/API contract: metric_source + status fields present for LIVE path."""
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
     ctrl = SessionController()
+    ctrl.aggtrade_cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    ctrl._agg_archive_fetch = ctrl.aggtrade_cache.fetch_archive_range
     ctrl.mode = SessionMode.LIVE
     ctrl._agg_trades_fetch = _fake_fetch
     ctrl.engine.on_event(

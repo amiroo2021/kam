@@ -68,7 +68,8 @@ def combined_stream_url(symbol: str, interval: str = "1m", *, market: str = "spo
     """Multiplex aggTrade + kline on one connection."""
     s = canonical_binance_symbol(symbol).lower().replace("/", "")
     base = "wss://stream.binance.com:9443/stream?streams=" if market == "spot" else "wss://fstream.binance.com/stream?streams="
-    streams = f"{s}@aggTrade/{s}@kline_{interval}"
+    trade_stream = "aggTrade" if market == "spot" else "trade"
+    streams = f"{s}@{trade_stream}/{s}@kline_{interval}"
     return f"{base}{streams}"
 
 

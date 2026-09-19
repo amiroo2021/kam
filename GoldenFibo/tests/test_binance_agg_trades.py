@@ -42,7 +42,7 @@ from goldenfibo.metrics.trade_vap import AggTrade
 
 def test_parse_agg_trade_row_dict():
     t = parse_agg_trade_row({"a": 10, "p": "100.5", "q": "0.25", "T": 1234, "f": 1, "l": 1, "m": True})
-    assert t == AggTrade(agg_id=10, price=100.5, qty=0.25, ts_ms=1234)
+    assert t == AggTrade(agg_id=10, price=100.5, qty=0.25, ts_ms=1234, first_trade_id=1, last_trade_id=1, id_domain="aggtrade")
 
 
 def test_fetch_agg_trades_range_paginates_and_clips_window():

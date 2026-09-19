@@ -100,6 +100,7 @@ class SessionController:
         self._metric_broadcast_min_interval_ms: int = 500
         # Full aggTrade buffer while hist replay (id, price, qty, ts)
         self._agg_trade_buffer: List[Dict[str, Any]] = []
+        self._ws_coverage_edge_ms: Optional[int] = None
         # Explicit enable for LIVE AGGTRADE metrics (avoids REST in unit tests)
         self._aggtrade_metrics_enabled: bool = False
         # Injectable fetches for tests
@@ -849,6 +850,7 @@ class SessionController:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     self.feed_status = "live" if self._live_enabled else "buffering"
+                    self._ws_coverage_edge_ms = None
                     backoff = 1.0
                     async for raw in ws:
                         if self._stop.is_set():
@@ -859,8 +861,29 @@ class SessionController:
             except Exception as exc:
                 logger.warning("ws error: %s", exc)
                 self.feed_status = "live_degraded"
+                self._ws_coverage_edge_ms = None
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    def _record_ws_observation(self, ts_ms: int) -> None:
+        """Record verified live observation coverage while the WS is connected.
+
+        A connected stream verifies elapsed time even if no trade row exists in
+        every millisecond. The edge is reset on reconnect so disconnected time is
+        not falsely covered; REST must repair that gap.
+        """
+        ts = int(ts_ms)
+        prev = self._ws_coverage_edge_ms
+        start = ts if prev is None else min(ts, int(prev) + 1)
+        self.aggtrade_cache.record_coverage(
+            self.market,
+            self.symbol,
+            start,
+            ts,
+            source="ws",
+            note="ws-observed",
+        )
+        self._ws_coverage_edge_ms = max(ts, int(prev or ts))
 
     async def _on_ws_raw(self, raw: str) -> None:
         parsed = bn.parse_combined_message(raw)
@@ -868,7 +891,10 @@ class SessionController:
             return
         data = parsed["data"]
         event = data.get("e")
-        if event == "aggTrade":
+        obs_ts = int(data.get("T") or data.get("E") or 0)
+        if obs_ts > 0:
+            self._record_ws_observation(obs_ts)
+        if event in {"aggTrade", "trade"}:
             price = Decimal(str(data["p"]))
             ts_ms = int(data.get("T") or data.get("E") or 0)
             # Always retain full trade for metric store when LIVE metrics desired

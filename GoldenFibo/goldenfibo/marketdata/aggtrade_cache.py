@@ -82,6 +82,7 @@ class AggTradeCache:
                     last_trade_id INTEGER NOT NULL,
                     timestamp_ms INTEGER NOT NULL,
                     buyer_is_maker INTEGER NOT NULL,
+                    id_domain TEXT NOT NULL DEFAULT 'aggtrade',
                     source TEXT NOT NULL DEFAULT '',
                     inserted_at_ms INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (market, symbol, agg_trade_id)
@@ -92,6 +93,25 @@ class AggTradeCache:
                 """
                 CREATE INDEX IF NOT EXISTS idx_agg_trades_ts
                 ON agg_trades (market, symbol, timestamp_ms)
+                """
+            )
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(agg_trades)").fetchall()}
+            if "id_domain" not in cols:
+                conn.execute("ALTER TABLE agg_trades ADD COLUMN id_domain TEXT NOT NULL DEFAULT 'aggtrade'")
+            conn.execute("UPDATE agg_trades SET id_domain='trade' WHERE source='ws'")
+            conn.execute("UPDATE agg_trades SET id_domain='aggtrade' WHERE source IN ('rest', 'archive') OR id_domain='' OR id_domain IS NULL")
+            # Raw @trade IDs and aggregate-trade IDs are separate domains, but
+            # the legacy SQLite PK is (market, symbol, agg_trade_id). Store raw
+            # trade IDs in a negative keyspace while preserving the real raw ID
+            # in first_trade_id/last_trade_id. This avoids a rebuild and
+            # prevents cross-domain numeric collisions.
+            conn.execute(
+                """
+                UPDATE agg_trades
+                SET agg_trade_id = -ABS(agg_trade_id),
+                    first_trade_id = ABS(first_trade_id),
+                    last_trade_id = ABS(last_trade_id)
+                WHERE id_domain='trade' AND agg_trade_id > 0
                 """
             )
             conn.execute(
@@ -173,6 +193,9 @@ class AggTradeCache:
                         price=float(parts[1]),
                         qty=float(parts[2]),
                         ts_ms=int(parts[5]),
+                        first_trade_id=int(parts[3]),
+                        last_trade_id=int(parts[4]),
+                        id_domain="aggtrade",
                     )
                 )
             except (TypeError, ValueError):
@@ -255,20 +278,24 @@ class AggTradeCache:
         inserted_at_ms = int(time.time() * 1000)
         for t in trades:
             if isinstance(t, AggTrade):
-                agg_id = int(t.agg_id)
+                id_domain = str(getattr(t, "id_domain", "aggtrade") or "aggtrade")
+                raw_id = int(t.agg_id)
+                agg_id = -abs(raw_id) if id_domain == "trade" else raw_id
                 price = str(float(t.price))
                 qty = str(float(t.qty))
                 ts_ms = int(t.ts_ms)
-                first_trade_id = agg_id
-                last_trade_id = agg_id
+                first_trade_id = int(t.first_trade_id) if t.first_trade_id is not None else raw_id
+                last_trade_id = int(t.last_trade_id) if t.last_trade_id is not None else raw_id
                 buyer_is_maker = 0
             else:
                 try:
-                    agg_id = int(t["a"])
+                    id_domain = "aggtrade" if "a" in t else "trade"
+                    raw_id = int(t["a"] if "a" in t else t["t"])
+                    agg_id = -abs(raw_id) if id_domain == "trade" else raw_id
                     price = str(t["p"])
                     qty = str(t["q"])
-                    first_trade_id = int(t.get("f", agg_id))
-                    last_trade_id = int(t.get("l", agg_id))
+                    first_trade_id = int(t.get("f", raw_id))
+                    last_trade_id = int(t.get("l", raw_id))
                     ts_ms = int(t.get("T") or t.get("E") or 0)
                     buyer_is_maker = 1 if bool(t.get("m")) else 0
                 except Exception:
@@ -284,6 +311,7 @@ class AggTradeCache:
                     last_trade_id,
                     ts_ms,
                     buyer_is_maker,
+                    id_domain,
                     source,
                     inserted_at_ms,
                 )
@@ -297,8 +325,8 @@ class AggTradeCache:
                 INSERT INTO agg_trades(
                     market, symbol, agg_trade_id, price, quantity,
                     first_trade_id, last_trade_id, timestamp_ms,
-                    buyer_is_maker, source, inserted_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    buyer_is_maker, id_domain, source, inserted_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(market, symbol, agg_trade_id) DO NOTHING
                 """,
                 rows,
@@ -318,9 +346,19 @@ class AggTradeCache:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT agg_trade_id, price, quantity, timestamp_ms
-                FROM agg_trades
+                SELECT agg_trade_id, price, quantity, timestamp_ms, first_trade_id, last_trade_id, id_domain
+                FROM agg_trades AS t
                 WHERE market=? AND symbol=? AND timestamp_ms BETWEEN ? AND ?
+                  AND NOT (
+                    t.id_domain='trade'
+                    AND EXISTS (
+                      SELECT 1 FROM agg_trades AS a
+                      WHERE a.market=t.market AND a.symbol=t.symbol
+                        AND a.id_domain='aggtrade'
+                        AND a.first_trade_id <= t.first_trade_id
+                        AND a.last_trade_id >= t.last_trade_id
+                    )
+                  )
                 ORDER BY timestamp_ms, agg_trade_id
                 """,
                 (market_n, symbol_n, int(start_ms), int(end_ms)),
@@ -331,6 +369,9 @@ class AggTradeCache:
                 price=float(r["price"]),
                 qty=float(r["quantity"]),
                 ts_ms=int(r["timestamp_ms"]),
+                first_trade_id=int(r["first_trade_id"]),
+                last_trade_id=int(r["last_trade_id"]),
+                id_domain=str(r["id_domain"] or "aggtrade"),
             )
             for r in rows
         ]
@@ -567,9 +608,10 @@ class AggTradeCache:
                     timeout=timeout,
                 )
                 fetched_trade_count += len(rows)
-                inserted_trade_count += self.insert_trades(market_n, symbol_n, rows, source="rest")
+                rows_to_store = [t for t in rows if int(t.ts_ms) <= int(miss_end)]
+                inserted_trade_count += self.insert_trades(market_n, symbol_n, rows_to_store, source="rest")
                 if rows:
-                    actual_end = max(int(t.ts_ms) for t in rows)
+                    actual_end = min(max(int(t.ts_ms) for t in rows), int(miss_end))
                     # The requested start was verified even if the first trade arrived later.
                     # Record the requested start through the last returned trade.
                     self.record_coverage(
@@ -605,11 +647,15 @@ class AggTradeCache:
 
     def ingest_ws_message(self, market: str, symbol: str, data: dict, *, source: str = "ws") -> bool:
         try:
+            raw_id = data["a"] if "a" in data else data["t"]
             trade = AggTrade(
-                agg_id=int(data["a"]),
+                agg_id=int(raw_id),
                 price=float(data["p"]),
                 qty=float(data["q"]),
                 ts_ms=int(data.get("T") or data.get("E") or 0),
+                first_trade_id=int(raw_id),
+                last_trade_id=int(raw_id),
+                id_domain="aggtrade" if "a" in data else "trade",
             )
         except (KeyError, TypeError, ValueError):
             return False

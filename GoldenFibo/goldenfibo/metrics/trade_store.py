@@ -118,6 +118,7 @@ class TradeMetricStore:
         self._gap_count: int = 0
         self._known_gaps: List[Tuple[int, int]] = []
         self._ws_attached: bool = False
+        self._strict_id_gaps: bool = True
         self.detail: str = ""
 
     # --- identity / size ---
@@ -138,6 +139,7 @@ class TradeMetricStore:
         self._gap_count = 0
         self._known_gaps.clear()
         self._ws_attached = False
+        self._strict_id_gaps = True
         self.detail = ""
 
     # --- windows (engine-driven) ---
@@ -203,10 +205,14 @@ class TradeMetricStore:
         return n
 
     def ingest_ws_message(self, data: dict) -> bool:
-        """Parse Binance aggTrade WS payload and ingest."""
+        """Parse Binance aggregate/raw trade WS payload and ingest."""
         try:
+            raw_id = data["a"] if "a" in data else data["t"]
+            if "a" not in data and "t" in data:
+                self._strict_id_gaps = False
+                raw_id = -abs(int(raw_id))
             t = AggTrade(
-                agg_id=int(data["a"]),
+                agg_id=int(raw_id),
                 price=float(data["p"]),
                 qty=float(data["q"]),
                 ts_ms=int(data.get("T") or data.get("E") or 0),
@@ -305,11 +311,11 @@ class TradeMetricStore:
                 f"coverage floor {self.coverage_floor_ms} after window start {window_start_ms}"
             )
         # Large unresolved id gaps after backfill → incomplete (missing volume)
-        if self._gap_count > 0 and self.handoff_status != "live_ready":
+        if self._strict_id_gaps and self._gap_count > 0 and self.handoff_status != "live_ready":
             return False, STATUS_INCOMPLETE, f"{self._gap_count} missing agg trade ids"
         # Allow live_ready with minor gaps but flag detail; still complete if floor OK
         # Strict: any gap in the ladder window id span marks incomplete
-        if self._gap_count > 0:
+        if self._strict_id_gaps and self._gap_count > 0:
             return False, STATUS_INCOMPLETE, f"gapped agg trade ids count={self._gap_count}"
         return True, STATUS_COMPLETE, self.detail or "complete"
 
