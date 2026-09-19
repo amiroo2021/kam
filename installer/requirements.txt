@@ -20,3 +20,4 @@ eth-utils>=2.2
 hyperliquid-python-sdk>=0.9
 solders>=0.19
 base58>=2.1
+Pillow>=12.3.0

@@ -579,17 +579,17 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     )
     payload = result.state_payload
     n = int(payload.get("n") or 0)
-    p0 = payload.get("p0")
-    pn = payload.get("current_p")
-    pnm1 = payload.get("shared_tp") if n >= 1 else payload.get("shared_tp")
-    pn1 = payload.get("next_p")
-    pn2 = payload.get("further_p")
-    ladder_vwap = payload.get("ladder_vwap")
-    step_vwap = payload.get("step_vwap")
-    ladder_poc = payload.get("ladder_poc")
-    step_poc = payload.get("step_poc")
-    ladder_val = payload.get("ladder_val")
-    ladder_vah = payload.get("ladder_vah")
+    p0 = result.engine.state.p0
+    pn = result.engine.state.current_p()
+    pnm1 = result.engine.state.shared_tp if n >= 1 else result.engine.state.shared_tp
+    pn1 = result.engine.state.next_p()
+    pn2 = result.engine.state.further_p()
+    ladder_vwap = result.metric_display.ladder_vwap
+    step_vwap = result.metric_display.step_vwap
+    ladder_poc = result.metric_display.ladder_poc
+    step_poc = result.metric_display.step_poc
+    ladder_val = result.metric_display.ladder_val
+    ladder_vah = result.metric_display.ladder_vah
     last = float(candles[-1][4])
     label = "BUY" if side is Side.BUY else "SELL"
     lines = [
@@ -607,9 +607,30 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
         f"Step POC: {_fmt(float(step_poc)) if step_poc is not None else 'nan'}",
         f"Last close: {_fmt(last)}",
     ]
-    # Rebuild the chart summary locally; formatting only, values come from canonical payload.
-    levels = payload.get("levels") or []
-    jpg = _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, last, ladder_value_area={"val": ladder_val, "vah": ladder_vah})
+    # Rebuild the chart summary locally; formatting only, values come from canonical result.
+    levels = []
+    for item in payload.get("levels") or []:
+        price = item.get("price")
+        levels.append(
+            {
+                "level": item.get("id") or item.get("level"),
+                "price": float(price) if price is not None else float("nan"),
+                "role": item.get("label") or item.get("role") or "",
+            }
+        )
+    jpg = _draw_jpg(
+        symbol,
+        market,
+        side,
+        levels,
+        n,
+        ladder_vwap,
+        step_vwap,
+        ladder_poc,
+        step_poc,
+        last,
+        ladder_value_area={"val": ladder_val, "vah": ladder_vah},
+    )
     return {"text": "\n".join(lines), "svg": jpg}
 
 
