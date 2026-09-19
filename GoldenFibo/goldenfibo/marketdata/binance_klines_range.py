@@ -124,7 +124,8 @@ def iter_klines_pages(
                 "limit": limit,
             }
         )
-        url = f"{base_url}/api/v3/klines?{qs}"
+        path = "/fapi/v1/klines" if "fapi.binance.com" in str(base_url) else "/api/v3/klines"
+        url = f"{base_url}{path}?{qs}"
         batch = fetch(url)
         if not batch:
             if on_page:
