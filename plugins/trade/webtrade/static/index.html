@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>webtrade</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/chart_scale.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar sticky-top">
+      <div class="brand">webtrade</div>
+      <div id="actionToast" class="toast" hidden></div>
+      <form method="post" action="/logout"><button type="submit">Logout</button></form>
+    </header>
+
+    <section class="controls sticky-controls">
+      <label>Exchange
+        <select id="exchange"></select>
+      </label>
+      <label>Account
+        <select id="account"></select>
+      </label>
+      <label>Symbol
+        <input id="symbol" value="BTCUSD" list="symbolSuggestions" />
+        <datalist id="symbolSuggestions"></datalist>
+      </label>
+      <label>TF
+        <select id="tf">
+          <option value="1m">1m</option>
+          <option value="5m">5m</option>
+          <option value="15m" selected>15m</option>
+          <option value="30m">30m</option>
+          <option value="1h">1h</option>
+          <option value="4h">4h</option>
+          <option value="1D">1D</option>
+        </select>
+      </label>
+      <label class="chk"><input type="checkbox" id="showOrdersOverlay" checked /> Orders</label>
+      <label>&nbsp;<button type="button" id="reloadBtn">Reload all</button></label>
+      <div id="accountFinancials" class="account-financials" aria-live="polite" title=""></div>
+    </section>
+
+    <div class="workspace">
+      <div class="chart-col">
+        <div class="meta">
+          <span>Native <strong id="nativeSym">—</strong></span>
+          <span>Last <strong id="lastPrice">—</strong></span>
+          <span>Candles <strong id="candleCount">—</strong></span>
+        </div>
+        <div id="chartStatus" class="status-line">Chart idle</div>
+        <div id="instrumentCandidates" class="instrument-candidates" hidden></div>
+        <div id="chart" aria-label="webtrade chart"></div>
+      </div>
+
+      <aside class="trade-panel" id="tradePanel">
+        <div class="trade-ctx" id="tradeCtx">—</div>
+        <div class="seg">
+          <button type="button" class="seg-btn buy active" id="sideBuy" data-side="buy">BUY</button>
+          <button type="button" class="seg-btn sell" id="sideSell" data-side="sell">SELL</button>
+        </div>
+        <div class="seg">
+          <button type="button" class="seg-btn active" id="modeSingle" data-mode="single">Single</button>
+          <button type="button" class="seg-btn" id="modeLadder" data-mode="ladder">Ladder</button>
+        </div>
+
+        <div id="singleForm" class="trade-form" data-mode-panel="single">
+          <label>Type
+            <select id="orderType"><option value="limit">LIMIT</option></select>
+          </label>
+          <label>Price
+            <div class="row">
+              <input id="orderPrice" type="text" inputmode="decimal" placeholder="Limit price" autocomplete="off" />
+              <button type="button" class="btn-ghost" id="useCurrentPrice">Current</button>
+            </div>
+          </label>
+          <label>Size <span class="hint-inline">(this order only)</span>
+            <input id="orderSize" type="text" inputmode="decimal" placeholder="Size" autocomplete="off" />
+          </label>
+          <p id="singleNotional" class="notional-hint" hidden></p>
+          <button type="button" id="previewOrderBtn">Preview Order</button>
+        </div>
+
+        <div id="ladderForm" class="trade-form" data-mode-panel="ladder" hidden>
+          <label>Start Price
+            <div class="row">
+              <input id="ladderStart" type="text" inputmode="decimal" placeholder="Start price" autocomplete="off" />
+              <button type="button" class="btn-ghost" id="ladderStartCurrent">Current</button>
+            </div>
+          </label>
+          <label>End Price
+            <input id="ladderEnd" type="text" inputmode="decimal" placeholder="End price" autocomplete="off" />
+          </label>
+          <label>Orders
+            <input id="ladderCount" type="number" min="2" value="20" />
+          </label>
+          <label>Total Size <span class="hint-inline">(distributed across children)</span>
+            <input id="ladderTotal" type="text" inputmode="decimal" placeholder="Total size" autocomplete="off" />
+          </label>
+          <label>Distribution
+            <select id="ladderDist">
+              <option value="half_gaussian">Half-Gaussian</option>
+              <option value="uniform">Uniform</option>
+            </select>
+          </label>
+          <button type="button" id="previewLadderBtn">Preview Ladder</button>
+        </div>
+
+        <div id="previewBox" class="preview-box" hidden>
+          <pre id="previewText"></pre>
+          <div id="childTableWrap" class="child-table" hidden>
+            <table>
+              <thead><tr><th>#</th><th class="num">Price</th><th class="num">Size</th></tr></thead>
+              <tbody id="childBody"></tbody>
+            </table>
+          </div>
+          <div class="row preview-actions">
+            <button type="button" class="btn-secondary" id="previewBackBtn">Back</button>
+            <button type="button" class="btn-danger" id="placeBtn">Place</button>
+          </div>
+          <p id="previewError" class="error" hidden></p>
+        </div>
+        <p id="tradeStatus" class="status-line"></p>
+      </aside>
+    </div>
+
+    <div class="main">
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab active" id="tabPositions" data-tab="positions" role="tab" aria-selected="true">Positions</button>
+        <button type="button" class="tab" id="tabOrders" data-tab="orders" role="tab" aria-selected="false">Orders</button>
+        <button type="button" class="tab-refresh" id="refreshPanelBtn" title="Refresh panel">↻</button>
+      </div>
+
+      <section class="panel" id="panelPositions">
+        <div class="panel-meta">
+          <span id="positionsStatus" class="status-line">Positions idle</span>
+          <span id="positionsUpdated" class="updated">Last updated: —</span>
+        </div>
+        <div class="positions">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th class="num">Size</th>
+                <th class="num">Entry</th>
+                <th class="num">Mark</th>
+                <th class="num">PnL</th>
+                <th class="num">SL</th>
+                <th class="num">TP</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="positionsBody">
+              <tr><td colspan="9">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" id="panelOrders" hidden>
+        <div class="panel-meta">
+          <span id="ordersStatus" class="status-line">Orders idle</span>
+          <span id="ordersUpdated" class="updated">Last updated: —</span>
+        </div>
+        <div class="positions">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side / Type</th>
+                <th class="num">Orders</th>
+                <th class="num">Total Volume</th>
+                <th class="num">Price Range</th>
+                <th class="num">VWAP</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="ordersBody">
+              <tr><td colspan="7">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <h2 id="modalTitle">Action</h2>
+      <p id="modalBody" class="modal-body"></p>
+      <div id="modalFields" class="modal-fields" hidden>
+        <label id="modalFieldLabel">New value
+          <input id="modalInput" type="text" inputmode="decimal" autocomplete="off" />
+        </label>
+      </div>
+      <p id="modalError" class="error" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="modalCancel">Cancel</button>
+        <button type="button" class="btn-danger" id="modalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
-"""Shared ladder distribution math used by /trade (Hyperliquid agent) and TradeMenu.
+"""Shared ladder distribution math used by /trade (Hyperliquid agent) and WebTrade.
 
 Keep Half-Gaussian and Uniform identical to x_hyperliquid_agent so Telegram
-and TradeMenu produce the same children from the same inputs.
+and WebTrade produce the same children from the same inputs.
 """
 
 from __future__ import annotations

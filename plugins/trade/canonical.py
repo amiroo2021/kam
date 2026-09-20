@@ -110,7 +110,7 @@ class CanonicalPosition:
     sl_count: Optional[int] = None
     exchange_instrument: Optional[str] = None
     # Authoritative mark when the exchange supplies one. Optional so older
-    # agents remain valid; TradeMenu must not invent mark=entry when absent.
+    # agents remain valid; WebTrade must not invent mark=entry when absent.
     mark: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

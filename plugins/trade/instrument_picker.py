@@ -1,4 +1,4 @@
-"""Shared instrument candidate picker used by Telegram /trade and TradeMenu.
+"""Shared instrument candidate picker used by Telegram /trade and WebTrade.
 
 Mirrors TradeWizard._build_priced_candidates / catalog ranking / market_price
 enrichment so both surfaces show the same native symbols and prices for a
@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Single shared safety cap for Telegram /trade and TradeMenu candidate chips.
+# Single shared safety cap for Telegram /trade and WebTrade candidate chips.
 # Must stay identical so both surfaces show the same native list (e.g. silver → 5).
 INSTRUMENT_PICK_MAX = 5
 # Back-compat aliases (same value — never diverge).
@@ -310,7 +310,7 @@ def enrich_candidate_prices(
         seen.add(key)
         entry = dict(item) if isinstance(item, dict) else {"symbol": sym}
         entry["symbol"] = sym
-        # Normalize native field for TradeMenu / Telegram consumers.
+        # Normalize native field for WebTrade / Telegram consumers.
         entry["native_symbol"] = sym
         if entry.get("display_name") in (None, ""):
             entry["display_name"] = sym
@@ -403,9 +403,9 @@ def resolve_with_candidates(
     *,
     limit: int = INSTRUMENT_PICK_MAX,
 ) -> Dict[str, Any]:
-    """One-shot resolve for TradeMenu: unique | ambiguous (priced) | not found.
+    """One-shot resolve for WebTrade: unique | ambiguous (priced) | not found.
 
-    Returns a plain dict consumable by TradeMenuService /api/instruments/resolve.
+    Returns a plain dict consumable by WebTradeService /api/instruments/resolve.
     """
     requested = str(symbol or "").strip()
     try:
@@ -479,7 +479,7 @@ def resolve_with_candidates(
 
     # Unique success with no need to pick — same as Telegram continuing after Agree.
     if primary_native and resolve_error_code is None:
-        # Still build candidates for optional confirm UI; TradeMenu may open chart directly.
+        # Still build candidates for optional confirm UI; WebTrade may open chart directly.
         candidates = build_priced_candidates(
             desk,
             exchange,

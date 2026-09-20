@@ -1067,7 +1067,7 @@ class TradeWizard:
         primary_native: Optional[str] = None,
         agent_candidates: Optional[List[Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Delegate to shared picker (identical candidates for TradeMenu)."""
+        """Delegate to shared picker (identical candidates for WebTrade)."""
         from plugins.trade.instrument_picker import (
             INSTRUMENT_PICK_MAX_TELEGRAM,
             build_priced_candidates,

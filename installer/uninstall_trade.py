@@ -242,7 +242,7 @@ def main(argv: List[str]) -> int:
         revert_config(manifest, args.dry_run)
         say()
 
-        step("Remove trade-web systemd units")
+        step("Remove webtrade systemd units")
         from trade_web_unit import uninstall_trade_web_unit
 
         tw = uninstall_trade_web_unit(

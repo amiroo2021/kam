@@ -1,10 +1,10 @@
-# KAM — `/trade` + `/fibo` + trade-web add-on for Hermes
+# KAM — `/trade` + `/fibo` + webtrade add-on for Hermes
 
 KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https://hermes-agent.nousresearch.com) node that is already connected to Telegram. It adds:
 
 - `/trade`: the Telegram trading console wizard backed by a pluggable set of exchange agents
 - `/fibo`: the Telegram Fibo control wizard (lightweight UI skeleton; future iterations will reuse the shared exchange-agent layer)
-- **trade-web**: password-gated web UI on `http://<server-ip>:8001/` (same TradeDesk + agents as Telegram)
+- **webtrade**: password-gated web UI on `http://<server-ip>:9001/` (same TradeDesk + agents as Telegram)
 
 **There is no enable flag.** If the add-on is installed, `/trade` and/or `/fibo` is enabled. If you remove it, the commands are gone.
 
@@ -19,9 +19,9 @@ KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https:/
 | Python 3.10+ | Uses the same interpreter your Hermes gateway runs |
 | `git` | For clone and upgrade |
 | Exchange credentials | Only for the exchanges you actually want to use — see [Credentials](#credentials) |
-| `TRADE_WEB_PASSWORD` in `$HERMES_HOME/.env` | Required for trade-web on :8001; operator-supplied only (never auto-generated) |
+| `WEB_PASSWORD` in `$HERMES_HOME/.env` | Required for WebTrade on :9001; operator-supplied only (never auto-generated) |
 | root / sudo | Required to write into the Hermes tree and manage systemd units |
-| Firewall | Allow TCP 8001 from clients that should reach trade-web |
+| Firewall | Allow TCP 9001 from clients that should reach webtrade |
 
 ---
 
@@ -30,7 +30,7 @@ KAM is an installable `/trade` + `/fibo` add-on for an existing [Hermes](https:/
 ```bash
 git clone https://github.com/amiroo2021/kam.git
 cd kam
-# Set TRADE_WEB_PASSWORD in $HERMES_HOME/.env before or after install (required for a healthy :8001)
+# Set WEB_PASSWORD in $HERMES_HOME/.env before or after install (required for a healthy :9001)
 sudo ./install.sh --trade --hermes-root /usr/local/lib/hermes-agent
 sudo ./verify.sh --trade --hermes-root /usr/local/lib/hermes-agent
 ```
@@ -40,9 +40,9 @@ If Hermes is in a standard location you may omit `--hermes-root` and let it auto
 After installation:
 
 - Telegram: send `/trade` (gateway restart may be required unless `--no-restart`)
-- Web: open `http://<server-public-ip>:8001/` (login at `/login`)
+- Web: open `http://<server-public-ip>:9001/` (login at `/login`)
 - Both UIs load code from `$HERMES_ROOT/plugins/trade` (not the git checkout)
-- systemd unit: `trade-web.service` (legacy `trademenu.service` is disabled/removed)
+- systemd unit: `webtrade.service` (legacy `webtrade.service` is disabled/removed)
 
 ### Options
 
@@ -59,9 +59,9 @@ After installation:
 
 1. Hermes installed and Telegram connected
 2. Clone KAM and run `./install.sh --trade --hermes-root …`
-3. Put exchange credentials + `TRADE_WEB_PASSWORD` in `$HERMES_HOME/.env` (do not commit)
-4. `systemctl enable --now trade-web` if password was added after install
-5. Open `http://192.34.66.78:8001/` (example public IP) — bind is `0.0.0.0:8001`
+3. Put exchange credentials + `WEB_PASSWORD` in `$HERMES_HOME/.env` (do not commit)
+4. `systemctl enable --now webtrade` if password was added after install
+5. Open `http://192.34.66.78:9001/` (example public IP) — bind is `0.0.0.0:9001`
 6. `./verify.sh --trade --hermes-root …` must PASS
 
 ---
@@ -78,13 +78,13 @@ sudo ./install.sh --trade --dry-run --hermes-root /path/to/hermes
 
 ## Verify
 
-Offline and read-only for exchange APIs. Never places or cancels an order. trade-web checks include unit file contract, password presence (length only), and live `GET /api/health` when the unit is active.
+Offline and read-only for exchange APIs. Never places or cancels an order. webtrade checks include unit file contract, password presence (length only), and live `GET /api/health` when the unit is active.
 
 ```bash
 ./verify.sh --trade --hermes-root /path/to/hermes
 ```
 
-Prints PASS or FAIL with the exact failed checks, and exits non-zero on failure. Missing `TRADE_WEB_PASSWORD` is a hard FAIL with guidance to set it in `$HERMES_HOME/.env`.
+Prints PASS or FAIL with the exact failed checks, and exits non-zero on failure. Missing `WEB_PASSWORD` is a hard FAIL with guidance to set it in `$HERMES_HOME/.env`.
 
 ---
 
@@ -105,7 +105,7 @@ The installer is idempotent. Re-running it will not duplicate handlers, imports,
 sudo ./uninstall.sh --trade --hermes-root /path/to/hermes
 ```
 
-Removes only add-on-owned files and only the marked KAM blocks from shared Hermes files. Stops/disables `trade-web.service` and any legacy `trademenu.service`. It never deletes your `.env`, your credentials, unrelated plugins, or shared dependencies. Backups are preserved unless you pass `--purge-backups`. Supports `--dry-run` and `--no-restart`.
+Removes only add-on-owned files and only the marked KAM blocks from shared Hermes files. Stops/disables `webtrade.service` and any legacy `webtrade.service`. It never deletes your `.env`, your credentials, unrelated plugins, or shared dependencies. Backups are preserved unless you pass `--purge-backups`. Supports `--dry-run` and `--no-restart`.
 
 ---
 

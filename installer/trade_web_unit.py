@@ -1,45 +1,50 @@
-"""Install / verify / remove the KAM trade-web systemd unit.
+"""Install / verify / remove the KAM WebChat systemd unit.
 
-Canonical runtime after install is $HERMES_ROOT/plugins/trade.
-Python module path stays plugins.trade.trademenu.
-Product name / unit name: trade-web.
+WebChat is the clean upstream Hermes WebUI deployed separately from KAM
+source. KAM only provides the wrapper, systemd unit, and environment mapping.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-UNIT_TEMPLATE = REPO_ROOT / "installer" / "systemd" / "trade-web.service"
-UNIT_NAME = "trade-web.service"
-LEGACY_UNIT_NAME = "trademenu.service"
+UNIT_TEMPLATE = REPO_ROOT / "installer" / "systemd" / "webchat.service"
+UNIT_NAME = "webchat.service"
+LEGACY_UNIT_NAME = "hermes-web-chat.service"
 DEFAULT_SYSTEMD_DIR = Path("/etc/systemd/system")
+DEFAULT_WEBUI_ROOT = Path("/opt/hermes-webui")
+UPSTREAM_REPO = "https://github.com/nesquena/hermes-webui.git"
 
 
-def render_unit(*, hermes_root: Path, hermes_home: Path) -> str:
-    text = UNIT_TEMPLATE.read_text(encoding="utf-8")
-    return (
-        text.replace("__HERMES_ROOT__", str(hermes_root))
-        .replace("__HERMES_HOME__", str(hermes_home))
-    )
-
-
-def _run(cmd: List[str], *, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+def _run(cmd: List[str], *, check: bool = False, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, cwd=str(cwd) if cwd else None)
 
 
 def _systemctl_available() -> bool:
     return shutil.which("systemctl") is not None
 
 
+def _python_exe() -> str:
+    return shutil.which("python3") or sys.executable
+
+
+def _webchat_port() -> int:
+    raw = os.environ.get("WEBCHAT_PORT", "9000").strip() or "9000"
+    try:
+        return int(raw)
+    except ValueError:
+        return 9000
+
+
 def password_status(hermes_home: Path) -> Tuple[bool, int]:
-    """Return (present, length) for TRADE_WEB_PASSWORD. Never returns the value."""
-    live = os.environ.get("TRADE_WEB_PASSWORD", "").strip()
+    """Return (present, length) for WEB_PASSWORD. Never returns the value."""
+    live = os.environ.get("WEB_PASSWORD", "").strip()
     if live:
         return True, len(live)
     env_path = Path(hermes_home).expanduser() / ".env"
@@ -54,7 +59,7 @@ def password_status(hermes_home: Path) -> Tuple[bool, int]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key.strip() != "TRADE_WEB_PASSWORD":
+        if key.strip() != "WEB_PASSWORD":
             continue
         value = value.strip()
         if value.startswith('"') and value.endswith('"') and len(value) >= 2:
@@ -66,6 +71,32 @@ def password_status(hermes_home: Path) -> Tuple[bool, int]:
     return False, 0
 
 
+def ensure_webui_checkout(webui_root: Path, dry_run: bool = False) -> Tuple[bool, str]:
+    """Clone the upstream Hermes WebUI repo if needed."""
+    if webui_root.is_dir():
+        bootstrap = webui_root / "bootstrap.py"
+        if bootstrap.is_file():
+            return True, f"present {webui_root}"
+        return False, f"existing path is not a Hermes WebUI checkout: {webui_root}"
+    if dry_run:
+        return True, f"would clone {UPSTREAM_REPO} -> {webui_root}"
+    webui_root.parent.mkdir(parents=True, exist_ok=True)
+    proc = _run(["git", "clone", "--depth", "1", UPSTREAM_REPO, str(webui_root)], check=False)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "git clone failed").strip()
+    return True, f"cloned {webui_root}"
+
+
+def render_unit(*, hermes_home: Path, webui_root: Path, python_exe: str, webchat_port: int) -> str:
+    text = UNIT_TEMPLATE.read_text(encoding="utf-8")
+    return (
+        text.replace("__WEBUI_ROOT__", str(webui_root))
+        .replace("__HERMES_HOME__", str(hermes_home))
+        .replace("__WEBCHAT_PORT__", str(webchat_port))
+        .replace("__PYTHON__", python_exe)
+    )
+
+
 def install_trade_web_unit(
     *,
     hermes_root: Path,
@@ -74,12 +105,14 @@ def install_trade_web_unit(
     dry_run: bool = False,
     start: bool = True,
 ) -> Dict[str, Any]:
-    """Render unit, retire legacy trademenu.service, enable trade-web."""
+    """Render unit, retire legacy Hermes WebUI unit, enable webchat."""
+    webui_root = Path(os.environ.get("WEBCHAT_WEBUI_ROOT", str(DEFAULT_WEBUI_ROOT))).expanduser()
+    webchat_port = _webchat_port()
     record: Dict[str, Any] = {
         "unit": UNIT_NAME,
         "legacy_unit": LEGACY_UNIT_NAME,
         "systemd_dir": str(systemd_dir),
-        "hermes_root": str(hermes_root),
+        "webui_root": str(webui_root),
         "hermes_home": str(hermes_home),
         "ok": True,
         "dry_run": dry_run,
@@ -90,7 +123,19 @@ def install_trade_web_unit(
         record["error"] = f"missing unit template: {UNIT_TEMPLATE}"
         return record
 
-    body = render_unit(hermes_root=hermes_root, hermes_home=hermes_home)
+    checkout_ok, checkout_msg = ensure_webui_checkout(webui_root, dry_run=dry_run)
+    record["actions"].append(checkout_msg)
+    if not checkout_ok:
+        record["ok"] = False
+        record["error"] = checkout_msg
+        return record
+
+    body = render_unit(
+        hermes_home=hermes_home,
+        webui_root=webui_root,
+        python_exe=_python_exe(),
+        webchat_port=webchat_port,
+    )
     dst = Path(systemd_dir) / UNIT_NAME
     legacy = Path(systemd_dir) / LEGACY_UNIT_NAME
 
@@ -98,7 +143,7 @@ def install_trade_web_unit(
         record["actions"].append(f"would-write {dst}")
         if legacy.is_file():
             record["actions"].append(f"would-remove {legacy}")
-        record["actions"].append("would daemon-reload / enable --now trade-web (if start)")
+        record["actions"].append("would daemon-reload / enable --now webchat (if start)")
         return record
 
     if not str(systemd_dir).strip():
@@ -108,7 +153,7 @@ def install_trade_web_unit(
     systemd_dir = Path(systemd_dir)
     systemd_dir.mkdir(parents=True, exist_ok=True)
 
-    # Retire legacy unit first so :8001 cannot double-bind.
+    # Retire legacy upstream unit first so :9000 cannot double-bind.
     if _systemctl_available():
         _run(["systemctl", "disable", "--now", LEGACY_UNIT_NAME], check=False)
         record["actions"].append(f"disable --now {LEGACY_UNIT_NAME}")
@@ -133,14 +178,13 @@ def install_trade_web_unit(
     record["actions"].append("daemon-reload")
 
     pw_ok, pw_len = password_status(hermes_home)
-    record["trade_web_password_present"] = pw_ok
-    record["trade_web_password_length"] = pw_len
+    record["web_password_present"] = pw_ok
+    record["web_password_length"] = pw_len
     if not pw_ok:
         record["actions"].append(
-            "WARNING: TRADE_WEB_PASSWORD missing — unit installed but not started; "
-            "set it in $HERMES_HOME/.env then: systemctl enable --now trade-web"
+            "WARNING: WEB_PASSWORD missing — unit installed but not started; "
+            "set it in $HERMES_HOME/.env then: systemctl enable --now webchat"
         )
-        # Still enable so a later start works once password is set.
         _run(["systemctl", "enable", UNIT_NAME], check=False)
         record["actions"].append(f"enable {UNIT_NAME} (not started: no password)")
         return record
@@ -203,50 +247,46 @@ def verify_trade_web_unit(
 ) -> List[Tuple[str, bool, str]]:
     """Return list of (name, ok, detail). Never includes secret values."""
     results: List[Tuple[str, bool, str]] = []
-    main_py = hermes_root / "plugins" / "trade" / "trademenu" / "__main__.py"
+    webui_root = Path(os.environ.get("WEBCHAT_WEBUI_ROOT", str(DEFAULT_WEBUI_ROOT))).expanduser()
+    main_py = webui_root / "bootstrap.py"
     if main_py.is_file():
-        results.append(("trade-web package files", True, str(main_py)))
+        results.append(("upstream hermes-webui clone", True, str(main_py)))
     else:
-        results.append(("trade-web package files", False, f"missing {main_py}"))
+        results.append(("upstream hermes-webui clone", False, f"missing {main_py}"))
 
     unit_path = Path(systemd_dir) / UNIT_NAME
     if not unit_path.is_file():
-        results.append(("trade-web.service present", False, f"missing {unit_path}"))
+        results.append(("webchat.service present", False, f"missing {unit_path}"))
     else:
         text = unit_path.read_text(encoding="utf-8", errors="ignore")
-        root_s = str(hermes_root)
         checks = [
-            (f"WorkingDirectory={root_s}" in text or f"WorkingDirectory={root_s}/" in text,
-             "WorkingDirectory uses hermes-root"),
-            (f"PYTHONPATH={root_s}" in text, "PYTHONPATH=hermes-root"),
-            ("-m plugins.trade.trademenu" in text, "ExecStart module plugins.trade.trademenu"),
-            (f"{root_s}/venv/bin/python" in text, "ExecStart uses hermes-root venv python"),
-            ("0.0.0.0" not in text or True, "bind left to app config (0.0.0.0:8001)"),
+            (f"WorkingDirectory={webui_root}" in text or f"WorkingDirectory={webui_root}/" in text,
+             "WorkingDirectory uses webui root"),
+            (f"EnvironmentFile=-{hermes_home}/.env" in text, "reads KAM .env"),
+            ("WEBCHAT_PORT" in text, "WEBCHAT_PORT in unit"),
+            ("HERMES_WEBUI_PORT" in text, "maps WEBCHAT_PORT to HERMES_WEBUI_PORT"),
+            ("HERMES_WEBUI_PASSWORD" in text, "maps WEB_PASSWORD to HERMES_WEBUI_PASSWORD"),
+            ("HERMES_WEBUI_HINT" in text, "maps WEB_HINT to HERMES_WEBUI_HINT"),
+            ("0.0.0.0" in text, "binds externally"),
+            ("bootstrap.py" in text, "ExecStart points to upstream bootstrap"),
         ]
         bad = [msg for ok, msg in checks if not ok]
         if bad:
-            results.append(("trade-web.service contents", False, "; ".join(bad)))
+            results.append(("webchat.service contents", False, "; ".join(bad)))
         else:
-            results.append(("trade-web.service contents", True, str(unit_path)))
+            results.append(("webchat.service contents", True, str(unit_path)))
 
-    # Legacy unit must not remain enabled on real systemd dir.
     legacy = Path(systemd_dir) / LEGACY_UNIT_NAME
     if legacy.is_file():
-        results.append(("legacy trademenu.service removed", False, f"still present: {legacy}"))
+        results.append(("legacy hermes-web-chat.service removed", False, f"still present: {legacy}"))
     else:
-        results.append(("legacy trademenu.service removed", True, "absent"))
+        results.append(("legacy hermes-web-chat.service removed", True, "absent"))
 
     pw_ok, pw_len = password_status(hermes_home)
     if pw_ok:
-        results.append(("TRADE_WEB_PASSWORD present", True, f"present len={pw_len}"))
+        results.append(("WEB_PASSWORD present", True, f"present len={pw_len}"))
     else:
-        results.append(
-            (
-                "TRADE_WEB_PASSWORD present",
-                False,
-                f"set TRADE_WEB_PASSWORD in {hermes_home}/.env",
-            )
-        )
+        results.append(("WEB_PASSWORD present", False, f"set WEB_PASSWORD in {hermes_home}/.env"))
 
     if require_active_health and _systemctl_available():
         st = _run(["systemctl", "is-active", UNIT_NAME], check=False)
@@ -255,35 +295,30 @@ def verify_trade_web_unit(
             import json
             import urllib.request
 
+            port = _webchat_port()
             try:
-                with urllib.request.urlopen("http://127.0.0.1:8001/api/health", timeout=5) as resp:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
                     code = getattr(resp, "status", None) or resp.getcode()
                     body = resp.read().decode("utf-8", errors="ignore")
                 if int(code) != 200:
-                    results.append(("trade-web health", False, f"HTTP {code}"))
+                    results.append(("webchat health", False, f"HTTP {code}"))
                 else:
                     try:
                         payload = json.loads(body)
                     except json.JSONDecodeError:
                         payload = {}
                     svc = str(payload.get("service") or "")
-                    if svc != "trade-web":
-                        results.append(("trade-web health", False, f"service={svc!r} body={body[:80]!r}"))
+                    if svc and svc != "webchat":
+                        results.append(("webchat health", False, f"service={svc!r} body={body[:80]!r}"))
                     else:
-                        results.append(("trade-web health", True, "200 service=trade-web"))
+                        results.append(("webchat health", True, f"200 port={port}"))
             except Exception as exc:  # noqa: BLE001
-                results.append(("trade-web health", False, f"{type(exc).__name__}: {exc}"))
+                results.append(("webchat health", False, f"{type(exc).__name__}: {exc}"))
         else:
             if not pw_ok:
-                results.append(
-                    (
-                        "trade-web active",
-                        False,
-                        "inactive (expected until TRADE_WEB_PASSWORD is set)",
-                    )
-                )
+                results.append(("webchat active", False, "inactive (expected until WEB_PASSWORD is set)"))
             else:
-                results.append(("trade-web active", False, f"is-active={(st.stdout or st.stderr or '').strip()}"))
+                results.append(("webchat active", False, f"is-active={(st.stdout or st.stderr or '').strip()}"))
     return results
 
 
@@ -295,4 +330,5 @@ __all__ = [
     "verify_trade_web_unit",
     "password_status",
     "render_unit",
+    "ensure_webui_checkout",
 ]

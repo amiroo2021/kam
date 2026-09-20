@@ -1,6 +1,6 @@
 """Capability-specific uninstaller: TRADE.
 
-Removes trade-only payloads and the trade-web systemd unit.
+Removes trade-only payloads and the webtrade systemd unit.
 
 Does NOT delete operator .env keys.
 Does NOT remove shared agents / tradedesk / canonical while fibo may remain
@@ -55,12 +55,12 @@ def run(
             if not dry_run:
                 dst.unlink()
 
-    # Remove trademenu package directory (web UI)
-    trademenu_dir = plugin_root / "trademenu"
-    if trademenu_dir.is_dir():
-        record["removed_dirs"].append(str(trademenu_dir))
+    # Remove webtrade package directory (web UI)
+    webtrade_dir = plugin_root / "webtrade"
+    if webtrade_dir.is_dir():
+        record["removed_dirs"].append(str(webtrade_dir))
         if not dry_run:
-            shutil.rmtree(trademenu_dir, ignore_errors=True)
+            shutil.rmtree(webtrade_dir, ignore_errors=True)
 
     # tests under plugins/trade/tests are trade-capability owned
     tests_dir = plugin_root / "tests"
@@ -78,7 +78,7 @@ def run(
         if not dry_run:
             shutil.rmtree(own_dir, ignore_errors=True)
 
-    # Always retire trade-web + legacy trademenu units; never touch .env.
+    # Always retire webtrade + legacy webtrade units; never touch .env.
     sd = systemd_dir if systemd_dir is not None else Path("/etc/systemd/system")
     record["trade_web_unit"] = uninstall_trade_web_unit(systemd_dir=sd, dry_run=dry_run)
     return record

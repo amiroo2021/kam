@@ -2,7 +2,7 @@
 
 Installs the full ``plugins/trade/`` payload into ``$HERMES_ROOT/plugins/trade``
 (including wizard, backtest_wizard, agents already handled by shared when needed,
-trademenu web UI, candles helpers, etc.) and stages the trade-web systemd unit.
+webtrade web UI, candles helpers, etc.) and stages the webtrade systemd unit.
 
 Takes EXPLICIT ``hermes_root`` (the installed app tree) and ``hermes_home``
 (the persistent state). The two are independent.
@@ -75,7 +75,7 @@ def run(
     shared: Dict[str, Any],
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Install the /trade capability + trade-web unit. Idempotent."""
+    """Install the /trade capability + webtrade unit. Idempotent."""
     plugin_root = hermes_root / "plugins" / "trade"
     record: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -101,15 +101,15 @@ def run(
         own_dir.mkdir(parents=True, exist_ok=True)
     record["owned_dir"] = str(own_dir)
 
-    # trade-web systemd unit
+    # webtrade systemd unit
     systemd_dir_str = str(shared.get("systemd_dir", "") or "")
     pw_ok, pw_len = password_status(hermes_home)
     record["trade_web_password_present"] = pw_ok
     record["trade_web_password_length"] = pw_len
     if not pw_ok:
         print(
-            "WARNING: TRADE_WEB_PASSWORD is missing from env / "
-            f"{hermes_home}/.env — trade-web will fail closed until set "
+            "WARNING: WEB_PASSWORD is missing from env / "
+            f"{hermes_home}/.env — webtrade will fail closed until set "
             "(operator must supply it; installer will not invent a password).",
             flush=True,
         )

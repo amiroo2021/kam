@@ -1,0 +1,17 @@
+[Unit]
+Description=Clean upstream Hermes WebUI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WEBUI_ROOT__
+EnvironmentFile=-__HERMES_HOME__/.env
+Environment=WEBCHAT_PORT=__WEBCHAT_PORT__
+Environment=HERMES_WEBUI_HOST=0.0.0.0
+Environment=HERMES_WEBUI_STATE_DIR=__HERMES_HOME__/webui
+ExecStart=/bin/sh -lc 'export HERMES_WEBUI_PORT="${WEBCHAT_PORT:-__WEBCHAT_PORT__}"; export HERMES_WEBUI_PASSWORD="${WEB_PASSWORD:-}"; export HERMES_WEBUI_HINT="${WEB_HINT:-}"; exec "__PYTHON__" "__WEBUI_ROOT__/bootstrap.py"'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

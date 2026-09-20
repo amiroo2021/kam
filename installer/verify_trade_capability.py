@@ -5,8 +5,8 @@ Verifies that the /trade capability is correctly installed:
   - manifest says trade=true
   - ~/.hermes/trade/ folder exists
   - tradedesk.py and wizard.py AST-parse cleanly
-  - trademenu package present under hermes-root
-  - trade-web.service contract + TRADE_WEB_PASSWORD + optional live health
+  - webtrade package present under hermes-root
+  - webtrade.service contract + WEB_PASSWORD + optional live health
 
 Takes EXPLICIT ``hermes_root`` and ``hermes_home``. The two are
 independent.
@@ -57,8 +57,8 @@ def run(
     for rel in [
         "plugins/trade/tradedesk.py",
         "plugins/trade/wizard.py",
-        "plugins/trade/trademenu/__main__.py",
-        "plugins/trade/trademenu/app.py",
+        "plugins/trade/webtrade/__main__.py",
+        "plugins/trade/webtrade/app.py",
         "plugins/trade/candles.py",
         "plugins/trade/instrument_picker.py",
         "plugins/trade/ladder_math.py",
@@ -80,16 +80,16 @@ def run(
         else:
             print(f"    [ok] {rel} present ({path})")
 
-    # Import trade-web package with hermes-root first on sys.path
-    print("==> verify trade-web import")
+    # Import webtrade package with hermes-root first on sys.path
+    print("==> verify webtrade import")
     sys.path.insert(0, str(hermes_root))
     for name in [m for m in list(sys.modules) if m.startswith("plugins.trade")]:
         del sys.modules[name]
     try:
-        importlib.import_module("plugins.trade.trademenu")
-        print("    [ok] import plugins.trade.trademenu")
+        importlib.import_module("plugins.trade.webtrade")
+        print("    [ok] import plugins.trade.webtrade")
     except Exception as exc:  # noqa: BLE001
-        print(f"    [FAIL] import plugins.trade.trademenu: {type(exc).__name__}: {exc}")
+        print(f"    [FAIL] import plugins.trade.webtrade: {type(exc).__name__}: {exc}")
         ok = False
 
     # Telegram adapter dispatch (installed tree only — this is the Lodo gate).
@@ -109,7 +109,7 @@ def run(
                 print(f"    [FAIL] adapter trade {kind} seam missing")
                 ok = False
 
-    print("==> verify trade-web unit / password / health")
+    print("==> verify webtrade unit / password / health")
     sd = systemd_dir if systemd_dir is not None else Path("/etc/systemd/system")
     for name, passed, detail in verify_trade_web_unit(
         hermes_root=hermes_root,

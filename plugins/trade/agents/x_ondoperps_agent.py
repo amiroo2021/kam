@@ -4013,7 +4013,7 @@ def _execute_list_instruments(
 def _execute_candles(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     """OHLCV via authenticated GET /v1/perps/candles (market=BTC-USD.P).
 
-    TradeMenu/TradeDesk pass the canonical resolved instrument (e.g.
+    WebTrade/TradeDesk pass the canonical resolved instrument (e.g.
     ``BTC-USD.P``). The Ondo candle API uses the same market id — no
     frontend rewrite. Resolution strings are minutes (``15``) or ``1D``.
     """
@@ -4040,7 +4040,7 @@ def _execute_candles(account: str, request: Dict[str, Any]) -> CanonicalResponse
             message="symbol is required for candles.",
         )
 
-    # TradeMenu TFs → Ondo resolution (minutes, or 1D).
+    # WebTrade TFs → Ondo resolution (minutes, or 1D).
     resolution_map = {
         "1m": "1",
         "5m": "5",

@@ -1,216 +1,240 @@
 """Exchange OHLCV fetchers for TradeDesk ``candles`` operations.
 
-TradeMenu must not grow per-exchange if/elif chains. Agents call these
-helpers (or ``handle_candles_operation``) and return normalized bars via
-``CanonicalResponse.data["candles"]``.
+WebTrade must not grow per-exchange if/elif chains. Agents either call these
+helpers (when their candle path is plain REST) or return explicit UNSUPPORTED /
+UNAVAILABLE errors with a documented reason.
 
-Each fetcher returns a list of:
-  {time (unix sec), open, high, low, close, volume}
-sorted ascending, de-duplicated by time.
+Contract:
+- input: canonical native symbol from the exchange resolver
+- output: normalized OHLCV list
+- no exchange-specific symbol rewriting in WebTrade UI code
+- no Binance fallback unless a venue explicitly uses it as its official source
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .canonical import make_failure, make_success, sanitize_error_message
-
-SUPPORTED_TFS: Tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "4h", "1D")
-
-_TF_SECONDS = {
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "30m": 1800,
-    "1h": 3600,
-    "4h": 14400,
-    "1D": 86400,
-}
+from .canonical import make_failure, make_success
 
 
-def normalize_candle(ts_ms: int, o: float, h: float, l: float, c: float, v: float = 0.0) -> Dict[str, Any]:
+def _http_json(url: str, timeout: int = 20) -> Any:
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Hermes-KAM/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 public market data
+        data = resp.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(data)
+    except Exception:
+        return data
+
+
+def _extract_ts_ms(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        if ts > 10_000_000_000_000_000:  # ns
+            return ts // 1_000_000
+        if ts > 10_000_000_000_000:  # µs
+            return ts // 1000
+        if ts > 10_000_000_000:  # ms
+            return ts
+        return ts * 1000
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def normalize_candle(time_ms: Any, open_: Any, high: Any, low: Any, close: Any, volume: Any = 0) -> Dict[str, Any]:
+    ts = _extract_ts_ms(time_ms)
+    if ts is None:
+        raise ValueError("invalid candle timestamp")
     return {
-        "time": int(ts_ms // 1000),
-        "open": float(o),
-        "high": float(h),
-        "low": float(l),
-        "close": float(c),
-        "volume": float(v),
+        "time": int(ts),
+        "open": float(open_),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "volume": float(volume or 0),
     }
 
 
-def finalize_candles(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    rows = [r for r in rows if isinstance(r, dict) and r.get("time") is not None]
-    rows.sort(key=lambda c: int(c["time"]))
-    dedup: Dict[int, Dict[str, Any]] = {int(c["time"]): c for c in rows}
-    ordered = [dedup[k] for k in sorted(dedup.keys())]
-    limit_n = max(1, min(int(limit), 1500))
-    return ordered[-limit_n:]
-
-
-def _http_json(url: str, *, method: str = "GET", body: Optional[dict] = None, timeout: int = 25) -> Any:
-    data = None
-    headers = {"User-Agent": "Hermes-TradeDesk/1.0", "Accept": "application/json"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 public market data
-        raw = resp.read().decode("utf-8", errors="replace")
-    if not raw:
-        return None
-    return json.loads(raw)
-
-
-# ---------------------------------------------------------------------------
-# Venue fetchers
-# ---------------------------------------------------------------------------
-
-def fetch_binance(symbol: str, tf: str, *, market: str = "futures", limit: int = 300) -> List[Dict[str, Any]]:
-    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1D": "1d"}.get(tf)
-    if not interval:
-        raise ValueError("UNSUPPORTED_TIMEFRAME")
-    s = str(symbol or "").upper().replace("-", "").replace("_", "").replace("/", "")
-    if s.endswith("USD") and not s.endswith(("USDT", "USDC")):
-        s = s[:-3] + "USDT"
-    if not s.endswith(("USDT", "USDC", "BUSD")):
-        s = f"{s}USDT"
-    if market == "spot":
-        base, path = "https://api.binance.com", "/api/v3/klines"
-    else:
-        base, path = "https://fapi.binance.com", "/fapi/v1/klines"
-    qs = urllib.parse.urlencode({"symbol": s, "interval": interval, "limit": min(int(limit), 1000)})
-    rows = _http_json(f"{base}{path}?{qs}")
-    out = []
-    for row in rows or []:
-        out.append(normalize_candle(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])))
-    return finalize_candles(out, limit)
-
-
-def fetch_hyperliquid(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1D": "1d"}.get(tf)
-    if not interval:
-        raise ValueError("UNSUPPORTED_TIMEFRAME")
-    coin = str(symbol or "").strip()
-    if ":" in coin:
-        dex, _, tail = coin.partition(":")
-        tail = tail.strip()
-        for suffix in ("-USD", "-USDT", "USDT", "USDC", "USD"):
-            if tail.upper().endswith(suffix) and len(tail) > len(suffix):
-                tail = tail[: -len(suffix)]
-                break
-        coin = f"{dex}:{tail}" if tail else coin
-    else:
-        for suffix in ("-USD", "-USDT", "USDT", "USDC", "USD"):
-            if coin.upper().endswith(suffix) and len(coin) > len(suffix):
-                coin = coin[: -len(suffix)]
-                break
-    if not coin:
-        raise ValueError("MISSING_SYMBOL")
-    end_ms = int(time.time() * 1000)
-    tf_ms = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}[interval]
-    start_ms = end_ms - tf_ms * max(int(limit), 50)
-    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms}}
-    try:
-        rows = _http_json("https://api.hyperliquid.xyz/info", method="POST", body=payload)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"CANDLES_UNAVAILABLE: Hyperliquid rejected coin {coin!r} ({exc.code})") from exc
-    if not isinstance(rows, list):
-        raise RuntimeError("Unexpected Hyperliquid candle response")
-    out = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        t = int(row.get("t") or 0)
-        out.append(normalize_candle(t, float(row["o"]), float(row["h"]), float(row["l"]), float(row["c"]), float(row.get("v") or 0)))
-    return finalize_candles(out, limit)
-
-
-def fetch_phemex(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    # Prefer existing TradeMenu implementation for parity.
-    from plugins.trade.trademenu import marketdata as md
-
-    return md.fetch_phemex_candles(symbol, tf, limit=limit)
-
-
-def fetch_mexc(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    from plugins.trade.trademenu import marketdata as md
-
-    return md.fetch_mexc_candles(symbol, tf, limit=limit)
-
-
-def fetch_raydium(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    from plugins.trade.trademenu import marketdata as md
-
-    return md.fetch_raydium_candles(symbol, tf, limit=limit)
-
-
-def fetch_arcus(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    from plugins.trade.trademenu import marketdata as md
-
-    return md.fetch_arcus_candles(symbol, tf, limit=limit)
-
-
-def fetch_rise(symbol: str, tf: str, limit: int = 300, *, api_base: str = "https://api.rise.trade") -> List[Dict[str, Any]]:
-    """Rise trading-view OHLCV by numeric market id.
-
-    Endpoint: GET /v1/markets/id/{market_id}/trading-view-data
-    interval/from/to are nanoseconds. Native symbols are BTC, ETH, … (display BTC/USDC).
-    """
-    sec = _TF_SECONDS.get(tf)
-    if not sec:
-        raise ValueError("UNSUPPORTED_TIMEFRAME")
-    market_id = _rise_market_id(symbol, api_base=api_base)
-    if market_id is None:
-        raise RuntimeError(f"CANDLES_UNAVAILABLE: Rise market not found for {symbol!r}")
-    interval_ns = int(sec) * 1_000_000_000
-    to_ns = int(time.time() * 1_000_000_000)
-    limit_n = max(1, min(int(limit), 1000))
-    from_ns = to_ns - interval_ns * limit_n
-    qs = urllib.parse.urlencode({"interval": str(interval_ns), "from": str(from_ns), "to": str(to_ns)})
-    url = f"{api_base.rstrip('/')}/v1/markets/id/{market_id}/trading-view-data?{qs}"
-    data = _http_json(url, timeout=25)
-    rows = _extract_list(data, keys=("data", "candles", "bars"))
+def finalize_candles(rows: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    seen = set()
     out: List[Dict[str, Any]] = []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ts_raw = row.get("time") or row.get("t") or 0
         try:
-            ts = int(ts_raw)
-        except (TypeError, ValueError):
-            continue
-        # nanoseconds → ms
-        if ts > 10_000_000_000_000_000:  # ns
-            ts_ms = ts // 1_000_000
-        elif ts > 10_000_000_000_000:  # µs
-            ts_ms = ts // 1000
-        elif ts > 10_000_000_000:  # ms
-            ts_ms = ts
-        else:
-            ts_ms = ts * 1000
-        try:
-            out.append(
-                normalize_candle(
-                    ts_ms,
-                    float(row.get("open")),
-                    float(row.get("high")),
-                    float(row.get("low")),
-                    float(row.get("close")),
-                    float(row.get("volume") or 0),
-                )
+            candle = normalize_candle(
+                row.get("time"), row.get("open"), row.get("high"), row.get("low"), row.get("close"), row.get("volume", 0)
             )
-        except (TypeError, ValueError):
+        except Exception:
             continue
+        if candle["time"] in seen:
+            continue
+        seen.add(candle["time"])
+        out.append(candle)
+    out.sort(key=lambda x: x["time"])
+    if limit > 0:
+        out = out[-limit:]
+    return out
+
+
+SUPPORTED_TFS = {"1m", "5m", "15m", "30m", "1h", "4h", "1D"}
+_TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1D": 86400}
+
+
+def _resample_1m(rows: Sequence[Dict[str, Any]], target_sec: int, limit: int) -> List[Dict[str, Any]]:
+    if target_sec <= 60:
+        return finalize_candles(rows, limit)
+    bucket_ms = target_sec * 1000
+    buckets: Dict[int, Dict[str, Any]] = {}
+    for raw in rows:
+        try:
+            c = normalize_candle(raw.get("time"), raw.get("open"), raw.get("high"), raw.get("low"), raw.get("close"), raw.get("volume", 0))
+        except Exception:
+            continue
+        b = (c["time"] // bucket_ms) * bucket_ms
+        existing = buckets.get(b)
+        if existing is None:
+            buckets[b] = {"time": b, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]}
+        else:
+            existing["high"] = max(existing["high"], c["high"])
+            existing["low"] = min(existing["low"], c["low"])
+            existing["close"] = c["close"]
+            existing["volume"] += c["volume"]
+    return finalize_candles(list(buckets.values()), limit)
+
+
+# ---------------------------------------------------------------------------
+# Apex
+# ---------------------------------------------------------------------------
+
+def _apex_wire_symbol(symbol: str) -> str:
+    sym = str(symbol or "").strip().upper()
+    return sym.replace("-", "").replace("/", "").replace("_", "")
+
+
+def fetch_apex(symbol: str, tf: str, limit: int = 300, *, base: str = "https://omni.apex.exchange") -> List[Dict[str, Any]]:
+    sym = _apex_wire_symbol(symbol)
+    if tf not in _TF_SECONDS:
+        raise ValueError("UNSUPPORTED_TIMEFRAME")
+    interval = str(_TF_SECONDS[tf] // 60 if tf != "1m" else 1)
+    url = f"{base.rstrip('/')}/api/v3/klines?{urllib.parse.urlencode({'symbol': sym, 'interval': interval, 'limit': str(max(limit, 1))})}"
+    data = _http_json(url, timeout=20)
+    rows = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        for k in ("data", "result", "rows", "candles"):
+            v = data.get(k)
+            if isinstance(v, list):
+                rows = v
+                break
+            if isinstance(v, dict):
+                rows = v.get("rows") or v.get("candles") or []
+                if rows:
+                    break
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, list) and len(row) >= 6:
+            out.append(normalize_candle(row[0], row[1], row[2], row[3], row[4], row[5]))
+        elif isinstance(row, dict):
+            out.append(normalize_candle(row.get("time") or row.get("t") or row.get("openTime"), row.get("open") or row.get("o"), row.get("high") or row.get("h"), row.get("low") or row.get("l"), row.get("close") or row.get("c"), row.get("volume") or row.get("v") or 0))
     if not out:
-        raise RuntimeError(f"Empty Rise candles for market_id={market_id} symbol={symbol}")
+        raise RuntimeError(f"CANDLES_UNAVAILABLE: Apex returned no klines for {symbol}")
     return finalize_candles(out, limit)
 
+
+# ---------------------------------------------------------------------------
+# QFEX
+# ---------------------------------------------------------------------------
+
+def _qfex_resolution(tf: str) -> str:
+    return {"1m": "1MIN", "5m": "1MIN", "15m": "1MIN", "30m": "1MIN", "1h": "1HOUR", "4h": "1HOUR", "1D": "1DAY"}[tf]
+
+
+def _qfex_resample(rows: Sequence[Dict[str, Any]], tf: str, limit: int) -> List[Dict[str, Any]]:
+    return _resample_1m(rows, _TF_SECONDS[tf], limit)
+
+
+def fetch_qfex(symbol: str, tf: str, limit: int = 300, *, base: str = "https://api.qfex.com") -> List[Dict[str, Any]]:
+    sym = str(symbol or "").strip().upper()
+    if tf not in _TF_SECONDS:
+        raise ValueError("UNSUPPORTED_TIMEFRAME")
+    res = _qfex_resolution(tf)
+    if res == "1MIN":
+        secs = _TF_SECONDS[tf]
+        rows_req = max(limit * max(secs // 60, 1) * 2, limit * 2, 120)
+        end = int(time.time())
+        start = end - rows_req * 60
+        url = f"{base.rstrip('/')}/candles/{urllib.parse.quote(sym)}?{urllib.parse.urlencode({'resolution': res, 'from': str(start), 'to': str(end)})}"
+        data = _http_json(url, timeout=20)
+        rows = []
+        if isinstance(data, dict):
+            for k in ("data", "candles", "rows", "result"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    rows = v
+                    break
+                if isinstance(v, dict):
+                    rows = v.get("candles") or v.get("rows") or []
+                    if rows:
+                        break
+        elif isinstance(data, list):
+            rows = data
+        out = []
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 6:
+                out.append(normalize_candle(row[0], row[1], row[2], row[3], row[4], row[5]))
+            elif isinstance(row, dict):
+                out.append(normalize_candle(row.get("time") or row.get("t") or row.get("openTime"), row.get("open") or row.get("o"), row.get("high") or row.get("h"), row.get("low") or row.get("l"), row.get("close") or row.get("c"), row.get("volume") or row.get("v") or 0))
+        if tf == "1m":
+            return finalize_candles(out, limit)
+        return _qfex_resample(out, tf, limit)
+    url = f"{base.rstrip('/')}/candles/{urllib.parse.quote(sym)}?{urllib.parse.urlencode({'resolution': res})}"
+    data = _http_json(url, timeout=20)
+    rows = []
+    if isinstance(data, dict):
+        for k in ("data", "candles", "rows", "result"):
+            v = data.get(k)
+            if isinstance(v, list):
+                rows = v
+                break
+            if isinstance(v, dict):
+                rows = v.get("candles") or v.get("rows") or []
+                if rows:
+                    break
+    elif isinstance(data, list):
+        rows = data
+    out = []
+    for row in rows:
+        if isinstance(row, list) and len(row) >= 6:
+            out.append(normalize_candle(row[0], row[1], row[2], row[3], row[4], row[5]))
+        elif isinstance(row, dict):
+            out.append(normalize_candle(row.get("time") or row.get("t") or row.get("openTime"), row.get("open") or row.get("o"), row.get("high") or row.get("h"), row.get("low") or row.get("l"), row.get("close") or row.get("c"), row.get("volume") or row.get("v") or 0))
+    if not out:
+        raise RuntimeError(f"CANDLES_UNAVAILABLE: QFEX returned no candles for {symbol}")
+    return finalize_candles(out, limit)
+
+
+# ---------------------------------------------------------------------------
+# Rise
+# ---------------------------------------------------------------------------
 
 _RISE_MARKET_CACHE: Dict[str, Any] = {"ts": 0.0, "by_sym": {}}
 
@@ -219,13 +243,12 @@ def _rise_market_id(symbol: str, *, api_base: str) -> Optional[str]:
     text = str(symbol or "").strip().upper()
     if not text:
         return None
-    # Already a pure market id?
     if text.isdigit():
         return text
     now = time.time()
     if now - float(_RISE_MARKET_CACHE.get("ts") or 0) > 300 or not _RISE_MARKET_CACHE.get("by_sym"):
         data = _http_json(f"{api_base.rstrip('/')}/v1/markets", timeout=20)
-        markets = []
+        markets: List[Dict[str, Any]] = []
         if isinstance(data, dict):
             inner = data.get("data")
             if isinstance(inner, dict):
@@ -242,18 +265,12 @@ def _rise_market_id(symbol: str, *, api_base: str) -> Optional[str]:
             if not mid:
                 continue
             cfg = m.get("config") if isinstance(m.get("config"), dict) else {}
-            names = [
-                cfg.get("name"),
-                m.get("display_name"),
-                m.get("base_asset_symbol"),
-                m.get("underlying"),
-            ]
+            names = [cfg.get("name"), m.get("display_name"), m.get("base_asset_symbol"), m.get("underlying")]
             for n in names:
                 key = str(n or "").strip().upper()
                 if not key:
                     continue
                 by_sym[key] = mid
-                # BTC/USDC → BTC, BTC-USDC → BTC
                 base = key.split("/")[0].split("-")[0].split("_")[0]
                 if base and base not in by_sym:
                     by_sym[base] = mid
@@ -278,74 +295,114 @@ def _rise_market_id(symbol: str, *, api_base: str) -> Optional[str]:
     return by_sym.get(base)
 
 
-def fetch_pacifica(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
-    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1D": "1d"}.get(tf)
-    if not interval:
+def fetch_rise(symbol: str, tf: str, limit: int = 300, *, api_base: str = "https://api.rise.trade") -> List[Dict[str, Any]]:
+    sec = _TF_SECONDS.get(tf)
+    if not sec:
         raise ValueError("UNSUPPORTED_TIMEFRAME")
-    sym = str(symbol or "").strip().upper()
-    for suffix in ("-USD", "-USDT", "-USDC", "USDT", "USDC", "USD"):
-        if sym.endswith(suffix) and len(sym) > len(suffix) and ":" not in sym:
-            # Pacifica uses bare BTC/ETH
-            if suffix.startswith("-") or suffix in ("USDT", "USDC", "USD"):
-                cand = sym[: -len(suffix)] if not suffix.startswith("-") else sym[: -len(suffix)]
-                if cand and cand.isalpha():
-                    sym = cand
+    market_id = _rise_market_id(symbol, api_base=api_base)
+    if market_id is None:
+        raise RuntimeError(f"CANDLES_UNAVAILABLE: Rise market not found for {symbol!r}")
+    # Rise returns 1m candles from trading-view-data; aggregate locally for
+    # all higher timeframes.
+    interval_sec = 60
+    now_s = int(time.time())
+    target_bars = max(int(limit) * max(_TF_SECONDS[tf] // 60, 1) * 4 + 200, 400)
+    from_s = now_s - interval_sec * target_bars
+    qs = urllib.parse.urlencode({"interval": str(interval_sec), "from": str(from_s), "to": str(now_s)})
+    url = f"{api_base.rstrip('/')}/v1/markets/id/{market_id}/trading-view-data?{qs}"
+    data = _http_json(url, timeout=30)
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, list):
+            rows = inner
+        elif isinstance(inner, dict):
+            for k in ("data", "candles", "bars"):
+                v = inner.get(k)
+                if isinstance(v, list):
+                    rows = v
                     break
-    # BTCUSD → BTC
-    if sym.endswith("USD") and len(sym) > 3 and sym[:-3].isalpha():
-        sym = sym[:-3]
-    sec = _TF_SECONDS[tf]
-    limit_n = max(1, min(int(limit), 1000))
-    end_ms = int(time.time() * 1000)
-    start_ms = end_ms - sec * 1000 * limit_n
-    qs = urllib.parse.urlencode({"symbol": sym, "interval": interval, "start_time": start_ms, "end_time": end_ms})
-    data = _http_json(f"https://api.pacifica.fi/api/v1/kline?{qs}", timeout=25)
-    if not isinstance(data, dict) or not data.get("success"):
-        raise RuntimeError(f"Pacifica candles failed for {sym}")
-    rows = data.get("data")
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"Empty Pacifica candles for {sym}")
-    out = []
+    if not rows:
+        raise RuntimeError(f"Empty Rise candles for {market_id} symbol={symbol}")
+    out: List[Dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        t = int(row.get("t") or row.get("T") or 0)
-        if t <= 0:
+        ts_ms = _extract_ts_ms(row.get("time") or row.get("t") or row.get("startTime"))
+        if ts_ms is None or ts_ms <= 0:
             continue
-        out.append(
-            normalize_candle(
-                t if t > 10_000_000_000 else t * 1000,
-                float(row.get("o") or row.get("open")),
-                float(row.get("h") or row.get("high")),
-                float(row.get("l") or row.get("low")),
-                float(row.get("c") or row.get("close")),
-                float(row.get("v") or row.get("volume") or 0),
-            )
-        )
-    return finalize_candles(out, limit)
+        try:
+            out.append(normalize_candle(ts_ms, row.get("open"), row.get("high"), row.get("low"), row.get("close"), row.get("volume") or 0))
+        except Exception:
+            continue
+    if not out:
+        raise RuntimeError(f"Empty Rise candles after normalize for {market_id} symbol={symbol}")
+    return _resample_1m(out, sec, limit)
 
 
-def _extract_list(data: Any, keys: Sequence[str] = ("data", "candles", "bars", "rows")) -> List[Any]:
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
-    for k in keys:
-        v = data.get(k)
-        if isinstance(v, list):
-            return v
-        if isinstance(v, dict):
-            for k2 in keys:
-                v2 = v.get(k2)
-                if isinstance(v2, list):
-                    return v2
-    return []
+# ---------------------------------------------------------------------------
+# Previously verified adapters (delegates to WebTrade marketdata helpers)
+# ---------------------------------------------------------------------------
+
+def fetch_phemex(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_phemex_candles(symbol, tf, limit=limit)
 
 
-# Exchange → fetcher (account may adjust binance spot/futures)
-Fetcher = Callable[..., List[Dict[str, Any]]]
+def fetch_mexc(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_mexc_candles(symbol, tf, limit=limit)
 
-FETCHERS: Dict[str, Fetcher] = {
+
+def fetch_raydium(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_raydium_candles(symbol, tf, limit=limit)
+
+
+def fetch_arcus(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_arcus_candles(symbol, tf, limit=limit)
+
+
+def fetch_pacifica(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_pacifica_candles(symbol, tf, limit=limit)
+
+
+def fetch_hyperliquid(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_hyperliquid_candles(symbol, tf, limit=limit)
+
+
+def fetch_binance(symbol: str, tf: str, limit: int = 300, *, market: str = "spot") -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_binance_candles(symbol, tf, limit=limit, market=market)
+
+
+def fetch_ondoperps(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    from plugins.trade.webtrade import marketdata as md
+    return md.fetch_ondoperps_candles(symbol, tf, limit=limit)
+
+
+def fetch_edgex(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    raise RuntimeError(
+        "UNSUPPORTED_CANDLES: Public /api/v1/public/quote/getKline returns empty dataList for the probed contract IDs at multiple intervals."
+    )
+
+
+def fetch_lighter(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    raise RuntimeError(
+        "UNSUPPORTED_CANDLES: Public candlesticks endpoint returns 403 without a session and no public historical OHLCV was verified."
+    )
+
+
+def fetch_hibachi(symbol: str, tf: str, limit: int = 300) -> List[Dict[str, Any]]:
+    raise RuntimeError(
+        "UNSUPPORTED_CANDLES: The visible /v1/candles REST surface is gRPC-Web or 429 rate-limited, not a stable JSON OHLCV feed."
+    )
+
+
+FETCHERS: Dict[str, Callable[..., List[Dict[str, Any]]]] = {
     "binance": fetch_binance,
     "hyperliquid": fetch_hyperliquid,
     "phemex": fetch_phemex,
@@ -354,45 +411,53 @@ FETCHERS: Dict[str, Fetcher] = {
     "arcus": fetch_arcus,
     "rise": fetch_rise,
     "pacifica": fetch_pacifica,
+    "apex": fetch_apex,
+    "hibachi": fetch_hibachi,
+    "qfex": fetch_qfex,
+    "ondoperps": fetch_ondoperps,
+    "edgex": fetch_edgex,
+    "lighter": fetch_lighter,
 }
 
-# Documented gaps (no public OHLCV found / auth-walled / empty) — do not fake.
-# OndoPerps candles are authenticated via the agent (GET /v1/perps/candles) —
-# not listed here; capabilities advertise "candles" and agent handles them.
 UNSUPPORTED_NATIVE_CANDLES: Dict[str, str] = {
-    "lighter": "Public candlesticks endpoint returns 403 without session; no alternate public OHLCV found.",
-    "hibachi": "No public OHLCV endpoint discovered on api.hibachi.xyz / data-api.hibachi.xyz.",
-    "edgex": "getKline returns empty dataList for probed contract ids; needs confirmed contract mapping.",
-    "apex": "api/v3/klines returned empty data for BTC-USDT probes.",
-    "nado": "No candlesticks query variant accepted on gateway/archive hosts.",
-    "qfex": "Market data endpoints require authentication; no public candle path found.",
-    "perpl": "No stable public candle API (TLS/host issues on probed endpoints).",
+    "perpl": (
+        "Public REST hosts api.perpl.xyz (DNS NXDOMAIN), app.perpl.xyz (SPA HTML), perpl.xyz (marketing page). "
+        "Authenticated SDK path exposes /v1/market-data/{id}/candles/{sec}/{from}-{to}, but the public REST surface is not reachable for candle data."
+    ),
+    "nado": (
+        "Gateway /v1/query type=candlesticks (or any historical aggregate variant) rejects with 'unknown variant'. No public OHLCV endpoint found on gateway/indexer."
+    ),
 }
 
 
 def has_native_candles(exchange: str) -> bool:
-    """True when the exchange can serve TradeMenu candles (public or agent-auth)."""
     ex = str(exchange or "").strip().lower()
-    if ex in FETCHERS:
-        return True
-    # Agent-authenticated native OHLCV (not in public FETCHERS map).
-    return ex in {"ondoperps"}
+    return ex in FETCHERS or ex == "ondoperps"
 
 
 def fetch_for_exchange(exchange: str, symbol: str, tf: str, limit: int = 300, *, account: str = "") -> List[Dict[str, Any]]:
     ex = str(exchange or "").strip().lower()
     fn = FETCHERS.get(ex)
     if fn is None:
-        reason = UNSUPPORTED_NATIVE_CANDLES.get(ex, "No native candle adapter registered.")
-        raise RuntimeError(f"UNSUPPORTED_CANDLES: {reason}")
+        raise RuntimeError(f"UNSUPPORTED_CANDLES: {UNSUPPORTED_NATIVE_CANDLES.get(ex, 'No native candle adapter registered.')}")
     if ex == "binance":
         market = "futures" if str(account).lower() in {"futures", "future", "perp", "perps"} else "spot"
-        return fn(symbol, tf, market=market, limit=limit)
+        return fn(symbol, tf, limit=limit, market=market)
     return fn(symbol, tf, limit=limit)
 
 
+def candle_error_class(error_message: str) -> str:
+    msg = (error_message or "").upper()
+    if msg.startswith("UNSUPPORTED_CANDLES"):
+        return "UNSUPPORTED_CANDLES"
+    if msg.startswith("UNSUPPORTED_TIMEFRAME"):
+        return "UNSUPPORTED_TIMEFRAME"
+    if msg.startswith("CANDLES_UNAVAILABLE"):
+        return "CANDLES_UNAVAILABLE"
+    return "CANDLES_UPSTREAM_ERROR"
+
+
 def handle_candles_operation(exchange_name: str, account: str, request: Dict[str, Any]):
-    """Shared agent handler for operation=candles."""
     symbol = str(request.get("symbol") or request.get("native_symbol") or "").strip()
     interval = str(request.get("interval") or request.get("tf") or request.get("timeframe") or "15m").strip()
     try:
@@ -400,66 +465,27 @@ def handle_candles_operation(exchange_name: str, account: str, request: Dict[str
     except (TypeError, ValueError):
         limit = 300
     if not symbol:
-        return make_failure(
-            operation="candles",
-            exchange=exchange_name,
-            account=account,
-            code="MISSING_SYMBOL",
-            message="symbol is required for candles.",
-        )
+        return make_failure(operation="candles", exchange=exchange_name, account=account, code="MISSING_SYMBOL", message="symbol is required for candles.")
     if interval not in SUPPORTED_TFS:
-        return make_failure(
-            operation="candles",
-            exchange=exchange_name,
-            account=account,
-            code="UNSUPPORTED_TIMEFRAME",
-            message=f"Timeframe {interval!r} is not supported.",
-        )
+        return make_failure(operation="candles", exchange=exchange_name, account=account, code="UNSUPPORTED_TIMEFRAME", message=f"Timeframe {interval!r} is not supported.")
     try:
         candles = fetch_for_exchange(exchange_name, symbol, interval, limit, account=account)
     except ValueError as exc:
-        code = str(exc)
-        if code == "UNSUPPORTED_TIMEFRAME":
-            return make_failure(
-                operation="candles",
-                exchange=exchange_name,
-                account=account,
-                code="UNSUPPORTED_TIMEFRAME",
-                message=f"Timeframe {interval!r} is not supported on {exchange_name}.",
-            )
-        return make_failure(
-            operation="candles",
-            exchange=exchange_name,
-            account=account,
-            code="CANDLE_ERROR",
-            message=sanitize_error_message(str(exc)),
-        )
+        if str(exc) == "UNSUPPORTED_TIMEFRAME":
+            return make_failure(operation="candles", exchange=exchange_name, account=account, code="UNSUPPORTED_TIMEFRAME", message=f"Timeframe {interval!r} is not supported on {exchange_name}.")
+        return make_failure(operation="candles", exchange=exchange_name, account=account, code="CANDLE_ERROR", message=str(exc)[:240])
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        code = "UNSUPPORTED_CANDLES" if "UNSUPPORTED_CANDLES" in msg else "CANDLES_UNAVAILABLE"
         if msg.startswith("UNSUPPORTED_CANDLES:"):
-            msg = msg.split(":", 1)[1].strip()
+            code = "UNSUPPORTED_CANDLES"
+            user_msg = msg.split(":", 1)[1].strip()
         elif msg.startswith("CANDLES_UNAVAILABLE:"):
-            msg = msg.split(":", 1)[1].strip()
-        clean = sanitize_error_message(msg)[:240]
-        if "HTTP Error" in clean or "url:" in clean.lower():
-            clean = f"Candles unavailable for {symbol} on {exchange_name}."
-        return make_failure(
-            operation="candles",
-            exchange=exchange_name,
-            account=account,
-            code=code,
-            message=clean or f"Candles unavailable for {symbol} on {exchange_name}.",
-        )
-    return make_success(
-        operation="candles",
-        exchange=exchange_name,
-        account=account,
-        data={
-            "candles": candles,
-            "symbol": symbol,
-            "interval": interval,
-            "source": "native",
-            "count": len(candles),
-        },
-    )
+            code = "CANDLES_UNAVAILABLE"
+            user_msg = msg.split(":", 1)[1].strip()
+        else:
+            code = "CANDLES_UPSTREAM_ERROR"
+            user_msg = msg[:240]
+        if "HTTP Error" in user_msg or "url:" in user_msg.lower():
+            user_msg = f"Candles unavailable for {symbol} on {exchange_name}."
+        return make_failure(operation="candles", exchange=exchange_name, account=account, code=code, message=user_msg or f"Candles unavailable for {symbol} on {exchange_name}.")
+    return make_success(operation="candles", exchange=exchange_name, account=account, data={"candles": candles, "symbol": symbol, "interval": interval, "source": "native", "count": len(candles)})

@@ -1387,8 +1387,9 @@ class TestPluginInvariants(unittest.TestCase):
         self.assertEqual(
             agents,
             [
-                "apex", "arcus", "edgex", "hibachi", "hyperliquid",
-                "lighter", "ondoperps", "pacifica", "raydium", "rise",
+                "apex", "arcus", "binance", "edgex", "hibachi", "hyperliquid",
+                "lighter", "mexc", "nado", "ondoperps", "pacifica", "perpl",
+                "phemex", "qfex", "raydium", "rise",
             ],
         )
 
