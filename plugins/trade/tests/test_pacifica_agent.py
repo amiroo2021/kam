@@ -190,6 +190,31 @@ class TestPacificaCancelOrderGroupSide(unittest.TestCase):
         # This is the contract the wizard expects: buy/sell, not bid/ask.
         self.assertEqual(group.side, "buy")
 
+    def test_cancel_order_group_accepts_sell_side(self) -> None:
+        open_orders = [
+            {"symbol": "ZEC", "side": "ask", "order_id": 191},
+        ]
+
+        with mock.patch.object(pacifica, "_lookup_credentials", return_value={"account": "amiroo", "address": "addr"}), \
+             mock.patch.object(pacifica, "_canonical_market_symbol", return_value="ZEC"), \
+             mock.patch.object(pacifica, "_get_open_orders", side_effect=[open_orders, []]), \
+             mock.patch.object(pacifica, "_signed_cancel_order", return_value=(True, "ok")) as signed_cancel:
+            resp = pacifica.execute({
+                "operation": "cancel_order_group",
+                "account": "amiroo",
+                "symbol": "ZEC",
+                "side": "sell",
+            })
+
+        self.assertTrue(resp.success)
+        self.assertIsNotNone(resp.cancel_group)
+        cg = resp.cancel_group
+        assert cg is not None
+        self.assertEqual(cg.side, "sell")
+        self.assertEqual(cg.targeted_order_count, 1)
+        self.assertEqual(cg.confirmed_absent_count, 1)
+        signed_cancel.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

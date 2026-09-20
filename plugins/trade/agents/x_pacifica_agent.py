@@ -928,9 +928,9 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
 
     Wizard contract:
       - ``request["symbol"]`` : str, required, uppercase
-      - ``request["side"]``   : str, required, ``"long"`` or ``"short"``
-                               (canonical; we translate to Pacifica's
-                               ``bid``/``ask`` for filtering)
+      - ``request["side"]``   : str, required, order side (``buy``/``sell``)
+                               or position side (``long``/``short``)
+                               from the positions view.
 
     Pacifica doesn't expose a per-(symbol, side) bulk-cancel
     endpoint. The ``/orders/cancel_all`` endpoint takes a symbol but
@@ -958,16 +958,20 @@ def _execute_cancel_order_group(account: str, request: Dict[str, Any]) -> Canoni
         )
 
     symbol = str(request.get("symbol") or "").strip().upper()
-    canonical_side = str(request.get("side") or "").strip().lower()
+    request_side = str(request.get("side") or "").strip().lower()
     if not symbol:
         return make_failure(
             operation="cancel_order_group", exchange=name, account=account,
             code="MISSING_SYMBOL", message="Symbol is required.",
         )
-    if canonical_side not in {"long", "short"}:
+    if request_side in {"buy", "long"}:
+        canonical_side = "buy"
+    elif request_side in {"sell", "short"}:
+        canonical_side = "sell"
+    else:
         return make_failure(
             operation="cancel_order_group", exchange=name, account=account,
-            code="INVALID_SIDE", message="Side must be 'long' or 'short'.",
+            code="INVALID_SIDE", message="Side must be 'buy' or 'sell'.",
         )
     try:
         canonical = _canonical_market_symbol(symbol)
