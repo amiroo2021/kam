@@ -31,6 +31,7 @@ from capabilities import (  # noqa: E402
     load_manifest,
 )
 from trade_web_unit import verify_trade_web_unit  # noqa: E402
+from webbacktest_unit import verify_webbacktest_unit  # noqa: E402
 
 
 def run(

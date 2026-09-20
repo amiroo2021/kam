@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from capabilities import capability_dir  # noqa: E402
 from trade_web_unit import uninstall_trade_web_unit  # noqa: E402
+from webbacktest_unit import uninstall_webbacktest_unit  # noqa: E402
 
 # Trade-only files/dirs relative to plugins/trade/. Shared core is left alone.
 # Includes backtest_wizard.py (origin/main trade capability) plus web helpers.

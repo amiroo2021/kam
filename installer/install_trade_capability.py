@@ -24,6 +24,7 @@ from capabilities import (  # noqa: E402
 )
 import kamlib as K  # noqa: E402
 from trade_web_unit import install_trade_web_unit, password_status  # noqa: E402
+from webbacktest_unit import install_webbacktest_unit  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Full tree under plugins/trade (not just wizard.py). Web UI + helpers included.

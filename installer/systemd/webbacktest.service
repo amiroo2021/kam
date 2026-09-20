@@ -1,0 +1,18 @@
+[Unit]
+Description=KAM webbacktest
+After=network.target
+# Independent from Hermes gateway and other web services
+
+[Service]
+Type=simple
+WorkingDirectory=__HERMES_ROOT__
+Environment=PYTHONPATH=__HERMES_ROOT__
+Environment=HERMES_HOME=__HERMES_HOME__
+EnvironmentFile=-__HERMES_HOME__/.env
+Environment=WEBBACKTEST_PORT=__WEBBACKTEST_PORT__
+ExecStart=__HERMES_ROOT__/venv/bin/python -m plugins.trade.webbacktest
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -793,7 +793,16 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
         elif suffix == "run":
             try: await query.edit_message_text(_WIZARD._progress_text("loading_cache", 0.0, ""), reply_markup=None)
             except Exception: pass
-            from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
+            try:
+                from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
+            except Exception:
+                class InlineKeyboardButton:  # type: ignore
+                    def __init__(self, text, callback_data=None):
+                        self.text = text
+                        self.callback_data = callback_data
+                class InlineKeyboardMarkup:  # type: ignore
+                    def __init__(self, rows):
+                        self.inline_keyboard = rows
             loop = asyncio.get_running_loop()
             progress_lock = asyncio.Lock()
             def progress_cb(payload: dict):
@@ -825,7 +834,16 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
             screen = await asyncio.to_thread(_WIZARD._run_backtest, _WIZARD._state(key), on_progress=progress_cb)
         else:
             screen=await asyncio.to_thread(_WIZARD.handle_callback,key,suffix)
-        from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
+        try:
+            from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
+        except Exception:
+            class InlineKeyboardButton:  # type: ignore
+                def __init__(self, text, callback_data=None):
+                    self.text = text
+                    self.callback_data = callback_data
+            class InlineKeyboardMarkup:  # type: ignore
+                def __init__(self, rows):
+                    self.inline_keyboard = rows
         rows=[]
         for row in screen.buttons:
             br=[]

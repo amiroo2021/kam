@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>webbacktest</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">webbacktest</div>
+    <div class="modes" hidden>
+      <button type="button" class="mode" data-mode="LIVE">LIVE</button>
+      <button type="button" class="mode active" data-mode="REPLAY_TO_LIVE">REPLAY→LIVE</button>
+      
+    </div>
+    <div class="status" id="connStatus">connecting…</div>
+  </header>
+  <section class="controls">
+    <label>Symbol <input id="symbol" value="BTCUSDT" /></label>
+    <label>Market
+      <select id="market">
+        <option value="spot" selected>Spot</option>
+        <option value="futures">Futures</option>
+      </select>
+    </label>
+    <label>TF
+      <select id="timeframe">
+        <option value="1m" selected>1m</option>
+        <option value="5m">5m</option>
+        <option value="15m">15m</option>
+        <option value="1h">1h</option>
+      </select>
+    </label>
+    <label>Side
+      <select id="side">
+        <option value="BUY" selected>BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+    </label>
+    <label>Percentage <input id="percentage" value="0.001" /></label>
+    <label class="dt" id="startWrap">Start (UTC)
+      <input id="startTime" type="datetime-local" step="60" />
+    </label>
+    <button type="button" id="applyBtn">START BACKTEST</button>
+    <label class="toggle" title="Historical P0/progression/TP markers only">
+      <input type="checkbox" id="showEvents" /> Show events
+    </label>
+    <div class="hud">
+      <span>Phase <strong id="hudPhase">—</strong></span>
+      <span>Price <strong id="hudPrice">—</strong></span>
+      <span>Cycle <strong id="hudCycle">—</strong></span>
+      <span>Step <strong id="hudStep">—</strong></span>
+      <span>P0 <strong id="hudP0">—</strong></span>
+      <span>TP <strong id="hudTp">—</strong></span>
+      <span>Ambiguous <strong id="hudAmb">—</strong></span>
+    </div>
+  </section>
+  <div class="progress" id="progressBar" hidden>
+    <div class="progress-fill" id="progressFill"></div>
+    <span id="progressText"></span>
+  </div>
+  <p class="hint" id="histNote"></p>
+  <main id="chart" aria-label="webbacktest chart"></main>
+  <footer class="footer">
+    Backend owns webbacktest state · JS renders only · public Binance · no orders ·
+    LEGACY OHLC hist ≠ tick-perfect aggTrade
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
