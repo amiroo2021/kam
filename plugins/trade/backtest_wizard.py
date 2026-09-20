@@ -744,7 +744,12 @@ def _draw_svg(symbol, market, side, levels, n, ladder_vwap, step_vwap, current):
 
 
 def _chat_key_from_message(msg: Any) -> Tuple[Any, ...]:
-    chat=getattr(msg,"chat",None); chat_id=getattr(chat,"id",None) if chat is not None else None; thread=getattr(msg,"message_thread_id",None)
+    chat = getattr(msg, "chat", None)
+    chat_id = getattr(chat, "id", None) if chat is not None else None
+    thread = getattr(msg, "message_thread_id", None)
+    # Canonical Telegram key: always include the string chat id, and include
+    # the thread id only when the message actually belongs to a forum thread.
+    # This must match the exact shape used by both command/callback/text paths.
     return (str(chat_id), thread) if thread is not None else (str(chat_id),)
 
 def _chat_id_from_message(msg: Any) -> Optional[str]:
@@ -885,10 +890,13 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
             pass
 
 async def handle_backtest_text(adapter: Any, msg: Any) -> bool:
-    key=_chat_key_from_message(msg); screen=await asyncio.to_thread(_WIZARD.handle_text,key,getattr(msg,"text","") or "")
-    if screen is None: return False
-    cid=_chat_id_from_message(msg)
-    if cid: await _send_screen(adapter,cid,screen,metadata=_metadata_from_message(msg))
+    key = _chat_key_from_message(msg)
+    screen = await asyncio.to_thread(_WIZARD.handle_text, key, getattr(msg, "text", "") or "")
+    if screen is None:
+        return False
+    cid = _chat_id_from_message(msg)
+    if cid:
+        await _send_screen(adapter, cid, screen, metadata=_metadata_from_message(msg))
     return True
 
 __all__=["handle_backtest_command","handle_backtest_callback","handle_backtest_text","BacktestWizard"]
