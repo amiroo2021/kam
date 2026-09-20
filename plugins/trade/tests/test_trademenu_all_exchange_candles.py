@@ -72,29 +72,42 @@ class RiseCandleUnitTests(unittest.TestCase):
             self.assertEqual(cmod._rise_market_id("BTCUSD", api_base="https://api.rise.trade"), "1")
             self.assertEqual(cmod._rise_market_id("ETH", api_base="https://api.rise.trade"), "2")
 
-    def test_rise_candle_normalize_ns(self) -> None:
-        payload = {
+    def test_rise_trade_history_aggregates_market_pages_then_resamples(self) -> None:
+        page1 = {
             "data": {
-                "data": [
-                    {
-                        "market_id": "1",
-                        "interval": "15m",
-                        "time": "1700000000000000000",
-                        "open": "100",
-                        "high": "110",
-                        "low": "90",
-                        "close": "105",
-                        "volume": "1",
-                    }
-                ]
+                "market_id": "1",
+                "trades": [
+                    {"id": "t3", "time": 1_700_000_050_000_000_000, "price": "102", "size": "3"},
+                    {"id": "t2", "time": 1_700_000_030_000_000_000, "price": "105", "size": "2"},
+                    {"id": "t1", "time": 1_700_000_000_000_000_000, "price": "100", "size": "1"},
+                ],
             }
         }
-        with mock.patch.object(cmod, "_rise_market_id", return_value="1"):
-            with mock.patch.object(cmod, "_http_json", return_value=payload):
-                rows = cmod.fetch_rise("BTC", "15m", limit=10)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["time"], 1_700_000_000)
-        self.assertEqual(rows[0]["close"], 105.0)
+        page2 = {"data": {"market_id": "1", "trades": []}}
+
+        def fake_http_json(url, timeout=30):  # noqa: ARG001
+            if "page=1" in url:
+                return page1
+            if "page=2" in url:
+                return page2
+            raise AssertionError(url)
+
+        cmod._RISE_TRADE_CACHE.update({"market_id": "", "ts": 0.0, "rows": []})
+        with mock.patch.object(cmod, "_rise_market_id", return_value="1"), \
+             mock.patch.object(cmod, "_http_json", side_effect=fake_http_json):
+            rows = cmod.fetch_rise("BTC", "15m", limit=10)
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertEqual(rows[0]["open"], 100.0)
+        self.assertEqual(rows[0]["high"], 105.0)
+        self.assertEqual(rows[0]["low"], 100.0)
+        self.assertEqual(rows[0]["close"], 102.0)
+        self.assertEqual(rows[0]["volume"], 6.0)
+
+    def test_rise_alias_keys_cover_plain_and_quote_suffixes(self) -> None:
+        self.assertIn("ZEC", cmod._rise_alias_keys("ZECUSDC"))
+        self.assertIn("ZEC", cmod._rise_alias_keys("ZEC-USDC"))
+        self.assertIn("ZEC", cmod._rise_alias_keys("ZEC/USDC"))
+        self.assertIn("ZEC", cmod._rise_alias_keys("ZEC"))
 
 
 if __name__ == "__main__":

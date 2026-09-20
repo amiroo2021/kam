@@ -550,14 +550,19 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
             err = getattr(resp, "error", None)
             code = getattr(err, "code", None) or "CANDLES_UNAVAILABLE"
             msg = getattr(err, "message", None) or f"Candles unavailable for {symbol} on {ex}."
+            msg_s = str(msg)
             # Never surface Phase-1 leftovers or raw HTTP URLs.
-            if "Phase 1" in str(msg):
-                msg = f"Candles unavailable for {symbol} on {ex}."
-            if "url:" in str(msg).lower() or "HTTP Error" in str(msg):
-                msg = f"Candles unavailable for {symbol} on {ex}."
+            if "Phase 1" in msg_s:
+                msg_s = f"Candles unavailable for {symbol} on {ex}."
+            if "url:" in msg_s.lower() or "HTTP Error" in msg_s or "forbidden" in msg_s.lower() or "empty rise candles" in msg_s.lower() or "python-multipart" in msg_s.lower() or "form data requires" in msg_s.lower():
+                code = "CANDLES_UNAVAILABLE"
+                msg_s = f"Candles unavailable for {symbol} on {ex}."
+            elif str(code) == "CANDLES_UPSTREAM_ERROR":
+                code = "CANDLES_UNAVAILABLE"
+                msg_s = f"Candles unavailable for {symbol} on {ex}."
             return {
                 "success": False,
-                "error": {"code": str(code), "message": str(msg)[:300]},
+                "error": {"code": str(code), "message": msg_s[:300]},
                 "candles": [],
                 "exchange": ex,
                 "symbol": symbol,
@@ -578,11 +583,14 @@ def fetch_candles(exchange: str, account: str, symbol: str, tf: str, limit: int 
         }
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)[:300]
-        code = "CANDLES_UNAVAILABLE" if "CANDLES_UNAVAILABLE" in msg or "HTTP Error" in msg else "CANDLE_ERROR"
         if msg.startswith("CANDLES_UNAVAILABLE:"):
+            code = "CANDLES_UNAVAILABLE"
             msg = msg.split(":", 1)[1].strip()
-        elif "HTTP Error" in msg:
+        elif "HTTP Error" in msg or "url:" in msg.lower() or "forbidden" in msg.lower() or "empty rise candles" in msg.lower() or "python-multipart" in msg.lower() or "form data requires" in msg.lower():
+            code = "CANDLES_UNAVAILABLE"
             msg = f"Candles unavailable for {symbol} on {ex}."
+        else:
+            code = "CANDLE_ERROR"
         return {
             "success": False,
             "error": {"code": code, "message": msg},

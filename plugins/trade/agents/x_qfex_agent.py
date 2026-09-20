@@ -161,7 +161,7 @@ def list_accounts() -> list[str]:
 
 
 def capabilities() -> list[str]:
-    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "ladder", "close_position", "set_tp", "set_sl"]
+    return ["balance", "positions_orders", "positions_management", "new_order", "cancel_order_group", "resolve_instrument", "market_price", "candles", "ladder", "close_position", "set_tp", "set_sl"]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -270,16 +270,23 @@ def _format_decimal(value: Any) -> str:
 
 
 def _native_symbol(symbol: str) -> str:
-    raw = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
+    raw = str(symbol or "").strip().upper().replace("/", "-")
     if not raw:
         return ""
+    if raw.startswith("PERP_"):
+        return raw.replace("_", "-")
+    raw = raw.replace("_", "-")
+    if raw.startswith("PERP-"):
+        raw = raw[5:]
     if "-" not in raw:
         return f"{raw}-USD"
     return raw
 
 
 def _display_symbol(symbol: str) -> str:
-    raw = str(symbol or "").strip().upper()
+    raw = str(symbol or "").strip().upper().replace("_", "-")
+    if raw.startswith("PERP-"):
+        raw = raw[5:]
     for suffix in ("-USD", "-USDC", "-USDT"):
         if raw.endswith(suffix) and len(raw) > len(suffix):
             return raw[: -len(suffix)]

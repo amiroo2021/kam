@@ -81,6 +81,12 @@ class QfexAgentTests(unittest.TestCase):
         self.assertEqual(resp.instrument.price_increment, "0.01")
         self.assertEqual(resp.instrument.size_increment, "0.001")
 
+    def test_native_and_display_symbol_handle_perp_usdc(self) -> None:
+        self.assertEqual(qfex._native_symbol("PERP_ZEC_USDC"), "PERP-ZEC-USDC")
+        self.assertEqual(qfex._native_symbol("zec"), "ZEC-USD")
+        self.assertEqual(qfex._display_symbol("ZEC-USD"), "ZEC")
+        self.assertEqual(qfex._display_symbol("PERP_ZEC_USDC"), "ZEC")
+
     def test_market_price_returns_last_price_for_confirmation(self) -> None:
         self._creds()
 
