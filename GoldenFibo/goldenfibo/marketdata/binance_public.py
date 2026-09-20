@@ -54,7 +54,13 @@ def bars_to_chart_candles(klines: Sequence[Sequence[Any]]) -> List[Dict[str, Any
 
 
 def resample_chart_candles(klines: Sequence[Sequence[Any]], timeframe: str) -> List[Dict[str, Any]]:
-    """Aggregate 1m klines into display-timeframe candles for the UI."""
+    """Aggregate 1m klines into display-timeframe candles for the UI.
+
+    Bucket open times are interval-aligned (e.g. 1h uses HH:00). Engine start may
+    fall mid-bucket; the first display bar still uses the first available 1m open
+    as its OHLC open, but the bar *time* is the aligned bucket so adjacent bars
+    are spaced by the display interval after the first partial bucket.
+    """
     if not klines:
         return []
     if timeframe == "1m":
@@ -82,11 +88,12 @@ def resample_chart_candles(klines: Sequence[Sequence[Any]], timeframe: str) -> L
     for group in grouped:
         first = group[0]
         last = group[-1]
+        bucket_ms = int(first[0]) - (int(first[0]) % step)
         highs = max(float(x[2]) for x in group)
         lows = min(float(x[3]) for x in group)
         volume = sum(float(x[5]) for x in group)
         out.append({
-            "time": int(first[0]) // 1000,
+            "time": bucket_ms // 1000,
             "open": float(first[1]),
             "high": highs,
             "low": lows,
@@ -94,6 +101,43 @@ def resample_chart_candles(klines: Sequence[Sequence[Any]], timeframe: str) -> L
             "volume": volume,
         })
     return out
+
+
+def upsert_display_candle_from_1m(
+    chart_candles: List[Dict[str, Any]],
+    kline_1m: Sequence[Any],
+    timeframe: str,
+) -> Dict[str, Any]:
+    """Merge one 1m kline into the display-TF series (in-place). Returns candle sent to UI."""
+    if timeframe == "1m":
+        candle = kline_to_chart_candle(kline_1m)
+        if chart_candles and int(chart_candles[-1]["time"]) == int(candle["time"]):
+            chart_candles[-1] = candle
+        else:
+            chart_candles.append(candle)
+        return candle
+
+    from .timeframes import interval_ms
+
+    step = interval_ms(timeframe)
+    open_ms = int(kline_1m[0])
+    bucket_ms = open_ms - (open_ms % step)
+    t = bucket_ms // 1000
+    o = float(kline_1m[1])
+    h = float(kline_1m[2])
+    l = float(kline_1m[3])
+    c = float(kline_1m[4])
+    v = float(kline_1m[5])
+    if chart_candles and int(chart_candles[-1]["time"]) == t:
+        cur = chart_candles[-1]
+        cur["high"] = max(float(cur["high"]), h)
+        cur["low"] = min(float(cur["low"]), l)
+        cur["close"] = c
+        cur["volume"] = float(cur.get("volume") or 0.0) + v
+        return cur
+    candle = {"time": t, "open": o, "high": h, "low": l, "close": c, "volume": v}
+    chart_candles.append(candle)
+    return candle
 
 
 def agg_trade_stream_url(symbol: str, *, ws_base: str = BINANCE_SPOT_WS) -> str:

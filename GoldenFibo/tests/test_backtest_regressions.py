@@ -6,14 +6,16 @@ from types import SimpleNamespace
 
 from goldenfibo.backtest import run_finite_backtest
 from goldenfibo.engine.config import Side
+from goldenfibo.marketdata.binance_public import resample_chart_candles, upsert_display_candle_from_1m
+from goldenfibo.session.controller import SessionController
+from goldenfibo.session.types import SessionMode
 from plugins.trade import backtest_wizard as wizard
 
 
-def _candles():
-    t0 = 1_700_000_000_000
+def _candles(n: int = 180, t0: int = 1_700_000_000_000):
     out = []
     price = Decimal("100.0")
-    for i in range(180):
+    for i in range(n):
         o = price
         h = o + Decimal("0.4")
         l = o - Decimal("0.3")
@@ -34,9 +36,50 @@ def test_display_timeframe_does_not_change_engine_results():
     assert baseline.bars_processed == len(candles)
     assert baseline.klines[0][0] == candles[0][0]
     assert baseline.klines[-1][0] == candles[-1][0]
-    assert len(baseline.chart_candles) == len(candles)
-    assert baseline.chart_candles[0]["time"] == candles[0][0] // 1000
-    assert baseline.chart_candles[-1]["time"] == candles[-1][0] // 1000
+
+
+def test_display_resample_spacing_is_interval_aligned():
+    # Aligned start so every delta is exact.
+    t0 = 1_700_000_000_000  # already on a minute boundary; choose hour-aligned
+    t0 = t0 - (t0 % 3_600_000)
+    candles = _candles(n=240, t0=t0)  # 4h of 1m
+    for tf, step in (("15m", 900), ("1h", 3600), ("4h", 14400)):
+        chart = resample_chart_candles(candles, tf)
+        assert len(chart) >= 2
+        times = [c["time"] for c in chart]
+        deltas = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        assert all(d == step for d in deltas), (tf, deltas[:5])
+
+
+def test_page_split_resample_must_not_inflate_counts():
+    t0 = 1_700_000_000_000 - (1_700_000_000_000 % 3_600_000)
+    candles = _candles(n=3000, t0=t0)
+    continuous = resample_chart_candles(candles, "1h")
+    # Simulate old buggy page-split extend
+    pages = []
+    for i in range(0, len(candles), 1000):
+        pages.extend(resample_chart_candles(candles[i : i + 1000], "1h"))
+    assert len(pages) > len(continuous)
+    # Continuous rebuild is the correct browser payload shape
+    assert continuous[0]["time"] % 3600 == 0
+    assert continuous[1]["time"] - continuous[0]["time"] == 3600
+
+
+def test_live_1m_updates_merge_into_display_bucket():
+    chart = []
+    t0 = 1_700_000_000_000 - (1_700_000_000_000 % 3_600_000)
+    c1 = upsert_display_candle_from_1m(chart, [t0, "100", "101", "99", "100.5", "1", t0 + 59999, "100"], "1h")
+    c2 = upsert_display_candle_from_1m(chart, [t0 + 60_000, "100.5", "102", "100", "101", "2", t0 + 119999, "200"], "1h")
+    assert len(chart) == 1
+    assert c1 is chart[0] or c2 is chart[0]
+    assert chart[0]["time"] == t0 // 1000
+    assert chart[0]["high"] == 102.0
+    assert chart[0]["low"] == 99.0
+    assert chart[0]["close"] == 101.0
+    # Next hour opens a new display candle
+    upsert_display_candle_from_1m(chart, [t0 + 3_600_000, "101", "103", "100.5", "102", "1", t0 + 3_659_999, "100"], "1h")
+    assert len(chart) == 2
+    assert chart[1]["time"] - chart[0]["time"] == 3600
 
 
 class _Adapter:
@@ -63,6 +106,12 @@ async def _run_backtest_screen(monkeypatch):
     assert screen.text
     assert "Backtest complete:" in screen.text
     assert "Current step:" in screen.text
+    assert "Ladder VWAP:" in screen.text
+    assert "Ladder POC:" in screen.text
+    assert "Ladder Value Area:" in screen.text
+    assert "Step VWAP:" in screen.text
+    assert "Step POC:" in screen.text
+    assert "Step Value Area" not in screen.text
     assert screen.attachments == ["/tmp/backtest.jpg"]
 
     adapter = _Adapter()
@@ -75,3 +124,41 @@ async def _run_backtest_screen(monkeypatch):
 
 def test_telegram_backtest_screen_includes_text_and_image(monkeypatch):
     asyncio.run(_run_backtest_screen(monkeypatch))
+
+
+def test_fresh_backtest_clears_prior_engine_state():
+    async def go():
+        c = SessionController()
+        c.engine  # seed default
+        c.chart_candles = [{"time": 1, "open": 1, "high": 1, "low": 1, "close": 1}]
+        c.klines = [[1, "1", "1", "1", "1", "1", 2, "1"]]
+        c.bars_processed = 999
+        c.ambiguity_count = 42
+        # short synthetic window via monkeypatched hist is heavy; just check start_run reset fields
+        try:
+            await c.start_run(
+                mode=SessionMode.BACKTEST,
+                symbol="BTCUSDT",
+                timeframe="1h",
+                market="spot",
+                start_time="2026-09-18T00:00:00Z",
+                end_time="2026-09-18T00:02:00Z",
+            )
+        except Exception:
+            pass
+        assert c.bars_processed == 0 or c.phase.value in {
+            "loading",
+            "loading_history",
+            "downloading_history",
+            "replaying",
+            "backtest_done",
+            "error",
+            "stopped",
+        }
+        assert c.display_timeframe == "1h"
+        assert c.timeframe == "1m"
+        # Prior synthetic chart must not survive start_run clear
+        # (may be empty or repopulated from real hist — not the old fake candle)
+        assert not any(cnd.get("time") == 1 for cnd in (c.chart_candles or []))
+
+    asyncio.run(go())

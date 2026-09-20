@@ -847,10 +847,15 @@ class SessionController:
         return self._stop.is_set()
 
     def _trim_chart(self) -> None:
+        """Trim browser display series only. Engine already consumed full 1m history."""
         if len(self.chart_candles) > CHART_CANDLE_LIMIT:
             self.chart_candles = self.chart_candles[-CHART_CANDLE_LIMIT:]
-        if len(self.klines) > CHART_CANDLE_LIMIT:
-            self.klines = self.klines[-CHART_CANDLE_LIMIT:]
+
+    def _rebuild_display_chart(self, source_1m: Optional[List[list]] = None) -> None:
+        """Build display candles from continuous 1m rows (never page-split resample)."""
+        rows = source_1m if source_1m is not None else list(self.klines)
+        self.chart_candles = bn.resample_chart_candles(rows, self.display_timeframe)
+        self._trim_chart()
 
     def _trim_metric_bars(self) -> None:
         """Keep bars needed for current-cycle ladder/step metrics only."""
@@ -1003,8 +1008,8 @@ class SessionController:
             async with self._lock:
                 self.klines.extend(page_rows)
                 self.bars.extend(bar_from_binance_kline(k) for k in page_rows)
-                self.chart_candles.extend(bn.resample_chart_candles(page_rows, self.display_timeframe))
-                self._trim_chart()
+                # Do NOT page-split resample here — incomplete higher-TF buckets
+                # at chunk boundaries would fabricate extra display bars.
                 self._trim_metric_bars()
                 self.ambiguity_count = amb_total
                 self.bars_processed = bars_done
@@ -1012,6 +1017,9 @@ class SessionController:
                 self._p0_seeded = self.engine.state.active
                 if page_rows:
                     self.last_price = str(page_rows[-1][4])
+                # Periodic continuous rebuild for UI progress (source is full 1m so far).
+                if i == 0 or (i // chunk) % 5 == 0 or bars_done >= total:
+                    self._rebuild_display_chart(list(self.klines))
 
             frac = bars_done / max(1, total)
             pct = 40.0 + 59.0 * frac
@@ -1034,6 +1042,13 @@ class SessionController:
 
         if self._stopped():
             return bars_done, amb_total, last_open
+
+        async with self._lock:
+            # Final continuous display series from the full engine 1m input.
+            self._rebuild_display_chart(list(self.klines))
+            # Retain a tail of 1m rows for live bucket updates after handoff.
+            if len(self.klines) > CHART_CANDLE_LIMIT:
+                self.klines = self.klines[-CHART_CANDLE_LIMIT:]
 
         await self._set_phase(
             SessionPhase.REPLAYING,
@@ -1067,7 +1082,7 @@ class SessionController:
             async with self._lock:
                 self.klines = klines
                 self.bars = [bar_from_binance_kline(k) for k in klines]
-                self.chart_candles = bn.bars_to_chart_candles(klines)
+                self._rebuild_display_chart(list(klines))
                 if klines and not self._p0_seeded:
                     open_px = Decimal(str(klines[-1][1]))
                     ts_ms = int(klines[-1][0])
@@ -1449,18 +1464,19 @@ class SessionController:
             int(k.get("T") or 0),
             k.get("q") or "0",
         ]
-        candle = bn.kline_to_chart_candle(arr)
         final = bool(k.get("x"))
         async with self._lock:
-            if self.chart_candles and self.chart_candles[-1]["time"] == candle["time"]:
-                self.chart_candles[-1] = candle
-                if self.klines:
-                    self.klines[-1] = arr
-                    self.bars[-1] = bar_from_binance_kline(arr)
+            candle = bn.upsert_display_candle_from_1m(self.chart_candles, arr, self.display_timeframe)
+            if self.klines and int(self.klines[-1][0]) == o_time:
+                self.klines[-1] = arr
+                self.bars[-1] = bar_from_binance_kline(arr)
             else:
-                self.chart_candles.append(candle)
                 self.klines.append(arr)
                 self.bars.append(bar_from_binance_kline(arr))
+                if len(self.klines) > CHART_CANDLE_LIMIT:
+                    self.klines = self.klines[-CHART_CANDLE_LIMIT:]
+                    self.bars = self.bars[-CHART_CANDLE_LIMIT:]
+            self._trim_chart()
             self.last_price = str(k["c"])
         if self._live_enabled or self.mode is SessionMode.LIVE:
             await self.broadcast(schemas.candle_update_msg(candle, final=final))

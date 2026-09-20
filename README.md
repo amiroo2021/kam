@@ -35,6 +35,8 @@ sudo ./install.sh --trade --hermes-root /usr/local/lib/hermes-agent
 sudo ./verify.sh --trade --hermes-root /usr/local/lib/hermes-agent
 ```
 
+For a reproducible clean-server migration, see `docs/NEW_SERVER_INSTALL.md`.
+
 If Hermes is in a standard location you may omit `--hermes-root` and let it auto-detect. If several installations are found, the installer stops and asks you to choose one explicitly.
 
 After installation:
