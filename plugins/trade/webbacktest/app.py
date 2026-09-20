@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import html
-import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Body, FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Body, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 _KAM_ROOT = Path("/root/kam")
@@ -24,135 +21,14 @@ from goldenfibo.engine.config import Side
 from goldenfibo.session.controller import get_session
 from goldenfibo.session.types import SessionMode
 
-from .auth import LoginRateLimiter, SessionManager
-from .config import WebBacktestConfig, WebBacktestConfigError, load_config
-
 logger = logging.getLogger("webbacktest")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-def create_app(
-    config: Optional[WebBacktestConfig] = None,
-) -> FastAPI:
-    try:
-        cfg = config or load_config()
-    except WebBacktestConfigError:
-        app = FastAPI(title="webbacktest", version="0.1.0")
-
-        @app.get("/")
-        async def locked_root() -> HTMLResponse:
-            return HTMLResponse(
-                "<!doctype html><html><body style='font-family:sans-serif;background:#0b0e11;color:#eee;padding:40px'>"
-                "<h1>webbacktest unavailable</h1>"
-                "<p>WEB_PASSWORD is not configured. Refusing to start unprotected.</p>"
-                "</body></html>",
-                status_code=503,
-            )
-
-        @app.api_route("/{full_path:path}", methods=["GET", "POST", "WS"])
-        async def locked_all(full_path: str) -> HTMLResponse:
-            return await locked_root()
-
-        return app
-
-    sessions = SessionManager(cfg)
-    limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)
+def create_app() -> FastAPI:
     app = FastAPI(title="webbacktest", version="0.1.0")
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-    def _client_key(request: Request) -> str:
-        fwd = request.headers.get("x-forwarded-for") or ""
-        if fwd:
-            return fwd.split(",")[0].strip()
-        if request.client:
-            return request.client.host or "unknown"
-        return "unknown"
-
-    def _session_token(request: Request) -> Optional[str]:
-        raw = request.cookies.get(cfg.cookie_name)
-        if not raw:
-            return None
-        return raw.strip().strip('"')
-
-    def _authenticated(request: Request) -> bool:
-        return sessions.verify(_session_token(request))
-
-    def _set_session_cookies(resp: Response, token: str, csrf: str) -> None:
-        resp.set_cookie(
-            key=cfg.cookie_name,
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=cfg.session_max_age_seconds,
-            path="/",
-        )
-        resp.set_cookie(
-            key="webbacktest_csrf",
-            value=csrf,
-            httponly=False,
-            samesite="lax",
-            secure=False,
-            max_age=cfg.session_max_age_seconds,
-            path="/",
-        )
-
-    def _require_auth(request: Request) -> Optional[JSONResponse]:
-        if _authenticated(request):
-            return None
-        return JSONResponse(
-            {"success": False, "error": {"code": "UNAUTHORIZED", "message": "Login required."}},
-            status_code=401,
-        )
-
-    def _require_csrf(request: Request) -> Optional[JSONResponse]:
-        denied = _require_auth(request)
-        if denied:
-            return denied
-        token = _session_token(request)
-        provided = request.headers.get("x-csrf-token") or request.headers.get("X-CSRF-Token")
-        if not sessions.csrf_of(token):
-            return JSONResponse(
-                {
-                    "success": False,
-                    "error": {
-                        "code": "CSRF_SESSION_STALE",
-                        "message": "Session is missing CSRF binding. Please log in again.",
-                    },
-                },
-                status_code=403,
-            )
-        if not sessions.csrf_ok(token, provided):
-            return JSONResponse(
-                {"success": False, "error": {"code": "CSRF_FAILED", "message": "Invalid or missing CSRF token."}},
-                status_code=403,
-            )
-        return None
-
-    def _login_page(error: str = "") -> HTMLResponse:
-        err_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
-        body = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>webbacktest Login</title>
-  <link rel="stylesheet" href="/static/style.css" />
-</head>
-<body class="login-body">
-  <form class="login-card" method="post" action="/login" autocomplete="current-password">
-    <h1>webbacktest</h1>
-    {err_html}
-    <label>Password
-      <input type="password" name="password" required autofocus />
-    </label>
-    <p class="hint">Hint: {html.escape(cfg.hint)}</p>
-    <button type="submit">Login</button>
-  </form>
-</body>
-</html>"""
-        return HTMLResponse(body)
 
     def _app_page() -> HTMLResponse:
         path = STATIC_DIR / "index.html"
@@ -167,80 +43,20 @@ def create_app(
         return HTMLResponse("<h1>webbacktest</h1><p>Static UI missing.</p>", status_code=500)
 
     @app.get("/", response_class=HTMLResponse)
-    async def root(request: Request) -> Response:
-        if not _authenticated(request):
-            return _login_page()
+    async def root() -> Response:
         return _app_page()
-
-    @app.get("/login", response_class=HTMLResponse)
-    async def login_get(request: Request) -> Response:
-        if _authenticated(request):
-            return RedirectResponse("/", status_code=303)
-        return _login_page()
-
-    @app.post("/login")
-    async def login_post(request: Request) -> Response:
-        key = _client_key(request)
-        gate = limiter.check(key)
-        if not gate.allowed:
-            return _login_page(gate.message)
-        body = await request.body()
-        password = ""
-        try:
-            from urllib.parse import parse_qs
-            parsed = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
-            password = (parsed.get("password") or [""])[0]
-        except Exception:
-            password = ""
-        if not sessions.password_ok(password):
-            limiter.record_failure(key)
-            logger.info("webbacktest login failure from %s", key)
-            return _login_page("Invalid password.")
-        limiter.record_success(key)
-        token, csrf = sessions.issue()
-        resp = RedirectResponse("/", status_code=303)
-        _set_session_cookies(resp, token, csrf)
-        return resp
-
-    @app.post("/logout")
-    async def logout() -> Response:
-        resp = RedirectResponse("/login", status_code=303)
-        resp.delete_cookie(cfg.cookie_name, path="/")
-        resp.delete_cookie("webbacktest_csrf", path="/")
-        return resp
 
     @app.get("/api/health")
     async def health() -> dict:
         s = get_session()
         return {"ok": True, "service": "webbacktest", "phase": s.phase.value, "mode": s.mode.value}
 
-    @app.get("/api/session")
-    async def api_session(request: Request) -> Response:
-        denied = _require_auth(request)
-        if denied:
-            return denied
-        token = _session_token(request)
-        csrf = sessions.csrf_of(token)
-        if not csrf:
-            token, csrf = sessions.issue()
-            body = {"success": True, "authenticated": True, "csrf": csrf, "rotated": True}
-            resp = JSONResponse(body)
-            _set_session_cookies(resp, token, csrf)
-            return resp
-        return JSONResponse({"success": True, "authenticated": True, "csrf": csrf, "rotated": False})
-
     @app.get("/api/state")
-    async def api_state(request: Request) -> Response:
-        denied = _require_auth(request)
-        if denied:
-            return denied
+    async def api_state() -> Response:
         return JSONResponse(get_session().snapshot_dict())
 
     @app.post("/api/session/start")
-    async def api_session_start(request: Request, body: Optional[dict] = Body(None)) -> JSONResponse:
-        denied = _require_csrf(request)
-        if denied:
-            return denied
+    async def api_session_start(body: Optional[dict] = Body(None)) -> JSONResponse:
         b = body or {}
         mode_s = str(b.get("mode") or "REPLAY_TO_LIVE").upper().replace("-", "_")
         if mode_s == "REPLAY":
@@ -279,36 +95,24 @@ def create_app(
         return JSONResponse(snap)
 
     @app.post("/api/session/stop")
-    async def api_session_stop(request: Request) -> JSONResponse:
-        denied = _require_csrf(request)
-        if denied:
-            return denied
+    async def api_session_stop() -> JSONResponse:
         await get_session().stop()
         return JSONResponse(get_session().snapshot_dict())
 
     @app.get("/api/cache/stats")
-    async def api_cache_stats(request: Request, symbol: str = "BTCUSDT", timeframe: str = "1m") -> JSONResponse:
-        denied = _require_auth(request)
-        if denied:
-            return denied
+    async def api_cache_stats(symbol: str = "BTCUSDT", timeframe: str = "1m") -> JSONResponse:
         s = get_session()
         return JSONResponse(s.kline_cache.stats_for(symbol, timeframe, market=s.market))
 
     @app.post("/api/cache/clear")
-    async def api_cache_clear(request: Request, body: Optional[dict] = Body(None)) -> JSONResponse:
-        denied = _require_csrf(request)
-        if denied:
-            return denied
+    async def api_cache_clear(body: Optional[dict] = Body(None)) -> JSONResponse:
         b = body or {}
         s = get_session()
         n = s.kline_cache.clear(str(b.get("symbol") or s.symbol), str(b.get("timeframe") or s.timeframe), market=str(b.get("market") or s.market))
         return JSONResponse({"cleared": n, "symbol": b.get("symbol") or s.symbol, "timeframe": b.get("timeframe") or s.timeframe})
 
     @app.post("/api/cache/validate")
-    async def api_cache_validate(request: Request, body: Optional[dict] = Body(None)) -> JSONResponse:
-        denied = _require_auth(request)
-        if denied:
-            return denied
+    async def api_cache_validate(body: Optional[dict] = Body(None)) -> JSONResponse:
         from goldenfibo.marketdata.kline_cache import validate_klines_sequence
         b = body or {}
         s = get_session()
@@ -325,10 +129,6 @@ def create_app(
 
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
-        token = ws.cookies.get(cfg.cookie_name) if hasattr(ws, "cookies") else None
-        if not sessions.verify(token):
-            await ws.close(code=4401)
-            return
         await ws.accept()
         session = get_session()
         session.register_client(ws)
@@ -374,6 +174,8 @@ def create_app(
         finally:
             session.unregister_client(ws)
 
+    app.get_session = get_session  # type: ignore[attr-defined]
+    app.STATIC_DIR = STATIC_DIR  # type: ignore[attr-defined]
     return app
 
 
@@ -385,7 +187,7 @@ app.STATIC_DIR = STATIC_DIR  # type: ignore[attr-defined]
 def main() -> None:
     import uvicorn
 
-    cfg = load_config()
+    cfg = __import__("plugins.trade.webbacktest.config", fromlist=["load_config"]).load_config()
     uvicorn.run(
         "plugins.trade.webbacktest.app:app",
         host=cfg.host,
