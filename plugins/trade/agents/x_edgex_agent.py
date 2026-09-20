@@ -132,6 +132,7 @@ def capabilities() -> List[str]:
         "cancel_orders", "cancel_order_group",
         "set_tp", "set_sl", "close_position",
         "resolve_instrument",
+        "candles",
         # Phase 2.4: catalog + public ticker/mark price.
         "list_instruments",
         "market_price",

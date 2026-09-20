@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from plugins.trade import candles as cmod
+from plugins.trade.agents import x_perpl_agent as pmod
 from plugins.trade.tradedesk import TradeDesk
 from plugins.trade.trademenu import marketdata as md
 
@@ -108,6 +109,50 @@ class RiseCandleUnitTests(unittest.TestCase):
         self.assertIn("ZEC", cmod._rise_alias_keys("ZEC-USDC"))
         self.assertIn("ZEC", cmod._rise_alias_keys("ZEC/USDC"))
         self.assertIn("ZEC", cmod._rise_alias_keys("ZEC"))
+
+    def test_perpl_candles_use_authenticated_market_data(self) -> None:
+        creds = pmod._credentials("BITGET")
+        self.assertIsNotNone(creds)
+        with mock.patch.object(pmod, "_markets_index", return_value={50: {"id": 50, "name": "ZEC", "price_decimals": 3, "size_decimals": 3}}), \
+             mock.patch.object(pmod, "_match_market", return_value={"id": 50, "name": "ZEC", "price_decimals": 3, "size_decimals": 3}), \
+             mock.patch.object(pmod, "_signed_request", return_value=(200, {"d": [{"t": 1700000000000, "o": 100, "h": 110, "l": 90, "c": 105, "v": "0"}]}, "")):
+            rows = cmod.fetch_perpl("ZEC", "15m", limit=10, account="BITGET")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["open"], 0.1)
+        self.assertEqual(rows[0]["close"], 0.105)
+        self.assertEqual(rows[0]["volume"], 0.0)
+
+    def test_pacifica_candles_use_public_kline_endpoint(self) -> None:
+        payload = {"success": True, "data": [{"t": 1700000000000, "o": "1.0", "h": "2.0", "l": "0.5", "c": "1.5", "v": "3.0"}]}
+        with mock.patch.object(cmod, "_http_json", return_value=payload):
+            rows = cmod.fetch_pacifica("ZEC", "15m", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["open"], 1.0)
+        self.assertEqual(rows[0]["high"], 2.0)
+        self.assertEqual(rows[0]["low"], 0.5)
+        self.assertEqual(rows[0]["close"], 1.5)
+        self.assertEqual(rows[0]["volume"], 3.0)
+
+    def test_nado_candles_use_archive_indexer(self) -> None:
+        symbols = {
+            "ZEC-PERP": {"product_id": 18, "symbol": "ZEC-PERP"},
+            "BTC-PERP": {"product_id": 1, "symbol": "BTC-PERP"},
+        }
+        archive = {"candlesticks": [{"timestamp": "1700000000", "open_x18": "1000000000000000000", "high_x18": "2000000000000000000", "low_x18": "500000000000000000", "close_x18": "1500000000000000000", "volume": "3000000000000000000"}]}
+        def fake_query(payload, *, base="https://api.prod.nado.xyz/gateway/v1"):
+            if payload.get("type") == "symbols":
+                return {"status": "success", "data": {"symbols": symbols}}
+            if payload.get("candlesticks"):
+                return archive
+            raise AssertionError(payload)
+        with mock.patch.object(cmod, "_nado_gateway_query", side_effect=fake_query):
+            rows = cmod.fetch_nado("ZEC-PERP", "1m", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["open"], 1.0)
+        self.assertEqual(rows[0]["high"], 2.0)
+        self.assertEqual(rows[0]["low"], 0.5)
+        self.assertEqual(rows[0]["close"], 1.5)
+        self.assertEqual(rows[0]["volume"], 3.0)
 
 
 if __name__ == "__main__":

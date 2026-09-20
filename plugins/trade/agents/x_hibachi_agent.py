@@ -389,6 +389,7 @@ def capabilities() -> List[str]:
         "set_sl",
         "close_position",
         "resolve_instrument",
+        "candles",
         # Phase 2.4: catalog + public mark price.
         "list_instruments",
         "market_price",

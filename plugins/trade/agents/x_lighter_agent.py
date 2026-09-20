@@ -795,6 +795,7 @@ def capabilities() -> List[str]:
     return [
         "balance", "positions_orders", "positions_management",
         "new_order", "ladder", "cancel_orders",
+        "candles",
         # Public instrument resolve + Phase 2.4 catalog/price readers.
         "resolve_instrument", "list_instruments", "market_price",
     ]
@@ -5864,7 +5865,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "list_instruments", "market_price", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "list_instruments", "market_price", "candles", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
         return make_failure(
             operation=operation,
             exchange=name,

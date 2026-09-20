@@ -204,6 +204,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "candles",
     ]
 
 
