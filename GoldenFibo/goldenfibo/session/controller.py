@@ -72,6 +72,7 @@ class SessionController:
         self.klines: List[list] = []
         self.bars: List[OhlcvBar] = []
         self.chart_candles: List[Dict[str, Any]] = []
+        self.display_timeframe = "1m"
         self.last_price: Optional[str] = None
         self.recent_domain: List[DomainEvent] = []
         self.ambiguity_count = 0
@@ -160,7 +161,7 @@ class SessionController:
         payload = schemas.build_state_payload(
             mode=self.mode.value,
             symbol=self.symbol,
-            timeframe=self.timeframe,
+            timeframe=self.display_timeframe,
             side=self.side.value,
             percentage=str(self.percentage),
             price=self.last_price,
@@ -181,6 +182,10 @@ class SessionController:
             metric_display=None,
             prefer_aggtrade=False,
         )
+        payload["engine_timeframe"] = self.timeframe
+        payload["display_timeframe"] = self.display_timeframe
+        payload["chart_source_timeframe"] = self.display_timeframe
+        payload["engine_source_timeframe"] = self.timeframe
         payload.update(
             {
                 "phase": self.phase.value,
@@ -781,7 +786,8 @@ class SessionController:
         if symbol:
             self.symbol = canonical_binance_symbol(symbol)
         if timeframe:
-            self.timeframe = validate_interval(timeframe)
+            self.display_timeframe = validate_interval(timeframe)
+        self.timeframe = "1m"
         if market is not None:
             self.market = _normalize_market(market)
         if side is not None:
@@ -870,6 +876,7 @@ class SessionController:
         """
         step = interval_ms(self.timeframe)
         est = max(1, (int(end_ms) - int(start_ms)) // step)
+        display_step = interval_ms(self.display_timeframe)
         amb_total = 0
         last_open: int | None = None
         bars_done = 0
@@ -994,11 +1001,9 @@ class SessionController:
                 last_open = int(page_rows[-1][0])
 
             async with self._lock:
-                for k in page_rows:
-                    self.klines.append(k)
-                    self.bars.append(bar_from_binance_kline(k))
-                new_cc = bn.bars_to_chart_candles(page_rows)
-                self.chart_candles.extend(new_cc)
+                self.klines.extend(page_rows)
+                self.bars.extend(bar_from_binance_kline(k) for k in page_rows)
+                self.chart_candles.extend(bn.resample_chart_candles(page_rows, self.display_timeframe))
                 self._trim_chart()
                 self._trim_metric_bars()
                 self.ambiguity_count = amb_total

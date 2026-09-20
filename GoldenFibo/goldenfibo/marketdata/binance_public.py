@@ -53,6 +53,49 @@ def bars_to_chart_candles(klines: Sequence[Sequence[Any]]) -> List[Dict[str, Any
     return [kline_to_chart_candle(k) for k in klines]
 
 
+def resample_chart_candles(klines: Sequence[Sequence[Any]], timeframe: str) -> List[Dict[str, Any]]:
+    """Aggregate 1m klines into display-timeframe candles for the UI."""
+    if not klines:
+        return []
+    if timeframe == "1m":
+        return bars_to_chart_candles(klines)
+    from .timeframes import interval_ms
+
+    step = interval_ms(timeframe)
+    grouped: List[List[Any]] = []
+    current_bucket: List[List[Any]] = []
+    current_open = None
+    for k in klines:
+        open_ms = int(k[0])
+        bucket = open_ms - (open_ms % step)
+        if current_open is None or bucket != current_open:
+            if current_bucket:
+                grouped.append(current_bucket)
+            current_bucket = [list(k)]
+            current_open = bucket
+        else:
+            current_bucket.append(list(k))
+    if current_bucket:
+        grouped.append(current_bucket)
+
+    out: List[Dict[str, Any]] = []
+    for group in grouped:
+        first = group[0]
+        last = group[-1]
+        highs = max(float(x[2]) for x in group)
+        lows = min(float(x[3]) for x in group)
+        volume = sum(float(x[5]) for x in group)
+        out.append({
+            "time": int(first[0]) // 1000,
+            "open": float(first[1]),
+            "high": highs,
+            "low": lows,
+            "close": float(last[4]),
+            "volume": volume,
+        })
+    return out
+
+
 def agg_trade_stream_url(symbol: str, *, ws_base: str = BINANCE_SPOT_WS) -> str:
     """Combined stream path for public aggTrade (ordered buyer/seller trades)."""
     s = canonical_binance_symbol(symbol).lower().replace("/", "")
