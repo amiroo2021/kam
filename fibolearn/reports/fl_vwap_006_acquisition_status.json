@@ -1,0 +1,50 @@
+{
+  "acquisition_status": "ACQUISITION_IN_PROGRESS",
+  "LINEAGE_ID": "FL-VWAP-006-BINANCE-SPOT-1M-20260917-20261017",
+  "raw_db_path": "/root/kam/fibolearn/data/fl_vwap_006_binance_validation.sqlite",
+  "preregistered_start_utc": "2026-09-17T00:00:00Z",
+  "preregistered_end_utc": "2026-10-17T00:00:00Z",
+  "acquisition_cutoff_utc": "2026-09-21T10:11:53Z",
+  "latest_available_timestamp_per_symbol": {
+    "BTC": "2026-09-21T10:09:00Z",
+    "ETH": "2026-09-21T10:09:00Z",
+    "PAXG": "2026-09-21T10:09:00Z",
+    "SOL": "2026-09-21T10:09:00Z",
+    "ZEC": "2026-09-21T10:09:00Z"
+  },
+  "rows_per_symbol": {
+    "BTC": 6370,
+    "ETH": 6370,
+    "PAXG": 6370,
+    "SOL": 6370,
+    "ZEC": 6370
+  },
+  "gaps_per_symbol": {
+    "BTC": 0,
+    "ETH": 0,
+    "PAXG": 0,
+    "SOL": 0,
+    "ZEC": 0
+  },
+  "duplicates_per_symbol": {
+    "BTC": 0,
+    "ETH": 0,
+    "PAXG": 0,
+    "SOL": 0,
+    "ZEC": 0
+  },
+  "ohlc_violations_total": 0,
+  "volume_violations_total": 0,
+  "canonical_logical_fingerprint_sha256": "599a2a01a43086780ab9d1e94a1c97cac8b1f22312637071ac06aa7cfd7e470b",
+  "per_symbol_fingerprints": {
+    "BTC": "b65ef79fe46031ac1acb5c93dcd6427a00244b9d85a821629ae28f43e6287000",
+    "ETH": "68e10fe6204529e15d64033c9329b3bfec5198f5ff446ac12b7a3f9fdfb1dc66",
+    "PAXG": "ae989221820292c4c85d65565e8fd282bd6381bda62a57f0075a7ec3ec60a9f9",
+    "SOL": "27ed37191f25dc7e3ddac5eeffff9738cba81ae456e8d1628125405c588c6bd8",
+    "ZEC": "4fc009da2ddbcf4763786d01b2a2aa668a1bf4c55e2e122a2df94758aa41c235"
+  },
+  "overlap_prior_use_audit_result": "PASS_NO_OVERLAP",
+  "READY_FOR_NEXT_APPEND": true,
+  "methodology_freeze_commit": "69b4da676966f83822a66b8fc54068633004ca45",
+  "outcome_analysis": "NOT_PERFORMED"
+}

@@ -1,0 +1,280 @@
+{
+  "schema_version": 1,
+  "LINEAGE_ID": "FL-VWAP-006-BINANCE-SPOT-1M-20260917-20261017",
+  "hypothesis_id": "FL-VWAP-006",
+  "methodology_version": "fl_vwap_006_methodology_v1",
+  "methodology_freeze_commit": "69b4da676966f83822a66b8fc54068633004ca45",
+  "acquisition_status": "ACQUISITION_IN_PROGRESS",
+  "complete": false,
+  "note": "Dataset incomplete until preregistered_end has elapsed and full range is acquired. No outcome/effect analysis performed.",
+  "source": {
+    "venue": "Binance",
+    "market": "spot",
+    "api": "https://api.binance.com/api/v3/klines",
+    "timeframe": "1m"
+  },
+  "preregistered_start_utc": "2026-09-17T00:00:00Z",
+  "preregistered_end_utc": "2026-10-17T00:00:00Z",
+  "preregistered_start_ms": 1789603200000,
+  "preregistered_end_ms": 1792195200000,
+  "acquisition_cutoff_utc": "2026-09-21T10:11:53Z",
+  "acquisition_cutoff_ms": 1789985513846,
+  "latest_closed_open_ms": 1789985400000,
+  "latest_closed_open_utc": "2026-09-21T10:10:00Z",
+  "raw_db_path": "/root/kam/fibolearn/data/fl_vwap_006_binance_validation.sqlite",
+  "raw_db_physical_sha256": "04cae4b683bcb679a752ee48ed4119434b527228ff2bb56278e4a4ec59fa8707",
+  "raw_db_size_bytes": 5754880,
+  "canonical_logical_fingerprint_method": "fl_vwap_006_logical_fingerprint_v1: sha256 over sorted (symbol,open_time) rows of symbol|open_time|o|h|l|c|vol|close_time|quote_vol|trades|tb_base|tb_quote|source|market|timeframe newline-delimited",
+  "canonical_logical_fingerprint_sha256": "599a2a01a43086780ab9d1e94a1c97cac8b1f22312637071ac06aa7cfd7e470b",
+  "symbols": [
+    "BTC",
+    "ETH",
+    "PAXG",
+    "SOL",
+    "ZEC"
+  ],
+  "per_symbol": {
+    "BTC": {
+      "symbol": "BTC",
+      "source": "binance",
+      "market": "spot",
+      "timeframe": "1m",
+      "candle_count": 6370,
+      "earliest_timestamp": 1789603200000,
+      "latest_timestamp": 1789985340000,
+      "earliest_utc": "2026-09-17T00:00:00Z",
+      "latest_utc": "2026-09-21T10:09:00Z",
+      "expected_candle_count_from_span": 6370,
+      "expected_from_prereg_start_to_latest": 6370,
+      "missing_1m_intervals": 0,
+      "gap_events": 0,
+      "gap_samples": [],
+      "duplicate_timestamps": 0,
+      "non_monotonic_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0,
+      "logical_fingerprint_sha256": "b65ef79fe46031ac1acb5c93dcd6427a00244b9d85a821629ae28f43e6287000",
+      "prior_use_classification": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION"
+    },
+    "ETH": {
+      "symbol": "ETH",
+      "source": "binance",
+      "market": "spot",
+      "timeframe": "1m",
+      "candle_count": 6370,
+      "earliest_timestamp": 1789603200000,
+      "latest_timestamp": 1789985340000,
+      "earliest_utc": "2026-09-17T00:00:00Z",
+      "latest_utc": "2026-09-21T10:09:00Z",
+      "expected_candle_count_from_span": 6370,
+      "expected_from_prereg_start_to_latest": 6370,
+      "missing_1m_intervals": 0,
+      "gap_events": 0,
+      "gap_samples": [],
+      "duplicate_timestamps": 0,
+      "non_monotonic_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0,
+      "logical_fingerprint_sha256": "68e10fe6204529e15d64033c9329b3bfec5198f5ff446ac12b7a3f9fdfb1dc66",
+      "prior_use_classification": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION"
+    },
+    "PAXG": {
+      "symbol": "PAXG",
+      "source": "binance",
+      "market": "spot",
+      "timeframe": "1m",
+      "candle_count": 6370,
+      "earliest_timestamp": 1789603200000,
+      "latest_timestamp": 1789985340000,
+      "earliest_utc": "2026-09-17T00:00:00Z",
+      "latest_utc": "2026-09-21T10:09:00Z",
+      "expected_candle_count_from_span": 6370,
+      "expected_from_prereg_start_to_latest": 6370,
+      "missing_1m_intervals": 0,
+      "gap_events": 0,
+      "gap_samples": [],
+      "duplicate_timestamps": 0,
+      "non_monotonic_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0,
+      "logical_fingerprint_sha256": "ae989221820292c4c85d65565e8fd282bd6381bda62a57f0075a7ec3ec60a9f9",
+      "prior_use_classification": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION"
+    },
+    "SOL": {
+      "symbol": "SOL",
+      "source": "binance",
+      "market": "spot",
+      "timeframe": "1m",
+      "candle_count": 6370,
+      "earliest_timestamp": 1789603200000,
+      "latest_timestamp": 1789985340000,
+      "earliest_utc": "2026-09-17T00:00:00Z",
+      "latest_utc": "2026-09-21T10:09:00Z",
+      "expected_candle_count_from_span": 6370,
+      "expected_from_prereg_start_to_latest": 6370,
+      "missing_1m_intervals": 0,
+      "gap_events": 0,
+      "gap_samples": [],
+      "duplicate_timestamps": 0,
+      "non_monotonic_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0,
+      "logical_fingerprint_sha256": "27ed37191f25dc7e3ddac5eeffff9738cba81ae456e8d1628125405c588c6bd8",
+      "prior_use_classification": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION"
+    },
+    "ZEC": {
+      "symbol": "ZEC",
+      "source": "binance",
+      "market": "spot",
+      "timeframe": "1m",
+      "candle_count": 6370,
+      "earliest_timestamp": 1789603200000,
+      "latest_timestamp": 1789985340000,
+      "earliest_utc": "2026-09-17T00:00:00Z",
+      "latest_utc": "2026-09-21T10:09:00Z",
+      "expected_candle_count_from_span": 6370,
+      "expected_from_prereg_start_to_latest": 6370,
+      "missing_1m_intervals": 0,
+      "gap_events": 0,
+      "gap_samples": [],
+      "duplicate_timestamps": 0,
+      "non_monotonic_timestamps": 0,
+      "ohlc_violations": 0,
+      "volume_violations": 0,
+      "logical_fingerprint_sha256": "4fc009da2ddbcf4763786d01b2a2aa668a1bf4c55e2e122a2df94758aa41c235",
+      "prior_use_classification": "NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION"
+    }
+  },
+  "totals": {
+    "rows": 31850,
+    "gap_events": 0,
+    "missing_1m_intervals": 0,
+    "ohlc_violations": 0,
+    "volume_violations": 0,
+    "duplicate_timestamps": 0
+  },
+  "overlap_prior_use_audit": {
+    "result": "PASS_NO_OVERLAP",
+    "policy": "preregistered interval must not overlap development market/episode coverage, FL-VWAP-005 validation candles, or development kline cache content in the same timestamps; prior_use must be NO_EVIDENCE_OF_PRIOR_OUTCOME_INSPECTION for primary claim",
+    "development_fibolearn_sqlite": {
+      "BTC": {
+        "dev_market_obs_in_prereg_window": 0,
+        "dev_market_max_ts": 1789581660000,
+        "dev_market_max_utc": "2026-09-16T18:01:00Z",
+        "overlap_with_006_prereg_start": false
+      },
+      "ETH": {
+        "dev_market_obs_in_prereg_window": 0,
+        "dev_market_max_ts": 1789581780000,
+        "dev_market_max_utc": "2026-09-16T18:03:00Z",
+        "overlap_with_006_prereg_start": false
+      },
+      "PAXG": {
+        "dev_market_obs_in_prereg_window": 0,
+        "dev_market_max_ts": 1789582200000,
+        "dev_market_max_utc": "2026-09-16T18:10:00Z",
+        "overlap_with_006_prereg_start": false
+      },
+      "SOL": {
+        "dev_market_obs_in_prereg_window": 0,
+        "dev_market_max_ts": 1789581900000,
+        "dev_market_max_utc": "2026-09-16T18:05:00Z",
+        "overlap_with_006_prereg_start": false
+      },
+      "ZEC": {
+        "dev_market_obs_in_prereg_window": 0,
+        "dev_market_max_ts": 1789582080000,
+        "dev_market_max_utc": "2026-09-16T18:08:00Z",
+        "overlap_with_006_prereg_start": false
+      }
+    },
+    "development_binance_klines": {
+      "BTC": {
+        "klines_in_prereg_window": 0,
+        "max": null
+      },
+      "ETH": {
+        "klines_in_prereg_window": 0,
+        "max": null
+      },
+      "SOL": {
+        "klines_in_prereg_window": 0,
+        "max": null
+      },
+      "ZEC": {
+        "klines_in_prereg_window": 0,
+        "max": null
+      },
+      "PAXG": {
+        "klines_in_prereg_window": 0,
+        "max": null
+      }
+    },
+    "fl_vwap_005_validation": {
+      "BTC": {
+        "candles_in_prereg_window": 0,
+        "max_open_time": 1735689540000,
+        "max_utc": "2024-12-31T23:59:00Z"
+      },
+      "ETH": {
+        "candles_in_prereg_window": 0,
+        "max_open_time": 1735689540000,
+        "max_utc": "2024-12-31T23:59:00Z"
+      },
+      "PAXG": {
+        "candles_in_prereg_window": 0,
+        "max_open_time": 1735689540000,
+        "max_utc": "2024-12-31T23:59:00Z"
+      },
+      "SOL": {
+        "candles_in_prereg_window": 0,
+        "max_open_time": 1735689540000,
+        "max_utc": "2024-12-31T23:59:00Z"
+      },
+      "ZEC": {
+        "candles_in_prereg_window": 0,
+        "max_open_time": 1735689540000,
+        "max_utc": "2024-12-31T23:59:00Z"
+      }
+    },
+    "development_max_before_prereg": true,
+    "fl_vwap_005_ends_2024": true
+  },
+  "append_policy": {
+    "existing_minutes_immutable": true,
+    "append_only_new_open_times": true,
+    "duplicate_open_time": "detect and skip if identical values; STOP if conflicting values",
+    "no_interpolation": true,
+    "no_synthetic_candles": true,
+    "manifest_versioned_each_acquisition": true,
+    "gaps_remain_explicit": true
+  },
+  "protected_reference_dbs_unchanged": true,
+  "protected_db_after": [
+    {
+      "path": "/root/.hermes/fibolearn/fibolearn.sqlite",
+      "ok": true,
+      "sha256": "b38bcf14a25a01ef9dc53e8b801a0309dcb07e9f54f31a7e878361f596199cc5",
+      "size": 4242903040
+    },
+    {
+      "path": "/root/kam/GoldenFibo/data/binance_klines.sqlite",
+      "ok": true,
+      "sha256": "e44164be58717a0c67b3fd90d677653f97af0d4d8178a75116e00cb6910c5b05",
+      "size": 138215424
+    },
+    {
+      "path": "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite",
+      "ok": true,
+      "sha256": "2c17e874b92d8216fa9da505bf80aab8972cbf1a74649d42fb2d36e48cf208e6",
+      "size": 2742136832
+    }
+  ],
+  "outcome_effect_analysis_performed": false,
+  "terminal_event_inspected_for_006": false,
+  "methodology_changed": false,
+  "goldenfibo_changed": false,
+  "READY_FOR_NEXT_APPEND": true,
+  "blockers": [],
+  "created_at_utc": "2026-09-21T10:12:12Z"
+}

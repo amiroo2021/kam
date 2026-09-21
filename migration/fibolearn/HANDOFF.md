@@ -7,6 +7,7 @@ This document is the **authoritative project-state handoff**. It must not depend
 - `VERIFY.md` — verification steps
 - `REGENERATION_PARITY_CHECKPOINT.md` — GIANT BTC 24h regeneration-parity PASS (scoped)
 - `FL_VWAP_006_METHODOLOGY_PREREGISTRATION.md` — pre-exposure FL-VWAP-006 methodology freeze
+- `FL_VWAP_006_ACQUISITION.md` — raw 006 append-safe acquisition policy (in progress until 2026-10-17)
 - data bundle under `bundles/` (non-Git REQUIRED databases)
 
 Generated on clinic host. Do not treat chat history as source of truth.
@@ -159,17 +160,23 @@ Formal prospective preregistration is documented at:
 - `fibolearn/reports/fl_vwap_006_methodology_freeze.json`
 
 ```
-METHODOLOGY_FROZEN_PRE_EXPOSURE = YES   # after freeze commit on origin/main
-READY_TO_ACQUIRE_FL_VWAP_006 = YES        # acquisition only after freeze commit
+METHODOLOGY_FROZEN_PRE_EXPOSURE = YES   # freeze commit 69b4da6 on origin/main
+READY_TO_ACQUIRE_FL_VWAP_006 = YES
+FL_VWAP_006_ACQUISITION_STATUS = ACQUISITION_IN_PROGRESS  # raw candles only; not complete until 2026-10-17
 FL_VWAP_005 = CONTAMINATED_DEVELOPMENT_ONLY
 ```
+
+Raw 006 lineage (not Git): `fibolearn/data/fl_vwap_006_binance_validation.sqlite`  
+Manifests: `fibolearn/reports/fl_vwap_006_raw_data_manifest.json`, `fl_vwap_006_acquisition_status.json`  
+Append policy: `migration/fibolearn/FL_VWAP_006_ACQUISITION.md`
 
 Do **NOT**:
 
 - calculate development effect sizes as validation evidence
-- inspect or acquire FL-VWAP-006 before the freeze commit is on `origin/main`
+- run FL-VWAP-006 outcome/effect analysis before acquisition is complete and a separate analysis task is authorized
 - rehabilitate INVALID FL-VWAP-005 effect estimates
 - change frozen matcher/estimand/inference after any 006 outcome is visible
+- fabricate candles through the preregistered end date
 
 ## Historical commits (preserve meaning)
 
