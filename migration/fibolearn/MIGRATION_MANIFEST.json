@@ -294,6 +294,25 @@
       "platforms_observed": ["telegram", "photon", "email"]
     }
   },
+  "data_lineage": {
+    "warning": "validation DB (2017-2024, gapped) and dev episode store (30d window, binance_klines.sqlite source) are DISTINCT data lineages — do not conflate when extending either store.",
+    "A_fl_vwap_005_validation_candle_db": {
+      "path": "fibolearn/data/fl_vwap_005_binance_validation.sqlite",
+      "purpose": "Frozen multi-symbol Binance 1m candles for FL-VWAP-005 validation freeze only",
+      "btc_range_utc": "2017-08-17T04:00:00Z to 2024-12-31T23:59:00Z",
+      "contiguous": false,
+      "btc_gap_events": 35,
+      "canonical_logical_fingerprint_sha256": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+      "note": "LOGICAL fingerprint must not be compared to physical SQLite file SHA-256"
+    },
+    "B_development_episode_primitive_store": {
+      "path": "~/.hermes/fibolearn/fibolearn.sqlite",
+      "purpose": "30-day development market/ladder/episode research store + prospective accounting inputs",
+      "approx_window_utc": "2026-08-17 to 2026-09-16",
+      "candle_source_for_build": "GoldenFibo KlineCache (binance_klines.sqlite), not the FL-VWAP-005 validation DB",
+      "do_not": "merge, append, or regenerate either lineage during transfer-only work"
+    }
+  },
   "safety": {
     "secrets_included_in_bundle": false,
     "goldenfibo_behavior_changed_by_migration_package": false,
