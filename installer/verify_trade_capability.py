@@ -112,11 +112,12 @@ def run(
 
     print("==> verify webtrade unit / password / health")
     sd = systemd_dir if systemd_dir is not None else Path("/etc/systemd/system")
+    require_active = sd.resolve() == Path("/etc/systemd/system").resolve()
     for name, passed, detail in verify_trade_web_unit(
         hermes_root=hermes_root,
         hermes_home=hermes_home,
         systemd_dir=sd,
-        require_active_health=True,
+        require_active_health=require_active,
     ):
         mark = "ok" if passed else "FAIL"
         print(f"    [{mark}] {name} - {detail}")

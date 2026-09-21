@@ -118,6 +118,19 @@ except Exception as exc:  # noqa: BLE001
     )
 '''
 
+_BACKTEST_TEXT_BLOCK = '''\
+try:
+    from plugins.trade.backtest_wizard import handle_backtest_text
+
+    if await handle_backtest_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /backtest text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
+'''
+
 _FIBO_TEXT_BLOCK = '''\
 try:
     from plugins.trade.fibo_wizard import handle_fibo_text
@@ -543,6 +556,12 @@ def _choose_helper_anchor(hermes_root: Optional[Path]) -> tuple[str, str]:
                 "        await self.handle_message(event)",
                 "    def _should_process_message",
             )
+        if "backtest" in text and "MessageType.TEXT" in text:
+            return (
+                "        event.text = self._clean_bot_trigger_text(event.text)\n"
+                "        await self.handle_message(event)",
+                "    def _should_process_message",
+            )
     # Conservative fallback for unknown adapters: insert immediately before the
     # message-trigger gate when present.
     return ("    return bot_id is not None and user_id is not None and bot_id == user_id",
@@ -722,6 +741,28 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_TEXT_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_text",
+            method_name="_handle_text",
+            method_name_candidates=[
+                "_handle_text",
+                "_handle_text_message",
+                "_on_text",
+                "handle_text",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(update.message)",
+                "await self._ensure_forum_commands(msg)",
+                "_ensure_forum_commands",
+                "MessageType.TEXT",
+            ],
+        ),
+        PatchSpec(
+            seam="backtest text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=text_before,
+            anchor_after=text_after,
+            block=_BACKTEST_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.backtest_wizard import handle_backtest_text",
             method_name="_handle_text",
             method_name_candidates=[
                 "_handle_text",

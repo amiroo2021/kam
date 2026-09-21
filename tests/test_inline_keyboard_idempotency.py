@@ -83,7 +83,7 @@ COMPATIBLE_DIRECT_HELPER = (
     "        for row in buttons:\n"
     "            rb = []\n"
     "            for btn in row:\n"
-    "                rb.append((btn[\"text\"], f\"{callback_prefix}:{btn[\'callback_data\']}\"))\n"
+    "                rb.append((btn[\"text\"], f\"{callback_prefix}:{btn['callback_data']}\"))\n"
     "            if rb:\n"
     "                rows.append(rb)\n"
     "        markup = InlineKeyboardMarkup(rows)\n"
@@ -106,7 +106,7 @@ COMPATIBLE_DIRECT_HELPER_LINES_5771 = (
     "        for row in buttons:\n"
     "            rb = []\n"
     "            for btn in row:\n"
-    "                rb.append((btn[\"text\"], f\"{callback_prefix}:{btn[\'callback_data\']}\"))\n"
+    "                rb.append((btn[\"text\"], f\"{callback_prefix}:{btn['callback_data']}\"))\n"
     "            if rb:\n"
     "                rows.append(rb)\n"
     "        markup = InlineKeyboardMarkup(rows)\n"
@@ -232,3 +232,75 @@ class TestInlineKeyboardIdempotencyExisting(_Base):
         text_after_second = self.adapter.read_text()
         self.assertEqual(text_after_first, text_after_second)
         self.assertIn("already-installed", proc2.stdout)
+
+
+class TestMultiLineAnchorRegression(unittest.TestCase):
+    def test_apply_patch_anchors_after_full_multiline_match(self):
+        from kamlib import PatchSpec, apply_patch
+
+        fixture = (
+            'class TelegramAdapter:\n'
+            '    def _is_own_message(self, message):\n'
+            '        """True when sent by this bot itself (echoed getUpdates must not count as incoming unread)."""\n'
+            '        if not self._bot:\n'
+            '            return False\n'
+            '        from_user = getattr(message, "from_user", None)\n'
+            '        if from_user is None:\n'
+            '            return False\n'
+            '        bot_id = getattr(self._bot, "id", None)\n'
+            '        user_id = getattr(from_user, "id", None)\n'
+            '        return bot_id is not None and user_id is not None and bot_id == user_id\n'
+            '\n'
+            '    def _after_anchor(self):\n'
+            '        return "done"\n'
+        )
+
+        anchor_before = (
+            '    def _is_own_message(self, message):\n'
+            '        """True when sent by this bot itself (echoed getUpdates must not count as incoming unread)."""\n'
+            '        if not self._bot:\n'
+            '            return False\n'
+            '        from_user = getattr(message, "from_user", None)\n'
+            '        if from_user is None:\n'
+            '            return False\n'
+            '        bot_id = getattr(self._bot, "id", None)\n'
+            '        user_id = getattr(from_user, "id", None)\n'
+            '        return bot_id is not None and user_id is not None and bot_id == user_id\n'
+        )
+        anchor_after = '    def _after_anchor(self):\n'
+        block = (
+            'async def send_inline_keyboard(self, chat_id, text, buttons, callback_prefix="", *, metadata=None, parse_mode=None):\n'
+            '    return None\n'
+        )
+        spec = PatchSpec(
+            seam="inline keyboard helper",
+            relative_path=Path("plugins/platforms/telegram/adapter.py"),
+            anchor_before=anchor_before,
+            anchor_after=anchor_after,
+            block=block,
+            insertion_indent="    ",
+            native_sentinel="__kam__sentinel__",
+        )
+
+        patched, action, detail = apply_patch(fixture, spec)
+        self.assertEqual(action, "patched", detail)
+        self.assertIn("def _is_own_message", patched)
+        self.assertIn("def send_inline_keyboard", patched)
+        self.assertLess(patched.index("return bot_id is not None"), patched.index("def send_inline_keyboard"))
+        compile(patched, "<patched-adapter>", "exec")
+
+        module = ast.parse(patched)
+        cls = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "TelegramAdapter")
+        own = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_is_own_message")
+        helper = next(
+            node for node in cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "send_inline_keyboard"
+        )
+        self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(own)))
+        self.assertIsNotNone(own.end_lineno)
+        self.assertIsNotNone(helper.lineno)
+        self.assertGreater(helper.lineno, own.end_lineno)
+
+        repatched, action2, detail2 = apply_patch(patched, spec)
+        self.assertEqual(action2, "already-installed", detail2)
+        self.assertEqual(repatched, patched)

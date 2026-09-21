@@ -170,8 +170,10 @@ def install_trade_web_unit(
     record["actions"].append(f"wrote {dst}")
     record["unit_path"] = str(dst)
 
-    if not _systemctl_available():
-        record["actions"].append("systemctl unavailable; unit file installed only")
+    default_systemd = DEFAULT_SYSTEMD_DIR.resolve()
+    current_systemd = systemd_dir.resolve()
+    if not _systemctl_available() or current_systemd != default_systemd:
+        record["actions"].append("systemctl unavailable or nonstandard systemd_dir; unit file installed only")
         return record
 
     _run(["systemctl", "daemon-reload"], check=False)

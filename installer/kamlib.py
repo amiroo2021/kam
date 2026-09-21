@@ -476,16 +476,7 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
     )
     if can_anchor:
         idx_before = text.index(spec.anchor_before)
-        lines = text.splitlines(keepends=True)
-        target_line_index: Optional[int] = None
-        running = 0
-        for i, line in enumerate(lines):
-            if running <= idx_before < running + len(line):
-                target_line_index = i
-                break
-            running += len(line)
-        if target_line_index is None:
-            raise InstallError(f"[{spec.seam}] could not locate anchor line; refusing to patch.")
+        insert_at = idx_before + len(spec.anchor_before)
 
         indent = spec.insertion_indent
         marker_open = f"{indent}# {spec.marker_begin()}\n"
@@ -495,11 +486,7 @@ def apply_patch(text: str, spec: PatchSpec) -> Tuple[str, str, str]:
             code += (f"{indent}{raw}\n" if raw.strip() else "\n")
         insertion = "\n" + marker_open + code + marker_close
 
-        new_text = (
-            "".join(lines[: target_line_index + 1])
-            + insertion
-            + "".join(lines[target_line_index + 1 :])
-        )
+        new_text = text[:insert_at] + insertion + text[insert_at:]
 
         if new_text.index(spec.marker_begin()) >= new_text.index(spec.anchor_after):
             raise InstallError(

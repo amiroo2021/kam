@@ -365,17 +365,21 @@ class TestFreshInstall(FixtureCase):
         for entry in manifest["copied_files"]:
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
-        self.assertEqual(len(patched), 7, patched)
+        self.assertEqual(len(patched), 11, patched)
         seams = {p["seam"] for p in patched}
         self.assertEqual(
             seams,
             {
                 "callback dispatch",
                 "wizard text interception",
+                "backtest text interception",
                 "slash command dispatch",
                 "fibo callback dispatch",
                 "fibo text interception",
                 "fibo slash command dispatch",
+                "fibolearn callback dispatch",
+                "fibolearn text interception",
+                "fibolearn slash command dispatch",
                 "inline keyboard helper",
             },
         )
@@ -636,6 +640,31 @@ class TestVerificationGate(FixtureCase):
         lowered = proc.stdout.lower()
         for forbidden in ("order placed", "cancelled order", "balance:", "position:"):
             self.assertNotIn(forbidden, lowered)
+
+    def test_verifier_public_only_agents_do_not_need_credentials(self):
+        run_installer(self.hermes)
+        from plugins.trade.agents import x_binance_agent as binance
+        self.assertIn("candles", binance.capabilities())
+        self.assertNotIn("balance", binance.capabilities())
+        self.assertNotIn("new_order", binance.capabilities())
+        proc = subprocess.run(
+            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes), "--systemd-dir", str(self.hermes.parent / "systemd")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("public agents exempt", proc.stdout)
+
+    def test_verifier_still_detects_credential_required_agents(self):
+        run_installer(self.hermes)
+        from plugins.trade.agents import x_phemex_agent as phemex
+        self.assertIn("balance", phemex.capabilities())
+        self.assertIn("new_order", phemex.capabilities())
+        proc = subprocess.run(
+            [PY, str(INSTALLER / "verify_trade.py"), "--hermes-root", str(self.hermes), "--systemd-dir", str(self.hermes.parent / "systemd")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("credential-required", proc.stdout)
 
 
 class TestDependencyInstallUnit(unittest.TestCase):

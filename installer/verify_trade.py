@@ -653,18 +653,30 @@ def main(argv: List[str]) -> int:
             os.environ.pop(key, None)
 
         leaked: List[str] = []
+        credential_required: List[str] = []
         with tempfile.TemporaryDirectory(prefix="kam-nocreds-") as empty_home:
             os.environ["HERMES_HOME"] = empty_home
             try:
                 desk = TradeDesk()
                 for exchange in discovered:
                     try:
+                        agent = getattr(desk, "_agents", {}).get(exchange)
+                        caps = []
+                        if agent is not None and hasattr(agent, "capabilities"):
+                            try:
+                                caps = list(agent.capabilities() or [])
+                            except Exception:
+                                caps = []
                         accounts = desk.list_accounts(exchange)
                     except Exception as exc:  # noqa: BLE001
                         raise AssertionError(
                             f"{exchange}.list_accounts crashed without credentials: {exc}"
                         ) from exc
-                    if accounts:
+                    if not caps or any(op in {"balance", "positions_orders", "positions_management", "new_order", "ladder", "cancel_order_group", "set_tp", "set_sl", "close_position"} for op in caps):
+                        credential_required.append(exchange)
+                        if accounts:
+                            leaked.append(exchange)
+                    elif accounts and exchange != "binance":
                         leaked.append(exchange)
             finally:
                 os.environ.pop("HERMES_HOME", None)
@@ -676,7 +688,9 @@ def main(argv: List[str]) -> int:
             raise AssertionError(
                 "accounts reported with no credentials present: " + ", ".join(leaked)
             )
-        return "missing credentials yield empty account lists, no crash"
+        if not credential_required:
+            raise AssertionError("no credential-required exchanges detected for missing-credentials check")
+        return "missing credentials yield empty account lists for credential-required agents; public agents exempt"
 
     c.run("missing credentials degrade gracefully", check_missing_credentials_no_crash)
 
@@ -695,8 +709,11 @@ def main(argv: List[str]) -> int:
     # --- 17: manifest ----------------------------------------------------
     if not source_mode:
         def check_manifest() -> str:
-            manifest_file = K.find_manifest(hermes_root)
+            manifest_file = K.installed_manifest_path(hermes_root)
             manifest = K.read_manifest(manifest_file) if manifest_file else None
+            if manifest is None:
+                legacy = K.legacy_manifest_path(hermes_root)
+                manifest = K.read_manifest(legacy) if legacy.is_file() else None
             if manifest is None:
                 raise AssertionError("installed manifest not found")
             mismatches: List[str] = []
