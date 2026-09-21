@@ -26,10 +26,12 @@ if str(_GF_ROOT) not in sys.path:
 
 from golden_fibo.constants import Side  # noqa: E402
 from goldenfibo.backtest import run_finite_backtest  # noqa: E402
+from goldenfibo.marketdata.aggtrade_cache import AggTradeCache  # noqa: E402
 from goldenfibo.marketdata.kline_cache import CachePolicy, KlineCache, fetch_range_cached  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
 
 _BACKTEST_CACHE = KlineCache(Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite"))
+_BACKTEST_AGGTRADE_CACHE = AggTradeCache(Path("/root/kam/GoldenFibo/data/aggtrades.sqlite"))
 _BACKTEST_TIMEFRAME = "1m"
 _BACKTEST_REFRESH_TAIL_MS = 0
 
@@ -455,6 +457,359 @@ def _vwap(candles, ts):
     return quote/base if base else float("nan")
 
 
+LIGHTBLUE = "#7ec8ff"
+DARKBLUE = "#004c99"
+LIGHTRED = "#ff9a9a"
+DARKRED = "#990000"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _aggressor_metrics_from_trades(trades, start_ts: int, end_ts: int | None = None) -> Dict[str, float | str | None]:
+    """Return aggressor metrics from Binance aggTrade side, never OHLC.
+
+    Binance aggTrade ``m`` means buyer is maker. Therefore:
+    - m=False: buyer is taker/aggressor => BUY aggressor
+    - m=True: seller is taker/aggressor => SELL aggressor
+    If any trade lacks side, mark the window unavailable instead of guessing.
+    """
+    buy_base = buy_quote = sell_base = sell_quote = all_base = all_quote = 0.0
+    start = int(start_ts)
+    end = None if end_ts is None else int(end_ts)
+    count = 0
+    missing_side = 0
+    for t in trades:
+        ts = int(getattr(t, "ts_ms"))
+        if ts < start or (end is not None and ts >= end):
+            continue
+        q = max(0.0, _safe_float(getattr(t, "qty", 0.0)))
+        if q <= 0:
+            continue
+        p = _safe_float(getattr(t, "price", 0.0))
+        count += 1
+        all_base += q
+        all_quote += p * q
+        side = getattr(t, "buyer_is_maker", None)
+        if side is None:
+            missing_side += 1
+            continue
+        if bool(side):
+            sell_base += q
+            sell_quote += p * q
+        else:
+            buy_base += q
+            buy_quote += p * q
+    total = buy_base + sell_base
+    status = "COMPLETE" if count and missing_side == 0 else "UNAVAILABLE"
+    return {
+        "status": status,
+        "trade_count": float(count),
+        "missing_side_count": float(missing_side),
+        "total_volume": all_base,
+        "buy_volume": buy_base,
+        "sell_volume": sell_base,
+        "all_vwap": (all_quote / all_base) if all_base > 0 else None,
+        "buy_vwap": (buy_quote / buy_base) if buy_base > 0 and status == "COMPLETE" else None,
+        "sell_vwap": (sell_quote / sell_base) if sell_base > 0 and status == "COMPLETE" else None,
+        "delta_ratio": ((buy_base - sell_base) / total) if total > 0 and status == "COMPLETE" else None,
+    }
+
+
+def _step_delta_ratios_from_trades(trades, state) -> Dict[int, float | None]:
+    """Delta ratio per active ladder step window from aggTrade side."""
+    ratios: Dict[int, float | None] = {}
+    legs = list(getattr(state, "legs", None) or [])
+    for idx, leg in enumerate(legs):
+        step = int(getattr(leg, "step", idx))
+        start = _leg_ts_ms(leg)
+        end = _leg_ts_ms(legs[idx + 1]) if idx + 1 < len(legs) else None
+        ratios[step] = _aggressor_metrics_from_trades(trades, start, end).get("delta_ratio")
+    return ratios
+
+
+def _step_delta_ratios(candles, state) -> Dict[int, float | None]:
+    return {int(getattr(leg, "step", idx)): None for idx, leg in enumerate(list(getattr(state, "legs", None) or []))}
+
+
+# ---------------------------------------------------------------------------
+# Canonical /backtest aggressive-flow metrics — kline primitive path
+# (File 2 definition: BUY = SUM(taker_buy_base), SELL = SUM(volume-taker_buy_base),
+# DELTA = BUY - SELL, DELTA_RATIO = (BUY - SELL) / (BUY + SELL), base volume).
+#
+# Window semantics:
+#   Completed step i:    [leg_i.ts_ms, leg_(i+1).ts_ms)         exclusive on right
+#   Current active step: [leg_last.ts_ms, last_complete_candle_open_time + 60_000)
+#   Whole ladder:        [P0.ts_ms, last_complete_candle_open_time + 60_000)
+# Only COMPLETE 1m candles contribute.
+# ---------------------------------------------------------------------------
+
+
+def _aggressor_metrics_from_candles(
+    candles, start_ms: int, end_ms_exclusive: int | None = None
+) -> Dict[str, Any]:
+    """Canonical /backtest aggressive-flow metrics from Binance 1m kline primitives.
+
+    Kline row layout (matches ``goldenfibo.KlineCache.read_range``):
+        [open_time, open, high, low, close, volume, close_time,
+         quote_volume, trades, taker_buy_base, taker_buy_quote, ignore]
+    """
+    buy_base = sell_base = buy_quote = sell_quote = 0.0
+    start = int(start_ms)
+    end = None if end_ms_exclusive is None else int(end_ms_exclusive)
+    count = 0
+    for k in candles:
+        ts = int(k[0])
+        if ts < start:
+            continue
+        if end is not None and ts >= end:
+            continue
+        base = _safe_float(k[5])
+        if base <= 0:
+            continue
+        tbb = _safe_float(k[9])
+        tbq = _safe_float(k[10])
+        quote = _safe_float(k[7])
+        count += 1
+        buy_base += tbb
+        sell_base += base - tbb
+        buy_quote += tbq
+        sell_quote += quote - tbq
+    total = buy_base + sell_base
+    delta = buy_base - sell_base
+    status = "COMPLETE" if total > 0 else ("EMPTY" if count == 0 else "COMPLETE")
+    return {
+        "status": status,
+        "buy_base": buy_base,
+        "sell_base": sell_base,
+        "total_base": total,
+        "buy_quote": buy_quote,
+        "sell_quote": sell_quote,
+        "buy_vwap": (buy_quote / buy_base) if buy_base > 0 else None,
+        "sell_vwap": (sell_quote / sell_base) if sell_base > 0 else None,
+        "delta": delta,
+        "delta_ratio": (delta / total) if total > 0 else None,
+    }
+
+
+def _step_aggressor_metrics_from_candles(candles, state, step: int) -> Dict[str, Any] | None:
+    """Per-completed-step snapshot from candles. Window = [leg_i.ts_ms, leg_(i+1).ts_ms)."""
+    legs = list(getattr(state, "legs", None) or [])
+    leg = None
+    for L in legs:
+        if int(getattr(L, "step", -1)) == int(step):
+            leg = L
+            break
+    if leg is None:
+        return None
+    try:
+        start_ts = _leg_ts_ms(leg)
+    except AttributeError:
+        return None
+    # Find the next leg's ts to bound the window exclusive on the right.
+    leg_indexes = sorted(range(len(legs)), key=lambda i: _leg_ts_ms(legs[i]))
+    end_ts = None
+    for idx in leg_indexes:
+        if int(getattr(legs[idx], "step", -1)) == int(step):
+            nxt = idx + 1
+            if nxt < len(leg_indexes):
+                end_ts = _leg_ts_ms(legs[leg_indexes[nxt]])
+            break
+    return _aggressor_metrics_from_candles(candles, start_ts, end_ts)
+
+
+def _active_step_aggressor_metrics_from_candles(candles, state) -> Dict[str, Any]:
+    """Active (current) step window = [leg_last.ts_ms, last_complete_candle_open_time + 60_000)."""
+    legs = list(getattr(state, "legs", None) or [])
+    if not legs:
+        return _aggressor_metrics_from_candles([], 0, None)
+    last_leg = max(legs, key=lambda L: _leg_ts_ms(L))
+    start_ts = _leg_ts_ms(last_leg)
+    if not candles:
+        return _aggressor_metrics_from_candles([], start_ts, None)
+    last_complete_open = int(candles[-1][0])
+    end_ts = last_complete_open + 60_000
+    return _aggressor_metrics_from_candles(candles, start_ts, end_ts)
+
+
+def _ladder_aggressor_metrics_from_candles(candles, state) -> Dict[str, Any]:
+    """Ladder window = [P0.ts_ms, last_complete_candle_open_time + 60_000)."""
+    legs = list(getattr(state, "legs", None) or [])
+    if not legs:
+        return _aggressor_metrics_from_candles([], 0, None)
+    p0_leg = min(legs, key=lambda L: _leg_ts_ms(L))
+    start_ts = _leg_ts_ms(p0_leg)
+    if not candles:
+        return _aggressor_metrics_from_candles([], start_ts, None)
+    end_ts = int(candles[-1][0]) + 60_000
+    return _aggressor_metrics_from_candles(candles, start_ts, end_ts)
+
+
+def _per_step_aggressor_table(candles, state) -> Dict[int, Dict[str, Any]]:
+    """Build a dict[step] -> aggressor snapshot for every completed leg, plus
+    the current active leg's snapshot using the active-step window.
+
+    Each entry contains both scopes so the per-step history table can show
+    both L (ladder cumulative) and S (step window) values:
+        - "buy_vwap" / "sell_vwap" / "delta_ratio" / "buy_base" / "sell_base":
+              step-window metrics (current step only)
+        - "ladder_buy_vwap" / "ladder_sell_vwap" / "ladder_delta_ratio"
+          / "ladder_buy_base" / "ladder_sell_base":
+              cumulative metrics from P0 through that step's end boundary
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    legs = list(getattr(state, "legs", None) or [])
+    leg_indexes = sorted(range(len(legs)), key=lambda i: _leg_ts_ms(legs[i]))
+    # P0 start timestamp (anchor for cumulative ladder metrics).
+    p0_ts = _leg_ts_ms(legs[leg_indexes[0]]) if leg_indexes else 0
+
+    for idx_pos, idx in enumerate(leg_indexes):
+        leg = legs[idx]
+        step_n = int(getattr(leg, "step", -1))
+        leg_ts = _leg_ts_ms(leg)
+        # Step window: [leg_ts, next_leg_ts) — end boundary is the next leg's ts,
+        # or candles[-1][0] + 60_000 for the highest filled (active) leg.
+        if idx_pos + 1 < len(leg_indexes):
+            end_ts = _leg_ts_ms(legs[leg_indexes[idx_pos + 1]])
+            is_active = False
+        else:
+            end_ts = int(candles[-1][0]) + 60_000 if candles else leg_ts + 60_000
+            is_active = True
+        step_snap = _aggressor_metrics_from_candles(candles, leg_ts, end_ts)
+        # Ladder cumulative metrics from P0 through this step's end boundary.
+        ladder_snap = _aggressor_metrics_from_candles(candles, p0_ts, end_ts)
+        merged = dict(step_snap)
+        merged["ladder_buy_vwap"] = ladder_snap.get("buy_vwap")
+        merged["ladder_sell_vwap"] = ladder_snap.get("sell_vwap")
+        merged["ladder_delta_ratio"] = ladder_snap.get("delta_ratio")
+        merged["ladder_buy_base"] = ladder_snap.get("buy_base")
+        merged["ladder_sell_base"] = ladder_snap.get("sell_base")
+        merged["is_active"] = is_active
+        out[step_n] = merged
+    return out
+
+
+def _aggressor_summary_lines_v2(
+    *, ladder: Dict[str, Any], step: Dict[str, Any], side: Side
+) -> List[str]:
+    """Canonical /backtest aggressive-flow summary lines (File 2 §7).
+
+    Labels are absolute market-aggressor labels and NEVER invert with
+    GoldenFibo direction (File 2 §11).
+    """
+    def _line(label: str, m: Dict[str, Any], key: str) -> str:
+        status = m.get("status")
+        if status and status != "COMPLETE":
+            return f"{label}: unavailable ({status})"
+        v = m.get(key)
+        if v is None:
+            return f"{label}: nan"
+        return f"{label}: {_fmt(float(v))}"
+
+    def _ratio_line(label: str, m: Dict[str, Any]) -> str:
+        status = m.get("status")
+        if status and status != "COMPLETE":
+            return f"{label}: unavailable ({status})"
+        v = m.get("delta_ratio")
+        if v is None:
+            return f"{label}: nan"
+        return f"{label}: {_fmt_delta(v)}"
+
+    lines = [
+        "",
+        "AGGRESSIVE FLOW (canonical /backtest, base volume)",
+        "",
+        "Whole Ladder (P0 -> now)",
+        _line("  Buy VWAP", ladder, "buy_vwap"),
+        _line("  Sell VWAP", ladder, "sell_vwap"),
+        f"  Buy Vol:     {_fmt_metric(ladder.get('buy_base'))}",
+        f"  Sell Vol:    {_fmt_metric(ladder.get('sell_base'))}",
+        f"  Delta:       {_fmt_metric(ladder.get('delta'))}",
+        _ratio_line("  Delta Ratio", ladder),
+        "",
+        "Current Step",
+        _line("  Buy VWAP", step, "buy_vwap"),
+        _line("  Sell VWAP", step, "sell_vwap"),
+        f"  Buy Vol:     {_fmt_metric(step.get('buy_base'))}",
+        f"  Sell Vol:    {_fmt_metric(step.get('sell_base'))}",
+        f"  Delta:       {_fmt_metric(step.get('delta'))}",
+        _ratio_line("  Delta Ratio", step),
+    ]
+    return lines
+
+
+def _step_delta_color(delta_ratio: float | None) -> str:
+    if delta_ratio is None:
+        return "#666666"
+    d = float(delta_ratio)
+    if d >= 0.5:
+        return DARKBLUE
+    if d > 0:
+        return LIGHTBLUE
+    if d <= -0.5:
+        return DARKRED
+    if d < 0:
+        return LIGHTRED
+    return "#666666"
+
+
+def _fmt_metric(value: float | None) -> str:
+    if value is None:
+        return "nan"
+    try:
+        return _fmt(float(value))
+    except (TypeError, ValueError):
+        return "nan"
+
+
+def _fmt_delta(value: float | None) -> str:
+    if value is None:
+        return "nan"
+    try:
+        return f"{float(value):+.4f}"
+    except (TypeError, ValueError):
+        return "nan"
+
+
+def _aggressor_vwap_label(side: Side, prefix: str) -> str:
+    return f"{prefix}-B-VWAP" if side is Side.SELL else f"{prefix}-S-VWAP"
+
+
+def _aggressor_side_vwap(side: Side, metrics: Dict[str, Any]) -> float | None:
+    return metrics.get("buy_vwap") if side is Side.SELL else metrics.get("sell_vwap")
+
+
+def _aggressor_summary_line(side: Side, prefix: str, metrics: Dict[str, Any]) -> str:
+    label = _aggressor_vwap_label(side, prefix)
+    status = metrics.get("status")
+    if status and status != "COMPLETE":
+        return f"{label}: unavailable ({status})"
+    return f"{label}: {_fmt_metric(_aggressor_side_vwap(side, metrics))}"
+
+
+def _aggressor_summary_lines(side: Side, ladder_window: Dict[str, Any], step_window: Dict[str, Any], ladder_aggressor: Dict[str, Any], step_aggressor: Dict[str, Any]) -> List[str]:
+    return [
+        f"Ladder VWAP: {_fmt_metric(ladder_window.get('all_vwap'))}",
+        _aggressor_summary_line(side, "L", ladder_aggressor),
+        f"Step VWAP: {_fmt_metric(step_window.get('all_vwap'))}",
+        _aggressor_summary_line(side, "S", step_aggressor),
+        f"Step Delta Ratio: {_fmt_delta(step_aggressor.get('delta_ratio'))}",
+    ]
+
+
+def _leg_ts_ms(leg: Any) -> int:
+    ts = getattr(leg, "ts", None)
+    if ts is None:
+        ts = getattr(leg, "ts_ms", None)
+    if ts is None:
+        raise AttributeError("leg has neither ts nor ts_ms")
+    return int(ts)
+
+
 def _active_ladder_start_ts(state) -> int:
     """Return the timestamp of the currently open cycle's P0 leg.
 
@@ -467,7 +822,7 @@ def _active_ladder_start_ts(state) -> int:
     """
     if not getattr(state, "legs", None):
         raise ValueError("active ladder has no open P0 leg")
-    return int(state.legs[0].ts)
+    return _leg_ts_ms(state.legs[0])
 
 
 def _active_step_start_ts(state) -> int:
@@ -479,7 +834,7 @@ def _active_step_start_ts(state) -> int:
     """
     if not getattr(state, "legs", None):
         raise ValueError("active ladder has no open step leg")
-    return int(state.legs[-1].ts)
+    return _leg_ts_ms(state.legs[-1])
 
 
 def _volume_profile(candles, ts, bins: int = 160):
@@ -590,6 +945,45 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     step_poc = result.metric_display.step_poc
     ladder_val = result.metric_display.ladder_val
     ladder_vah = result.metric_display.ladder_vah
+    ladder_start_ts = _active_ladder_start_ts(result.engine.state)
+    step_start_ts = _active_step_start_ts(result.engine.state)
+    aggtrade_end_ts = int(candles[-1][0]) + 60_000 - 1
+    try:
+        covered = _BACKTEST_AGGTRADE_CACHE.coverage_covers(market, symbol, ladder_start_ts, aggtrade_end_ts)
+        agg_trades = _BACKTEST_AGGTRADE_CACHE.query_trades_range(market, symbol, ladder_start_ts, aggtrade_end_ts) if covered else []
+    except Exception as exc:
+        logger.warning("aggTrade coverage unavailable for %s %s: %s", market, symbol, exc)
+        covered = False
+        agg_trades = []
+    ladder_window = {"all_vwap": ladder_vwap}
+    step_window = {"all_vwap": step_vwap}
+    # Canonical aggressive-flow metrics are computed from Binance 1m kline
+    # taker-buy primitives (File 2). aggTrades remain available as an
+    # informational path only when the kline path is empty; we do NOT mix
+    # formulas — the wizard reports exactly one canonical Delta Ratio.
+    ladder_aggressor = _ladder_aggressor_metrics_from_candles(candles, result.engine.state)
+    step_aggressor = _active_step_aggressor_metrics_from_candles(candles, result.engine.state)
+    per_step_aggressor = _per_step_aggressor_table(candles, result.engine.state)
+    # Legacy chart expects ``step_delta_ratios`` to be a dict[step] -> float
+    # mapping (Delta Ratio only). Extract that shape from the new full table.
+    step_delta_ratios = {
+        int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
+    }
+    # If kline path has no data (taker_buy_base/quote columns absent), fall
+    # back to the legacy aggTrades path purely for informational display —
+    # never as the canonical Delta Ratio.
+    if ladder_aggressor.get("total_base", 0) == 0 and step_aggressor.get("total_base", 0) == 0:
+        if covered:
+            legacy_ladder = _aggressor_metrics_from_trades(agg_trades, ladder_start_ts)
+            legacy_step = _aggressor_metrics_from_trades(agg_trades, step_start_ts)
+            ladder_aggressor = dict(ladder_aggressor)
+            ladder_aggressor["status"] = "FALLBACK_AGGTRADES"
+            ladder_aggressor.update({k: v for k, v in legacy_ladder.items() if k != "status"})
+            step_aggressor = dict(step_aggressor)
+            step_aggressor["status"] = "FALLBACK_AGGTRADES"
+            step_aggressor.update({k: v for k, v in legacy_step.items() if k != "status"})
+            # step_delta_ratios stays candle-derived (None for kline-empty); legacy path
+            # is informational only and does not produce per-step ladder snapshots here.
     last = float(candles[-1][4])
     label = "BUY" if side is Side.BUY else "SELL"
     lines = [
@@ -600,13 +994,29 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
         f"TP/P(n-1): {_fmt(float(pnm1)) if pnm1 is not None else 'nan'}",
         f"Next P{n+1}: {_fmt(float(pn1)) if pn1 is not None else 'nan'}",
         f"P{n+2}: {_fmt(float(pn2)) if pn2 is not None else 'nan'}",
-        f"Ladder VWAP: {_fmt(float(ladder_vwap)) if ladder_vwap is not None else 'nan'}",
-        f"Step VWAP: {_fmt(float(step_vwap)) if step_vwap is not None else 'nan'}",
+        *_aggressor_summary_lines(side, ladder_window, step_window, ladder_aggressor, step_aggressor),
+        *_aggressor_summary_lines_v2(ladder=ladder_aggressor, step=step_aggressor, side=side),
         f"Ladder POC: {_fmt(float(ladder_poc)) if ladder_poc is not None else 'nan'}",
         f"Ladder Value Area: {_fmt(float(ladder_val)) if ladder_val is not None else 'nan'} → {_fmt(float(ladder_vah)) if ladder_vah is not None else 'nan'}",
         f"Step POC: {_fmt(float(step_poc)) if step_poc is not None else 'nan'}",
         f"Last close: {_fmt(last)}",
+        "",
+        "Per-step aggressive-flow history (L = ladder cumulative, S = step window):",
     ]
+    # Append a compact per-step table.
+    if per_step_aggressor:
+        rows = []
+        rows.append("Step | L-BVWAP     | L-SVWAP     | L-ΔR     | S-BVWAP     | S-SVWAP     | S-ΔR")
+        for s_idx in sorted(per_step_aggressor.keys()):
+            s = per_step_aggressor[s_idx]
+            def _v(x):
+                return "nan" if x is None else (f"{x:,.2f}" if abs(x) >= 1 else f"{x:.4f}")
+            rows.append(
+                f"P{s_idx:<3}| {_v(s.get('ladder_buy_vwap')):>11} | {_v(s.get('ladder_sell_vwap')):>11} | "
+                f"{_v(s.get('ladder_delta_ratio')):>8} | {_v(s.get('buy_vwap')):>11} | {_v(s.get('sell_vwap')):>11} | "
+                f"{_v(s.get('delta_ratio')):>8}"
+            )
+        lines.extend(rows)
     # Rebuild the chart summary locally; formatting only, values come from canonical result.
     levels = []
     for item in payload.get("levels") or []:
@@ -630,20 +1040,58 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
         step_poc,
         last,
         ladder_value_area={"val": ladder_val, "vah": ladder_vah},
+        step_delta_ratios=step_delta_ratios,
+        ladder_aggressor=ladder_aggressor,
+        step_aggressor=step_aggressor,
+        ladder_buy_vwap=ladder_aggressor.get("buy_vwap"),
+        ladder_sell_vwap=ladder_aggressor.get("sell_vwap"),
+        step_buy_vwap=step_aggressor.get("buy_vwap"),
+        step_sell_vwap=step_aggressor.get("sell_vwap"),
+        step_aggressor_table=per_step_aggressor,
     )
     return {"text": "\n".join(lines), "svg": jpg}
 
 
-def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_poc, step_poc, current, *, ladder_value_area=None):
+def _draw_jpg(
+    symbol,
+    market,
+    side,
+    levels,
+    n,
+    ladder_vwap,
+    step_vwap,
+    ladder_poc,
+    step_poc,
+    current,
+    *,
+    ladder_value_area=None,
+    step_delta_ratios=None,
+    ladder_aggressor=None,
+    step_aggressor=None,
+    ladder_buy_vwap=None,
+    ladder_sell_vwap=None,
+    step_buy_vwap=None,
+    step_sell_vwap=None,
+    step_aggressor_table=None,
+):
     """Draw visual ladder summary directly to JPEG for Telegram photo delivery."""
     from PIL import Image, ImageDraw, ImageFont
 
-    W,H=1200,1600; left,right=170,1100; top,bottom=110,1440
+    W,H=1200,1600; left,right=170,1100; top,bottom=110,1210
     va_prices=[]
     if ladder_value_area:
         va_prices=[float(ladder_value_area.get('val', float('nan'))), float(ladder_value_area.get('vah', float('nan')))]
         va_prices=[p for p in va_prices if p == p]
     prices=[float(x['price']) for x in levels]+[ladder_vwap,step_vwap,ladder_poc,step_poc,current]+va_prices
+    # Include aggressive-flow VWAPs in the price-bounds calculation if numeric.
+    for extra in (ladder_buy_vwap, ladder_sell_vwap, step_buy_vwap, step_sell_vwap):
+        try:
+            f = float(extra)
+            if f == f:  # not NaN
+                prices.append(f)
+        except (TypeError, ValueError):
+            pass
+    prices=[float(p) for p in prices if p is not None and float(p) == float(p)]
     pmin=min(prices); pmax=max(prices); pad=(pmax-pmin)*0.07 or 1; pmin-=pad; pmax+=pad
     def y(p): return bottom-(float(p)-pmin)/(pmax-pmin)*(bottom-top)
     def font(path, size):
@@ -678,16 +1126,63 @@ def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_po
     line_color='#77aaff' if side is Side.BUY else '#ff7a7a'; active='#0058ff' if side is Side.BUY else '#d71920'
     xmid=left+65
     d.line([xmid,y(float(levels[0]['price'])),xmid,y(float(levels[-1]['price']))],fill=line_color,width=3)
+    step_delta_ratios = dict(step_delta_ratios or {})
+    per_step = dict(step_aggressor_table or {})
+    level_labels=[]
     for item in levels:
         i=int(str(item['level'])[1:]); p=float(item['price']); yy=y(p); is_active=i==n
         col=active if is_active else line_color
         d.line([left,yy,right,yy],fill=col,width=5 if is_active else 2)
         d.ellipse([xmid-7,yy-7,xmid+7,yy+7],fill=col,outline='white',width=2)
         role=item.get('role') or ''
-        txt=f"{item['level']} {_fmt(p)}" + (f"  {role}" if role else '')
+        ratio = step_delta_ratios.get(i)
+        # Keep the price chart focused on prices/roles. Historical per-step
+        # aggressive-flow ΔR values are rendered in the dedicated panel below so
+        # dense Fibonacci levels cannot collide with flow-history text.
+        ratio_txt = ''
+        if is_active:
+            s_dr = (step_aggressor or {}).get('delta_ratio')
+            l_dr = (ladder_aggressor or {}).get('delta_ratio')
+            if ratio is not None:
+                ratio_txt = f"  ΔR {_fmt_delta(ratio)}"
+            if s_dr is not None:
+                ratio_txt += f"  S-ΔR {_fmt_delta(s_dr)}"
+            if l_dr is not None:
+                ratio_txt += f"  L-ΔR {_fmt_delta(l_dr)}"
+        txt=f"{item['level']} {_fmt(p)}" + (f"  {role}" if role else '') + ratio_txt
         f=fmb if is_active else fm
-        bbox=d.textbbox((0,0),txt,font=f)
-        d.text((right-12-bbox[2],yy-25),txt,fill=active if is_active else '#933',font=f)
+        fill=_step_delta_color(ratio) if ratio is not None else (active if is_active else '#933')
+        level_labels.append({"txt": txt, "font": f, "fill": fill, "target_y": yy-25, "line_y": yy, "active": is_active})
+    # Resolve vertical collisions among Pn labels by shifting label baselines and
+    # drawing short leader ticks back to the actual price line. The line itself
+    # remains at the exact price.
+    min_gap=28
+    if level_labels:
+        level_labels.sort(key=lambda r: r["target_y"])
+        lo=top+6; hi=bottom-26
+        for rec in level_labels:
+            rec["draw_y"] = max(lo, min(hi, rec["target_y"]))
+        for idx in range(1, len(level_labels)):
+            if level_labels[idx]["draw_y"] < level_labels[idx-1]["draw_y"] + min_gap:
+                level_labels[idx]["draw_y"] = level_labels[idx-1]["draw_y"] + min_gap
+        overflow = level_labels[-1]["draw_y"] - hi
+        if overflow > 0:
+            for rec in level_labels:
+                rec["draw_y"] -= overflow
+            for idx in range(len(level_labels)-2, -1, -1):
+                if level_labels[idx]["draw_y"] > level_labels[idx+1]["draw_y"] - min_gap:
+                    level_labels[idx]["draw_y"] = level_labels[idx+1]["draw_y"] - min_gap
+            underflow = lo - level_labels[0]["draw_y"]
+            if underflow > 0:
+                for rec in level_labels:
+                    rec["draw_y"] += underflow
+        for rec in level_labels:
+            bbox=d.textbbox((0,0),rec["txt"],font=rec["font"])
+            x=right-12-bbox[2]
+            yy=rec["line_y"]; dy=rec["draw_y"]
+            if abs(dy-(yy-25)) > 2:
+                d.line([right-122, yy, right-92, dy+12], fill='#bbb', width=1)
+            d.text((x,dy),rec["txt"],fill=rec["fill"],font=rec["font"])
     def dashed(x1, yy, x2, color, width=4, dash=12, gap=8):
         x=x1
         while x<x2:
@@ -707,11 +1202,95 @@ def _draw_jpg(symbol, market, side, levels, n, ladder_vwap, step_vwap, ladder_po
             d.line([left,yy,right,yy],fill='#138a36',width=3)
         d.rounded_rectangle([left+410,yy-30,left+750,yy-4],radius=6,fill='white')
         d.text((left+420,yy-28),f'{name}: {_fmt(p)}',fill='#138a36',font=fmb)
+    # Aggressive-flow VWAP overlays (File 2). Distinct from ordinary VWAP.
+    # Ladder Buy = solid magenta, Ladder Sell = solid teal, Step Buy/Sell = dashed.
+    try:
+        def _draw_vwap_line(name, price_val, color, is_dashed):
+            try:
+                fv = float(price_val)
+            except (TypeError, ValueError):
+                return
+            if fv != fv:  # NaN
+                return
+            yyv = y(fv)
+            if is_dashed:
+                dashed(left, yyv, right, color, width=2, dash=6, gap=6)
+            else:
+                d.line([left, yyv, right, yyv], fill=color, width=2)
+            d.rounded_rectangle([left+820, yyv-18, left+1170, yyv+4], radius=5, fill='white')
+            d.text((left+828, yyv-16), f'{name}: {_fmt(fv)}', fill=color, font=fs)
+
+        _draw_vwap_line('L-B-VWAP', ladder_buy_vwap, '#c050c0', False)
+        _draw_vwap_line('L-S-VWAP', ladder_sell_vwap, '#008b8b', False)
+        _draw_vwap_line('S-B-VWAP', step_buy_vwap, '#c050c0', True)
+        _draw_vwap_line('S-S-VWAP', step_sell_vwap, '#008b8b', True)
+    except Exception:
+        logger.exception("aggressive-flow VWAP overlay failed")
+
+    # Dedicated aggressive-flow history panel. Historical per-step L-ΔR/S-ΔR
+    # snapshots live here instead of beside price lines, preventing collisions
+    # when reached Fibonacci levels are vertically dense.
+    try:
+        panel_top=1230; panel_bottom=1484
+        d.rounded_rectangle([60,panel_top,1140,panel_bottom],radius=12,fill='#ffffff',outline='#d6d6d6',width=2)
+        d.text((78,panel_top+10),'Current active-step aggressive flow',fill='#222',font=fmb)
+        lag = ladder_aggressor or {}
+        sag = step_aggressor or {}
+        d.text((78,panel_top+38),
+               f"L-B-VWAP {_fmt_metric(lag.get('buy_vwap'))}   L-S-VWAP {_fmt_metric(lag.get('sell_vwap'))}   L-ΔR {_fmt_delta(lag.get('delta_ratio'))}",
+               fill='#222',font=fm)
+        d.text((78,panel_top+64),
+               f"S-B-VWAP {_fmt_metric(sag.get('buy_vwap'))}   S-S-VWAP {_fmt_metric(sag.get('sell_vwap'))}   S-ΔR {_fmt_delta(sag.get('delta_ratio'))}",
+               fill='#222',font=fm)
+        d.line([78,panel_top+94,1122,panel_top+94],fill='#e4e4e4',width=2)
+        d.text((78,panel_top+106),'Historical frozen per-step flow snapshots',fill='#222',font=fmb)
+        reached_steps=sorted([int(k) for k in per_step.keys() if int(k) <= int(n)])
+        cols=[reached_steps[:5], reached_steps[5:10], reached_steps[10:15]]
+        col_x=[78,440,802]
+        header_y=panel_top+122
+        row_h=21
+        for ci, steps in enumerate(cols):
+            if not steps:
+                continue
+            x0=col_x[ci]
+            d.text((x0,header_y),'Pn',fill='#555',font=fmb)
+            d.text((x0+80,header_y),'L-ΔR',fill='#555',font=fmb)
+            d.text((x0+210,header_y),'S-ΔR',fill='#555',font=fmb)
+            for ri, step_n in enumerate(steps):
+                row=per_step.get(step_n) or {}
+                yy=header_y+28+ri*row_h
+                d.text((x0,yy),f'P{step_n}',fill='#222',font=fm)
+                d.text((x0+80,yy),_fmt_delta(row.get('ladder_delta_ratio')),fill=_step_delta_color(row.get('ladder_delta_ratio')),font=fm)
+                d.text((x0+210,yy),_fmt_delta(row.get('delta_ratio')),fill=_step_delta_color(row.get('delta_ratio')),font=fm)
+    except Exception:
+        logger.exception("aggressive-flow history panel failed")
+
     pn=float(levels[n]['price']); tp=float(levels[n-1]['price']) if n>=1 else float(levels[0]['price'])
     pn1=float(levels[n+1]['price']) if n+1 < len(levels) else pn
     pn2=float(levels[n+2]['price']) if n+2 < len(levels) else pn1
     d.text((60,1500),f'Active: P{n}={_fmt(pn)} · TP=P{max(n-1,0)}={_fmt(tp)} · Next P{n+1}={_fmt(pn1)} · P{n+2}={_fmt(pn2)}',fill='#222',font=fmb)
     d.text((60,1532),f'VWAP: ladder={_fmt(ladder_vwap)} · active step={_fmt(step_vwap)} · POC: ladder={_fmt(ladder_poc)} · step={_fmt(step_poc)} · current={_fmt(current)}',fill='#222',font=fmb)
+    if ladder_aggressor or step_aggressor:
+        lag = ladder_aggressor or {}
+        sag = step_aggressor or {}
+        summary = f'{_aggressor_summary_line(side, "L", lag)} · {_aggressor_summary_line(side, "S", sag)} · Step Delta Ratio: {_fmt_delta(sag.get("delta_ratio"))}'
+        d.text((60,1560),summary,fill='#222',font=fs)
+    # Aggressive-flow summary line (File 2 canonical).
+    try:
+        lag = ladder_aggressor or {}
+        sag = step_aggressor or {}
+        aggr_line = (
+            f"AGGRESSIVE FLOW  "
+            f"L-BVWAP={_fmt_metric(lag.get('buy_vwap'))}  "
+            f"L-SVWAP={_fmt_metric(lag.get('sell_vwap'))}  "
+            f"L-ΔR={_fmt_delta(lag.get('delta_ratio'))}  "
+            f"S-BVWAP={_fmt_metric(sag.get('buy_vwap'))}  "
+            f"S-SVWAP={_fmt_metric(sag.get('sell_vwap'))}  "
+            f"S-ΔR={_fmt_delta(sag.get('delta_ratio'))}"
+        )
+        d.text((60,1582), aggr_line, fill='#222', font=fs)
+    except Exception:
+        logger.exception("aggressive-flow summary line failed")
     out=_OUT/f"backtest_{symbol}_{market}_{side.value.lower()}_{int(time.time()*1000)}.jpg"
     img.save(out, 'JPEG', quality=92, optimize=True)
     return str(out)

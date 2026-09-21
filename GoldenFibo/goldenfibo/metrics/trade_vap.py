@@ -30,6 +30,7 @@ class AggTrade:
     first_trade_id: Optional[int] = None
     last_trade_id: Optional[int] = None
     id_domain: str = "aggtrade"
+    buyer_is_maker: Optional[bool] = None
 
 
 @dataclass(frozen=True)

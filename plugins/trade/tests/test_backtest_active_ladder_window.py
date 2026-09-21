@@ -6,6 +6,7 @@ from PIL import Image
 
 from golden_fibo.constants import Side
 from golden_fibo.historical_replay import ReplayLeg, ReplayState, replay_ohlc
+from goldenfibo.metrics.trade_vap import AggTrade
 from plugins.trade import backtest_wizard as wizard
 
 
@@ -14,6 +15,34 @@ def _candle(ts, o, h, l, c, base_vol, quote_vol=None):
     if quote_vol is None:
         quote_vol = base_vol * ((h + l + c) / 3.0)
     return [ts, str(o), str(h), str(l), str(c), str(base_vol), ts + 59_999, str(quote_vol)]
+
+
+def _aggressor_candle(ts, o, h, l, c, base_vol, buy_base, quote_vol=None, buy_quote=None):
+    """Binance-style kline with taker-buy aggressor volume at indexes 9/10."""
+    if quote_vol is None:
+        quote_vol = base_vol * c
+    if buy_quote is None:
+        buy_quote = buy_base * c
+    return [
+        ts,
+        str(o),
+        str(h),
+        str(l),
+        str(c),
+        str(base_vol),
+        ts + 59_999,
+        str(quote_vol),
+        1,
+        str(buy_base),
+        str(buy_quote),
+        "0",
+    ]
+
+
+class _LegMs:
+    def __init__(self, step, ts_ms):
+        self.step = step
+        self.ts_ms = ts_ms
 
 
 class BacktestActiveLadderWindowTests(unittest.TestCase):
@@ -81,9 +110,11 @@ class BacktestActiveLadderWindowTests(unittest.TestCase):
         # Future P3/P4 live high on the chart. The top chart band should not be shaded pink.
         future_band_pixels = [img.getpixel((x, y)) for x in range(220, 1000, 40) for y in range(130, 360, 20)]
         self.assertLess(sum(1 for px in future_band_pixels if pinkish(px)), 30)
-        # Active value-area region should contain many pink pixels.
-        active_band_pixels = [img.getpixel((x, y)) for x in range(220, 1000, 40) for y in range(1265, 1335, 10)]
-        self.assertGreater(sum(1 for px in active_band_pixels if pinkish(px)), 20)
+        # Active value-area region should contain many pink pixels. The chart now
+        # reserves bottom space for the flow-history panel, so don't pin this to
+        # old pre-panel y-coordinates.
+        active_chart_pixels = [img.getpixel((x, y)) for x in range(220, 1000, 40) for y in range(110, 1210, 10)]
+        self.assertGreater(sum(1 for px in active_chart_pixels if pinkish(px)), 20)
 
     def test_ladder_vwap_and_poc_share_identical_p0_window(self):
         """Ladder VWAP start == Ladder POC start == current P0 timestamp."""
@@ -289,6 +320,89 @@ class BacktestActiveLadderWindowTests(unittest.TestCase):
         ranked = sorted(enumerate(vols), key=lambda x: -x[1])[:10]
         self.assertEqual(ranked[0][0], idx)
         self.assertGreater(ranked[0][1], ranked[1][1])
+
+    def test_active_window_helpers_accept_engine_ts_ms_legs(self):
+        state = ReplayState(side=Side.SELL, cycle=1, p0=100.0, highest_filled=1, shared_tp=99.9)
+        state.legs = [_LegMs(0, 111_000), _LegMs(1, 222_000)]
+
+        self.assertEqual(wizard._active_ladder_start_ts(state), 111_000)
+        self.assertEqual(wizard._active_step_start_ts(state), 222_000)
+        self.assertEqual(wizard._step_delta_ratios([], state), {0: None, 1: None})
+
+    def test_aggressor_vwap_uses_aggtrade_m_side_not_kline_taker_fields(self):
+        p0_ts = 1_000_000
+        pn_ts = 1_120_000
+        trades = [
+            # m=False => buyer taker/aggressor => BUY aggressor
+            AggTrade(1, 100.0, 8.0, p0_ts, buyer_is_maker=False),
+            # m=True => seller taker/aggressor => SELL aggressor
+            AggTrade(2, 100.0, 2.0, p0_ts, buyer_is_maker=True),
+            AggTrade(3, 110.0, 2.0, pn_ts, buyer_is_maker=False),
+            AggTrade(4, 110.0, 8.0, pn_ts, buyer_is_maker=True),
+        ]
+
+        ladder = wizard._aggressor_metrics_from_trades(trades, p0_ts)
+        step = wizard._aggressor_metrics_from_trades(trades, pn_ts)
+
+        self.assertAlmostEqual(ladder["total_volume"], 20.0)
+        self.assertAlmostEqual(ladder["buy_volume"], 10.0)
+        self.assertAlmostEqual(ladder["sell_volume"], 10.0)
+        self.assertAlmostEqual(ladder["all_vwap"], (100 * 10 + 110 * 10) / 20)
+        self.assertAlmostEqual(ladder["buy_vwap"], (100 * 8 + 110 * 2) / 10)
+        self.assertAlmostEqual(ladder["sell_vwap"], (100 * 2 + 110 * 8) / 10)
+        self.assertAlmostEqual(ladder["delta_ratio"], 0.0)
+        self.assertAlmostEqual(step["buy_vwap"], 110.0)
+        self.assertAlmostEqual(step["sell_vwap"], 110.0)
+        self.assertAlmostEqual(step["delta_ratio"], -0.6)
+
+    def test_step_delta_ratio_windows_and_color_thresholds_from_aggtrades(self):
+        p0_ts = 1_000_000
+        p1_ts = 1_060_000
+        p2_ts = 1_120_000
+        trades = [
+            AggTrade(1, 100, 6, p0_ts, buyer_is_maker=False),  # +0.2 lightblue
+            AggTrade(2, 100, 4, p0_ts, buyer_is_maker=True),
+            AggTrade(3, 101, 8, p1_ts, buyer_is_maker=False),  # +0.6 darkblue
+            AggTrade(4, 101, 2, p1_ts, buyer_is_maker=True),
+            AggTrade(5, 102, 3, p2_ts, buyer_is_maker=False),  # current step with next row = -0.5 darkred
+            AggTrade(6, 102, 7, p2_ts, buyer_is_maker=True),
+            AggTrade(7, 103, 2, p2_ts + 60_000, buyer_is_maker=False),
+            AggTrade(8, 103, 8, p2_ts + 60_000, buyer_is_maker=True),
+        ]
+        state = ReplayState(side=Side.SELL, cycle=1, p0=100.0, highest_filled=2, shared_tp=101.0)
+        state.legs = [
+            ReplayLeg(0, 100.0, p0_ts, "p0"),
+            ReplayLeg(1, 101.0, p1_ts, "p1"),
+            ReplayLeg(2, 102.0, p2_ts, "p2"),
+        ]
+
+        ratios = wizard._step_delta_ratios_from_trades(trades, state)
+
+        self.assertAlmostEqual(ratios[0], 0.2)
+        self.assertAlmostEqual(ratios[1], 0.6)
+        self.assertAlmostEqual(ratios[2], -0.5)
+        self.assertEqual(wizard._step_delta_color(ratios[0]), wizard.LIGHTBLUE)
+        self.assertEqual(wizard._step_delta_color(ratios[1]), wizard.DARKBLUE)
+        self.assertEqual(wizard._step_delta_color(-0.4), wizard.LIGHTRED)
+        self.assertEqual(wizard._step_delta_color(ratios[2]), wizard.DARKRED)
+
+    def test_final_aggressor_output_has_one_delta_and_directional_vwap_only(self):
+        sell = {"buy_vwap": 101.5, "sell_vwap": 99.5, "delta_ratio": 0.0187, "status": "COMPLETE"}
+        buy = {"buy_vwap": 101.5, "sell_vwap": 99.5, "delta_ratio": -0.0023, "status": "COMPLETE"}
+
+        sell_lines = wizard._aggressor_summary_lines(Side.SELL, {"all_vwap": 100.0}, {"all_vwap": 101.0}, sell, sell)
+        buy_lines = wizard._aggressor_summary_lines(Side.BUY, {"all_vwap": 100.0}, {"all_vwap": 101.0}, buy, buy)
+
+        self.assertEqual(sum("Step Delta Ratio" in line for line in sell_lines), 1)
+        self.assertIn("L-B-VWAP: 101.50", sell_lines)
+        self.assertIn("S-B-VWAP: 101.50", sell_lines)
+        self.assertIn("Step Delta Ratio: +0.0187", sell_lines)
+        self.assertFalse(any("L-S-VWAP" in line or "S-S-VWAP" in line for line in sell_lines))
+        self.assertEqual(sum("Step Delta Ratio" in line for line in buy_lines), 1)
+        self.assertIn("L-S-VWAP: 99.50", buy_lines)
+        self.assertIn("S-S-VWAP: 99.50", buy_lines)
+        self.assertIn("Step Delta Ratio: -0.0023", buy_lines)
+        self.assertFalse(any("L-B-VWAP" in line or "S-B-VWAP" in line for line in buy_lines))
 
 
 if __name__ == "__main__":

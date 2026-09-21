@@ -196,6 +196,7 @@ class AggTradeCache:
                         first_trade_id=int(parts[3]),
                         last_trade_id=int(parts[4]),
                         id_domain="aggtrade",
+                        buyer_is_maker=str(parts[6]).strip().lower() == "true",
                     )
                 )
             except (TypeError, ValueError):
@@ -286,7 +287,7 @@ class AggTradeCache:
                 ts_ms = int(t.ts_ms)
                 first_trade_id = int(t.first_trade_id) if t.first_trade_id is not None else raw_id
                 last_trade_id = int(t.last_trade_id) if t.last_trade_id is not None else raw_id
-                buyer_is_maker = 0
+                buyer_is_maker = 1 if bool(getattr(t, "buyer_is_maker", False)) else 0
             else:
                 try:
                     id_domain = "aggtrade" if "a" in t else "trade"
@@ -372,7 +373,7 @@ class AggTradeCache:
             aggregate_rows = conn.execute(
                 """
                 SELECT agg_trade_id, price, quantity, timestamp_ms,
-                       first_trade_id, last_trade_id
+                       first_trade_id, last_trade_id, buyer_is_maker
                 FROM agg_trades
                 WHERE market=? AND symbol=? AND id_domain='aggtrade'
                   AND timestamp_ms BETWEEN ? AND ?
@@ -382,7 +383,7 @@ class AggTradeCache:
             raw_rows = conn.execute(
                 """
                 SELECT agg_trade_id, price, quantity, timestamp_ms,
-                       first_trade_id, last_trade_id
+                       first_trade_id, last_trade_id, buyer_is_maker
                 FROM agg_trades
                 WHERE market=? AND symbol=? AND id_domain='trade'
                   AND timestamp_ms BETWEEN ? AND ?
@@ -433,6 +434,7 @@ class AggTradeCache:
                     first_trade_id=int(r["first_trade_id"]),
                     last_trade_id=int(r["last_trade_id"]),
                     id_domain="aggtrade",
+                    buyer_is_maker=bool(r["buyer_is_maker"]),
                 )
             )
         for r in raw_rows_iter:
@@ -448,6 +450,7 @@ class AggTradeCache:
                     first_trade_id=raw_tid,
                     last_trade_id=raw_tid,
                     id_domain="trade",
+                    buyer_is_maker=bool(r["buyer_is_maker"]),
                 )
             )
 
@@ -495,7 +498,7 @@ class AggTradeCache:
                 rows = conn.execute(
                     """
                     SELECT agg_trade_id, price, quantity, timestamp_ms,
-                           first_trade_id, last_trade_id
+                           first_trade_id, last_trade_id, buyer_is_maker
                     FROM agg_trades
                     WHERE market=? AND symbol=? AND id_domain='aggtrade'
                       AND timestamp_ms BETWEEN ? AND ?
@@ -525,6 +528,7 @@ class AggTradeCache:
                         first_trade_id=int(r["first_trade_id"]),
                         last_trade_id=int(r["last_trade_id"]),
                         id_domain="aggtrade",
+                        buyer_is_maker=bool(r["buyer_is_maker"]),
                     )
                 last = rows[-1]
                 cur_ts = int(last["timestamp_ms"])
@@ -560,7 +564,7 @@ class AggTradeCache:
                 rows = conn.execute(
                     """
                     SELECT agg_trade_id, price, quantity, timestamp_ms,
-                           first_trade_id, last_trade_id
+                           first_trade_id, last_trade_id, buyer_is_maker
                     FROM agg_trades
                     WHERE market=? AND symbol=? AND id_domain='trade'
                       AND timestamp_ms BETWEEN ? AND ?
@@ -584,6 +588,7 @@ class AggTradeCache:
                         first_trade_id=raw_tid,
                         last_trade_id=raw_tid,
                         id_domain="trade",
+                        buyer_is_maker=bool(r["buyer_is_maker"]),
                     )
                 last = rows[-1]
                 cur_ts = int(last["timestamp_ms"])
@@ -629,7 +634,7 @@ class AggTradeCache:
                 rows = conn.execute(
                     """
                     SELECT agg_trade_id, price, quantity, timestamp_ms,
-                           first_trade_id, last_trade_id
+                           first_trade_id, last_trade_id, buyer_is_maker
                     FROM agg_trades
                     WHERE market=? AND symbol=? AND id_domain='aggtrade'
                       AND timestamp_ms <= ?
@@ -659,6 +664,7 @@ class AggTradeCache:
                         first_trade_id=int(r["first_trade_id"]),
                         last_trade_id=int(r["last_trade_id"]),
                         id_domain="aggtrade",
+                        buyer_is_maker=bool(r["buyer_is_maker"]),
                     )
                 last = rows[-1]
                 cur_ts = int(last["timestamp_ms"])
@@ -699,7 +705,7 @@ class AggTradeCache:
                 rows = conn.execute(
                     """
                     SELECT agg_trade_id, price, quantity, timestamp_ms,
-                           first_trade_id, last_trade_id
+                           first_trade_id, last_trade_id, buyer_is_maker
                     FROM agg_trades
                     WHERE market=? AND symbol=? AND id_domain='trade'
                       AND timestamp_ms <= ?
@@ -723,6 +729,7 @@ class AggTradeCache:
                         first_trade_id=raw_tid,
                         last_trade_id=raw_tid,
                         id_domain="trade",
+                        buyer_is_maker=bool(r["buyer_is_maker"]),
                     )
                 last = rows[-1]
                 cur_ts = int(last["timestamp_ms"])

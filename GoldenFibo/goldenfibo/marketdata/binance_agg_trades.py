@@ -51,6 +51,7 @@ def parse_agg_trade_row(row: object) -> AggTrade:
             first_trade_id=int(row.get("f", row["a"])),
             last_trade_id=int(row.get("l", row["a"])),
             id_domain="aggtrade",
+            buyer_is_maker=bool(row.get("m")),
         )
     if isinstance(row, (list, tuple)) and len(row) >= 6:
         # uncommon; keep defensive
@@ -62,6 +63,7 @@ def parse_agg_trade_row(row: object) -> AggTrade:
             first_trade_id=int(row[3]) if len(row) > 3 else int(row[0]),
             last_trade_id=int(row[4]) if len(row) > 4 else int(row[0]),
             id_domain="aggtrade",
+            buyer_is_maker=bool(row[6]) if len(row) > 6 else None,
         )
     raise TypeError(f"unexpected aggTrade row: {type(row)!r}")
 
