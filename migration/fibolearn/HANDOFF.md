@@ -6,6 +6,7 @@ This document is the **authoritative project-state handoff**. It must not depend
 - `RESTORE.md` — restore steps
 - `VERIFY.md` — verification steps
 - `REGENERATION_PARITY_CHECKPOINT.md` — GIANT BTC 24h regeneration-parity PASS (scoped)
+- `FL_VWAP_006_METHODOLOGY_PREREGISTRATION.md` — pre-exposure FL-VWAP-006 methodology freeze
 - data bundle under `bundles/` (non-Git REQUIRED databases)
 
 Generated on clinic host. Do not treat chat history as source of truth.
@@ -149,14 +150,26 @@ Local scratch only (not Git): `/root/kam/.scratch/fibolearn-replay/WINDOW_FREEZE
 
 ## J. IMPORTANT NEXT STEP
 
-**Preregister / freeze the final methodology BEFORE acquiring or inspecting FL-VWAP-006.**
+### J.1 FL-VWAP-006 methodology freeze (pre-exposure)
+
+Formal prospective preregistration is documented at:
+
+- `migration/fibolearn/FL_VWAP_006_METHODOLOGY_PREREGISTRATION.md`
+- `fibolearn/reports/fl_vwap_006_preregistration.json`
+- `fibolearn/reports/fl_vwap_006_methodology_freeze.json`
+
+```
+METHODOLOGY_FROZEN_PRE_EXPOSURE = YES   # after freeze commit on origin/main
+READY_TO_ACQUIRE_FL_VWAP_006 = YES        # acquisition only after freeze commit
+FL_VWAP_005 = CONTAMINATED_DEVELOPMENT_ONLY
+```
 
 Do **NOT**:
 
-- calculate development effect sizes first
-- inspect FL-VWAP-006 before the methodology freeze
-- acquire FL-VWAP-006 early
+- calculate development effect sizes as validation evidence
+- inspect or acquire FL-VWAP-006 before the freeze commit is on `origin/main`
 - rehabilitate INVALID FL-VWAP-005 effect estimates
+- change frozen matcher/estimand/inference after any 006 outcome is visible
 
 ## Historical commits (preserve meaning)
 

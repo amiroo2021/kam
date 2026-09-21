@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "hypothesis_id": "FL-VWAP-006",
+  "methodology_version": "fl_vwap_006_methodology_v1",
+  "document": "migration/fibolearn/FL_VWAP_006_METHODOLOGY_PREREGISTRATION.md",
+  "methodology_freeze_json": "fibolearn/reports/fl_vwap_006_methodology_freeze.json",
+  "created_at_utc": "2026-09-21T10:02:03Z",
+  "code_baseline_at_draft": "c203e4a7dce7449785dba68d78dcea661aa06a10",
+  "freeze_commit": "c239cfad6791567eeef7e02d87e060d22617bf4a",
+  "METHODOLOGY_FROZEN_PRE_EXPOSURE": true,
+  "READY_TO_ACQUIRE_FL_VWAP_006": true,
+  "FL_VWAP_006_DATA_ACCESSED": false,
+  "FL_VWAP_006_DATA_ACQUIRED": false,
+  "HYPOTHESIS_EFFECTS_CALCULATED": false,
+  "lineage": {
+    "FL-VWAP-001": "invalidated_leakage",
+    "FL-VWAP-002_003": "developmental_iterations",
+    "FL-VWAP-004": "verified_landmark_riskset_foundation",
+    "FL-VWAP-005": "INVALID_outcome_conditioned_treated_selection_development_only",
+    "FL-VWAP-006": "first_new_validation_after_corrected_prospective_freeze"
+  },
+  "fl_vwap_005_status": "CONTAMINATED_DEVELOPMENT_ONLY_NOT_VALIDATION_EVIDENCE",
+  "hypothesis": "Favorable cycle-anchored whole-ladder VWAP condition at landmark T prospectively changes P(PN_PLUS_1_FIRST vs TP_FIRST) vs matched risk-set controls.",
+  "exposure": {
+    "feature_version": "whole_ladder_vwap_v1",
+    "vwap_definition": "cumulative quote/base from episode start to current bar (cycle-local whole-ladder); NOT UTC-daily VWAP",
+    "BUY_favorable": "vwap <= pn",
+    "SELL_favorable": "vwap >= pn",
+    "cross_timestamp": "first bar where favorable condition true after episode start",
+    "landmark_T": "cross_timestamp_ms",
+    "cross_elapsed_ms": "T_cross - episode_start_timestamp_ms",
+    "percentages": [
+      "1",
+      "0.1",
+      "0.01",
+      "0.001"
+    ],
+    "directions": [
+      "BUY",
+      "SELL"
+    ],
+    "active_steps": "all including step 0",
+    "terminal_event_in_eligibility": false,
+    "future_outcomes_in_eligibility": false,
+    "forbidden_selectors": [
+      "valid_cross conditioned on terminal_event",
+      "valid_cross conditioned on outcome != censored",
+      "treated filter terminal_event == pn_plus_1_before_tp"
+    ]
+  },
+  "landmark_temporal_semantics": {
+    "events_at_T": "state_only",
+    "outcome_events_require": "timestamp > T",
+    "categories": [
+      "PN_PLUS_1_FIRST",
+      "TP_FIRST",
+      "OTHER_TERMINAL",
+      "CENSORED",
+      "SAME_CANDLE_AMBIGUOUS",
+      "OTHER_UNKNOWN"
+    ],
+    "coverage_end": "valid landmark + no usable primitives strictly after T => CENSORED",
+    "stored_terminal_event_as_prospective_input": false
+  },
+  "control_risk_set": {
+    "foundation": "FL-VWAP-004",
+    "implementation": "fibolearn/research/phase3b_cross_riskset.py",
+    "control_landmark_formula": "control_start_ms + treated_cross_elapsed_ms",
+    "control_landmark_immutable": true,
+    "gates_G0_G7": {
+      "G0": "exact stratum (symbol, percentage, direction, active_step); exclude self; partition match if present",
+      "G1": "episode started by landmark",
+      "G2": "coverage through landmark",
+      "G3": "alive at landmark (TP not <= T)",
+      "G4": "P(n+1) not reached by landmark",
+      "G5": "favorable VWAP not crossed by landmark",
+      "G6": "time-coordinate consistency / ambiguity blocking state",
+      "G7": "immutable landmark formula held through matcher/audit/outcome"
+    }
+  },
+  "matching": {
+    "functions": [
+      "match_controls_for_cross",
+      "stream_match_controls_for_cross"
+    ],
+    "K_MATCH": 5,
+    "seed": "fl-vwap-006-match-v1",
+    "stratification": [
+      "symbol",
+      "percentage",
+      "direction",
+      "active_step"
+    ],
+    "tie_break": "sha256(seed|treated_id|control_id) ascending",
+    "reuse_allowed": true,
+    "weight": "1/k_selected",
+    "zero_controls": "exclude treated from matched primary; count eligible_treated_unmatched",
+    "min_controls": 1,
+    "effective_control_n_binary": "sum of control weights over binary-resolved control outcomes"
+  },
+  "primary_population": {
+    "venue": "Binance",
+    "market": "spot",
+    "timeframe": "1m",
+    "symbols": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "ZEC",
+      "PAXG"
+    ],
+    "binance_symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "ZECUSDT",
+      "PAXGUSDT"
+    ],
+    "percentages": [
+      "1",
+      "0.1",
+      "0.01",
+      "0.001"
+    ],
+    "directions": [
+      "BUY",
+      "SELL"
+    ],
+    "active_steps": "all",
+    "acquisition_rule": "acq_start = UTC midnight strictly after max(dev_end, fl_vwap_005_end, 2026-09-16T18:01:00Z); acq_end = acq_start + 30d",
+    "planned_acq_start_utc": "2026-09-17T00:00:00Z",
+    "planned_acq_end_utc": "2026-10-17T00:00:00Z",
+    "LINEAGE_ID": "FL-VWAP-006-BINANCE-SPOT-1M-20260917-20261017",
+    "primary_symbol_subset": null,
+    "note": "No cleaner/secondary primary split; symbol splits are secondary only"
+  },
+  "lineage_separation": {
+    "development": [
+      "/root/.hermes/fibolearn/fibolearn.sqlite",
+      "/root/kam/GoldenFibo/data/binance_klines.sqlite"
+    ],
+    "fl_vwap_005_contaminated": [
+      "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite"
+    ],
+    "fl_vwap_006": "new dedicated store at acquisition; not created in this freeze"
+  },
+  "gap_policy": "never bridge; no interpolation; no synthetic candles; insufficient coverage/CENSORED when unknowable",
+  "ambiguity_policy": {
+    "label": "SAME_CANDLE_AMBIGUOUS",
+    "exclude_from_primary_binary": true,
+    "report_separately": true,
+    "do_not_force_PN_or_TP": true
+  },
+  "primary_estimand": {
+    "name": "matched_risk_difference_PN_FIRST_vs_TP_FIRST",
+    "effect_measure_primary": "RD = p_treated - p_control",
+    "p_definition": "PN_PLUS_1_FIRST / (PN_PLUS_1_FIRST + TP_FIRST)",
+    "companions": [
+      "RR",
+      "OR_haldane_anscombe_descriptive"
+    ],
+    "exclude_from_binary_denominator": [
+      "OTHER_TERMINAL",
+      "CENSORED",
+      "SAME_CANDLE_AMBIGUOUS",
+      "OTHER_UNKNOWN"
+    ]
+  },
+  "inference": {
+    "primary_ci": "matched_set_cluster_bootstrap_RD",
+    "bootstrap_B": 5000,
+    "bootstrap_ci": "percentile_2.5_97.5",
+    "naive_independent_bernoulli_or_ci_as_primary": false,
+    "accounts_for_reused_controls": true,
+    "required_reports": [
+      "matched_treated_n",
+      "matched_treated_binary_n",
+      "unique_controls",
+      "sum_control_weights_binary",
+      "control_reuse_distribution"
+    ]
+  },
+  "secondary_analyses": [
+    "BUY_vs_SELL",
+    "by_symbol",
+    "by_percentage",
+    "by_active_step",
+    "early_mid_late_elapsed_from_start_bins",
+    "exploratory_multiscale_POC_VA_levels"
+  ],
+  "multiple_testing": {
+    "primary": "no_multiplicity_penalty",
+    "secondary_confirmatory": "BH_FDR_q_0.10",
+    "exploratory": "no_confirmatory_claim"
+  },
+  "interpretation_labels": [
+    "SUPPORTED_HISTORICAL_ASSOCIATION",
+    "NOT_SUPPORTED",
+    "INCONCLUSIVE",
+    "INSUFFICIENT_SAMPLE",
+    "INVALIDATED_DATA_INTEGRITY",
+    "INVALIDATED_METHODOLOGY"
+  ],
+  "interpretation_criteria_summary": {
+    "SUPPORTED_HISTORICAL_ASSOCIATION": "integrity PASS AND RD>0 AND bootstrap CI excludes 0 AND matched_treated_binary_n>=100 AND unique_controls>=30",
+    "NOT_SUPPORTED": "integrity PASS AND adequate N AND bootstrap CI entirely <= 0",
+    "INCONCLUSIVE": "integrity PASS AND (CI includes 0 OR below N thresholds handled as INSUFFICIENT_SAMPLE)",
+    "not_defined_as": "p < 0.05 alone"
+  },
+  "integrity_gates": [
+    "raw_fingerprint",
+    "raw_integrity",
+    "no_prohibited_overlap",
+    "future_independence",
+    "terminal_event_independence",
+    "G0_G7",
+    "immutable_control_landmarks",
+    "matcher_determinism",
+    "strict_gt_T_outcomes",
+    "ambiguity_policy",
+    "synthetic_fallback_count_0",
+    "deterministic_repeat",
+    "accounting_sums",
+    "lineage_id",
+    "unit_id_uniqueness_no_silent_upsert"
+  ],
+  "episode_identity": {
+    "historical_3day_reset_artifact_imported": false,
+    "unit_id_format": "{symbol}|{percentage}|{direction}|{active_step}|{start_timestamp_ms}|{cycle_id}|{run_id}",
+    "run_id_example": "FL006V1",
+    "unique_constraint": "unit_id",
+    "upsert_overwrite_forbidden": true,
+    "preferred_engine_mode": "continuous_per_symbol_no_3day_reset",
+    "collision_issue_resolved_frozen": true
+  },
+  "pre_exposure_tests": {
+    "command": "pytest tests/test_fl_vwap_005_outcome_resolver.py tests/test_phase3b_cross_riskset.py tests/test_phase3b_landmark_reconstruction.py tests/test_phase3b_corrected.py tests/test_fibolearn_ambiguity_policy.py -q",
+    "result": "54 passed",
+    "fl_vwap_006_data_required": false
+  },
+  "unresolved_critical_decisions": [],
+  "prohibited_post_exposure_changes": [
+    "exposure_definition",
+    "landmark_semantics",
+    "matcher_parameters",
+    "primary_estimand",
+    "inference_method",
+    "success_language",
+    "symbol_step_dropping_after_outcomes",
+    "promoting_secondary_to_primary",
+    "rehabilitating_FL_VWAP_005_INVALID_effects"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "artifact": "FL_VWAP_006_METHODOLOGY_FREEZE",
+  "hypothesis_id": "FL-VWAP-006",
+  "methodology_version": "fl_vwap_006_methodology_v1",
+  "human_document": "migration/fibolearn/FL_VWAP_006_METHODOLOGY_PREREGISTRATION.md",
+  "preregistration_json": "fibolearn/reports/fl_vwap_006_preregistration.json",
+  "created_at_utc": "2026-09-21T10:02:03Z",
+  "code_baseline_at_draft": "c203e4a7dce7449785dba68d78dcea661aa06a10",
+  "freeze_commit": "c239cfad6791567eeef7e02d87e060d22617bf4a",
+  "METHODOLOGY_FROZEN_PRE_EXPOSURE": true,
+  "READY_TO_ACQUIRE_FL_VWAP_006": true,
+  "implementation_anchors": {
+    "FL_VWAP_004_foundation_commit": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+    "strict_gt_T_fix_commit": "779356f05d9bbeb86375d561f23df48bdf0322ce",
+    "focused_prospective_verification_commit": "e3b10e13234fe8c7917318ac28f2c22611521dd2",
+    "coverage_censoring_checkpoint_commit": "1a074275f31ec4b804c1929c1e7431bbe2bcdbe1",
+    "fl_vwap_005_invalidation_commit": "285815e40a13ba74015dbf70c1c81a67d821549a",
+    "invalid_fl_vwap_005_result_commit": "1db85039f5ab8e94d0b02169c77066f420bf2c92",
+    "cross_riskset_module": "fibolearn/research/phase3b_cross_riskset.py",
+    "corrected_cross_feature_module": "fibolearn/research/phase3b_corrected.py",
+    "K_MATCH": 5,
+    "match_seed_fl006": "fl-vwap-006-match-v1",
+    "feature_version": "whole_ladder_vwap_v1"
+  },
+  "frozen_summary": {
+    "exposure": "cycle-anchored whole-ladder VWAP cross; BUY vwap<=pn; SELL vwap>=pn; T=first favorable cross after start",
+    "eligibility": "prospective state at T only; terminal_event forbidden",
+    "outcomes": "strict >T; PN_PLUS_1_FIRST/TP_FIRST/OTHER_TERMINAL/CENSORED/SAME_CANDLE_AMBIGUOUS/OTHER_UNKNOWN",
+    "controls": "G0-G7 FL-VWAP-004 risk set; landmark=start+elapsed immutable",
+    "matching": "K=5 hash-deterministic within stratum; weight 1/k; reuse allowed",
+    "population": "Binance spot 1m BTC/ETH/SOL/ZEC/PAXG; 2026-09-17 to 2026-10-17 planned",
+    "primary_estimand": "matched RD on PN_PLUS_1_FIRST vs TP_FIRST",
+    "inference": "matched-set cluster bootstrap B=5000; naive OR CI not primary",
+    "episode_identity": "unit_id includes start_timestamp_ms and run_id; no silent upsert"
+  },
+  "lineage_id": "FL-VWAP-006-BINANCE-SPOT-1M-20260917-20261017",
+  "do_not": [
+    "acquire_or_inspect_FL_VWAP_006_before_this_freeze_is_on_origin_main",
+    "treat_FL_VWAP_005_effects_as_validation_evidence",
+    "use_naive_independent_CI_as_primary",
+    "import_development_3day_reset_key_collisions_into_006_store"
+  ],
+  "pre_exposure_semantic_tests": {
+    "passed": 54,
+    "failed": 0,
+    "fl_vwap_006_data_used": false
+  },
+  "unresolved_critical_decisions": [],
+  "code_changed_by_this_freeze": false,
+  "methodology_behavior_code_changed": false
+}
