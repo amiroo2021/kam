@@ -64,3 +64,9 @@ installer/.hermes_protected_constraints.txt
 # FiboLearn migration data archives (too large; not secrets)
 migration/fibolearn/bundles/
 migration/fibolearn/.staging_bundle/
+
+# SQLite sidecars
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
