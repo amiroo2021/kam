@@ -6,7 +6,7 @@
   "methodology_freeze_json": "fibolearn/reports/fl_vwap_006_methodology_freeze.json",
   "created_at_utc": "2026-09-21T10:02:03Z",
   "code_baseline_at_draft": "c203e4a7dce7449785dba68d78dcea661aa06a10",
-  "freeze_commit": "c239cfad6791567eeef7e02d87e060d22617bf4a",
+  "freeze_commit": "69b4da676966f83822a66b8fc54068633004ca45",
   "METHODOLOGY_FROZEN_PRE_EXPOSURE": true,
   "READY_TO_ACQUIRE_FL_VWAP_006": true,
   "FL_VWAP_006_DATA_ACCESSED": false,
@@ -249,5 +249,6 @@
     "symbol_step_dropping_after_outcomes",
     "promoting_secondary_to_primary",
     "rehabilitating_FL_VWAP_005_INVALID_effects"
-  ]
+  ],
+  "freeze_stamp_commit": "73144d5603a8f3434cc0d40fcabb9abe1568a894"
 }

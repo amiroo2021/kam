@@ -5,7 +5,7 @@
 **Methodology version:** `fl_vwap_006_methodology_v1`  
 **Created (UTC):** `2026-09-21T10:02:03Z`  
 **Code baseline at freeze drafting:** `c203e4a7dce7449785dba68d78dcea661aa06a10`  
-**Freeze commit:** `dc335d7235d47e4a936560236b82dcf3e58f5eb2`  
+**Freeze commit:** 
 **Nature:** DOCUMENTATION + METHODOLOGY FREEZE ONLY  
 
 ```
