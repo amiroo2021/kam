@@ -1,0 +1,303 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-09-21T02:27:57Z",
+  "purpose": "Portability package for GoldenFibo/FiboLearn research continuity on a fresh Hermes server. No secrets. No FL-VWAP-006.",
+  "repository": {
+    "remote": "git@github.com:amiroo2021/kam.git",
+    "git_root": "/root/kam",
+    "branch_at_packaging": "main",
+    "local_HEAD_at_packaging": "41d83091168c02efa03199bfd72728b946efbf04",
+    "origin_main_at_packaging": "26e59511606c2650ad148d9ef8b821e10d2d1fbb",
+    "note": "Local clinic tree may lag origin/main. Prefer origin/main for runtime code after migrate; research accounting checkpoint is independent.",
+    "research_checkpoint_commit": "1a074275f31ec4b804c1929c1e7431bbe2bcdbe1",
+    "research_checkpoint_subject": "Treat coverage-end cases as censored",
+    "head_descends_from_research_checkpoint": true,
+    "gitignore_notes": [
+      "Root .gitignore ignores *.sqlite, *.db, .env, auth.json, keys",
+      "GoldenFibo/.gitignore ignores data/ and *.sqlite",
+      "fibolearn reports JSON are tracked; large SQLite DBs are not"
+    ]
+  },
+  "historical_commits": [
+    {
+      "sha": "25aaf95f31eb6c9152135e5ffae2bc02d4c9809b",
+      "meaning": "FL-VWAP-004 methodology freeze",
+      "status": "VALID_CHECKPOINT"
+    },
+    {
+      "sha": "6d40e12621446067ea4a63e804b5804162133b7e",
+      "meaning": "FL-VWAP-005 validation data freeze",
+      "status": "VALID_CHECKPOINT"
+    },
+    {
+      "sha": "1db85039f5ab8e94d0b02169c77066f420bf2c92",
+      "meaning": "INVALID FL-VWAP-005 result — future-conditioned treated selection",
+      "status": "INVALID_RESULT"
+    },
+    {
+      "sha": "285815e40a13ba74015dbf70c1c81a67d821549a",
+      "meaning": "FL-VWAP-005 invalidation / prospective semantics correction",
+      "status": "VALID_CORRECTION"
+    },
+    {
+      "sha": "779356f05d9bbeb86375d561f23df48bdf0322ce",
+      "meaning": "strict post-landmark >T outcome timing fix",
+      "status": "VALID_FIX"
+    },
+    {
+      "sha": "e3b10e13234fe8c7917318ac28f2c22611521dd2",
+      "meaning": "focused prospective primitive verification",
+      "status": "VALID_VERIFICATION"
+    },
+    {
+      "sha": "1a074275f31ec4b804c1929c1e7431bbe2bcdbe1",
+      "meaning": "current closed development accounting / coverage-aware censoring checkpoint",
+      "status": "CURRENT_RESEARCH_CHECKPOINT"
+    }
+  ],
+  "logical_fingerprints": {
+    "FL_VWAP_005_raw_validation_canonical_logical_sha256": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+    "note": "LOGICAL content fingerprint. Do NOT compare to physical SQLite file SHA-256."
+  },
+  "development_checkpoint_accounting": {
+    "source_report_git_path": "fibolearn/reports/fl_vwap_corrected_development_outcome_accounting.json",
+    "DEVELOPMENT_PROSPECTIVE_OUTCOME_ACCOUNTING_CLOSED": true,
+    "PROSPECTIVE_MEASUREMENT_PIPELINE_READY_TO_FREEZE": true,
+    "raw_favorable_crosses": 2176,
+    "prospective_eligible_treated": 2176,
+    "matched_treated": 2047,
+    "outcome_counts": {
+      "PN_PLUS_1_FIRST": 779,
+      "TP_FIRST": 1001,
+      "OTHER_TERMINAL": 258,
+      "CENSORED": 9,
+      "SAME_CANDLE_AMBIGUOUS": 0,
+      "OTHER_UNKNOWN": 0
+    },
+    "real_primitive_source_count": 2047,
+    "synthetic_fallback_count": 0,
+    "next_step": "Preregister/freeze final methodology BEFORE acquiring or inspecting FL-VWAP-006. Do not calculate development effect sizes first."
+  },
+  "bundle": {
+    "filename": "fibolearn_required_data_20260921T022757Z.tar.gz",
+    "path": "/root/kam/migration/fibolearn/bundles/fibolearn_required_data_20260921T022757Z.tar.gz",
+    "size_bytes": 1281334549,
+    "sha256": "d54c9f477c411ec66fb874ffc7e53d08ec33aa119feaef752bbff70b3c876297",
+    "contains_secrets": false,
+    "git_tracked": false
+  },
+  "files": [
+    {
+      "absolute_path": "/root/.hermes/fibolearn/fibolearn.sqlite",
+      "bundle_member": "data/fibolearn.sqlite",
+      "purpose": "Main FiboLearn research SQLite (episodes, observations, outcomes, checkpoints)",
+      "classification": "REQUIRED",
+      "tracked_by_git": false,
+      "reproducible_from_another_source": false,
+      "contains_secrets": false,
+      "size_bytes": 4242903040,
+      "physical_sha256": "b38bcf14a25a01ef9dc53e8b801a0309dcb07e9f54f31a7e878361f596199cc5",
+      "sqlite_integrity_check": "ok",
+      "tables": {
+        "backtests": 0,
+        "dataset_checkpoints": 57,
+        "episodes": 16371,
+        "ladder_observations": 1728000,
+        "market_observations": 216000,
+        "observations": 14400,
+        "outcomes": 295,
+        "patterns": 0,
+        "runtime_state": 0,
+        "schema_meta": 1
+      },
+      "timestamp_ranges": {
+        "market_observations.timestamp_ms": {
+          "min": 1786989720000,
+          "max": 1789582200000
+        },
+        "episodes.start_timestamp_ms_end_timestamp_ms": {
+          "min_start": 1786989720000,
+          "max_end": 1789582200000
+        }
+      }
+    },
+    {
+      "absolute_path": "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite",
+      "bundle_member": "data/fl_vwap_005_binance_validation.sqlite",
+      "purpose": "Frozen FL-VWAP-005 Binance validation candle store",
+      "classification": "REQUIRED",
+      "tracked_by_git": false,
+      "reproducible_from_another_source": "partially_from_binance_vision_archives_listed_in_raw_manifest",
+      "contains_secrets": false,
+      "size_bytes": 2742136832,
+      "physical_sha256": "2c17e874b92d8216fa9da505bf80aab8972cbf1a74649d42fb2d36e48cf208e6",
+      "sqlite_integrity_check": "ok",
+      "logical_fingerprint_reference": "75a7af08a21d9ffe1731079e37f198b1663fcd5c4da4d3dcedcb9d7d7480cd60",
+      "tables": {
+        "candles": 15370978,
+        "checkpoints": 5,
+        "provenance": 0
+      }
+    },
+    {
+      "absolute_path": "/root/kam/GoldenFibo/data/binance_klines.sqlite",
+      "bundle_member": "data/binance_klines.sqlite",
+      "purpose": "GoldenFibo kline cache (development convenience)",
+      "classification": "OPTIONAL_REPRODUCIBLE",
+      "tracked_by_git": false,
+      "reproducible_from_another_source": true,
+      "contains_secrets": false,
+      "size_bytes": 138215424,
+      "physical_sha256": "e44164be58717a0c67b3fd90d677653f97af0d4d8178a75116e00cb6910c5b05",
+      "sqlite_integrity_check": "ok",
+      "tables": {
+        "candles": 561177
+      }
+    },
+    {
+      "absolute_path": "/root/kam/GoldenFibo/data/backtest_klines.sqlite",
+      "bundle_member": "data/backtest_klines.sqlite",
+      "purpose": "GoldenFibo backtest kline/availability cache",
+      "classification": "OPTIONAL_REPRODUCIBLE",
+      "tracked_by_git": false,
+      "reproducible_from_another_source": true,
+      "contains_secrets": false,
+      "size_bytes": 56586240,
+      "physical_sha256": "66b036b402bc3b0516d212caba29553b6f21e2ea478ec6eacf1fef5fc1a0908b",
+      "sqlite_integrity_check": "ok",
+      "tables": {
+        "availability": 3,
+        "availability_checks": 21,
+        "candles": 238513
+      }
+    },
+    {
+      "absolute_path": "/root/kam/GoldenFibo/data/aggtrades.sqlite",
+      "bundle_member": null,
+      "purpose": "Live GoldenFibo aggTrade cache (WS/REST)",
+      "classification": "OPTIONAL_REPRODUCIBLE",
+      "tracked_by_git": false,
+      "packaged": false,
+      "reason_not_packaged": "Live/mutable cache with WAL; large; reproducible via exchange feeds; not required for FiboLearn checkpoint continuity",
+      "size_bytes": 886882304,
+      "physical_sha256": "b1f3a68ed3291d694248648b58c28688af6ca84fde8a0b089271032d57105747",
+      "contains_secrets": false
+    },
+    {
+      "absolute_path": "/root/kam/fibolearn/reports/phase3a_parity_btc_6h.sqlite",
+      "bundle_member": null,
+      "purpose": "Temporary phase3a parity scratch DB",
+      "classification": "TEMPORARY_NOT_REQUIRED",
+      "packaged": false,
+      "size_bytes_approx": 4294967296
+    },
+    {
+      "absolute_path": "/root/kam/fibolearn/reports/phase3a_parity_btc_24h.sqlite",
+      "bundle_member": null,
+      "classification": "TEMPORARY_NOT_REQUIRED",
+      "packaged": false
+    },
+    {
+      "absolute_path": "/root/kam/fibolearn/reports/phase3a_parity_btc_legacy.sqlite",
+      "bundle_member": null,
+      "classification": "TEMPORARY_NOT_REQUIRED",
+      "packaged": false
+    },
+    {
+      "absolute_path": "/root/kam/fibolearn/reports/phase3a_parity_btc.sqlite",
+      "bundle_member": null,
+      "classification": "TEMPORARY_NOT_REQUIRED",
+      "packaged": false
+    },
+    {
+      "absolute_path": "/root/kam/.scratch/fibolearn-replay/",
+      "bundle_member": null,
+      "classification": "TEMPORARY_NOT_REQUIRED",
+      "packaged": false,
+      "note": "Absent or empty at packaging time on clinic"
+    },
+    {
+      "absolute_path": "/root/.hermes/auth.json",
+      "bundle_member": null,
+      "classification": "SECRET_DO_NOT_PACKAGE",
+      "packaged": false
+    },
+    {
+      "absolute_path": "/root/.hermes/.env",
+      "bundle_member": null,
+      "classification": "SECRET_DO_NOT_PACKAGE",
+      "packaged": false
+    }
+  ],
+  "environment": {
+    "os": "Ubuntu 26.04 LTS (Resolute Raccoon)",
+    "kernel": "Linux clinic 7.0.0-27-generic",
+    "python": "3.11.16",
+    "uv": "0.12.13",
+    "goldenfibo_venv": "/root/kam/GoldenFibo/.venv",
+    "goldenfibo_install": "cd GoldenFibo && uv venv --python python3.11 .venv && uv pip install -e '.[dev]'",
+    "goldenfibo_pyproject": "GoldenFibo/pyproject.toml",
+    "goldenfibo_deps": ["fastapi>=0.110", "uvicorn[standard]>=0.27", "websockets>=12.0", "pytest>=8.0 (dev)", "httpx>=0.27 (dev)"],
+    "working_directories": [
+      "/root/kam",
+      "/root/kam/GoldenFibo",
+      "/root/kam/fibolearn",
+      "/root/.hermes"
+    ],
+    "important_commands": [
+      "cd /root/kam/GoldenFibo && ./.venv/bin/python -m pytest -q",
+      "cd /root/kam/GoldenFibo && ./.venv/bin/goldenfibo-web",
+      "python3 /root/kam/migration/fibolearn/scripts/verify_checkpoint_counts.py",
+      "hermes gateway run"
+    ],
+    "environment_variable_names_only": [
+      "HERMES_HOME",
+      "HERMES_AGENT",
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_ALLOWED_USERS",
+      "TELEGRAM_HOME_CHANNEL",
+      "PHOTON_PROJECT_ID",
+      "PHOTON_PROJECT_SECRET",
+      "PHOTON_ALLOWED_USERS",
+      "PHOTON_HOME_CHANNEL",
+      "OPENROUTER_API_KEY",
+      "KIMI_API_KEY",
+      "APEX_FIBO_APIKEY",
+      "APEX_FIBO_APIKEYSECRET",
+      "APEX_FIBO_APIKEYPASSPHRASE",
+      "APEX_FIBO_SEEDS",
+      "HYPERLIQUID_FIBO_SECRET",
+      "HYPERLIQUID_FIBO_WALLET",
+      "PYTHONPATH",
+      "PYTHONUNBUFFERED"
+    ],
+    "systemd_services": [
+      {
+        "name": "goldenfibo.service",
+        "unit_path": "/etc/systemd/system/goldenfibo.service",
+        "working_directory": "/root/kam/GoldenFibo",
+        "exec": "/root/kam/GoldenFibo/.venv/bin/goldenfibo-web"
+      }
+    ],
+    "hermes": {
+      "version": "0.21.2 (2026.9.11)",
+      "code_sha_at_packaging": "422bc9bde9d212ab3741fbc45a871a3938436d59",
+      "install_directory": "/usr/local/lib/hermes-agent",
+      "install_method": "git",
+      "hermes_home": "/root/.hermes",
+      "gateway_command": "python -m hermes_cli.main gateway run",
+      "gateway_service_note": "On clinic, gateway was a long-running process (not always a hermes-gateway.systemd unit). Recreate via Hermes docs / hermes gateway run under HERMES_HOME.",
+      "config_path": "/root/.hermes/config.yaml",
+      "config_packaging": "SAFE structure documented redacted; secrets manual",
+      "fibolearn_data_subdir": "/root/.hermes/fibolearn/",
+      "memory_note": "clinic hermes-gateway cgroup historically ~2.5GiB RSS cap, NO swap; run large pytest in isolated small batches",
+      "platforms_observed": ["telegram", "photon", "email"]
+    }
+  },
+  "safety": {
+    "secrets_included_in_bundle": false,
+    "goldenfibo_behavior_changed_by_migration_package": false,
+    "fibolearn_methodology_changed_by_migration_package": false,
+    "fl_vwap_006_accessed": false
+  }
+}
