@@ -313,6 +313,35 @@
       "do_not": "merge, append, or regenerate either lineage during transfer-only work"
     }
   },
+  "regeneration_parity_checkpoint": {
+    "REGENERATION_PARITY": "PASS",
+    "scope_only": {
+      "host": "GIANT",
+      "symbol": "BTC",
+      "eval_start_utc": "2026-08-21T00:00:00Z",
+      "eval_end_utc": "2026-08-22T00:00:00Z",
+      "packaged_scored_interior_episodes": 123,
+      "identity_terminal_obs_matches": "123/123"
+    },
+    "documentation": "migration/fibolearn/REGENERATION_PARITY_CHECKPOINT.md",
+    "machine_readable_report": "fibolearn/reports/regeneration_parity_btc_24h_giant.json",
+    "load_bearing_notes": [
+      "Historical development collection used 3-day chunk engine reset; continuously warm engines are not equivalent.",
+      "cycle_id/episode_key can recur across chunks; packaged unique keys may overwrite earlier collisions (351 window rebuild vs 123 packaged interior keys is a keyspace artifact, not semantic mismatch when rebuild-from-ref-obs matches independent regen 351/351)."
+    ],
+    "not_evidence_for": [
+      "VWAP edge",
+      "FL-VWAP-006",
+      "prospective validation"
+    ],
+    "local_scratch_not_in_git": [
+      "/root/kam/.scratch/fibolearn-replay/WINDOW_FREEZE.json",
+      "/root/kam/.scratch/fibolearn-replay/FINAL_PARITY_REPORT.json"
+    ],
+    "fl_vwap_006_accessed": false,
+    "methodology_changed": false,
+    "code_changed": false
+  },
   "safety": {
     "secrets_included_in_bundle": false,
     "goldenfibo_behavior_changed_by_migration_package": false,

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "checkpoint_name": "REGENERATION_PARITY_BTC_24H_GIANT",
+  "REGENERATION_PARITY": "PASS",
+  "scope": {
+    "host": "GIANT",
+    "symbol": "BTC",
+    "eval_start_utc": "2026-08-21T00:00:00Z",
+    "eval_end_utc": "2026-08-22T00:00:00Z",
+    "eval_start_ms": 1787270400000,
+    "eval_end_ms": 1787356800000,
+    "scoring_rule": "start_timestamp_ms >= eval_start AND end_timestamp_ms < eval_end",
+    "note": "PASS applies only to this BTC 24h scope. Do not broaden."
+  },
+  "context": {
+    "context_start_utc": "2026-08-17T18:02:00Z",
+    "context_end_utc": "2026-08-22T02:00:00Z",
+    "context_start_ms": 1786989720000,
+    "context_end_ms": 1787364000000,
+    "source_candle_count_context": 6238,
+    "source_candle_count_eval": 1440,
+    "source_gap_count_context": 0,
+    "source_gap_count_eval": 0
+  },
+  "packaged_scored_interior_episodes": 123,
+  "parity_vs_packaged_interior": {
+    "episode_identity_matches": "123/123",
+    "missing": 0,
+    "extra_vs_packaged_interior_keys": 228,
+    "boundary_mismatches": 0,
+    "terminal_event_matches": "123/123",
+    "terminal_mismatches": 0,
+    "ambiguity_mismatches": 0,
+    "observation_count_mismatches": 0
+  },
+  "reference_terminal_breakdown_packaged_interior": {
+    "pn_plus_1_before_tp": 46,
+    "tp_before_pn_plus_1": 65,
+    "other_terminal": 12
+  },
+  "domain_events_parity_eval_window": "1440/1440",
+  "regenerated_window_interior_episodes": 351,
+  "rebuild_from_packaged_observations_same_window": 351,
+  "independent_regen_vs_refobs_rebuild": "351/351",
+  "extra_classification": "historical_keyspace_uniqueness_artifact_not_semantic_mismatch",
+  "extra_explanation": "cycle_id restarts after historical 3-day engine reset; episode_key can recur across chunks; packaged store unique/upserts later keys over earlier ones.",
+  "reconstruction": {
+    "candle_lineage": "/root/kam/GoldenFibo/data/binance_klines.sqlite",
+    "development_episode_store": "/root/.hermes/fibolearn/fibolearn.sqlite",
+    "fl_vwap_005_validation_db_used_as_input": false,
+    "path": [
+      "KlineCache.read_range (development binance_klines lineage)",
+      "FiboLearnCollector.collect_historical_streaming with production 3-day chunk engine reset",
+      "continuous Stage-2 domain_events replay",
+      "FiboLearnStore.rebuild_episodes_streaming"
+    ],
+    "synthetic_fallback": false,
+    "load_bearing_historical_semantic": "3-day chunk engine reset; continuously warm engine is NOT equivalent"
+  },
+  "not_evidence_for": [
+    "VWAP edge",
+    "FL-VWAP-006",
+    "prospective validation",
+    "statistical independence of overwritten episodes",
+    "permission to change episode identity semantics before next preregistration"
+  ],
+  "reference_db_physical_sha256_verified": {
+    "/root/.hermes/fibolearn/fibolearn.sqlite": "b38bcf14a25a01ef9dc53e8b801a0309dcb07e9f54f31a7e878361f596199cc5",
+    "/root/kam/GoldenFibo/data/binance_klines.sqlite": "e44164be58717a0c67b3fd90d677653f97af0d4d8178a75116e00cb6910c5b05",
+    "/root/kam/fibolearn/data/fl_vwap_005_binance_validation.sqlite": "2c17e874b92d8216fa9da505bf80aab8972cbf1a74649d42fb2d36e48cf208e6"
+  },
+  "operational_note_kline_cache": "KlineCache may write availability/WAL metadata on live candle DB paths. Future work: open reference DBs truly read-only or use scratch copies. Not implemented in this checkpoint.",
+  "local_scratch_artifacts_not_in_git": [
+    "/root/kam/.scratch/fibolearn-replay/WINDOW_FREEZE.json",
+    "/root/kam/.scratch/fibolearn-replay/FINAL_PARITY_REPORT.json"
+  ],
+  "documentation": "migration/fibolearn/REGENERATION_PARITY_CHECKPOINT.md",
+  "FL_VWAP_006_ACCESSED": false,
+  "HYPOTHESIS_EFFECTS_CALCULATED": false,
+  "CODE_CHANGED": false,
+  "METHODOLOGY_CHANGED": false
+}

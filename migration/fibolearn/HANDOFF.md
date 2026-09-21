@@ -5,6 +5,7 @@ This document is the **authoritative project-state handoff**. It must not depend
 - `MIGRATION_MANIFEST.json` — inventory, hashes, classifications
 - `RESTORE.md` — restore steps
 - `VERIFY.md` — verification steps
+- `REGENERATION_PARITY_CHECKPOINT.md` — GIANT BTC 24h regeneration-parity PASS (scoped)
 - data bundle under `bundles/` (non-Git REQUIRED databases)
 
 Generated on clinic host. Do not treat chat history as source of truth.
@@ -121,6 +122,30 @@ PROSPECTIVE_MEASUREMENT_PIPELINE_READY_TO_FREEZE = YES
 Checkpoint commit (research accounting closed):
 
 `1a074275f31ec4b804c1929c1e7431bbe2bcdbe1` — *Treat coverage-end cases as censored*
+
+### I.1 GIANT regeneration-parity checkpoint (documentation)
+
+Portability verification on GIANT after migration + environment reproduction:
+
+```
+REGENERATION_PARITY = PASS
+```
+
+**Scope only:** BTC, `2026-08-21T00:00:00Z → 2026-08-22T00:00:00Z` (packaged scored interior **123** episodes; identity/terminal/obs **123/123**).
+
+Authoritative write-up:
+
+- `migration/fibolearn/REGENERATION_PARITY_CHECKPOINT.md`
+- `fibolearn/reports/regeneration_parity_btc_24h_giant.json`
+
+Load-bearing historical semantics (do not silently change when reproducing development data):
+
+1. **3-day chunk engine reset** during historical collection — continuously warm engines are **not** equivalent.
+2. **`cycle_id` / `episode_key` reuse across chunks** — packaged unique keys can overwrite earlier collisions; window rebuild can show more episodes than packaged interior keys (351 vs 123); classified as keyspace artifact, not semantic mismatch.
+
+This is **not** VWAP evidence, **not** FL-VWAP-006, **not** prospective validation.
+
+Local scratch only (not Git): `/root/kam/.scratch/fibolearn-replay/WINDOW_FREEZE.json`, `FINAL_PARITY_REPORT.json`.
 
 ## J. IMPORTANT NEXT STEP
 
