@@ -175,6 +175,12 @@ def register(ctx: Any) -> None:
             handler=_handle_trade_slash,
             description="Open the trading wizard",
         )
+        _try_register_command(
+            ctx,
+            "backtest",
+            handler=_handle_backtest_slash,
+            description="Open the backtest wizard",
+        )
     if caps.get("fibo"):
         _try_register_command(
             ctx,
@@ -206,6 +212,7 @@ def registered_commands() -> List[str]:
     out: List[str] = []
     if caps.get("trade"):
         out.append("trade")
+        out.append("backtest")
     if caps.get("fibo"):
         out.append("fibo")
         out.append("fibolearn")
