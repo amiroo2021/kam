@@ -34,6 +34,7 @@ _BACKTEST_CACHE = KlineCache(Path("/root/kam/GoldenFibo/data/backtest_klines.sql
 _BACKTEST_AGGTRADE_CACHE = AggTradeCache(Path("/root/kam/GoldenFibo/data/aggtrades.sqlite"))
 _BACKTEST_TIMEFRAME = "1m"
 _BACKTEST_REFRESH_TAIL_MS = 0
+INCOMPLETE_AGGTRADE_COVERAGE = "INCOMPLETE_AGGTRADE_COVERAGE"
 
 logger = logging.getLogger(__name__)
 
@@ -511,13 +512,100 @@ def _aggressor_metrics_from_trades(trades, start_ts: int, end_ts: int | None = N
         "trade_count": float(count),
         "missing_side_count": float(missing_side),
         "total_volume": all_base,
+        "buy_base": buy_base,
+        "sell_base": sell_base,
         "buy_volume": buy_base,
         "sell_volume": sell_base,
         "all_vwap": (all_quote / all_base) if all_base > 0 else None,
         "buy_vwap": (buy_quote / buy_base) if buy_base > 0 and status == "COMPLETE" else None,
         "sell_vwap": (sell_quote / sell_base) if sell_base > 0 and status == "COMPLETE" else None,
+        "delta": buy_base - sell_base,
         "delta_ratio": ((buy_base - sell_base) / total) if total > 0 and status == "COMPLETE" else None,
     }
+
+
+def _unavailable_aggressor(status: str = INCOMPLETE_AGGTRADE_COVERAGE) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "trade_count": 0.0,
+        "missing_side_count": 0.0,
+        "total_volume": 0.0,
+        "buy_base": 0.0,
+        "sell_base": 0.0,
+        "buy_volume": 0.0,
+        "sell_volume": 0.0,
+        "all_vwap": None,
+        "buy_vwap": None,
+        "sell_vwap": None,
+        "delta": None,
+        "delta_ratio": None,
+    }
+
+
+def _ensure_required_aggtrade_coverage(
+    cache: Any,
+    market: str,
+    symbol: str,
+    required_start_ms: int,
+    required_end_ms: int,
+    **ensure_kwargs: Any,
+) -> Tuple[bool, Any]:
+    """Ensure exactly the aggressive-metric window, not the full candle range.
+
+    ``AggTradeCache.ensure_coverage`` is idempotent: verified intervals are
+    reused and only missing ranges are fetched. Keep the completeness gate here
+    strict; callers must not calculate aggressive-flow metrics from partial
+    coverage.
+    """
+    start = int(required_start_ms)
+    end = int(required_end_ms)
+    result = cache.ensure_coverage(market, symbol, start, end, **ensure_kwargs)
+    covered = bool(getattr(result, "covered", False)) and bool(
+        cache.coverage_covers(market, symbol, start, end)
+    )
+    return covered, result
+
+
+def _aggtrade_aggressor_metrics_for_display(
+    cache: Any,
+    market: str,
+    symbol: str,
+    ladder_start_ms: int,
+    step_start_ms: int,
+    metric_end_ms: int,
+    **ensure_kwargs: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Return ladder and current-step aggTrade metrics for the display window.
+
+    For a SELL ladder the requested displayed metrics are L-B-VWAP and
+    S-B-VWAP. Their union is [current ladder P0, metric end]. Step metrics are a
+    subwindow [current step start, metric end]. The same strict coverage gate is
+    used for BUY too so the helper stays side-neutral.
+    """
+    required_start = min(int(ladder_start_ms), int(step_start_ms))
+    required_end = int(metric_end_ms)
+    meta: Dict[str, Any] = {
+        "required_start_ms": required_start,
+        "required_end_ms": required_end,
+        "covered": False,
+        "ensure_result": None,
+    }
+    try:
+        covered, ensure_result = _ensure_required_aggtrade_coverage(
+            cache, market, symbol, required_start, required_end, **ensure_kwargs
+        )
+        meta["ensure_result"] = ensure_result
+        meta["covered"] = covered
+        if not covered:
+            return _unavailable_aggressor(), _unavailable_aggressor(), meta
+        trades = cache.query_trades_range(market, symbol, required_start, required_end)
+        ladder = _aggressor_metrics_from_trades(trades, int(ladder_start_ms), required_end + 1)
+        step = _aggressor_metrics_from_trades(trades, int(step_start_ms), required_end + 1)
+        return ladder, step, meta
+    except Exception as exc:
+        logger.warning("aggTrade coverage/metrics unavailable for %s %s: %s", market, symbol, exc)
+        meta["error"] = str(exc)
+        return _unavailable_aggressor(), _unavailable_aggressor(), meta
 
 
 def _step_delta_ratios_from_trades(trades, state) -> Dict[int, float | None]:
@@ -530,6 +618,30 @@ def _step_delta_ratios_from_trades(trades, state) -> Dict[int, float | None]:
         end = _leg_ts_ms(legs[idx + 1]) if idx + 1 < len(legs) else None
         ratios[step] = _aggressor_metrics_from_trades(trades, start, end).get("delta_ratio")
     return ratios
+
+
+def _per_step_aggressor_table_from_trades(trades, state, metric_end_ms: int) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    legs = sorted(list(getattr(state, "legs", None) or []), key=_leg_ts_ms)
+    if not legs:
+        return out
+    p0_ts = _leg_ts_ms(legs[0])
+    final_end = int(metric_end_ms) + 1
+    for idx, leg in enumerate(legs):
+        step_n = int(getattr(leg, "step", idx))
+        start = _leg_ts_ms(leg)
+        end = _leg_ts_ms(legs[idx + 1]) if idx + 1 < len(legs) else final_end
+        step_snap = _aggressor_metrics_from_trades(trades, start, end)
+        ladder_snap = _aggressor_metrics_from_trades(trades, p0_ts, end)
+        row = dict(step_snap)
+        row["ladder_buy_vwap"] = ladder_snap.get("buy_vwap")
+        row["ladder_sell_vwap"] = ladder_snap.get("sell_vwap")
+        row["ladder_delta_ratio"] = ladder_snap.get("delta_ratio")
+        row["ladder_buy_base"] = ladder_snap.get("buy_base")
+        row["ladder_sell_base"] = ladder_snap.get("sell_base")
+        row["is_active"] = idx == len(legs) - 1
+        out[step_n] = row
+    return out
 
 
 def _step_delta_ratios(candles, state) -> Dict[int, float | None]:
@@ -792,12 +904,17 @@ def _aggressor_summary_line(side: Side, prefix: str, metrics: Dict[str, Any]) ->
 
 
 def _aggressor_summary_lines(side: Side, ladder_window: Dict[str, Any], step_window: Dict[str, Any], ladder_aggressor: Dict[str, Any], step_aggressor: Dict[str, Any]) -> List[str]:
+    step_status = step_aggressor.get("status")
+    if step_status and step_status != "COMPLETE":
+        step_delta = f"Step Delta Ratio: unavailable ({step_status})"
+    else:
+        step_delta = f"Step Delta Ratio: {_fmt_delta(step_aggressor.get('delta_ratio'))}"
     return [
         f"Ladder VWAP: {_fmt_metric(ladder_window.get('all_vwap'))}",
         _aggressor_summary_line(side, "L", ladder_aggressor),
         f"Step VWAP: {_fmt_metric(step_window.get('all_vwap'))}",
         _aggressor_summary_line(side, "S", step_aggressor),
-        f"Step Delta Ratio: {_fmt_delta(step_aggressor.get('delta_ratio'))}",
+        step_delta,
     ]
 
 
@@ -948,42 +1065,29 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     ladder_start_ts = _active_ladder_start_ts(result.engine.state)
     step_start_ts = _active_step_start_ts(result.engine.state)
     aggtrade_end_ts = int(candles[-1][0]) + 60_000 - 1
-    try:
-        covered = _BACKTEST_AGGTRADE_CACHE.coverage_covers(market, symbol, ladder_start_ts, aggtrade_end_ts)
-        agg_trades = _BACKTEST_AGGTRADE_CACHE.query_trades_range(market, symbol, ladder_start_ts, aggtrade_end_ts) if covered else []
-    except Exception as exc:
-        logger.warning("aggTrade coverage unavailable for %s %s: %s", market, symbol, exc)
-        covered = False
-        agg_trades = []
     ladder_window = {"all_vwap": ladder_vwap}
     step_window = {"all_vwap": step_vwap}
-    # Canonical aggressive-flow metrics are computed from Binance 1m kline
-    # taker-buy primitives (File 2). aggTrades remain available as an
-    # informational path only when the kline path is empty; we do NOT mix
-    # formulas — the wizard reports exactly one canonical Delta Ratio.
-    ladder_aggressor = _ladder_aggressor_metrics_from_candles(candles, result.engine.state)
-    step_aggressor = _active_step_aggressor_metrics_from_candles(candles, result.engine.state)
-    per_step_aggressor = _per_step_aggressor_table(candles, result.engine.state)
-    # Legacy chart expects ``step_delta_ratios`` to be a dict[step] -> float
-    # mapping (Delta Ratio only). Extract that shape from the new full table.
-    step_delta_ratios = {
-        int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
-    }
-    # If kline path has no data (taker_buy_base/quote columns absent), fall
-    # back to the legacy aggTrades path purely for informational display —
-    # never as the canonical Delta Ratio.
-    if ladder_aggressor.get("total_base", 0) == 0 and step_aggressor.get("total_base", 0) == 0:
-        if covered:
-            legacy_ladder = _aggressor_metrics_from_trades(agg_trades, ladder_start_ts)
-            legacy_step = _aggressor_metrics_from_trades(agg_trades, step_start_ts)
-            ladder_aggressor = dict(ladder_aggressor)
-            ladder_aggressor["status"] = "FALLBACK_AGGTRADES"
-            ladder_aggressor.update({k: v for k, v in legacy_ladder.items() if k != "status"})
-            step_aggressor = dict(step_aggressor)
-            step_aggressor["status"] = "FALLBACK_AGGTRADES"
-            step_aggressor.update({k: v for k, v in legacy_step.items() if k != "status"})
-            # step_delta_ratios stays candle-derived (None for kline-empty); legacy path
-            # is informational only and does not produce per-step ladder snapshots here.
+    ladder_aggressor, step_aggressor, agg_meta = _aggtrade_aggressor_metrics_for_display(
+        _BACKTEST_AGGTRADE_CACHE,
+        market,
+        symbol,
+        ladder_start_ts,
+        step_start_ts,
+        aggtrade_end_ts,
+    )
+    per_step_aggressor: Dict[int, Dict[str, Any]] = {}
+    step_delta_ratios: Dict[int, float | None] = {}
+    if agg_meta.get("covered"):
+        try:
+            required_start = int(agg_meta["required_start_ms"])
+            required_end = int(agg_meta["required_end_ms"])
+            agg_trades = _BACKTEST_AGGTRADE_CACHE.query_trades_range(market, symbol, required_start, required_end)
+            per_step_aggressor = _per_step_aggressor_table_from_trades(agg_trades, result.engine.state, aggtrade_end_ts)
+            step_delta_ratios = {
+                int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
+            }
+        except Exception as exc:
+            logger.warning("aggTrade per-step display unavailable for %s %s: %s", market, symbol, exc)
     last = float(candles[-1][4])
     label = "BUY" if side is Side.BUY else "SELL"
     lines = [
@@ -1273,7 +1377,11 @@ def _draw_jpg(
     if ladder_aggressor or step_aggressor:
         lag = ladder_aggressor or {}
         sag = step_aggressor or {}
-        summary = f'{_aggressor_summary_line(side, "L", lag)} · {_aggressor_summary_line(side, "S", sag)} · Step Delta Ratio: {_fmt_delta(sag.get("delta_ratio"))}'
+        if sag.get("status") and sag.get("status") != "COMPLETE":
+            step_delta = f'Step Delta Ratio: unavailable ({sag.get("status")})'
+        else:
+            step_delta = f'Step Delta Ratio: {_fmt_delta(sag.get("delta_ratio"))}'
+        summary = f'{_aggressor_summary_line(side, "L", lag)} · {_aggressor_summary_line(side, "S", sag)} · {step_delta}'
         d.text((60,1560),summary,fill='#222',font=fs)
     # Aggressive-flow summary line (File 2 canonical).
     try:

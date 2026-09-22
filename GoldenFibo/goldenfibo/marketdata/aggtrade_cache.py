@@ -938,54 +938,87 @@ class AggTradeCache:
 
         now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
         rest_floor = max(start, now - _TWO_DAYS_MS) if market_n == MARKET_FUTURES else start
+        current_day_start, _ = self._utc_day_bounds_ms(now)
 
-        for miss_start, miss_end in missing:
-            if miss_end < miss_start:
-                continue
-            if market_n == MARKET_FUTURES and miss_start < rest_floor:
-                archive_end = min(miss_end, rest_floor - 1)
-                if archive_end >= miss_start:
-                    archive_requests += 1
-                    archive_fn = archive_fetcher or self.fetch_archive_range
-                    rows = list(archive_fn(market_n, symbol_n, miss_start, archive_end))
-                    fetched_trade_count += len(rows)
-                    inserted_trade_count += self.insert_trades(market_n, symbol_n, rows, source="archive")
-                    # Daily archive ingestion verifies the whole day slice it touched.
-                    for day_start, day_end, day_ymd in self._iter_days(miss_start, archive_end):
-                        day_rows = self.query_trades_range(market_n, symbol_n, day_start, day_end)
-                        if day_rows:
-                            self.record_coverage(market_n, symbol_n, day_start, day_end, source="archive", note=day_ymd)
-                    notes.append(f"archive:{miss_start}-{archive_end}")
-                miss_start = max(miss_start, rest_floor)
-            if miss_start <= miss_end:
+        def _ingest_archive_range(a: int, b: int) -> None:
+            nonlocal archive_requests, fetched_trade_count, inserted_trade_count
+            if b < a:
+                return
+            archive_requests += 1
+            archive_fn = archive_fetcher or self.fetch_archive_range
+            rows = list(archive_fn(market_n, symbol_n, a, b))
+            fetched_trade_count += len(rows)
+            inserted_trade_count += self.insert_trades(market_n, symbol_n, rows, source="archive")
+            for day_start, day_end, day_ymd in self._iter_days(a, b):
+                day_rows = self.query_trades_range(market_n, symbol_n, day_start, day_end)
+                if day_rows:
+                    self.record_coverage(market_n, symbol_n, day_start, day_end, source="archive", note=day_ymd)
+            notes.append(f"archive:{a}-{b}")
+
+        def _ingest_rest_range(a: int, b: int) -> None:
+            nonlocal rest_requests, fetched_trade_count, inserted_trade_count
+            if b < a:
+                return
+            max_chunk_ms = 60 * 60 * 1000
+            cursor = int(a)
+            while cursor <= int(b):
+                chunk_end = min(int(b), cursor + max_chunk_ms - 1)
                 rest_requests += 1
                 rows = self._rest_fetch_range(
                     market_n,
                     symbol_n,
-                    miss_start,
-                    miss_end,
+                    cursor,
+                    chunk_end,
                     fetcher=rest_fetcher,
                     pause_s=pause_s,
                     timeout=timeout,
                 )
                 fetched_trade_count += len(rows)
-                rows_to_store = [t for t in rows if int(t.ts_ms) <= int(miss_end)]
+                rows_to_store = [t for t in rows if int(t.ts_ms) <= int(chunk_end)]
                 inserted_trade_count += self.insert_trades(market_n, symbol_n, rows_to_store, source="rest")
                 if rows:
-                    actual_end = min(max(int(t.ts_ms) for t in rows), int(miss_end))
-                    # The requested start was verified even if the first trade arrived later.
-                    # Record the requested start through the last returned trade.
-                    self.record_coverage(
-                        market_n,
-                        symbol_n,
-                        miss_start,
-                        actual_end,
-                        source="rest",
-                        note="rest-range",
-                    )
-                    notes.append(f"rest:{miss_start}-{actual_end}")
+                    # A successful REST response for [cursor, chunk_end] verifies
+                    # the full requested chunk, even when the last trade precedes
+                    # chunk_end by a few quiet milliseconds.
+                    self.record_coverage(market_n, symbol_n, cursor, chunk_end, source="rest", note="rest-range")
+                    notes.append(f"rest:{cursor}-{chunk_end}")
                 else:
-                    notes.append(f"rest:{miss_start}-{miss_end}:empty")
+                    # Empty-but-successful REST responses still verify the
+                    # requested interval as having no aggregate trades.
+                    self.record_coverage(market_n, symbol_n, cursor, chunk_end, source="rest", note="rest-empty")
+                    notes.append(f"rest:{cursor}-{chunk_end}:empty")
+                cursor = chunk_end + 1
+
+        for miss_start, miss_end in missing:
+            if miss_end < miss_start:
+                continue
+            for day_start, day_end, _day_ymd in self._iter_days(miss_start, miss_end):
+                slice_start = max(int(miss_start), int(day_start))
+                slice_end = min(int(miss_end), int(day_end))
+                if slice_end < slice_start:
+                    continue
+                before = self.coverage_covers(market_n, symbol_n, slice_start, slice_end)
+                if before:
+                    continue
+                completed_day = day_end < current_day_start
+                if completed_day:
+                    _ingest_archive_range(slice_start, slice_end)
+                    if self.coverage_covers(market_n, symbol_n, slice_start, slice_end):
+                        continue
+                    # If a just-completed/recent archive is not available yet,
+                    # repair from REST only when Binance futures REST can cover it.
+                    if market_n != MARKET_FUTURES or slice_start >= rest_floor:
+                        _ingest_rest_range(slice_start, slice_end)
+                    continue
+                # Current UTC day / recent edge: REST where supported. If a
+                # futures slice starts before the 2-day REST floor, archive the
+                # older prefix first; never mark false coverage across the gap.
+                if market_n == MARKET_FUTURES and slice_start < rest_floor:
+                    archive_end = min(slice_end, rest_floor - 1)
+                    _ingest_archive_range(slice_start, archive_end)
+                    slice_start = max(slice_start, rest_floor)
+                if slice_start <= slice_end:
+                    _ingest_rest_range(slice_start, slice_end)
 
         intervals = self.coverage_intervals(market_n, symbol_n)
         covered = self.coverage_covers(market_n, symbol_n, start, end)

@@ -482,3 +482,222 @@ def test_per_step_table_is_frozen_no_future_candles_leak():
     # candles are appended. So step 1's snapshot WILL change.
     # That's the correct behavior — the active leg is not yet "completed".
     assert snap_after[1]["ladder_buy_base"] > snap_before[1]["ladder_buy_base"]
+
+
+# ----------------------------- aggTrade coverage acquisition -----------------
+
+
+def _trade(agg_id: int, price: float, qty: float, ts: int, buyer_is_maker: bool = False):
+    from goldenfibo.metrics.trade_vap import AggTrade
+    return AggTrade(
+        agg_id=agg_id,
+        price=price,
+        qty=qty,
+        ts_ms=ts,
+        first_trade_id=agg_id,
+        last_trade_id=agg_id,
+        id_domain="aggtrade",
+        buyer_is_maker=buyer_is_maker,
+    )
+
+
+def test_completely_uncached_metric_window_fetches_only_required_interval(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    calls = []
+
+    def rest_fetcher(symbol, start_ms, end_ms, **kwargs):
+        calls.append((symbol, start_ms, end_ms))
+        return [_trade(1, 100.0, 2.0, start_ms), _trade(2, 110.0, 3.0, end_ms)]
+
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        cache, "futures", "HYPEUSDT", 1_000, 2_000, 3_000,
+        rest_fetcher=rest_fetcher,
+        now_ms=3_000,
+    )
+
+    assert calls == [("HYPEUSDT", 1_000, 3_000)]
+    assert meta["required_start_ms"] == 1_000
+    assert meta["required_end_ms"] == 3_000
+    assert ladder["status"] == "COMPLETE"
+    assert step["status"] == "COMPLETE"
+    assert step["buy_vwap"] == pytest.approx(110.0)
+
+
+def test_partially_cached_metric_window_fetches_only_missing_suffix(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    cache.insert_trades("futures", "HYPEUSDT", [_trade(1, 100.0, 1.0, 1_000)], source="rest")
+    cache.record_coverage("futures", "HYPEUSDT", 1_000, 1_999, source="rest")
+    calls = []
+
+    def rest_fetcher(symbol, start_ms, end_ms, **kwargs):
+        calls.append((start_ms, end_ms))
+        return [_trade(2, 101.0, 1.0, start_ms), _trade(3, 102.0, 1.0, end_ms)]
+
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        cache, "futures", "HYPEUSDT", 1_000, 2_000, 3_000,
+        rest_fetcher=rest_fetcher,
+        now_ms=3_000,
+    )
+
+    assert calls == [(2_000, 3_000)]
+    assert meta["covered"] is True
+    assert ladder["buy_base"] == pytest.approx(3.0)
+    assert step["buy_base"] == pytest.approx(2.0)
+
+
+def test_fully_cached_metric_window_causes_zero_refetch(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    cache.insert_trades("futures", "HYPEUSDT", [_trade(1, 100.0, 1.0, 1_000)], source="rest")
+    cache.record_coverage("futures", "HYPEUSDT", 1_000, 3_000, source="rest")
+
+    def rest_fetcher(*args, **kwargs):
+        raise AssertionError("should not refetch covered range")
+
+    result = cache.ensure_coverage("futures", "HYPEUSDT", 1_000, 3_000, rest_fetcher=rest_fetcher)
+    assert result.covered is True
+    assert result.rest_requests == 0
+
+
+def test_archive_and_rest_mixed_window(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    day = 86_400_000
+    now = 4 * day + 5_000
+    # Request crosses one completed historical day (archive) plus current-day edge (REST).
+    calls = {"archive": [], "rest": []}
+
+    def archive_fetcher(market, symbol, start_ms, end_ms):
+        calls["archive"].append((start_ms, end_ms))
+        return [_trade(10, 100.0, 1.0, start_ms), _trade(11, 101.0, 1.0, end_ms)]
+
+    def rest_fetcher(symbol, start_ms, end_ms, **kwargs):
+        calls["rest"].append((start_ms, end_ms))
+        return [_trade(20, 102.0, 1.0, start_ms), _trade(21, 103.0, 1.0, end_ms)]
+
+    result = cache.ensure_coverage(
+        "futures", "HYPEUSDT", 3 * day, 4 * day + 1_000,
+        archive_fetcher=archive_fetcher, rest_fetcher=rest_fetcher, now_ms=now,
+    )
+
+    assert calls["archive"] == [(3 * day, 4 * day - 1)]
+    assert calls["rest"] == [(4 * day, 4 * day + 1_000)]
+    assert result.covered is True
+    assert cache.coverage_covers("futures", "HYPEUSDT", 3 * day, 4 * day + 1_000)
+
+
+def test_archive_unavailable_leaves_metric_unavailable(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+
+    def archive_fetcher(market, symbol, start_ms, end_ms):
+        return []
+
+    result = cache.ensure_coverage(
+        "futures", "HYPEUSDT", 1_000, 2_000,
+        archive_fetcher=archive_fetcher, now_ms=2_000 + 3 * 86_400_000,
+    )
+    assert result.covered is False
+    assert result.missing_ranges == [(1_000, 2_000)]
+
+
+def test_rest_unavailable_leaves_user_facing_unavailable(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+
+    def rest_fetcher(*args, **kwargs):
+        raise RuntimeError("rest down")
+
+    cache.ensure_coverage = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rest down"))
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        cache, "futures", "HYPEUSDT", 1_000, 2_000, 3_000
+    )
+    assert ladder["status"] == wizard.INCOMPLETE_AGGTRADE_COVERAGE
+    assert step["status"] == wizard.INCOMPLETE_AGGTRADE_COVERAGE
+    assert "rest down" in meta["error"]
+    lines = wizard._aggressor_summary_lines(
+        __import__("golden_fibo.constants", fromlist=["Side"]).Side.SELL,
+        {"all_vwap": 1.0}, {"all_vwap": 1.0}, ladder, step,
+    )
+    assert "Step Delta Ratio: unavailable (INCOMPLETE_AGGTRADE_COVERAGE)" in lines
+    assert all("Step Delta Ratio: nan" not in line for line in lines)
+
+
+def test_genuine_gap_remains_unavailable(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    cache.record_coverage("futures", "HYPEUSDT", 1_000, 1_999, source="rest")
+    cache.record_coverage("futures", "HYPEUSDT", 3_000, 4_000, source="rest")
+    missing = cache.missing_ranges("futures", "HYPEUSDT", 1_000, 4_000)
+    assert missing == [(2_000, 2_999)]
+    assert cache.coverage_covers("futures", "HYPEUSDT", 1_000, 4_000) is False
+
+
+def test_restart_persistent_cache_reuse(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    db = tmp_path / "aggtrades.sqlite"
+    cache1 = AggTradeCache(db)
+    cache1.insert_trades("futures", "HYPEUSDT", [_trade(1, 100.0, 1.0, 1_000)], source="rest")
+    cache1.record_coverage("futures", "HYPEUSDT", 1_000, 3_000, source="rest")
+
+    cache2 = AggTradeCache(db)
+    assert cache2.coverage_covers("futures", "HYPEUSDT", 1_000, 3_000)
+
+    def rest_fetcher(*args, **kwargs):
+        raise AssertionError("persistent coverage should be reused after restart")
+
+    result = cache2.ensure_coverage("futures", "HYPEUSDT", 1_000, 3_000, rest_fetcher=rest_fetcher)
+    assert result.covered is True
+    assert result.rest_requests == 0
+
+
+def test_ladder_p0_later_than_backtest_start_does_not_fetch_from_backtest_start(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    calls = []
+
+    def rest_fetcher(symbol, start_ms, end_ms, **kwargs):
+        calls.append((start_ms, end_ms))
+        return [_trade(1, 100.0, 1.0, start_ms), _trade(2, 101.0, 1.0, end_ms)]
+
+    backtest_start = 1_000
+    ladder_p0 = 10_000
+    wizard._aggtrade_aggressor_metrics_for_display(
+        cache, "futures", "HYPEUSDT", ladder_p0, 12_000, 15_000,
+        rest_fetcher=rest_fetcher,
+        now_ms=15_000,
+    )
+    assert calls == [(ladder_p0, 15_000)]
+    assert calls[0][0] != backtest_start
+
+
+def test_step_vwap_uses_only_step_current_interval(tmp_path):
+    from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
+
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    trades = [
+        _trade(1, 50.0, 100.0, 1_000),
+        _trade(2, 200.0, 1.0, 2_000),
+        _trade(3, 300.0, 1.0, 3_000),
+    ]
+    cache.insert_trades("futures", "HYPEUSDT", trades, source="rest")
+    cache.record_coverage("futures", "HYPEUSDT", 1_000, 3_000, source="rest")
+
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        cache, "futures", "HYPEUSDT", 1_000, 2_000, 3_000
+    )
+    assert meta["covered"] is True
+    assert ladder["buy_base"] == pytest.approx(102.0)
+    assert step["buy_base"] == pytest.approx(2.0)
+    assert step["buy_vwap"] == pytest.approx(250.0)
