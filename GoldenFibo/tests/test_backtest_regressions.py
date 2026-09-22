@@ -162,3 +162,116 @@ def test_fresh_backtest_clears_prior_engine_state():
         assert not any(cnd.get("time") == 1 for cnd in (c.chart_candles or []))
 
     asyncio.run(go())
+
+
+def test_backtest_progress_payload_uses_bars_when_backtest_fields_absent():
+    phase, pct, detail = wizard.BacktestWizard._progress_from_payload(
+        {"stage": "backtest", "bars_done": 1, "bars_est": 4, "pct": 25.0}
+    )
+    assert phase == "backtest"
+    assert pct == 25.0
+    assert "1 / 4" in detail
+
+
+def test_aggtrade_acquisition_progress_payload_is_distinct_phase():
+    phase, pct, detail = wizard.BacktestWizard._progress_from_payload(
+        {
+            "stage": "acquiring_aggtrades",
+            "aggtrade_days_done": 2,
+            "aggtrade_days_total": 5,
+            "detail": "Acquiring aggressive trade data...",
+        }
+    )
+    assert phase == "acquiring_aggtrades"
+    assert pct == 40.0
+    assert "2 / 5" in detail
+
+
+class _CompleteSqlOnlyCache:
+    def __init__(self):
+        self.queries = []
+
+    def missing_ranges(self, market, symbol, start, end):
+        return []
+
+    def ensure_coverage(self, market, symbol, start, end, **kwargs):
+        return SimpleNamespace(covered=True, requested_start_ms=start, requested_end_ms=end)
+
+    def coverage_covers(self, market, symbol, start, end):
+        return True
+
+    def aggregate_aggressive_metrics(self, market, symbol, start, end):
+        self.queries.append((start, end))
+        return {
+            "status": "COMPLETE",
+            "trade_count": 2,
+            "buy_qty": 3.0,
+            "buy_notional": 33.0,
+            "buy_vwap": 11.0,
+            "sell_qty": 1.0,
+            "sell_notional": 9.0,
+            "sell_vwap": 9.0,
+            "total_qty": 4.0,
+            "delta": 2.0,
+            "delta_ratio": 0.5,
+        }
+
+    def query_trades_range(self, *args, **kwargs):
+        raise AssertionError("display aggregate metrics must not materialize trades")
+
+
+def test_aggtrade_display_metrics_use_sql_aggregates_not_query_trades_range():
+    cache = _CompleteSqlOnlyCache()
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        cache,
+        "futures",
+        "HYPEUSDT",
+        1000,
+        5000,
+        9000,
+    )
+    assert meta["covered"] is True
+    assert ladder["buy_vwap"] == 11.0
+    assert ladder["sell_vwap"] == 9.0
+    assert ladder["delta_ratio"] == 0.5
+    assert step["buy_vwap"] == 11.0
+    assert step["sell_vwap"] == 9.0
+    assert step["delta_ratio"] == 0.5
+    assert cache.queries == [(1000, 9000), (5000, 9000)]
+
+
+def test_per_step_aggtrade_table_uses_sql_aggregates_not_query_trades_range():
+    cache = _CompleteSqlOnlyCache()
+    state = SimpleNamespace(
+        legs=[
+            SimpleNamespace(step=0, ts=1000),
+            SimpleNamespace(step=1, ts=5000),
+        ]
+    )
+    table = wizard._per_step_aggressor_table_from_cache(cache, "futures", "HYPEUSDT", state, 9000)
+    assert sorted(table) == [0, 1]
+    assert table[0]["delta_ratio"] == 0.5
+    assert table[1]["ladder_delta_ratio"] == 0.5
+    assert cache.queries == [(1000, 4999), (1000, 4999), (5000, 9000), (1000, 9000)]
+
+
+def test_aggtrade_display_metrics_do_not_compute_when_coverage_incomplete():
+    class IncompleteCache(_CompleteSqlOnlyCache):
+        def missing_ranges(self, market, symbol, start, end):
+            return [(start, end)]
+
+        def ensure_coverage(self, market, symbol, start, end, **kwargs):
+            return SimpleNamespace(covered=False, requested_start_ms=start, requested_end_ms=end)
+
+        def coverage_covers(self, market, symbol, start, end):
+            return False
+
+        def aggregate_aggressive_metrics(self, *args, **kwargs):
+            raise AssertionError("must not calculate from partial coverage")
+
+    ladder, step, meta = wizard._aggtrade_aggressor_metrics_for_display(
+        IncompleteCache(), "futures", "HYPEUSDT", 1000, 5000, 9000
+    )
+    assert meta["covered"] is False
+    assert ladder["status"] == wizard.INCOMPLETE_AGGTRADE_COVERAGE
+    assert step["status"] == wizard.INCOMPLETE_AGGTRADE_COVERAGE

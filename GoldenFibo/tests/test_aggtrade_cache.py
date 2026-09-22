@@ -4,6 +4,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from goldenfibo.marketdata.aggtrade_cache import AggTradeCache
 from goldenfibo.metrics.trade_vap import AggTrade
 
@@ -423,3 +425,124 @@ def test_perf_no_correlated_query_and_bounded_time(tmp_path: Path):
             assert row[0]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# SQL aggregate aggressive-flow metrics must match canonical query semantics
+# without materializing every trade in Python.
+# ---------------------------------------------------------------------------
+
+
+def _expected_aggressive(rows):
+    buy_qty = sell_qty = buy_notional = sell_notional = 0.0
+    for r in rows:
+        qty = float(r.qty)
+        notional = float(r.price) * qty
+        if bool(r.buyer_is_maker):
+            sell_qty += qty
+            sell_notional += notional
+        else:
+            buy_qty += qty
+            buy_notional += notional
+    total = buy_qty + sell_qty
+    return {
+        "buy_qty": buy_qty,
+        "buy_notional": buy_notional,
+        "buy_vwap": buy_notional / buy_qty if buy_qty else None,
+        "sell_qty": sell_qty,
+        "sell_notional": sell_notional,
+        "sell_vwap": sell_notional / sell_qty if sell_qty else None,
+        "total_qty": total,
+        "delta_ratio": (buy_qty - sell_qty) / total if total else None,
+        "trade_count": len(rows),
+    }
+
+
+def _assert_metrics_close(actual, expected, *, tol=1e-12):
+    for key, want in expected.items():
+        got = actual[key]
+        if want is None:
+            assert got is None, key
+        else:
+            assert got == pytest.approx(want, abs=tol, rel=tol), key
+
+
+def test_aggregate_aggressive_metrics_buy_only_sell_only_mixed_and_boundaries(tmp_path: Path):
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    cache.insert_trades(
+        "futures",
+        "HYPEUSDT",
+        [
+            {"a": 1, "p": "10.5", "q": "2.0", "f": 1, "l": 1, "T": 1000, "m": False},
+            {"a": 2, "p": "11.5", "q": "3.0", "f": 2, "l": 2, "T": 2000, "m": False},
+            {"a": 3, "p": "12.5", "q": "4.0", "f": 3, "l": 3, "T": 3000, "m": True},
+            {"a": 4, "p": "13.5", "q": "5.0", "f": 4, "l": 4, "T": 4000, "m": True},
+        ],
+        source="archive",
+    )
+
+    _assert_metrics_close(
+        cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 1000, 2000),
+        _expected_aggressive(cache.query_trades_range("futures", "HYPEUSDT", 1000, 2000)),
+    )
+    _assert_metrics_close(
+        cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 3000, 4000),
+        _expected_aggressive(cache.query_trades_range("futures", "HYPEUSDT", 3000, 4000)),
+    )
+    _assert_metrics_close(
+        cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 2000, 3000),
+        _expected_aggressive(cache.query_trades_range("futures", "HYPEUSDT", 2000, 3000)),
+    )
+
+
+def test_aggregate_aggressive_metrics_empty_interval(tmp_path: Path):
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    actual = cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 5000, 5999)
+    assert actual["buy_qty"] == 0.0
+    assert actual["sell_qty"] == 0.0
+    assert actual["total_qty"] == 0.0
+    assert actual["buy_vwap"] is None
+    assert actual["sell_vwap"] is None
+    assert actual["delta_ratio"] is None
+    assert actual["trade_count"] == 0
+
+
+def test_aggregate_aggressive_metrics_matches_old_query_with_overlap_semantics(tmp_path: Path):
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    cache.ingest_ws_message("futures", "HYPEUSDT", {"e": "trade", "t": 100, "p": "10", "q": "1", "T": 1000, "m": False})
+    cache.ingest_ws_message("futures", "HYPEUSDT", {"e": "trade", "t": 101, "p": "10", "q": "2", "T": 1001, "m": True})
+    cache.ingest_ws_message("futures", "HYPEUSDT", {"e": "trade", "t": 999, "p": "20", "q": "3", "T": 1002, "m": False})
+    cache.insert_trades(
+        "futures",
+        "HYPEUSDT",
+        [{"a": 500, "p": "10", "q": "3", "f": 100, "l": 101, "T": 1001, "m": True}],
+        source="rest",
+    )
+    rows = cache.query_trades_range("futures", "HYPEUSDT", 1000, 1002)
+    assert sorted((r.id_domain, r.first_trade_id, r.last_trade_id) for r in rows) == [
+        ("aggtrade", 100, 101),
+        ("trade", 999, 999),
+    ]
+    _assert_metrics_close(
+        cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 1000, 1002),
+        _expected_aggressive(rows),
+    )
+
+
+def test_aggregate_aggressive_metrics_large_dataset_does_not_call_query_trades_range(monkeypatch, tmp_path: Path):
+    cache = AggTradeCache(tmp_path / "aggtrades.sqlite")
+    rows = [
+        {"a": i, "p": "100.25", "q": "0.5", "f": i, "l": i, "T": 1_000_000 + i, "m": bool(i % 2)}
+        for i in range(20_000)
+    ]
+    assert cache.insert_trades("futures", "HYPEUSDT", rows, source="archive") == 20_000
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("query_trades_range must not be used by SQL aggregation")
+
+    monkeypatch.setattr(cache, "query_trades_range", forbidden)
+    actual = cache.aggregate_aggressive_metrics("futures", "HYPEUSDT", 1_000_000, 1_020_000)
+    assert actual["trade_count"] == 20_000
+    assert actual["buy_qty"] == pytest.approx(5_000.0)
+    assert actual["sell_qty"] == pytest.approx(5_000.0)
+    assert actual["delta_ratio"] == pytest.approx(0.0)

@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 # GoldenFibo legacy engine lives in the repo checkout.
 _GF_LEGACY_ROOT = Path("/root/kam/GoldenFibo/reference/legacy_research")
@@ -97,6 +97,8 @@ class BacktestWizard:
             "downloading_gaps": "Downloading Gaps",
             "cache_ready": "Historical Data Ready",
             "backtest": "Running Backtest",
+            "acquiring_aggtrades": "Acquiring Aggressive Trade Data",
+            "processing_aggtrade_metrics": "Processing Aggressive-Flow Metrics",
         }
         label = labels.get(phase, phase.replace("_", " ").title())
         bar = BacktestWizard._progress_bar(pct)
@@ -134,8 +136,10 @@ class BacktestWizard:
         downloaded = int(payload.get("download_done") or payload.get("downloaded_candles") or stats.get("bars_downloaded") or 0)
         download_total = int(payload.get("download_total") or payload.get("missing_candles") or stats.get("download_total") or stats.get("gaps_remaining") or 0)
         final_candles = int(payload.get("final_candles") or stats.get("bars_total") or 0)
-        backtest_done = int(payload.get("backtest_done") or 0)
-        backtest_total = int(payload.get("backtest_total") or 0)
+        backtest_done = int(payload.get("backtest_done") or payload.get("bars_done") or 0)
+        backtest_total = int(payload.get("backtest_total") or payload.get("bars_est") or 0)
+        aggtrade_done = int(payload.get("aggtrade_days_done") or 0)
+        aggtrade_total = int(payload.get("aggtrade_days_total") or 0)
         cache_path = stats.get("path")
 
         if phase == "loading_cache":
@@ -184,6 +188,18 @@ class BacktestWizard:
             else:
                 pct = 0.0
                 detail = "Running backtest..."
+            return phase, pct, detail
+
+        if phase in {"acquiring_aggtrades", "processing_aggtrade_metrics"}:
+            if aggtrade_total > 0:
+                pct = min(100.0, 100.0 * aggtrade_done / aggtrade_total)
+                detail = f"{aggtrade_done:,} / {aggtrade_total:,} days"
+                extra = str(payload.get("detail") or "")
+                if extra:
+                    detail += f"\n{extra}"
+            else:
+                pct = float(payload.get("pct") or 0.0)
+                detail = str(payload.get("detail") or "Processing aggressive-flow metrics...")
             return phase, pct, detail
 
         pct = 100.0 if final_candles else 0.0
@@ -542,6 +558,50 @@ def _unavailable_aggressor(status: str = INCOMPLETE_AGGTRADE_COVERAGE) -> Dict[s
     }
 
 
+def _normalize_sql_aggressor_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert AggTradeCache SQL aggregates to the wizard display shape."""
+    status = str(metrics.get("status") or "EMPTY")
+    buy_base = _safe_float(metrics.get("buy_qty") if "buy_qty" in metrics else metrics.get("buy_base"))
+    sell_base = _safe_float(metrics.get("sell_qty") if "sell_qty" in metrics else metrics.get("sell_base"))
+    total_default = buy_base + sell_base
+    total = _safe_float(
+        metrics.get("total_qty") if "total_qty" in metrics else metrics.get("total_base"),
+        total_default,
+    )
+    return {
+        "status": "COMPLETE" if status in {"COMPLETE", "EMPTY"} else status,
+        "trade_count": _safe_float(metrics.get("trade_count")),
+        "missing_side_count": 0.0,
+        "total_volume": total,
+        "buy_base": buy_base,
+        "sell_base": sell_base,
+        "buy_volume": buy_base,
+        "sell_volume": sell_base,
+        "all_vwap": None,
+        "buy_vwap": metrics.get("buy_vwap"),
+        "sell_vwap": metrics.get("sell_vwap"),
+        "delta": metrics.get("delta"),
+        "delta_ratio": metrics.get("delta_ratio"),
+    }
+
+
+def _cache_aggressor_metrics(cache: Any, market: str, symbol: str, start_ms: int, end_ms: int) -> Dict[str, Any]:
+    """Bounded-memory cache aggregate for an inclusive millisecond window."""
+    if int(end_ms) < int(start_ms):
+        return _normalize_sql_aggressor_metrics({"status": "EMPTY"})
+    aggregate = getattr(cache, "aggregate_aggressive_metrics", None)
+    if callable(aggregate):
+        return _normalize_sql_aggressor_metrics(cast(Dict[str, Any], aggregate(market, symbol, int(start_ms), int(end_ms))))
+    # Compatibility fallback for older cache doubles only. The real AggTradeCache
+    # has aggregate_aggressive_metrics; production paths must not materialize
+    # multi-million-row windows.
+    return _aggressor_metrics_from_trades(
+        cache.query_trades_range(market, symbol, int(start_ms), int(end_ms)),
+        int(start_ms),
+        int(end_ms) + 1,
+    )
+
+
 def _ensure_required_aggtrade_coverage(
     cache: Any,
     market: str,
@@ -598,9 +658,8 @@ def _aggtrade_aggressor_metrics_for_display(
         meta["covered"] = covered
         if not covered:
             return _unavailable_aggressor(), _unavailable_aggressor(), meta
-        trades = cache.query_trades_range(market, symbol, required_start, required_end)
-        ladder = _aggressor_metrics_from_trades(trades, int(ladder_start_ms), required_end + 1)
-        step = _aggressor_metrics_from_trades(trades, int(step_start_ms), required_end + 1)
+        ladder = _cache_aggressor_metrics(cache, market, symbol, int(ladder_start_ms), required_end)
+        step = _cache_aggressor_metrics(cache, market, symbol, int(step_start_ms), required_end)
         return ladder, step, meta
     except Exception as exc:
         logger.warning("aggTrade coverage/metrics unavailable for %s %s: %s", market, symbol, exc)
@@ -633,6 +692,37 @@ def _per_step_aggressor_table_from_trades(trades, state, metric_end_ms: int) -> 
         end = _leg_ts_ms(legs[idx + 1]) if idx + 1 < len(legs) else final_end
         step_snap = _aggressor_metrics_from_trades(trades, start, end)
         ladder_snap = _aggressor_metrics_from_trades(trades, p0_ts, end)
+        row = dict(step_snap)
+        row["ladder_buy_vwap"] = ladder_snap.get("buy_vwap")
+        row["ladder_sell_vwap"] = ladder_snap.get("sell_vwap")
+        row["ladder_delta_ratio"] = ladder_snap.get("delta_ratio")
+        row["ladder_buy_base"] = ladder_snap.get("buy_base")
+        row["ladder_sell_base"] = ladder_snap.get("sell_base")
+        row["is_active"] = idx == len(legs) - 1
+        out[step_n] = row
+    return out
+
+
+def _per_step_aggressor_table_from_cache(
+    cache: Any,
+    market: str,
+    symbol: str,
+    state: Any,
+    metric_end_ms: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Per-step aggressive-flow table via SQL aggregates, no trade materialization."""
+    out: Dict[int, Dict[str, Any]] = {}
+    legs = sorted(list(getattr(state, "legs", None) or []), key=_leg_ts_ms)
+    if not legs:
+        return out
+    p0_ts = _leg_ts_ms(legs[0])
+    final_end_inclusive = int(metric_end_ms)
+    for idx, leg in enumerate(legs):
+        step_n = int(getattr(leg, "step", idx))
+        start = _leg_ts_ms(leg)
+        end_inclusive = (_leg_ts_ms(legs[idx + 1]) - 1) if idx + 1 < len(legs) else final_end_inclusive
+        step_snap = _cache_aggressor_metrics(cache, market, symbol, start, end_inclusive)
+        ladder_snap = _cache_aggressor_metrics(cache, market, symbol, p0_ts, end_inclusive)
         row = dict(step_snap)
         row["ladder_buy_vwap"] = ladder_snap.get("buy_vwap")
         row["ladder_sell_vwap"] = ladder_snap.get("sell_vwap")
@@ -1079,10 +1169,13 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     step_delta_ratios: Dict[int, float | None] = {}
     if agg_meta.get("covered"):
         try:
-            required_start = int(agg_meta["required_start_ms"])
-            required_end = int(agg_meta["required_end_ms"])
-            agg_trades = _BACKTEST_AGGTRADE_CACHE.query_trades_range(market, symbol, required_start, required_end)
-            per_step_aggressor = _per_step_aggressor_table_from_trades(agg_trades, result.engine.state, aggtrade_end_ts)
+            per_step_aggressor = _per_step_aggressor_table_from_cache(
+                _BACKTEST_AGGTRADE_CACHE,
+                market,
+                symbol,
+                result.engine.state,
+                aggtrade_end_ts,
+            )
             step_delta_ratios = {
                 int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
             }

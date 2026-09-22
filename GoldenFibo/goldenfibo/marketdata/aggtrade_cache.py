@@ -596,6 +596,94 @@ class AggTradeCache:
                 if len(rows) < int(chunk_size):
                     break
 
+    def aggregate_aggressive_metrics(
+        self,
+        market: str,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> dict[str, float | int | str | None]:
+        """Aggregate aggressive-flow metrics inside SQLite for a time window.
+
+        This bounded-memory path is used by finite backtests with long ladders.
+        It preserves ``query_trades_range`` canonicalization semantics:
+        aggregate rows are counted directly, and raw ``id_domain='trade'`` rows
+        are included only when no aggregate row in the same requested window
+        covers their underlying raw trade ID.
+        """
+        market_n = self._normalize_market(market)
+        symbol_n = self._normalize_symbol(symbol)
+        lo = int(start_ms)
+        hi = int(end_ms)
+        if hi < lo:
+            return {
+                "status": "EMPTY",
+                "trade_count": 0,
+                "buy_qty": 0.0,
+                "buy_notional": 0.0,
+                "buy_vwap": None,
+                "sell_qty": 0.0,
+                "sell_notional": 0.0,
+                "sell_vwap": None,
+                "total_qty": 0.0,
+                "delta": 0.0,
+                "delta_ratio": None,
+            }
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                WITH canonical AS (
+                    SELECT price, quantity, buyer_is_maker
+                    FROM agg_trades INDEXED BY idx_agg_trades_ts
+                    WHERE market=? AND symbol=? AND id_domain='aggtrade'
+                      AND timestamp_ms BETWEEN ? AND ?
+                    UNION ALL
+                    SELECT raw.price, raw.quantity, raw.buyer_is_maker
+                    FROM agg_trades AS raw INDEXED BY idx_agg_trades_ts
+                    WHERE raw.market=? AND raw.symbol=? AND raw.id_domain='trade'
+                      AND raw.timestamp_ms BETWEEN ? AND ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM agg_trades AS agg INDEXED BY idx_agg_trades_ts
+                          WHERE agg.market=raw.market
+                            AND agg.symbol=raw.symbol
+                            AND agg.id_domain='aggtrade'
+                            AND agg.timestamp_ms BETWEEN ? AND ?
+                            AND raw.first_trade_id BETWEEN agg.first_trade_id AND agg.last_trade_id
+                          LIMIT 1
+                      )
+                )
+                SELECT
+                    COUNT(*) AS trade_count,
+                    COALESCE(SUM(CASE WHEN buyer_is_maker=0 THEN CAST(quantity AS REAL) ELSE 0 END), 0.0) AS buy_qty,
+                    COALESCE(SUM(CASE WHEN buyer_is_maker=0 THEN CAST(price AS REAL) * CAST(quantity AS REAL) ELSE 0 END), 0.0) AS buy_notional,
+                    COALESCE(SUM(CASE WHEN buyer_is_maker=1 THEN CAST(quantity AS REAL) ELSE 0 END), 0.0) AS sell_qty,
+                    COALESCE(SUM(CASE WHEN buyer_is_maker=1 THEN CAST(price AS REAL) * CAST(quantity AS REAL) ELSE 0 END), 0.0) AS sell_notional
+                FROM canonical
+                """,
+                (market_n, symbol_n, lo, hi, market_n, symbol_n, lo, hi, lo, hi),
+            ).fetchone()
+        trade_count = int(row["trade_count"] or 0)
+        buy_qty = float(row["buy_qty"] or 0.0)
+        buy_notional = float(row["buy_notional"] or 0.0)
+        sell_qty = float(row["sell_qty"] or 0.0)
+        sell_notional = float(row["sell_notional"] or 0.0)
+        total_qty = buy_qty + sell_qty
+        delta = buy_qty - sell_qty
+        return {
+            "status": "COMPLETE" if trade_count else "EMPTY",
+            "trade_count": trade_count,
+            "buy_qty": buy_qty,
+            "buy_notional": buy_notional,
+            "buy_vwap": (buy_notional / buy_qty) if buy_qty > 0 else None,
+            "sell_qty": sell_qty,
+            "sell_notional": sell_notional,
+            "sell_vwap": (sell_notional / sell_qty) if sell_qty > 0 else None,
+            "total_qty": total_qty,
+            "delta": delta,
+            "delta_ratio": (delta / total_qty) if total_qty > 0 else None,
+        }
+
     def iter_after_frontier(
         self,
         market: str,
