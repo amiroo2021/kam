@@ -1,5 +1,5 @@
 [Unit]
-Description=KAM WebTrade2 trading terminal (Phase 2 — dry-run)
+Description=KAM WebTrade2 trading terminal (Phase 2 — controlled live activation)
 After=network.target
 # Independent from webtrade.service (:9001) and GoldenFibo
 
@@ -8,11 +8,22 @@ Type=simple
 WorkingDirectory=__HERMES_ROOT__
 Environment=PYTHONPATH=__HERMES_ROOT__
 Environment=HERMES_HOME=__HERMES_HOME__
-# Phase 2 first deployment = dry-run. WRITE_ENABLED=1 enables the
-# write endpoints; DRY_RUN=1 ensures no live exchange write is ever
-# performed. Switch DRY_RUN to 0 only after explicit operator approval.
+# Phase 2 controlled activation.
+#   WRITE_ENABLED=1     — write endpoints are mounted (preview/execute/TP/SL/Close/Cancel).
+#   DRY_RUN=0           — LIVE exchange writes are permitted for orders + position
+#                         management (set_tp / set_sl / close_position) and
+#                         single-order cancel.
+#   LADDER_ENABLED=0    — LIVE ladder writes are PERMANENTLY disabled at this
+#                         stage. The ladder Confirm modal in the UI shows
+#                         'LIVE LADDER TEST NOT YET ENABLED' and the server
+#                         refuses any LIVE ladder execute with
+#                         LADDER_NOT_ENABLED. To enable ladders after explicit
+#                         approval, set LADDER_ENABLED=1 and restart
+#                         webtrade2.service.
+#   PREVIEW_TTL_SECONDS=300 — preview_id validity window.
 Environment=WEBTRADE2_WRITE_ENABLED=1
-Environment=WEBTRADE2_DRY_RUN=1
+Environment=WEBTRADE2_DRY_RUN=0
+Environment=WEBTRADE2_LADDER_ENABLED=0
 Environment=WEBTRADE2_PREVIEW_TTL_SECONDS=300
 ExecStart=__HERMES_ROOT__/venv/bin/python -m plugins.trade.webtrade2
 Restart=on-failure

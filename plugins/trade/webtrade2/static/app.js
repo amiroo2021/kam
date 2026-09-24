@@ -854,6 +854,34 @@
       if (c.ellipsis) return `<tr><td colspan="2" class="muted">…</td></tr>`;
       return `<tr><td>${fmt(c.price)}</td><td>${fmt(c.size)}</td></tr>`;
     }).join('');
+    // Step 7 (controlled activation): LIVE ladder test is NOT YET enabled.
+    // Preview is allowed; Confirm is gated with an explicit safety banner.
+    if (!state.dryRun) {
+      showModal(
+        'CONFIRM LADDER (BLOCKED)',
+        contextRows().concat([
+          { label: 'Side', value: body.side.toUpperCase() },
+          { label: 'Distribution', value: body.distribution },
+          { label: 'Start', value: fmt(body.start_price) },
+          { label: 'End', value: fmt(body.end_price) },
+        ]),
+        `<div class="ladder-blocked-banner">
+           <div class="ladder-blocked-title">LIVE LADDER TEST NOT YET ENABLED</div>
+           <div class="ladder-blocked-detail">
+             Ladder preview is informational only. The CONFIRM action is currently
+             blocked until the controlled LIVE ladder activation is approved.
+           </div>
+         </div>
+         <div class="ctx-row"><span class="ctx-lbl">Requested Orders</span><span class="ctx-val">${fmt(body.order_count)}</span></div>
+         <div class="ctx-row"><span class="ctx-lbl">Final Normalized Count</span><span class="ctx-val">${fmt(body.order_count)}</span></div>
+         <div class="ctx-row"><span class="ctx-lbl">Total Size</span><span class="ctx-val">${fmt(body.total_size)}</span></div>
+         <div class="ctx-row"><span class="ctx-lbl">Ladder VWAP</span><span class="ctx-val">${fmt(body.vwap)}</span></div>
+         <table class="modal-children"><thead><tr><th>PRICE</th><th>SIZE</th></tr></thead><tbody>${childrenRows}</tbody></table>`,
+        async () => { return { success: false, error: { code: 'LADDER_NOT_ENABLED', message: 'LIVE ladder test is not yet enabled.' } }; },
+        'BLOCKED - NOT ENABLED'
+      );
+      return;
+    }
     showModal(
       'CONFIRM LADDER',
       contextRows().concat([

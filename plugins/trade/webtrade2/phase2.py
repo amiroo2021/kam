@@ -131,10 +131,15 @@ class WebTrade2Phase2Service:
         write_enabled: bool = False,
         dry_run: bool = True,
         preview_ttl_seconds: int = 300,
+        ladder_enabled: bool = False,
     ) -> None:
         self.desk = desk or get_tradedesk()
         self.write_enabled = bool(write_enabled)
         self.dry_run = bool(dry_run)
+        # Step 7: controlled LIVE ladder activation. Defaults to False so
+        # the server refuses LIVE ladder dispatches unless explicitly opted
+        # in via env (WEBTRADE2_LADDER_ENABLED=1).
+        self.ladder_enabled = bool(ladder_enabled)
         self.previews = PreviewPlanStore(session_secret, ttl_seconds=int(preview_ttl_seconds))
 
     # ---- status helpers -------------------------------------------------
@@ -144,6 +149,7 @@ class WebTrade2Phase2Service:
             "phase": 2,
             "write_enabled": self.write_enabled,
             "dry_run": self.dry_run,
+            "ladder_enabled": self.ladder_enabled,
             "preview_ttl_seconds": self.previews.ttl_seconds,
         }
 
@@ -698,6 +704,49 @@ class WebTrade2Phase2Service:
             return out
 
         if kind == "ladder":
+            # Defense-in-depth (Step 7): LIVE ladder is not yet enabled.
+            # Even if the frontend were bypassed, the server refuses the
+            # LIVE dispatch. The user MUST explicitly opt in via env.
+            if not self.ladder_enabled:
+                status = "REJECTED"
+                out = {
+                    "success": False,
+                    "status": status,
+                    "kind": "ladder",
+                    "operation": "ladder",
+                    "exchange": exchange,
+                    "account": account,
+                    "market_type": plan.get("market_type") or "futures",
+                    "symbol": symbol,
+                    "side": side,
+                    "distribution": plan.get("distribution"),
+                    "requested": int(plan.get("order_count") or 0),
+                    "accepted": 0,
+                    "partial": False,
+                    "preview_vwap": plan.get("vwap"),
+                    "preview_order_count": int(plan.get("order_count") or 0),
+                    "exchange_order_ids": [],
+                    "mode": "LIVE",
+                    "message": "LIVE ladder test is not yet enabled. Set WEBTRADE2_LADDER_ENABLED=1 and restart webtrade2.service after explicit approval.",
+                    "error": {
+                        "code": "LADDER_NOT_ENABLED",
+                        "message": "LIVE ladder is currently disabled. Approve explicit activation, then set WEBTRADE2_LADDER_ENABLED=1 and restart webtrade2.service.",
+                    },
+                }
+                self._audit(
+                    operation="ladder",
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=side,
+                    preview_id=preview_id,
+                    mode="LIVE",
+                    status=status,
+                    accepted=0,
+                    requested=int(plan.get("order_count") or 0),
+                    error_code="LADDER_NOT_ENABLED",
+                )
+                return out
             exec_body = plan.get("exec") or {}
             req = {
                 "operation": "ladder",

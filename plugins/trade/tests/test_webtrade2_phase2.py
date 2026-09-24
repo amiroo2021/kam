@@ -544,9 +544,9 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
         desk = FakeDesk()
-        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)
@@ -582,7 +582,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
         desk = FakeDesk()
 
         class PartialDesk(FakeDesk):
@@ -592,7 +592,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
                     return FakeCanonical(success=True, ladder=FakeLadder(requested_order_count=8, accepted_child_count=5, submitted_order_count=5, partial=True))
                 return super().execute(request)
 
-        p2 = p2_mod.WebTrade2Phase2Service(desk=PartialDesk(), session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        p2 = p2_mod.WebTrade2Phase2Service(desk=PartialDesk(), session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)
@@ -616,7 +616,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
 
         class PartialDesk(FakeDesk):
             def execute(self, request):
@@ -626,7 +626,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
                 return super().execute(request)
 
         partial = PartialDesk()
-        p2 = p2_mod.WebTrade2Phase2Service(desk=partial, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300)
+        p2 = p2_mod.WebTrade2Phase2Service(desk=partial, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True)
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)
@@ -824,8 +824,84 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         self.assertTrue(j.get("write_enabled"))
         self.assertTrue(j.get("dry_run"))
         self.assertEqual(j.get("phase"), 2)
+        # Step 7: ladder_enabled must be present and default False.
+        self.assertIn("ladder_enabled", j)
+        self.assertFalse(j.get("ladder_enabled"))
 
-    # ---- 33. preview invalidation UX on every relevant input ---------
+    # ---- 33. Step 7: LIVE ladder server-side guard -------------------
+
+    def test_live_ladder_blocked_when_ladder_enabled_false(self) -> None:
+        # LIVE + ladder_enabled=False → server refuses ladder execute
+        # with LADDER_NOT_ENABLED, no desk.execute() call for ladder.
+        app, desk, _, _ = _build_app(env_overrides={
+            "WEBTRADE2_DRY_RUN": "0",
+            "WEBTRADE2_LADDER_ENABLED": "0",
+        })
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/trade/preview_ladder",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC",
+                  "side": "buy", "distribution": "uniform", "order_count": 3,
+                  "total_size": "3", "start_price": "110", "end_price": "90"},
+            headers=_hdr(csrf),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        pid = r.json()["preview_id"]
+        r2 = client.post("/api/trade/execute", json={"preview_id": pid}, headers=_hdr(csrf))
+        # Server returns 400 for rejected LIVE because of `success=false`.
+        self.assertIn(r2.status_code, (200, 400), r2.text)
+        body = r2.json()
+        self.assertFalse(body.get("success"))
+        self.assertEqual(body.get("error", {}).get("code"), "LADDER_NOT_ENABLED")
+        # The ladder MUST NOT have reached desk.execute().
+        writes = [c for c in desk.calls if c.get("operation") == "ladder"]
+        self.assertEqual(writes, [])
+
+    # ---- 34. Step 7: LIVE ladder enabled → server dispatches ---------
+
+    def test_live_ladder_dispatches_when_ladder_enabled_true(self) -> None:
+        app, desk, _, _ = _build_app(env_overrides={
+            "WEBTRADE2_DRY_RUN": "0",
+            "WEBTRADE2_LADDER_ENABLED": "1",
+        })
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/trade/preview_ladder",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC",
+                  "side": "buy", "distribution": "uniform", "order_count": 3,
+                  "total_size": "3", "start_price": "110", "end_price": "90"},
+            headers=_hdr(csrf),
+        )
+        pid = r.json()["preview_id"]
+        r2 = client.post("/api/trade/execute", json={"preview_id": pid}, headers=_hdr(csrf))
+        body = r2.json()
+        # Status should NOT be LADDER_NOT_ENABLED; the dispatch should
+        # reach the desk (FakeDesk returns success by default).
+        self.assertNotEqual(body.get("error", {}).get("code"), "LADDER_NOT_ENABLED")
+        writes = [c for c in desk.calls if c.get("operation") == "ladder"]
+        self.assertEqual(len(writes), 1, "ladder should have reached desk.execute once")
+        # The dispatched children must match the plan's normalized children.
+        dispatched = writes[0]
+        self.assertEqual(dispatched.get("exchange"), "hyperliquid")
+        self.assertEqual(dispatched.get("account"), "fibo")
+        self.assertEqual(dispatched.get("side"), "buy")
+        self.assertEqual(dispatched.get("order_count"), 3)
+
+    # ---- 35. Step 7: status endpoint reports ladder_enabled=1 --------
+
+    def test_phase2_status_reports_ladder_enabled_when_set(self) -> None:
+        app, _, _, _ = _build_app(env_overrides={
+            "WEBTRADE2_LADDER_ENABLED": "1",
+        })
+        client = TestClient(app)
+        _login(client)
+        r = client.get("/api/phase2")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json().get("ladder_enabled"))
+
+    # ---- 36. preview invalidation UX on every relevant input ---------
 
     def test_preview_invalidation_ux_on_every_relevant_input(self) -> None:
         # Section 2: any change to execution-relevant inputs must visibly

@@ -55,6 +55,9 @@ class WebTrade2Config:
     # disabled read-only for safety; tests override explicitly.
     write_enabled: bool = False
     dry_run: bool = True
+    # Step 7: LIVE ladder activation is opt-in. Defaults to False; the
+    # server refuses LIVE ladder dispatches unless WEBTRADE2_LADDER_ENABLED=1.
+    ladder_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.password = self.password or str(_env("WEBTRADE2_PASSWORD") or _env("TRADE_WEB_PASSWORD") or _env("WEB_PASSWORD") or "")
@@ -71,6 +74,7 @@ class WebTrade2Config:
         self.preview_ttl_seconds = int(_env("WEBTRADE2_PREVIEW_TTL_SECONDS", str(self.preview_ttl_seconds)) or self.preview_ttl_seconds)
         self.write_enabled = _env_bool("WEBTRADE2_WRITE_ENABLED", self.write_enabled)
         self.dry_run = _env_bool("WEBTRADE2_DRY_RUN", self.dry_run)
+        self.ladder_enabled = _env_bool("WEBTRADE2_LADDER_ENABLED", self.ladder_enabled)
 
     @classmethod
     def from_values(
@@ -83,6 +87,7 @@ class WebTrade2Config:
         write_enabled: bool = False,
         dry_run: bool = True,
         preview_ttl_seconds: int = 300,
+        ladder_enabled: bool = False,
     ) -> "WebTrade2Config":
         return cls(
             password=password,
@@ -92,6 +97,7 @@ class WebTrade2Config:
             write_enabled=write_enabled,
             dry_run=dry_run,
             preview_ttl_seconds=preview_ttl_seconds,
+            ladder_enabled=ladder_enabled,
         )
 
     @classmethod
