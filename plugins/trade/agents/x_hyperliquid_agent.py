@@ -239,8 +239,11 @@ def capabilities() -> List[str]:
     """Return the operations this agent supports."""
     return [
         "candles","balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
- # Phase 2.4: catalog + mark price (metaAndAssetCtxs).
- "list_instruments", "market_price"]
+        # Phase 2.4: catalog + mark price (metaAndAssetCtxs).
+        "list_instruments", "market_price",
+        # Phase 2 promotion: position-management writes (implemented; advertised).
+        "set_tp", "set_sl", "close_position",
+    ]
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
