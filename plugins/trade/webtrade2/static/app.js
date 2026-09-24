@@ -163,6 +163,7 @@
     state.candleSeries = candleSeries;
     state.chartReady = true;
     chart.timeScale().fitContent();
+    exposeChartTelemetry();
     return true;
   }
 
@@ -186,29 +187,115 @@
     state.candleSeries.applyOptions({ priceFormat: { type: 'price', precision, minMove: Math.pow(10, -precision) } });
   }
 
+  // Render a small telemetry strip below the chart for live debugging.
+  // Pure DOM — never throws; safe to call from any phase of the chart
+  // pipeline. Stays in production build (very small) because chart
+  // blank-on-mobile was hard to diagnose without it.
+  function renderChartTelemetry() {
+    let el = document.getElementById('chartTelemetry');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'chartTelemetry';
+      el.style.cssText = 'margin-top:6px;padding:6px 8px;border:1px dashed #555;font:11px ui-monospace,monospace;color:#8a9bb5;background:#0b0f1a;border-radius:4px;white-space:pre-wrap;line-height:1.5';
+      const wrap = document.querySelector('.chart-wrap');
+      if (wrap && wrap.parentNode) wrap.parentNode.insertBefore(el, wrap.nextSibling);
+      else document.body.appendChild(el);
+    }
+    const t = state.chartTelemetry || {};
+    const f = (n) => (n == null ? '?' : (Number.isFinite(n) ? n : JSON.stringify(n)));
+    const lines = [
+      `symbol=${t.symbol||'-'} tf=${t.interval||'-'} status=${t.httpStatus||'?'} raw=${f(t.rawCount)} norm=${f(t.normalizedCount)} setData=${f(t.setDataCallCount)}${t.setDataThrew && t.setDataThrew!==false ? ' THROW='+t.setDataThrew : ''}`,
+      `first=${t.normalizedFirst ? JSON.stringify({t:t.normalizedFirst.time,o:t.normalizedFirst.open}) : '?'}`,
+      `last=${t.normalizedLast ? JSON.stringify({t:t.normalizedLast.time,c:t.normalizedLast.close}) : '?'}`,
+      `asc=${t.normalizedAscending==null?'?':t.normalizedAscending} dups=${f(t.normalizedDuplicates)}`,
+      `rect=${t.containerRectBefore ? (t.containerRectBefore.w+'x'+t.containerRectBefore.h) : '?'} canvas=${t.canvasDimsAfter ? (t.canvasDimsAfter.w+'x'+t.canvasDimsAfter.h+' (css:'+Math.round(t.canvasDimsAfter.cssW)+'x'+Math.round(t.canvasDimsAfter.cssH)+')') : '?'}`,
+      `nonBgPx=${f(t.canvasNonBgPixels)} range=${t.visibleRange ? JSON.stringify({from:t.visibleRange.from,to:t.visibleRange.to}) : '?'}`,
+    ];
+    el.textContent = lines.join('\n');
+  }
+
+  const TELEMETRY_KEY = '__webtrade2_chart__';
+  function exposeChartTelemetry() {
+    try {
+      window[TELEMETRY_KEY] = {
+        telemetry: state.chartTelemetry,
+        chartReady: !!state.chartReady,
+        hasChart: !!state.chart,
+        candleSeriesAttached: !!(state.candleSeries && state.candleSeries._internal__dataChangedEvent || true),
+        seriesOptions: (() => {
+          try { return state.candleSeries && state.candleSeries.options && state.candleSeries.options(); } catch (_) { return null; }
+        })(),
+        chartOptions: (() => {
+          try { return state.chart && state.chart.options && state.chart.options(); } catch (_) { return null; }
+        })(),
+        containerRect: (() => {
+          const c = document.getElementById('chart');
+          if (!c) return null;
+          const r = c.getBoundingClientRect();
+          return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+        })(),
+        canvases: (() => {
+          const c = document.getElementById('chart');
+          if (!c) return null;
+          return Array.from(c.querySelectorAll('canvas')).map(cv => {
+            const r = cv.getBoundingClientRect();
+            return { width: cv.width, height: cv.height, cssW: r.width, cssH: r.height };
+          });
+        })(),
+        selectedMarket: state.market ? state.market.symbol : null,
+        selectedExchange: state.exchange,
+        selectedAccount: state.account,
+        // Capture last setData arg snapshot via probe (the chart poller also calls setData)
+        lastSetDataArgLen: state._lastSetDataArgLen || null,
+        setDataCallsTotal: state._setDataCallsTotal || 0,
+      };
+    } catch (_) { /* never throw */ }
+  }
+
   async function loadChartHistory() {
     if (!state.chartReady || !state.market?.symbol || !state.exchange) return;
-    const params = new URLSearchParams({
+    const requestUrl = `/api/candles?${new URLSearchParams({
       exchange: state.exchange,
       account: state.account,
       symbol: state.market.symbol,
       interval: state.selectedTimeframe,
       limit: String(HISTORY_LIMIT),
       market_type: state.marketType,
-    });
+    })}`;
+    // ---- telemetry buffer (always-on, for headless diagnostics) ----
+    state.chartTelemetry = {
+      requestUrl, exchange: state.exchange, account: state.account,
+      symbol: state.market.symbol, interval: state.selectedTimeframe,
+      requestStartedAt: Date.now(),
+      httpStatus: null, responseInterval: null, rawCount: null,
+      normalizedCount: 0, normalizedFirst: null, normalizedLast: null,
+      normalizedAscending: null,
+      setDataCallCount: (state.chartTelemetry?.setDataCallCount || 0),
+      setDataThrew: null,
+      containerRectBefore: null, canvasDimsAfter: null,
+      priceScaleRange: null, visibleRange: null,
+      canvasNonBgPixels: null,
+    };
     let data;
     try {
-      data = await api(`/api/candles?${params}`);
+      data = await api(requestUrl);
+      state.chartTelemetry.httpStatus = 'ok';
     } catch (err) {
-      console.warn("[chart] /api/candles request failed:", err);
+      state.chartTelemetry.httpStatus = 'fail:' + (err && err.message || err);
+      renderChartTelemetry();
       return;
     }
     if (!data || !data.success || data.success === false) {
-      console.warn("[chart] /api/candles returned non-success:", data);
+      state.chartTelemetry.httpStatus = 'success=false';
+      renderChartTelemetry();
       return;
     }
     const dataBlock = data.data || {};
+    state.chartTelemetry.responseInterval = dataBlock.interval || null;
+    state.chartTelemetry.rawCount = (dataBlock.candles || []).length;
     const candles = Array.isArray(dataBlock.candles) ? dataBlock.candles : [];
+    // ---- build telemetry overlay as soon as we have raw count ----
+    renderChartTelemetry();
     if (candles.length === 0) {
       console.warn("[chart] /api/candles returned 0 candles for", state.market.symbol, "tf=", state.selectedTimeframe);
       return;
@@ -219,6 +306,9 @@
     // Normalize: enforce numbers, drop invalid rows, de-dup by time, sort asc.
     const seen = new Set();
     const series = [];
+    // Server normalizes /api/candles to seconds-since-epoch with de-dup,
+    // ascending sort, and OHLC sanity. Here we only enforce LWC contract:
+    // integer time + finite OHLC. Anything invalid is dropped client-side.
     for (const c of candles) {
       const t = Math.floor(Number(c.time));
       const o = Number(c.open);
@@ -232,13 +322,25 @@
       ) {
         continue;
       }
-      if (seen.has(t)) continue;   // de-dup
+      if (seen.has(t)) continue;
       seen.add(t);
       series.push({ time: t, open: o, high: h, low: l, close: cl });
     }
     series.sort((a, b) => a.time - b.time);
+    // ASC/UNIQUE sanity check
+    let ascending = true;
+    let dupCount = 0;
+    for (let i = 1; i < series.length; i++) {
+      if (series[i].time <= series[i-1].time) { ascending = false; dupCount++; }
+    }
+    state.chartTelemetry.normalizedCount = series.length;
+    state.chartTelemetry.normalizedFirst = series[0] || null;
+    state.chartTelemetry.normalizedLast = series[series.length - 1] || null;
+    state.chartTelemetry.normalizedAscending = !!ascending;
+    state.chartTelemetry.normalizedDuplicates = dupCount;
     if (series.length === 0) {
       console.warn("[chart] 0 valid candle rows after normalization for", state.market.symbol);
+      renderChartTelemetry();
       return;
     }
     // Apply. If the container has zero size at this moment (boot race),
@@ -251,15 +353,57 @@
     };
     const applySetData = () => {
       try {
+        // Capture container rect just before setData
+        const cont = document.getElementById('chart');
+        state.chartTelemetry.containerRectBefore = (function(){
+          const r = cont?.getBoundingClientRect?.();
+          return r ? { w: Math.round(r.width), h: Math.round(r.height) } : null;
+        })();
+        const rows = series.length;
+        state.chartTelemetry.normalizedCount = rows;
         state.candleSeries.setData(series);
+        state.chartTelemetry.setDataCallCount = (state.chartTelemetry.setDataCallCount || 0) + 1;
+        state.chartTelemetry.setDataThrew = false;
         applyChartPrecision(series[series.length - 1].close);
         state.chart.timeScale().fitContent();
         // Defer a second fitContent in case the chart container just resized.
         requestAnimationFrame(() => {
           try { state.chart && state.chart.timeScale().fitContent(); } catch (_) {}
+          // After rAF, capture canvas dims and pixel count
+          try {
+            const cv = cont?.querySelector('canvas');
+            if (cv) {
+              state.chartTelemetry.canvasDimsAfter = {
+                w: cv.width, h: cv.height,
+                cssW: cv.getBoundingClientRect().width,
+                cssH: cv.getBoundingClientRect().height,
+              };
+              // Count non-background pixels via getImageData
+              try {
+                const ctx = cv.getContext('2d');
+                if (ctx) {
+                  const data = ctx.getImageData(0, 0, cv.width, cv.height).data;
+                  let n = 0;
+                  for (let i = 0; i < data.length; i += 4) {
+                    if (data[i] > 25 || data[i+1] > 25 || data[i+2] > 25) n++;
+                  }
+                  state.chartTelemetry.canvasNonBgPixels = n;
+                }
+              } catch (e) { /* ignore */ }
+              // Price scale + time scale state
+              try {
+                const ps = state.chart.priceScale ? state.chart.priceScale('right') : null;
+                state.chartTelemetry.priceScaleRange = ps ? { mode: 'auto' } : null;
+                state.chartTelemetry.visibleRange = state.chart.timeScale().getVisibleLogicalRange ? state.chart.timeScale().getVisibleLogicalRange() : null;
+              } catch (_) {}
+            }
+          } catch (_) {}
+          renderChartTelemetry();
         });
       } catch (err) {
+        state.chartTelemetry.setDataThrew = String(err && err.message || err);
         console.error("[chart] setData threw for", state.market.symbol, "tf=", state.selectedTimeframe, err);
+        renderChartTelemetry();
       }
     };
     if (containerHasSize()) {

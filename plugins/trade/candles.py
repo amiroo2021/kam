@@ -13,6 +13,7 @@ Contract:
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 import gzip
 import json
@@ -23,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .canonical import make_failure, make_success
 
@@ -1096,6 +1097,65 @@ def has_native_candles(exchange: str) -> bool:
     return ex in FETCHERS or ex == "ondoperps"
 
 
+def _normalize_candle_time_units(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize candle ``time`` values to UTC seconds, dedupe, and sort ascending.
+
+    Some exchanges (Apex) return ``time`` in milliseconds while Hyperliquid
+    and most others return seconds. Mixing units makes the Lightweight
+    Charts v4.2 chart silently blank because it interprets the 13-digit
+    value as seconds-since-epoch, putting every bar ~58k years in the
+    future.
+
+    Threshold logic: anything above 1e10 seconds-since-epoch is year 2286
+    or later — for normal markets it must be milliseconds (or microseconds
+    / nanoseconds) and we divide by 1000 until it fits seconds-since-epoch.
+    We cap at three divisions (ms → s, us → ms → s, ns → us → ms → s) so a
+    genuinely large second value is preserved.
+
+    Returns a NEW list with normalized candles; invalid rows are dropped.
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for c in candles or []:
+        if not isinstance(c, Mapping):
+            continue
+        try:
+            t = int(round(float(c.get("time"))))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        # Coerce ms / us / ns to seconds. Cap iterations so any true seconds
+        # value above 1e10 is preserved intact.
+        for _ in range(3):
+            if t <= 1_000_000_000_000:  # <= year 33658 in seconds; below ms territory
+                break
+            t = t // 1000
+        if t <= 0:
+            continue
+        # OHLC sanity: only drop if a number is genuinely NaN/inf — None or
+        # "" are accepted (some upstreams return None for missing close).
+        try:
+            o = float(c.get("open"))  # type: ignore[arg-type]
+            h = float(c.get("high"))  # type: ignore[arg-type]
+            l = float(c.get("low"))   # type: ignore[arg-type]
+            cl = float(c.get("close"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(o) and math.isfinite(h) and math.isfinite(l) and math.isfinite(cl)):
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        merged = dict(c)
+        merged["time"] = t
+        merged["open"] = o
+        merged["high"] = h
+        merged["low"] = l
+        merged["close"] = cl
+        out.append(merged)
+    out.sort(key=lambda r: r.get("time") or 0)
+    return out
+
+
 def fetch_for_exchange(exchange: str, symbol: str, tf: str, limit: int = 300, *, account: str = "") -> List[Dict[str, Any]]:
     ex = str(exchange or "").strip().lower()
     fn = FETCHERS.get(ex)
@@ -1154,4 +1214,15 @@ def handle_candles_operation(exchange_name: str, account: str, request: Dict[str
         if "HTTP Error" in user_msg or "url:" in user_msg.lower():
             user_msg = f"Candles unavailable for {symbol} on {exchange_name}."
         return make_failure(operation="candles", exchange=exchange_name, account=account, code=code, message=user_msg or f"Candles unavailable for {symbol} on {exchange_name}.")
-    return make_success(operation="candles", exchange=exchange_name, account=account, data={"candles": candles, "symbol": symbol, "interval": interval, "source": "native", "count": len(candles)})
+    return make_success(
+        operation="candles",
+        exchange=exchange_name,
+        account=account,
+        data={
+            "candles": _normalize_candle_time_units(candles),
+            "symbol": symbol,
+            "interval": interval,
+            "source": "native",
+            "count": len(candles),
+        },
+    )

@@ -6,12 +6,16 @@ has no execution/cancel/position-modification methods.
 
 from __future__ import annotations
 
+import json
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from ..ladder_math import build_ladder_children, ladder_vwap
 from ..tradedesk import TradeDesk, get_tradedesk
 from ..webtrade.preview_plans import PreviewPlanStore
+
+log = logging.getLogger("webtrade2.service")
 
 _WRITE_CAPS = {"new_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "positions_management"}
 
@@ -114,7 +118,13 @@ def format_pct_change(raw: Any) -> str:
 
 
 def _volume_key(row: Mapping[str, Any]) -> tuple[int, Decimal, str]:
-    raw = row.get("volume_24h") or row.get("volume") or row.get("quote_volume") or row.get("trading_volume_24h")
+    raw = (
+        row.get("volume_24h")
+        or row.get("volume")
+        or row.get("quote_volume")
+        or row.get("turnover24h")
+        or row.get("trading_volume_24h")
+    )
     if raw is None or raw == "":
         return (1, Decimal("0"), str(row.get("symbol") or row.get("instrument") or ""))
     vol = _decimal(raw)
@@ -248,8 +258,77 @@ class WebTrade2Service:
                 "funding": funding,
                 "volume_unit": raw.get("volume_unit") or raw.get("quote") or "quote",
             })
+        # Apex does not expose a bulk 24h ticker endpoint. The list above has
+        # no prices and no volume; we enrich via the cache fan-out so the
+        # browser receives ranked, priced rows.
+        if str(exchange).lower() == "apex":
+            rows = self._apex_enrich(rows, account)
         ranked = self._rank_markets(rows, search=search)
         return {"success": True, "exchange": exchange, "account": account, "market_type": market_type, "markets": ranked}
+
+    def _apex_enrich(self, rows: List[Dict[str, Any]], account: str) -> List[Dict[str, Any]]:
+        """Best-effort enrichment via the Apex per-symbol ticker fan-out cache.
+
+        Falls back gracefully: if Apex is unreachable or returns no rows,
+        the catalog rows are returned untouched (price=None, turnover=None).
+        """
+        try:
+            from plugins.trade.webtrade2.apex_ticker_cache import (
+                get_cache, merge_ticker_into_rows,
+            )
+        except Exception as exc:  # pragma: no cover — import guard
+            log.warning("apex_ticker_cache unavailable: %s", exc)
+            return rows
+
+        symbols = [str(r.get("symbol") or "").strip() for r in rows if r.get("symbol")]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return rows
+
+        cache = get_cache()
+
+        def _fetch_one(sym: str) -> Optional[Dict[str, Any]]:
+            # Apex's /api/v3/ticker is a public endpoint — no auth.
+            import time as _t
+            from urllib import request as _u, error as _e
+            t0 = _t.perf_counter()
+            url = f"https://pro.apex.exchange/api/v3/ticker?symbol={sym.replace('-', '').replace('_', '')}"
+            req = _u.Request(url, headers={"User-Agent": "WebTrade2/1.0", "Accept": "application/json"})
+            try:
+                with _u.urlopen(req, timeout=8) as resp:
+                    body = resp.read()
+            except _e.HTTPError as he:
+                log.info("apex ticker %s HTTP %s", sym, he.code)
+                return None
+            except Exception as exc:
+                log.info("apex ticker %s failed: %s", sym, exc)
+                return None
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                return None
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list) or not data:
+                return None
+            # /api/v3/ticker accepts one symbol but the response is always a list;
+            # pick the row whose symbol matches the request (post-sanitization).
+            wanted = {sym.upper(), sym.replace("-", "").upper(), sym.replace("_", "").upper()}
+            for row in data:
+                if not isinstance(row, Mapping):
+                    continue
+                raw = str(row.get("symbol") or "").strip().upper()
+                if raw in wanted:
+                    dt_ms = int((_t.perf_counter() - t0) * 1000)
+                    log.debug("apex ticker %s ok in %dms", sym, dt_ms)
+                    return dict(row)
+            return None
+
+        try:
+            ticker_map = cache.refresh_sync("apex", account, symbols, _fetch_one) or {}
+        except Exception as exc:
+            log.warning("apex_ticker_cache.refresh_sync failed: %s", exc)
+            return rows
+        return merge_ticker_into_rows(rows, ticker_map)
 
     def _rank_markets(self, rows: List[Dict[str, Any]], search: str = "") -> List[Dict[str, Any]]:
         """Sort the market universe by 24h notional volume descending with unknown-volume alphabetical tail.
