@@ -1,29 +1,45 @@
-"""FastAPI app for independent read-only WebTrade2."""
+"""FastAPI app for independent read-only WebTrade2 (Phase 2: write surface)."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import LoginRateLimiter, SessionManager
 from .config import WebTrade2Config
+from .phase2 import WebTrade2Phase2Service
 from .service import WebTrade2Service
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-def create_app(config: Optional[WebTrade2Config] = None, service: Optional[WebTrade2Service] = None) -> FastAPI:
+def create_app(
+    config: Optional[WebTrade2Config] = None,
+    service: Optional[WebTrade2Service] = None,
+    phase2: Optional[WebTrade2Phase2Service] = None,
+) -> FastAPI:
     cfg = config or WebTrade2Config()
     svc = service or WebTrade2Service(session_secret=cfg.session_secret)
+    p2 = phase2 or WebTrade2Phase2Service(
+        desk=svc.desk,
+        session_secret=cfg.session_secret,
+        write_enabled=cfg.write_enabled,
+        dry_run=cfg.dry_run,
+        preview_ttl_seconds=cfg.preview_ttl_seconds,
+    )
     sessions = SessionManager(cfg)
     limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)
-    app = FastAPI(title="WebTrade2", version="0.1.0", docs_url=None, redoc_url=None)
+    app = FastAPI(title="WebTrade2", version="0.2.0", docs_url=None, redoc_url=None)
+    # Ensure audit-log entries for writes are visible.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     app.state.config = cfg
     app.state.service = svc
+    app.state.phase2 = p2
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     def session_token(request: Request) -> Optional[str]:
@@ -49,11 +65,25 @@ def create_app(config: Optional[WebTrade2Config] = None, service: Optional[WebTr
     @app.get("/health")
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True, "service": "webtrade2", "phase": 1, "read_only": True}
+        return {
+            "ok": True,
+            "service": "webtrade2",
+            "phase": 2,
+            "read_only": not p2.write_enabled,
+            "write_enabled": p2.write_enabled,
+            "dry_run": p2.dry_run,
+        }
 
     @app.get("/api/session")
     def api_session(token: str = Depends(require_auth)) -> dict:
-        return {"authenticated": True, "csrf": sessions.csrf_of(token), "phase": 1, "read_only": True}
+        return {
+            "authenticated": True,
+            "csrf": sessions.csrf_of(token),
+            "phase": 2,
+            "read_only": not p2.write_enabled,
+            "write_enabled": p2.write_enabled,
+            "dry_run": p2.dry_run,
+        }
 
     @app.post("/login")
     def login(request: Request, password: str = Form(...)) -> Response:
@@ -121,6 +151,118 @@ def create_app(config: Optional[WebTrade2Config] = None, service: Optional[WebTr
             start_price=str(body.get("start_price") or "0"),
             end_price=str(body.get("end_price") or "0"),
         )
+
+    # ------------------------------------------------------------------
+    # Phase 2: write surface.
+    # ------------------------------------------------------------------
+
+    async def _read_json(request: Request) -> Dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _send(result: Dict[str, Any]) -> JSONResponse:
+        # If the service signalled an HTTP gate (423), honor it.
+        if isinstance(result, dict) and "_http_status" in result:
+            status = int(result.pop("_http_status"))
+            return JSONResponse(result, status_code=status)
+        ok = bool(result.get("success"))
+        return JSONResponse(result, status_code=200 if ok else 400)
+
+    @app.get("/api/phase2")
+    def api_phase2(_: str = Depends(require_auth)) -> dict:
+        return p2.phase2_status()
+
+    @app.get("/api/phase2/capabilities")
+    def api_phase2_caps(exchange: str = Query(...), _: str = Depends(require_auth)) -> dict:
+        return p2.phase2_capabilities(exchange)
+
+    @app.post("/api/trade/preview_order")
+    async def api_preview_order(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.preview_order(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or "buy"),
+            order_type=str(body.get("order_type") or body.get("type") or "limit"),
+            size=str(body.get("size") or body.get("volume") or ""),
+            price=str(body.get("price") or ""),
+            market_type=str(body.get("market_type") or "futures"),
+            reduce_only=bool(body.get("reduce_only") or False),
+        )
+        return _send(out)
+
+    @app.post("/api/trade/preview_ladder")
+    async def api_preview_ladder(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.preview_ladder(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or "buy"),
+            distribution=str(body.get("distribution") or "uniform"),
+            order_count=body.get("order_count"),
+            total_size=str(body.get("total_size") or body.get("total_volume") or "0"),
+            start_price=str(body.get("start_price") or "0"),
+            end_price=str(body.get("end_price") or "0"),
+            market_type=str(body.get("market_type") or "futures"),
+            reduce_only=bool(body.get("reduce_only") or False),
+        )
+        return _send(out)
+
+    @app.post("/api/trade/execute")
+    async def api_trade_execute(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.execute_preview(str(body.get("preview_id") or ""))
+        return _send(out)
+
+    @app.post("/api/position/set_tp")
+    async def api_set_tp(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.set_tp(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+            price=str(body.get("price") or ""),
+        )
+        return _send(out)
+
+    @app.post("/api/position/set_sl")
+    async def api_set_sl(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.set_sl(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+            price=str(body.get("price") or ""),
+        )
+        return _send(out)
+
+    @app.post("/api/position/close")
+    async def api_close(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.close_position(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+        )
+        return _send(out)
+
+    @app.post("/api/orders/cancel_group")
+    async def api_cancel_group(request: Request, _: str = Depends(require_csrf)) -> JSONResponse:
+        body = await _read_json(request)
+        out = p2.cancel_order_group(
+            exchange=str(body.get("exchange") or ""),
+            account=str(body.get("account") or ""),
+            symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or "buy"),
+            order_type=str(body.get("order_type") or body.get("type") or "limit"),
+            order_ids=body.get("order_ids") if isinstance(body.get("order_ids"), list) else None,
+        )
+        return _send(out)
 
     return app
 

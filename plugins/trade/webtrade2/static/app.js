@@ -385,10 +385,37 @@
     const data = state.accountState || {};
     if (state.bottomTab === 'positions') {
       const rows = data.positions || [];
-      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Close</th></tr></thead><tbody>${rows.map(p => { const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); return `<tr><td>${fmt(p.symbol || p.instrument || p.market)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="muted">Read-only</td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
+      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Actions</th></tr></thead><tbody>${rows.map((p, idx) => { const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); return `<tr><td>${fmt(p.symbol || p.instrument || p.market)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="row-actions"><button class="row-action" data-pos-action="tp" data-pos-index="${idx}">TP</button><button class="row-action" data-pos-action="sl" data-pos-index="${idx}">SL</button><button class="row-action destructive" data-pos-action="close" data-pos-index="${idx}">CLOSE</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
+      box.querySelectorAll('[data-pos-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.posIndex, 10);
+          const pos = (data.positions || [])[idx];
+          if (!pos) return;
+          const action = btn.dataset.posAction;
+          if (action === 'close') return confirmClose(pos);
+          // TP/SL — prompt for price; modal requires explicit confirmation.
+          const label = action.toUpperCase();
+          const cur = action === 'tp' ? pos.tp : pos.sl;
+          const fallback = action === 'tp' ? pos.tp : pos.sl;
+          const entered = prompt(`${label} price for ${pos.symbol}${cur ? ` (current ${cur})` : ''}:`, fallback || '');
+          if (entered === null) return;
+          const price = String(entered).trim();
+          if (!price) return;
+          if (action === 'tp') return confirmTP(pos, price);
+          if (action === 'sl') return confirmSL(pos, price);
+        });
+      });
     } else if (state.bottomTab === 'orders') {
       const rows = data.order_groups || [];
-      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Orders</th><th>Status</th></tr></thead><tbody>${rows.map(o => { const side = fmt(o.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); return `<tr><td>${fmt(o.symbol || o.instrument || o.market)}</td><td class="${sideCls}">${fmt(o.side)}</td><td>${fmt(o.order_count || o.count || '')}</td><td>${fmt(o.status || 'open')}</td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No open orders</div>`;
+      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Orders</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows.map((o, idx) => { const side = fmt(o.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); return `<tr><td>${fmt(o.symbol || o.instrument || o.market)}</td><td class="${sideCls}">${fmt(o.side)}</td><td>${fmt(o.order_count || o.count || '')}</td><td>${fmt(o.status || 'open')}</td><td class="row-actions"><button class="row-action destructive" data-ord-action="cancel" data-ord-index="${idx}">CANCEL</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No open orders</div>`;
+      box.querySelectorAll('[data-ord-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.ordIndex, 10);
+          const ord = (data.order_groups || [])[idx];
+          if (!ord) return;
+          if (btn.dataset.ordAction === 'cancel') return confirmCancel(ord);
+        });
+      });
     } else {
       box.innerHTML = `<div class="empty">Fills are shown when the selected exchange exposes them.</div>`;
     }
@@ -496,16 +523,394 @@
     }
   }
 
+  // ---------------------------- Phase 2 ---------------------------------
+
+  // Local account persistence: ONLY the alias string per exchange.
+  const ACCOUNT_STORAGE_KEY = 'webtrade2.accounts.v1';
+
+  function loadAccountMap() {
+    try {
+      const raw = localStorage.getItem(ACCOUNT_STORAGE_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return {};
+      const out = {};
+      for (const k of Object.keys(obj)) {
+        if (typeof obj[k] === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(obj[k])) {
+          out[k] = obj[k];
+        }
+      }
+      return out;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function persistAccount(exchange, account) {
+    try {
+      const m = loadAccountMap();
+      if (!account) {
+        delete m[exchange];
+      } else {
+        m[exchange] = String(account);
+      }
+      localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(m));
+    } catch (_) { /* localStorage may be disabled */ }
+  }
+
+  function resolveStoredAccount(exchange, validAccounts) {
+    const map = loadAccountMap();
+    const stored = map[exchange];
+    if (stored && validAccounts.includes(stored)) return stored;
+    // Fallback to first valid account (safe).
+    return validAccounts[0] || null;
+  }
+
+  // Modal helpers
+  function showModal(title, contextRows, detailsHtml, onConfirm, confirmLabel = 'CONFIRM') {
+    const root = $('#modalRoot');
+    if (!root) return;
+    $('#modalTitle').textContent = title;
+    $('#modalContext').innerHTML = contextRows.map(r => `<div class="ctx-row"><span class="ctx-lbl">${r.label}</span><span class="ctx-val">${r.value}</span></div>`).join('');
+    $('#modalDetails').innerHTML = detailsHtml;
+    const btn = $('#modalConfirm');
+    btn.textContent = confirmLabel;
+    btn.disabled = false;
+    btn.dataset.inflight = '0';
+    btn.onclick = async () => {
+      if (btn.dataset.inflight === '1') return;
+      btn.dataset.inflight = '1';
+      btn.disabled = true;
+      const origText = btn.textContent;
+      btn.textContent = 'SUBMITTING…';
+      try {
+        const out = await onConfirm();
+        if (out !== false) {
+          hideModal();
+          if (out && typeof out === 'object') showResult(out);
+        }
+      } finally {
+        btn.dataset.inflight = '0';
+        btn.textContent = origText;
+        btn.disabled = false;
+      }
+    };
+    root.hidden = false;
+  }
+
+  function hideModal() {
+    const root = $('#modalRoot');
+    if (root) root.hidden = true;
+  }
+
+  function showResult(payload) {
+    const root = $('#resultRoot');
+    if (!root) return;
+    const status = String(payload.status || (payload.success ? 'OK' : 'ERROR'));
+    const statusEl = $('#resultStatus');
+    statusEl.className = 'result-status status-' + status.toLowerCase().replace(/_/g, '-');
+    statusEl.textContent = status;
+    // Pretty-print the full payload, stripping noisy fields for display.
+    const display = Object.assign({}, payload);
+    delete display.success;
+    $('#resultBody').textContent = JSON.stringify(display, null, 2);
+    root.hidden = false;
+  }
+
+  function hideResult() {
+    const root = $('#resultRoot');
+    if (root) root.hidden = true;
+  }
+
+  // Modal dismiss bindings (any element with data-modal-dismiss)
+  document.addEventListener('click', (e) => {
+    if (e.target?.hasAttribute?.('data-modal-dismiss')) hideModal();
+    if (e.target?.hasAttribute?.('data-result-dismiss')) hideResult();
+  });
+
+  function contextRows() {
+    return [
+      { label: 'Exchange', value: fmt(state.exchange) || '—' },
+      { label: 'Account', value: fmt(state.account) || '—' },
+      { label: 'Market Type', value: fmt(state.marketType) || 'futures' },
+      { label: 'Instrument', value: fmt(state.market?.symbol || $('#instrument')?.value) || '—' },
+    ];
+  }
+
+  // ---- Preview / confirm / execute -----------------------------------
+
+  let activeOrderPreview = null;     // {preview_id, ...}
+  let activeLadderPreview = null;
+  let previewCountdownTimer = null;
+
+  function clearPreviewCountdown() {
+    if (previewCountdownTimer) {
+      clearInterval(previewCountdownTimer);
+      previewCountdownTimer = null;
+    }
+  }
+
+  function startPreviewCountdown(expiresAtMs, onExpire) {
+    clearPreviewCountdown();
+    const tick = () => {
+      const remaining = Math.max(0, expiresAtMs - Date.now());
+      const els = document.querySelectorAll('.preview-expiry');
+      els.forEach(el => { el.textContent = `Preview expires in ${remaining}s`; });
+      if (remaining <= 0) {
+        clearPreviewCountdown();
+        if (typeof onExpire === 'function') onExpire();
+      }
+    };
+    tick();
+    previewCountdownTimer = setInterval(tick, 1000);
+  }
+
+  async function previewOrder() {
+    if (!state.exchange || !state.account) {
+      alert('Pick an exchange and account first.');
+      return;
+    }
+    const price = $('#orderPrice')?.value || '';
+    const size = $('#orderSize')?.value || '';
+    const reduceOnly = !!$('#reduceOnly')?.checked;
+    const side = ($('.side-row .seg.buy.active') ? 'buy' : 'sell');
+    const orderType = 'limit';
+    let body;
+    try {
+      body = await api('/api/trade/preview_order', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: state.exchange, account: state.account, market_type: state.marketType,
+          symbol: state.market?.symbol || $('#instrument')?.value || '',
+          side, order_type: orderType, size, price, reduce_only: reduceOnly,
+        }),
+      });
+    } catch (err) {
+      alert('Preview failed: ' + err.message);
+      return;
+    }
+    if (!body.success) {
+      alert('Preview rejected: ' + (body.error?.message || body.error?.code || 'unknown'));
+      return;
+    }
+    activeOrderPreview = body;
+    const summary = `${body.side.toUpperCase()} ${body.native_symbol} LIMIT @ ${body.final_price} × ${body.final_size} (notional ${body.notional})`;
+    $('#orderPreview .preview-summary').innerHTML = `
+      <div><span class="ctx-lbl">Side</span><span class="ctx-val">${body.side.toUpperCase()}</span></div>
+      <div><span class="ctx-lbl">Order Type</span><span class="ctx-val">LIMIT</span></div>
+      <div><span class="ctx-lbl">Final Price</span><span class="ctx-val">${fmt(body.final_price)}</span></div>
+      <div><span class="ctx-lbl">Final Size</span><span class="ctx-val">${fmt(body.final_size)}</span></div>
+      <div><span class="ctx-lbl">Notional</span><span class="ctx-val">${fmt(body.notional)}</span></div>
+      <div><span class="ctx-lbl">Reduce Only</span><span class="ctx-val">${body.reduce_only ? 'YES' : 'no'}</span></div>
+      <div class="muted">${summary}</div>`;
+    $('#orderPreview').hidden = false;
+    $('#orderPreview .confirm-action').disabled = false;
+    startPreviewCountdown(Date.now() + (body.expires_in_s || 300) * 1000, () => {
+      activeOrderPreview = null;
+      $('#orderPreview').hidden = true;
+    });
+    showModal(
+      'CONFIRM ORDER',
+      contextRows(),
+      `<div class="ctx-row"><span class="ctx-lbl">Side</span><span class="ctx-val">${body.side.toUpperCase()}</span></div>
+       <div><span class="ctx-lbl">Order Type</span><span class="ctx-val">LIMIT</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Final Price</span><span class="ctx-val">${fmt(body.final_price)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Final Size</span><span class="ctx-val">${fmt(body.final_size)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Notional</span><span class="ctx-val">${fmt(body.notional)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Reduce Only</span><span class="ctx-val">${body.reduce_only ? 'YES' : 'no'}</span></div>
+       <div class="muted">${summary}</div>`,
+      async () => {
+        try {
+          const r = await api('/api/trade/execute', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ preview_id: body.preview_id }),
+          });
+          activeOrderPreview = null;
+          $('#orderPreview').hidden = true;
+          clearPreviewCountdown();
+          await loadAccountState();
+          await loadMarkets();
+          return r;
+        } catch (err) {
+          alert('Execute failed: ' + err.message);
+          return false;
+        }
+      },
+      state.dryRun ? 'CONFIRM DRY RUN' : 'CONFIRM & SUBMIT'
+    );
+  }
+
+  async function previewLadderThenConfirm() {
+    if (!state.exchange || !state.account) {
+      alert('Pick an exchange and account first.');
+      return;
+    }
+    const symbol = state.market?.symbol || $('#instrument')?.value || '';
+    const startPrice = $('#ladderStart')?.value || '';
+    const endPrice = $('#ladderEnd')?.value || '';
+    const totalSize = $('#ladderSize')?.value || '';
+    const orderCount = parseInt($('#ladderCount')?.value || '0', 10);
+    const distribution = $('#ladderDistribution')?.value || 'uniform';
+    const side = state.ladderSide || 'buy';
+    let body;
+    try {
+      body = await api('/api/trade/preview_ladder', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: state.exchange, account: state.account, market_type: state.marketType,
+          symbol, side, distribution, order_count: orderCount, total_size: totalSize,
+          start_price: startPrice, end_price: endPrice,
+        }),
+      });
+    } catch (err) {
+      alert('Preview failed: ' + err.message);
+      return;
+    }
+    if (!body.success) {
+      alert('Preview rejected: ' + (body.error?.message || body.error?.code || 'unknown'));
+      return;
+    }
+    activeLadderPreview = body;
+    const childrenRows = (body.display_children || []).map(c => {
+      if (c.ellipsis) return `<tr><td colspan="2" class="muted">…</td></tr>`;
+      return `<tr><td>${fmt(c.price)}</td><td>${fmt(c.size)}</td></tr>`;
+    }).join('');
+    showModal(
+      'CONFIRM LADDER',
+      contextRows().concat([
+        { label: 'Side', value: body.side.toUpperCase() },
+        { label: 'Distribution', value: body.distribution },
+        { label: 'Start', value: fmt(body.start_price) },
+        { label: 'End', value: fmt(body.end_price) },
+      ]),
+      `<div class="ctx-row"><span class="ctx-lbl">Requested Orders</span><span class="ctx-val">${fmt(body.order_count)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Final Normalized Count</span><span class="ctx-val">${fmt(body.order_count)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Total Size</span><span class="ctx-val">${fmt(body.total_size)}</span></div>
+       <div class="ctx-row"><span class="ctx-lbl">Ladder VWAP</span><span class="ctx-val">${fmt(body.vwap)}</span></div>
+       <table class="modal-children"><thead><tr><th>PRICE</th><th>SIZE</th></tr></thead><tbody>${childrenRows}</tbody></table>`,
+      async () => {
+        try {
+          const r = await api('/api/trade/execute', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ preview_id: body.preview_id }),
+          });
+          activeLadderPreview = null;
+          clearPreviewCountdown();
+          await loadAccountState();
+          await loadMarkets();
+          return r;
+        } catch (err) {
+          alert('Execute failed: ' + err.message);
+          return false;
+        }
+      },
+      state.dryRun ? 'CONFIRM DRY RUN' : 'CONFIRM & SUBMIT'
+    );
+  }
+
+  async function confirmTP(position, newPrice) {
+    showModal('SET TAKE PROFIT', contextRows().concat([
+      { label: 'Position Side', value: fmt(position.side) },
+      { label: 'Position Size', value: fmt(position.size) },
+      { label: 'Entry', value: fmt(position.entry_price) },
+      { label: 'Mark', value: fmt(position.mark) },
+      { label: 'New TP', value: fmt(newPrice) },
+    ]), '', async () => {
+      const r = await api('/api/position/set_tp', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exchange: state.exchange, account: state.account, symbol: position.symbol, price: newPrice }),
+      });
+      await loadAccountState();
+      return r;
+    }, state.dryRun ? 'CONFIRM TP (DRY RUN)' : 'Confirm TP');
+  }
+
+  async function confirmSL(position, newPrice) {
+    showModal('SET STOP LOSS', contextRows().concat([
+      { label: 'Position Side', value: fmt(position.side) },
+      { label: 'Position Size', value: fmt(position.size) },
+      { label: 'Entry', value: fmt(position.entry_price) },
+      { label: 'Mark', value: fmt(position.mark) },
+      { label: 'New SL', value: fmt(newPrice) },
+    ]), '', async () => {
+      const r = await api('/api/position/set_sl', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exchange: state.exchange, account: state.account, symbol: position.symbol, price: newPrice }),
+      });
+      await loadAccountState();
+      return r;
+    }, state.dryRun ? 'CONFIRM SL (DRY RUN)' : 'Confirm SL');
+  }
+
+  async function confirmClose(position) {
+    showModal('CLOSE POSITION', contextRows().concat([
+      { label: 'Side', value: fmt(position.side) },
+      { label: 'Current Size', value: fmt(position.size) },
+      { label: 'Mark', value: fmt(position.mark) },
+      { label: 'Requested Close', value: 'Full Close' },
+    ]), '', async () => {
+      const r = await api('/api/position/close', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exchange: state.exchange, account: state.account, symbol: position.symbol }),
+      });
+      await loadAccountState();
+      return r;
+    }, state.dryRun ? 'CONFIRM CLOSE (DRY RUN)' : 'CONFIRM CLOSE');
+  }
+
+  async function confirmCancel(order) {
+    showModal('CANCEL ORDER', contextRows().concat([
+      { label: 'Side', value: fmt(order.side) },
+      { label: 'Price', value: fmt(order.price) },
+      { label: 'Remaining Size', value: fmt(order.size || order.remaining) },
+      { label: 'Order ID', value: fmt(order.order_id || order.id || '') },
+    ]), '', async () => {
+      const r = await api('/api/orders/cancel_group', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: state.exchange, account: state.account, symbol: order.symbol,
+          side: order.side, order_type: order.order_type || order.classification || 'limit',
+          order_ids: order.order_id ? [order.order_id] : undefined,
+        }),
+      });
+      await loadAccountState();
+      return r;
+    }, state.dryRun ? 'CONFIRM CANCEL (DRY RUN)' : 'CONFIRM CANCEL');
+  }
+
+  // ---- Capabilities / dry-run ----------------------------------------
+
+  async function loadPhase2Status() {
+    try {
+      const s = await api('/api/phase2');
+      state.dryRun = !!s.dry_run;
+      state.writeEnabled = !!s.write_enabled;
+      const banner = $('#dryRunBanner');
+      if (banner) banner.hidden = !state.dryRun;
+      const badge = $('#phaseBadge');
+      if (badge) {
+        if (!state.writeEnabled) {
+          badge.textContent = 'Phase 2 · Writes disabled';
+        } else if (state.dryRun) {
+          badge.textContent = 'Phase 2 · Dry-run';
+        } else {
+          badge.textContent = 'Phase 2 · LIVE';
+        }
+      }
+    } catch (_) { /* phase2 endpoint may not exist in older deployments */ }
+  }
+
   function wire() {
     document.querySelectorAll('[data-trade-tab]').forEach(btn => btn.addEventListener('click', () => setTradeTab(btn.dataset.tradeTab)));
     document.querySelectorAll('[data-mobile-target]').forEach(btn => btn.addEventListener('click', () => setMobileSection(btn.dataset.mobileTarget)));
     document.querySelectorAll('[data-bottom-tab]').forEach(btn => btn.addEventListener('click', () => { state.bottomTab = btn.dataset.bottomTab; document.querySelectorAll('[data-bottom-tab]').forEach(b => b.classList.toggle('active', b === btn)); renderBottom(); }));
     document.querySelectorAll('[data-timeframe]').forEach(btn => btn.addEventListener('click', () => setTimeframe(btn.dataset.timeframe)));
     $('#exchange')?.addEventListener('change', async (e) => { state.exchange = e.target.value; updateAccountsAndMarketTypes(); await refreshAll(); });
-    $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; await refreshAll(); });
+    $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; persistAccount(state.exchange, state.account); await refreshAll(); });
     $('#marketType')?.addEventListener('change', async (e) => { state.marketType = e.target.value; localStorage.setItem("webtrade2.marketType", state.marketType); await refreshAll(); });
     $('#marketSearch')?.addEventListener('input', () => loadMarkets().catch(() => {}));
     $('#previewLadder')?.addEventListener('click', () => previewLadder().catch(err => { const meta = $('#ladderPreview .preview-meta'); if (meta) meta.textContent = err.message; }));
+    $('#previewOrderBtn')?.addEventListener('click', () => previewOrder().catch(err => alert('Preview failed: ' + err.message)));
     $('#ladderBuy')?.addEventListener('click', () => { state.ladderSide = 'buy'; $('#ladderBuy')?.classList.add('active-side'); $('#ladderSell')?.classList.remove('active-side'); });
     $('#ladderSell')?.addEventListener('click', () => { state.ladderSide = 'sell'; $('#ladderSell')?.classList.add('active-side'); $('#ladderBuy')?.classList.remove('active-side'); });
     $('#loginForm')?.addEventListener('submit', async (e) => {
@@ -530,6 +935,7 @@
       const exchanges = await api('/api/exchanges');
       state.exchanges = exchanges.exchanges || [];
       renderSelectors();
+      await loadPhase2Status();
       await refreshAll();
     } catch (err) {
       showLogin(true, 'Sign in to load read-only data');

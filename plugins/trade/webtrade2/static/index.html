@@ -11,8 +11,9 @@
     <header class="topbar">
       <div class="brand-block">
         <div class="brand">WebTrade2</div>
-        <span class="badge">Phase 1 · Read-only</span>
+        <span id="phaseBadge" class="badge">Phase 2 · Dry-run</span>
       </div>
+      <div id="dryRunBanner" class="dry-run-banner" role="status" aria-live="polite">DRY RUN — NO LIVE ORDERS</div>
       <div class="selectors" aria-label="Trading selection hierarchy">
         <select id="exchange" aria-label="Exchange"><option>Exchange</option></select>
         <select id="account" aria-label="Account"><option>Account</option></select>
@@ -68,7 +69,12 @@
           <label>Size<input id="orderSize" inputmode="decimal" placeholder="0.00" /></label>
           <div class="quick"><button>25%</button><button>50%</button><button>75%</button><button>MAX</button></div>
           <label id="reduceOnlyWrap" class="checkline" hidden><input type="checkbox" id="reduceOnly" /> Reduce Only</label>
-          <button class="preview-action" disabled>Preview only — live trading disabled</button>
+          <button id="previewOrderBtn" class="preview-action">Preview Order</button>
+          <div id="orderPreview" class="trade-preview" aria-live="polite" hidden>
+            <div class="preview-summary"></div>
+            <button class="confirm-action" disabled>Confirm &amp; Submit</button>
+            <div class="preview-expiry"></div>
+          </div>
         </section>
 
         <section id="ladderPanel" class="trade-pane" role="tabpanel" hidden>
@@ -99,6 +105,43 @@
       </section>
     </section>
   </main>
+
+  <!-- Phase 2 confirmation modal -->
+  <div id="modalRoot" class="modal-root" hidden>
+    <div class="modal-backdrop" data-modal-dismiss></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header class="modal-header">
+        <h2 id="modalTitle">Confirm</h2>
+        <button class="modal-close" data-modal-dismiss aria-label="Close">×</button>
+      </header>
+      <section class="modal-body">
+        <div id="modalContext" class="modal-context"></div>
+        <div id="modalDetails" class="modal-details"></div>
+      </section>
+      <footer class="modal-footer">
+        <button class="ghost-action" data-modal-dismiss>Cancel</button>
+        <button id="modalConfirm" class="destructive-action">CONFIRM</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Phase 2 result modal -->
+  <div id="resultRoot" class="modal-root" hidden>
+    <div class="modal-backdrop" data-result-dismiss></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="resultTitle">
+      <header class="modal-header">
+        <h2 id="resultTitle">Result</h2>
+        <button class="modal-close" data-result-dismiss aria-label="Close">×</button>
+      </header>
+      <section class="modal-body">
+        <div id="resultStatus" class="result-status"></div>
+        <pre id="resultBody" class="result-body"></pre>
+      </section>
+      <footer class="modal-footer">
+        <button class="ghost-action" data-result-dismiss>Close</button>
+      </footer>
+    </div>
+  </div>
 
   <section id="loginPanel" class="login-panel" hidden>
     <form id="loginForm" class="login-card">

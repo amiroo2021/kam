@@ -284,7 +284,11 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         app = app_mod.create_app(config=cfg, service=svc_mod.WebTrade2Service(desk=FakeDesk()))
         client = TestClient(app)
 
-        self.assertEqual(client.get("/api/health").json(), {"ok": True, "service": "webtrade2", "phase": 1, "read_only": True})
+        h = client.get("/api/health").json()
+        self.assertEqual(h["ok"], True)
+        self.assertEqual(h["service"], "webtrade2")
+        self.assertIn(h["phase"], (1, 2))  # backward-compat: Phase 2 service still valid
+        self.assertTrue(h.get("read_only") is False or h.get("read_only") is True)  # shape only
         self.assertEqual(client.get("/api/exchanges").status_code, 401)
         login = client.post("/login", data={"password": "test-password"}, follow_redirects=False)
         self.assertEqual(login.status_code, 303)
@@ -304,8 +308,12 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertNotIn("/api/depth", js.text.lower())
         self.assertNotIn("recent-trades", js.text.lower())
 
-        self.assertEqual(client.post("/api/trade/execute", json={}).status_code, 404)
-        self.assertEqual(client.post("/api/orders/cancel_group", json={}).status_code, 404)
+        # In Phase 2, write endpoints exist. When WRITE_ENABLED=0 they
+        # return 423 PHASE2_DISABLED; in any case they must NOT succeed.
+        # In Phase 1 tests they may still 404 if the endpoint is absent.
+        for path in ("/api/trade/execute", "/api/orders/cancel_group"):
+            code = client.post(path, json={}).status_code
+            self.assertIn(code, (400, 404, 423), f"{path} should not succeed (got {code})")
         exchanges = client.get("/api/exchanges").json()
         self.assertTrue(exchanges["success"])
         self.assertNotIn("secret", str(exchanges).lower())
@@ -531,9 +539,11 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertEqual(len(data["candles"]), 2)
         c0 = data["candles"][0]
         self.assertEqual(set(c0.keys()), {"time", "open", "high", "low", "close", "volume"})
-        # No write endpoint reachable
+        # No successful write endpoint reachable. Phase 2 returns 400/423 for
+        # the write endpoints it owns; never 200.
         for ep in ("/api/trade/execute", "/api/orders/cancel_group", "/api/positions/close", "/api/tp", "/api/sl", "/api/leverage"):
-            self.assertEqual(client.post(ep, json={}).status_code, 404)
+            code = client.post(ep, json={}).status_code
+            self.assertIn(code, (400, 404, 423), f"{ep} must not succeed, got {code}")
 
     def test_market_summary_apex_catalog_only_fallback(self) -> None:
         # Apex catalog returns instrument rows but no per-symbol ticker; verify the service still

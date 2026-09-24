@@ -51,6 +51,10 @@ class WebTrade2Config:
     login_max_failures: int = 5
     login_lockout_seconds: int = 30
     preview_ttl_seconds: int = 300
+    # Phase 2: hard server-side kill switch + dry-run flag. Defaults to
+    # disabled read-only for safety; tests override explicitly.
+    write_enabled: bool = False
+    dry_run: bool = True
 
     def __post_init__(self) -> None:
         self.password = self.password or str(_env("WEBTRADE2_PASSWORD") or _env("TRADE_WEB_PASSWORD") or _env("WEB_PASSWORD") or "")
@@ -64,6 +68,9 @@ class WebTrade2Config:
         self.port = int(_env("WEBTRADE2_PORT", str(self.port)) or self.port)
         self.cookie_name = str(_env("WEBTRADE2_COOKIE_NAME", self.cookie_name) or self.cookie_name)
         self.csrf_cookie_name = str(_env("WEBTRADE2_CSRF_COOKIE_NAME", self.csrf_cookie_name) or self.csrf_cookie_name)
+        self.preview_ttl_seconds = int(_env("WEBTRADE2_PREVIEW_TTL_SECONDS", str(self.preview_ttl_seconds)) or self.preview_ttl_seconds)
+        self.write_enabled = _env_bool("WEBTRADE2_WRITE_ENABLED", self.write_enabled)
+        self.dry_run = _env_bool("WEBTRADE2_DRY_RUN", self.dry_run)
 
     @classmethod
     def from_values(
@@ -73,5 +80,37 @@ class WebTrade2Config:
         session_secret: str,
         port: int = 9009,
         host: str = "127.0.0.1",
+        write_enabled: bool = False,
+        dry_run: bool = True,
+        preview_ttl_seconds: int = 300,
     ) -> "WebTrade2Config":
-        return cls(password=password, session_secret=session_secret, port=port, host=host)
+        return cls(
+            password=password,
+            session_secret=session_secret,
+            port=port,
+            host=host,
+            write_enabled=write_enabled,
+            dry_run=dry_run,
+            preview_ttl_seconds=preview_ttl_seconds,
+        )
+
+    @classmethod
+    def from_env(cls) -> "WebTrade2Config":
+        """Build a config from current process env + ~/.hermes/.env.
+
+        Used by tests to spin up an app with the same env shape as
+        production.
+        """
+        return cls()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in {"1", "true", "yes", "on", "y"}:
+        return True
+    if s in {"0", "false", "no", "off", "n", ""}:
+        return False
+    return bool(default)
