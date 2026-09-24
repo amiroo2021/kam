@@ -19,11 +19,11 @@
     volumeSeries: null,
     chartReady: false,
     chartPollTimer: null,
-    selectedTimeframe: '1m',
-    defaultTimeframe: '1m',
+    selectedTimeframe: '15m',
+    defaultTimeframe: '15m',
     priceLines: [],
   };
-  const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1D'];
+  const TIMEFRAMES = ['15m', '1h', '4h', '1D'];
   const POLL_INTERVAL_MS = 10000;
   const HISTORY_LIMIT = 240;
 

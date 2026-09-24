@@ -22,7 +22,7 @@ Environment=HERMES_HOME=__HERMES_HOME__
 #                         webtrade2.service.
 #   PREVIEW_TTL_SECONDS=300 — preview_id validity window.
 Environment=WEBTRADE2_WRITE_ENABLED=1
-Environment=WEBTRADE2_DRY_RUN=0
+Environment=WEBTRADE2_DRY_RUN=1
 Environment=WEBTRADE2_LADDER_ENABLED=0
 Environment=WEBTRADE2_PREVIEW_TTL_SECONDS=300
 ExecStart=__HERMES_ROOT__/venv/bin/python -m plugins.trade.webtrade2

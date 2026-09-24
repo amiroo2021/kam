@@ -31,8 +31,14 @@
     <section class="grid workspace">
       <aside class="markets panel" data-mobile-section="markets">
         <div class="tabs market-tabs"><button class="active" data-market-tab="favorites">Favorites</button><button data-market-tab="all">All</button></div>
-        <input id="marketSearch" class="search" placeholder="Search markets" />
-        <div class="market-head"><span>Symbol</span><span style="text-align:right">Price</span><span style="text-align:right">24h</span><span style="text-align:right">Volume</span></div>
+        <div class="market-controls">
+          <input id="marketSearch" class="search" placeholder="Search markets" />
+          <select id="marketSort" class="market-sort" title="Sort markets">
+            <option value="volume">Vol 24h</option>
+            <option value="open_interest">Open Interest</option>
+            <option value="alpha">A–Z</option>
+          </select>
+        </div>
         <div id="markets" class="market-list"></div>
       </aside>
 
@@ -45,9 +51,7 @@
           <div><span class="lbl">Funding</span><strong id="funding" class="val">—</strong></div>
         </div>
         <div id="timeframes" class="timeframes" role="tablist" aria-label="Chart timeframe">
-          <button class="active" data-timeframe="1m">1m</button>
-          <button data-timeframe="5m">5m</button>
-          <button data-timeframe="15m">15m</button>
+          <button class="active" data-timeframe="15m">15m</button>
           <button data-timeframe="1h">1h</button>
           <button data-timeframe="4h">4h</button>
           <button data-timeframe="1D">1D</button>
