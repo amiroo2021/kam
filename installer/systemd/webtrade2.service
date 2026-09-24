@@ -1,0 +1,16 @@
+[Unit]
+Description=KAM WebTrade2 read-only trading terminal
+After=network.target
+# Independent from webtrade.service (:9001) and GoldenFibo
+
+[Service]
+Type=simple
+WorkingDirectory=__HERMES_ROOT__
+Environment=PYTHONPATH=__HERMES_ROOT__
+Environment=HERMES_HOME=__HERMES_HOME__
+ExecStart=__HERMES_ROOT__/venv/bin/python -m plugins.trade.webtrade2
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

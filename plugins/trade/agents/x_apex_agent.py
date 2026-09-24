@@ -874,6 +874,7 @@ def _positions_orders(account: str) -> CanonicalResponse:
             sl=prot.get("sl"),
             tp_count=prot.get("tp_count"),
             sl_count=prot.get("sl_count"),
+            mark=position.mark,
         ))
     return make_success(
         operation="positions_orders", exchange=name,
@@ -1821,19 +1822,32 @@ def _apex_enrich_positions_with_mark_pnl(
         except Exception:  # noqa: BLE001
             entry = Decimal("0")
         existing = _safe_decimal(position.pnl)
-        # Keep a non-zero server-provided PnL if present; otherwise compute.
-        if existing != 0:
-            enriched.append(position)
-            continue
-        if not symbol or size <= 0 or entry <= 0:
-            enriched.append(position)
-            continue
-        if symbol not in mark_cache:
+        # Keep a non-zero server-provided PnL if present, but still attach a
+        # ticker-derived mark when Apex exposes one.
+        if symbol not in mark_cache and symbol and size > 0:
             mark = _apex_fetch_mark_price(client, symbol)
             if mark <= 0 and "-" in symbol:
                 mark = _apex_fetch_mark_price(client, symbol.replace("-", ""))
             mark_cache[symbol] = mark
-        mark = mark_cache[symbol]
+        mark = mark_cache.get(symbol, Decimal("0"))
+        if existing != 0:
+            enriched.append(CanonicalPosition(
+                symbol=position.symbol,
+                side=position.side,
+                size=position.size,
+                entry_price=position.entry_price,
+                pnl=position.pnl,
+                tp=position.tp,
+                sl=position.sl,
+                tp_count=position.tp_count,
+                sl_count=position.sl_count,
+                exchange_instrument=getattr(position, "exchange_instrument", None),
+                mark=_format_decimal(mark) if mark > 0 else getattr(position, "mark", None),
+            ))
+            continue
+        if not symbol or size <= 0 or entry <= 0:
+            enriched.append(position)
+            continue
         if mark <= 0:
             enriched.append(position)
             continue
@@ -1855,6 +1869,7 @@ def _apex_enrich_positions_with_mark_pnl(
                 tp_count=position.tp_count,
                 sl_count=position.sl_count,
                 exchange_instrument=getattr(position, "exchange_instrument", None),
+                mark=_format_decimal(mark),
             )
         )
     return enriched

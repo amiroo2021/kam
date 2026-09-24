@@ -611,6 +611,9 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
                     "size_increment": _size_increment_from_sz_decimals(instrument.get("szDecimals")),
                     "sz_decimals": instrument.get("szDecimals"),
                     "mark_price": _decimal_text(mark) if mark is not None else None,
+                    "volume_24h": ctx.get("dayNtlVlm") or ctx.get("volume24h") or ctx.get("volume"),
+                    "change_24h": ctx.get("priceChange24h") or ctx.get("price24hPcnt"),
+                    "funding": ctx.get("funding") or ctx.get("fundingRate"),
                 }
             )
     _perp_market_candidates_cache = (now, [dict(item) for item in candidates])
@@ -662,6 +665,10 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
     mark = candidate.get("mark_price")
     if mark is not None and str(mark).strip():
         out["price"] = str(mark).strip()
+    for source_key, out_key in (("volume_24h", "volume_24h"), ("change_24h", "change_24h"), ("funding", "funding")):
+        value = candidate.get(source_key)
+        if value is not None and str(value).strip() != "":
+            out[out_key] = str(value).strip()
     dex = str(candidate.get("dex") or "").strip()
     # All surviving entries are perpetuals.
     out["market_type"] = "perp"

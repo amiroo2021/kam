@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>WebTrade2</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand">WebTrade2</div>
+        <span class="badge">Phase 1 · Read-only</span>
+      </div>
+      <div class="selectors" aria-label="Trading selection hierarchy">
+        <select id="exchange" aria-label="Exchange"><option>Exchange</option></select>
+        <select id="account" aria-label="Account"><option>Account</option></select>
+        <select id="marketType" aria-label="Market type"><option>Futures</option><option>Spot</option></select>
+        <input id="instrument" placeholder="Instrument" autocomplete="off" aria-label="Instrument" />
+      </div>
+    </header>
+
+    <nav id="mobileNav" class="mobile-nav" aria-label="Mobile sections">
+      <button data-mobile-target="markets" class="active">Markets</button>
+      <button data-mobile-target="trade">Trade</button>
+      <button data-mobile-target="bottom">Positions</button>
+    </nav>
+
+    <section class="grid workspace">
+      <aside class="markets panel" data-mobile-section="markets">
+        <div class="tabs market-tabs"><button class="active" data-market-tab="favorites">Favorites</button><button data-market-tab="all">All</button></div>
+        <input id="marketSearch" class="search" placeholder="Search markets" />
+        <div class="market-head"><span>Symbol</span><span style="text-align:right">Price</span><span style="text-align:right">24h</span><span style="text-align:right">Volume</span></div>
+        <div id="markets" class="market-list"></div>
+      </aside>
+
+      <section class="chart panel" data-mobile-section="chart">
+        <div id="marketHeader" class="market-header">
+          <div><span class="lbl">Instrument</span><strong id="marketSymbol" class="val">Select market</strong></div>
+          <div><span class="lbl">Current</span><strong id="currentPrice" class="val">—</strong></div>
+          <div><span class="lbl">24h Change</span><strong id="change24h" class="val">—</strong></div>
+          <div><span class="lbl">24h Volume</span><strong id="volume24h" class="val">—</strong></div>
+          <div><span class="lbl">Funding</span><strong id="funding" class="val">—</strong></div>
+        </div>
+        <div id="timeframes" class="timeframes" role="tablist" aria-label="Chart timeframe">
+          <button class="active" data-timeframe="1m">1m</button>
+          <button data-timeframe="5m">5m</button>
+          <button data-timeframe="15m">15m</button>
+          <button data-timeframe="1h">1h</button>
+          <button data-timeframe="4h">4h</button>
+          <button data-timeframe="1D">1D</button>
+        </div>
+        <div class="chart-wrap"><div id="chart" class="chart-canvas"></div></div>
+        <div class="overlay-hint">Read-only overlays planned for our data only: entry, open orders, ladders, TP, SL</div>
+      </section>
+
+      <aside class="trade panel" data-mobile-section="trade">
+        <div class="tabs trade-tabs" role="tablist" aria-label="Order and ladder tabs">
+          <button class="active" data-trade-tab="order" role="tab" aria-controls="orderPanel" aria-selected="true">ORDER</button>
+          <button data-trade-tab="ladder" role="tab" aria-controls="ladderPanel" aria-selected="false">LADDER</button>
+        </div>
+
+        <section id="orderPanel" class="trade-pane" role="tabpanel">
+          <div class="side-row"><button class="seg buy active">Buy</button><button class="seg sell">Sell</button></div>
+          <label>Order Type<select id="orderType"><option>Limit</option><option disabled>Market</option></select></label>
+          <label>Price<input id="orderPrice" inputmode="decimal" placeholder="0.00" /></label>
+          <label>Size<input id="orderSize" inputmode="decimal" placeholder="0.00" /></label>
+          <div class="quick"><button>25%</button><button>50%</button><button>75%</button><button>MAX</button></div>
+          <label id="reduceOnlyWrap" class="checkline" hidden><input type="checkbox" id="reduceOnly" /> Reduce Only</label>
+          <button class="preview-action" disabled>Preview only — live trading disabled</button>
+        </section>
+
+        <section id="ladderPanel" class="trade-pane" role="tabpanel" hidden>
+          <div class="side-row"><button id="ladderBuy" class="seg buy active-side">Buy</button><button id="ladderSell" class="seg sell">Sell</button></div>
+          <label>Start Price<input id="ladderStart" inputmode="decimal" placeholder="0.00" /></label>
+          <label>End Price<input id="ladderEnd" inputmode="decimal" placeholder="0.00" /></label>
+          <label>Total Size<input id="ladderSize" inputmode="decimal" placeholder="0.00" /></label>
+          <label>Number of Orders<input id="ladderCount" inputmode="numeric" value="12" /></label>
+          <label>Distribution<select id="ladderDistribution"><option value="uniform">Uniform</option><option value="half_gaussian">Half-Gaussian</option></select></label>
+          <button id="previewLadder" class="preview-action">Preview Ladder</button>
+          <section id="ladderPreview" class="ladder-preview" aria-live="polite">
+            <h3>Ladder Preview</h3>
+            <div class="preview-meta">Side · Instrument · Start · End · Orders · Total Size · Distribution · Ladder VWAP</div>
+            <table><thead><tr><th>PRICE</th><th>SIZE</th></tr></thead><tbody id="ladderPreviewRows"><tr><td colspan="2">No preview yet</td></tr></tbody></table>
+          </section>
+        </section>
+      </aside>
+
+      <section class="account-strip panel" data-mobile-section="account">
+        <span>Equity <strong id="equity">—</strong></span>
+        <span>Available <strong id="available">—</strong></span>
+        <span>Unrealized PnL <strong id="upnl">—</strong></span>
+      </section>
+
+      <section class="bottom panel" data-mobile-section="bottom">
+        <div class="tabs bottom-tabs"><button class="active" data-bottom-tab="positions">POSITIONS</button><button data-bottom-tab="orders">OPEN ORDERS</button><button data-bottom-tab="fills">FILLS</button></div>
+        <div id="dataPanel" class="data-table"></div>
+      </section>
+    </section>
+  </main>
+
+  <section id="loginPanel" class="login-panel" hidden>
+    <form id="loginForm" class="login-card">
+      <h1>WebTrade2</h1>
+      <p>Phase 1 read-only UI</p>
+      <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Password" />
+      <button type="submit" class="preview-action">Sign in</button>
+      <div id="loginError" class="error"></div>
+    </form>
+  </section>
+
+  <script src="/static/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
