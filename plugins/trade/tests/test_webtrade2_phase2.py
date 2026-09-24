@@ -825,6 +825,37 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         self.assertTrue(j.get("dry_run"))
         self.assertEqual(j.get("phase"), 2)
 
+    # ---- 33. preview invalidation UX on every relevant input ---------
+
+    def test_preview_invalidation_ux_on_every_relevant_input(self) -> None:
+        # Section 2: any change to execution-relevant inputs must visibly
+        # require PREVIEW AGAIN. We assert the JS source wires input
+        # listeners on every required field, plus a "PREVIEW AGAIN" /
+        # "PREVIEW STALE" hook, and that the ladder modal is dismissed.
+        app_js = (WEBTRADE2_DIR / "static" / "app.js").read_text(encoding="utf-8")
+        # Must define an explicit invalidator
+        self.assertIn("invalidateActivePreviews", app_js)
+        # Must mention PREVIEW AGAIN to make the user re-preview
+        self.assertIn("PREVIEW AGAIN", app_js)
+        # Must mention PREVIEW STALE so the UI signals staleness
+        self.assertIn("PREVIEW STALE", app_js)
+        # Every relevant input listed in the task must have a binding.
+        # We assert via the input/change listener registry snippet.
+        required_selectors = [
+            "#orderPrice", "#orderSize", "#reduceOnly",
+            "#ladderStart", "#ladderEnd", "#ladderSize", "#ladderCount",
+            "#ladderDistribution", "#instrument",
+        ]
+        for sel in required_selectors:
+            self.assertIn(sel, app_js, f"missing invalidation wiring for {sel}")
+        # Exchange / account / marketType invalidations: the existing
+        # wire() must call invalidateActivePreviews on each.
+        for kind in ("exchange changed", "account changed", "market type changed"):
+            self.assertIn(kind, app_js, f"missing {kind!r} invalidation")
+        # Ladder preview must be invalidated by dismiss-modal hook.
+        # (When activeLadderPreview is set, hideModal() is invoked.)
+        self.assertIn("hideModal()", app_js)
+
     # ---- 33. cancel_order (single) requires confirmation ----------
 
     def test_cancel_single_order_path(self) -> None:

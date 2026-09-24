@@ -643,6 +643,85 @@
   let activeLadderPreview = null;
   let previewCountdownTimer = null;
 
+  // ---- Preview invalidation ------------------------------------------
+  // Any change to execution-relevant inputs MUST visibly require
+  // PREVIEW AGAIN. We mark the active preview as stale (the server
+  // would also reject it because bindings changed) and rewrite the
+  // confirm button to read "PREVIEW AGAIN".
+  function invalidateActivePreviews(reason) {
+    const orderPreview = $('#orderPreview');
+    const ladderPreviewBlock = $('#ladderPreview');
+    let dirty = false;
+    if (activeOrderPreview) {
+      activeOrderPreview = null;
+      const sum = orderPreview?.querySelector?.('.preview-summary');
+      if (sum) {
+        const reasonText = reason ? ` — ${reason}` : '';
+        sum.innerHTML = `<div class="muted preview-stale">PREVIEW STALE${reasonText}. Click PREVIEW ORDER to refresh.</div>`;
+      }
+      const exp = orderPreview?.querySelector?.('.preview-expiry');
+      if (exp) exp.textContent = '';
+      const btn = orderPreview?.querySelector?.('.confirm-action');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'PREVIEW AGAIN';
+      }
+      clearPreviewCountdown();
+      dirty = true;
+    }
+    if (activeLadderPreview) {
+      activeLadderPreview = null;
+      // The ladder preview lives in the wizard modal context. The
+      // simplest UX is to dismiss any open confirm modal entirely so
+      // the user must re-preview.
+      hideModal();
+      dirty = true;
+    }
+    return dirty;
+  }
+
+  // Wire input-change invalidation. Use both 'input' (typing) and
+  // 'change' (committed) for select/checkbox elements.
+  ['#orderPrice', '#orderSize', '#reduceOnly'].forEach(sel => {
+    document.addEventListener('input', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews(`${sel.replace('#','')} changed`);
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews(`${sel.replace('#','')} changed`);
+    });
+  });
+  // Order side buttons (Buy/Sell)
+  document.addEventListener('click', (e) => {
+    if (e.target?.classList?.contains('seg') && e.target.closest('.side-row')) {
+      invalidateActivePreviews('side changed');
+    }
+  });
+  // Ladder inputs
+  ['#ladderStart', '#ladderEnd', '#ladderSize', '#ladderCount', '#ladderDistribution'].forEach(sel => {
+    document.addEventListener('input', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews(`${sel.replace('#','')} changed`);
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews(`${sel.replace('#','')} changed`);
+    });
+  });
+  // Instrument selection (typing into #instrument OR clicking a market row)
+  ['#instrument'].forEach(sel => {
+    document.addEventListener('input', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews('instrument changed');
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target?.matches?.(sel)) invalidateActivePreviews('instrument changed');
+    });
+  });
+  document.addEventListener('click', (e) => {
+    if (e.target?.closest?.('.market-row')) invalidateActivePreviews('market changed');
+  });
+  // Market type
+  document.addEventListener('change', (e) => {
+    if (e.target?.id === 'marketType') invalidateActivePreviews('market type changed');
+  });
+
   function clearPreviewCountdown() {
     if (previewCountdownTimer) {
       clearInterval(previewCountdownTimer);
@@ -905,8 +984,8 @@
     document.querySelectorAll('[data-mobile-target]').forEach(btn => btn.addEventListener('click', () => setMobileSection(btn.dataset.mobileTarget)));
     document.querySelectorAll('[data-bottom-tab]').forEach(btn => btn.addEventListener('click', () => { state.bottomTab = btn.dataset.bottomTab; document.querySelectorAll('[data-bottom-tab]').forEach(b => b.classList.toggle('active', b === btn)); renderBottom(); }));
     document.querySelectorAll('[data-timeframe]').forEach(btn => btn.addEventListener('click', () => setTimeframe(btn.dataset.timeframe)));
-    $('#exchange')?.addEventListener('change', async (e) => { state.exchange = e.target.value; updateAccountsAndMarketTypes(); await refreshAll(); });
-    $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; persistAccount(state.exchange, state.account); await refreshAll(); });
+    $('#exchange')?.addEventListener('change', async (e) => { state.exchange = e.target.value; invalidateActivePreviews('exchange changed'); updateAccountsAndMarketTypes(); await refreshAll(); });
+    $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; invalidateActivePreviews('account changed'); persistAccount(state.exchange, state.account); await refreshAll(); });
     $('#marketType')?.addEventListener('change', async (e) => { state.marketType = e.target.value; localStorage.setItem("webtrade2.marketType", state.marketType); await refreshAll(); });
     $('#marketSearch')?.addEventListener('input', () => loadMarkets().catch(() => {}));
     $('#previewLadder')?.addEventListener('click', () => previewLadder().catch(err => { const meta = $('#ladderPreview .preview-meta'); if (meta) meta.textContent = err.message; }));
