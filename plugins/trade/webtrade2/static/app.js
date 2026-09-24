@@ -13,6 +13,7 @@
     mobile: 'markets',
     ladderSide: 'buy',
     orderSide: 'buy',
+    marketSort: 'volume',
     chart: null,
     candleSeries: null,
     volumeSeries: null,
@@ -219,20 +220,68 @@
     try {
       data = await api(`/api/candles?${params}`);
     } catch (err) {
+      console.warn("[chart] /api/candles request failed:", err);
       return;
     }
-    const candles = (data && data.data && data.data.candles) || [];
-    const series = candles.map(c => ({
-      time: Math.floor(Number(c.time) / 1000),
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.close),
-    })).filter(c => Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && c.time > 0);
+    if (!data || !data.success || data.success === false) {
+      console.warn("[chart] /api/candles returned non-success:", data);
+      return;
+    }
+    const dataBlock = data.data || {};
+    const candles = Array.isArray(dataBlock.candles) ? dataBlock.candles : [];
+    if (candles.length === 0) {
+      console.warn("[chart] /api/candles returned 0 candles for", state.market.symbol, "tf=", state.selectedTimeframe);
+      return;
+    }
+    // Lightweight Charts v4.2 candle input:
+    //   { time: UTC seconds (number, integer), open, high, low, close }
+    //   times must be strictly ascending and unique.
+    // Normalize: enforce numbers, drop invalid rows, de-dup by time, sort asc.
+    const seen = new Set();
+    const series = [];
+    for (const c of candles) {
+      const t = Math.floor(Number(c.time));
+      const o = Number(c.open);
+      const h = Number(c.high);
+      const l = Number(c.low);
+      const cl = Number(c.close);
+      if (
+        !Number.isFinite(t) || t <= 0 ||
+        !Number.isFinite(o) || !Number.isFinite(h) ||
+        !Number.isFinite(l) || !Number.isFinite(cl)
+      ) {
+        continue;
+      }
+      if (seen.has(t)) continue;   // de-dup
+      seen.add(t);
+      series.push({ time: t, open: o, high: h, low: l, close: cl });
+    }
     series.sort((a, b) => a.time - b.time);
-    state.candleSeries.setData(series);
-    if (series.length) applyChartPrecision(series[series.length - 1].close);
-    state.chart.timeScale().fitContent();
+    if (series.length === 0) {
+      console.warn("[chart] 0 valid candle rows after normalization for", state.market.symbol);
+      return;
+    }
+    // Apply. If the container has zero size at this moment (boot race),
+    // defer setData one animation frame so LWC has a non-zero layout.
+    const applySetData = () => {
+      try {
+        state.candleSeries.setData(series);
+        applyChartPrecision(series[series.length - 1].close);
+        state.chart.timeScale().fitContent();
+        // Defer a second fitContent in case the chart container just resized.
+        requestAnimationFrame(() => {
+          try { state.chart && state.chart.timeScale().fitContent(); } catch (_) {}
+        });
+      } catch (err) {
+        console.error("[chart] setData threw for", state.market.symbol, "tf=", state.selectedTimeframe, err);
+      }
+    };
+    const rect = (state.chart && state.chart._container || document.getElementById('chart'))?.getBoundingClientRect?.();
+    if (!rect || rect.width < 1 || rect.height < 1) {
+      requestAnimationFrame(applySetData);
+    } else {
+      applySetData();
+    }
     await renderChartOverlays();
   }
 
@@ -287,10 +336,13 @@
     try { data = await api(`/api/candles?${params}`); } catch (_) { return; }
     const candles = (data && data.data && data.data.candles) || [];
     if (!candles.length) return;
+    // /api/candles returns seconds; Lightweight Charts update() takes the
+    // same shape. Incremental updates must NEVER call setData() here, or
+    // they would wipe the entire loaded history (zoom, scroll position).
     const sorted = candles.slice().sort((a, b) => Number(a.time) - Number(b.time));
     for (const c of sorted) {
-      const t = Math.floor(Number(c.time) / 1000);
-      if (!t || t <= 0) continue;
+      const t = Number(c.time);
+      if (!Number.isFinite(t) || t <= 0) continue;
       state.candleSeries.update({
         time: t,
         open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close),
@@ -310,21 +362,49 @@
   }
 
   // ---------------------------- Markets list --------------------------
+  function formatOpenInterest(market) {
+    // Apex returns openInterest in BASE quantity. Show the raw count
+    // plus a $ notional computed from price for cross-instrument ranking.
+    const o = num(market.openInterest);
+    if (o === null) return null;
+    const p = num(market.price || market.markPrice || market.lastPrice);
+    const qty = o.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    if (p === null || p <= 0) return qty;
+    const notional = o * p;
+    return `${qty} (${formatMoney(notional)})`;
+  }
+
   function renderMarkets(rows) {
     const box = $('#markets');
     if (!box) return;
     const visible = (rows || []).slice(0, 100);
     const selectedSymbol = state.market?.symbol;
-    box.innerHTML = visible.map(r => {
-      const priceTxt = formatDynamicPrice(r.price);
-      const chgTxt = formatPctChange(r.change_24h);
-      const volTxt = formatCompactVolume(r.volume_24h);
-      const chgCls = pnlClass(r.change_24h);
-      const selected = r.symbol === selectedSymbol ? ' selected' : '';
-      return `<button class="market-row${selected}" data-symbol="${fmt(r.symbol)}" title="${fmt(r.display_name || r.symbol)}">
-        <span class="sym">${fmt(r.symbol)}</span><span class="px">${priceTxt}</span><span class="chg ${chgCls}">${chgTxt}</span><span class="vol">${volTxt ?? '—'}</span>
-      </button>`;
-    }).join('') || `<div class="market-row"><span class="sym">No markets loaded</span><span class="px">—</span><span class="chg">—</span><span class="vol">—</span></div>`;
+    const sortMode = state.marketSort || 'volume';
+    const oiHeaderLabel = sortMode === 'open_interest' ? 'OI (Notional)' : 'OI';
+    box.innerHTML = `
+      <div class="market-head">
+        <span>Instrument</span>
+        <span>Price</span>
+        <span>24h</span>
+        <span>Vol 24h</span>
+        <span>${oiHeaderLabel}</span>
+      </div>
+      <div class="market-list-inner">${visible.map(r => {
+        const priceTxt = formatDynamicPrice(r.price);
+        const chgTxt = formatPctChange(r.change_24h);
+        const volTxt = formatCompactVolume(r.turnover24h || r.volume_24h);
+        const oiTxt = formatOpenInterest(r) ?? '—';
+        const chgCls = pnlClass(r.change_24h);
+        const selected = r.symbol === selectedSymbol ? ' selected' : '';
+        return `<button class="market-row${selected}" data-symbol="${fmt(r.symbol)}" title="${fmt(r.display_name || r.symbol)}">
+          <span class="sym">${fmt(r.symbol)}</span>
+          <span class="px">${priceTxt}</span>
+          <span class="chg ${chgCls}">${chgTxt}</span>
+          <span class="vol">${volTxt ?? '—'}</span>
+          <span class="oi">${oiTxt}</span>
+        </button>`;
+      }).join('') || `<div class="market-row empty"><span class="sym">No markets loaded</span><span class="px">—</span><span class="chg">—</span><span class="vol">—</span><span class="oi">—</span></div>`}</div>
+    `;
     box.querySelectorAll('[data-symbol]').forEach(btn => btn.addEventListener('click', () => selectMarket(btn.dataset.symbol)));
   }
 
@@ -425,7 +505,8 @@
   async function loadMarkets() {
     if (!state.exchange || !state.account) return;
     const search = $('#marketSearch')?.value || '';
-    const data = await api(`/api/markets?${new URLSearchParams({ exchange: state.exchange, account: state.account, market_type: state.marketType, search })}`);
+    const sort = state.marketSort || 'volume';
+    const data = await api(`/api/markets?${new URLSearchParams({ exchange: state.exchange, account: state.account, market_type: state.marketType, search, sort })}`);
     state.markets = data.markets || [];
     renderMarkets(state.markets);
     if (!state.market && state.markets.length) selectMarket(state.markets[0].symbol);
@@ -1045,6 +1126,10 @@
     $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; invalidateActivePreviews('account changed'); persistAccount(state.exchange, state.account); await refreshAll(); });
     $('#marketType')?.addEventListener('change', async (e) => { state.marketType = e.target.value; localStorage.setItem("webtrade2.marketType", state.marketType); await refreshAll(); });
     $('#marketSearch')?.addEventListener('input', () => loadMarkets().catch(() => {}));
+    $('#marketSort')?.addEventListener('change', (e) => {
+      state.marketSort = e.target.value || 'volume';
+      loadMarkets().catch(() => {});
+    });
     $('#previewLadder')?.addEventListener('click', () => previewLadder().catch(err => { const meta = $('#ladderPreview .preview-meta'); if (meta) meta.textContent = err.message; }));
     $('#previewOrderBtn')?.addEventListener('click', () => previewOrder().catch(err => alert('Preview failed: ' + err.message)));
     $('#orderBuy')?.addEventListener('click', () => { setOrderSide('buy'); invalidateActivePreviews('order side changed to buy'); });
