@@ -242,7 +242,13 @@
       return;
     }
     // Apply. If the container has zero size at this moment (boot race),
-    // defer setData one animation frame so LWC has a non-zero layout.
+    // wait for the chart's first ResizeObserver tick before setData so
+    // LWC actually has a non-zero canvas to draw into.
+    const container = document.getElementById('chart');
+    const containerHasSize = () => {
+      const rect = container?.getBoundingClientRect?.();
+      return !!rect && rect.width >= 1 && rect.height >= 1;
+    };
     const applySetData = () => {
       try {
         state.candleSeries.setData(series);
@@ -256,11 +262,37 @@
         console.error("[chart] setData threw for", state.market.symbol, "tf=", state.selectedTimeframe, err);
       }
     };
-    const rect = (state.chart && state.chart._container || document.getElementById('chart'))?.getBoundingClientRect?.();
-    if (!rect || rect.width < 1 || rect.height < 1) {
-      requestAnimationFrame(applySetData);
-    } else {
+    if (containerHasSize()) {
       applySetData();
+    } else {
+      // Wait for layout. ResizeObserver on the chart container, with
+      // a hard timeout fallback so we never strand the chart.
+      let observed = false;
+      let observer = null;
+      const onResize = () => {
+        if (!containerHasSize()) return;
+        if (observer) { observer.disconnect(); observer = null; }
+        applySetData();
+      };
+      if (typeof ResizeObserver !== 'undefined') {
+        observer = new ResizeObserver(onResize);
+        if (container) { observer.observe(container); observed = true; }
+      }
+      requestAnimationFrame(() => {
+        if (containerHasSize()) {
+          if (observer) { observer.disconnect(); observer = null; }
+          applySetData();
+          return;
+        }
+        if (!observed) applySetData(); // best-effort fallback
+      });
+      // Hard cap so we don't wait forever.
+      setTimeout(() => {
+        if (observer) { observer.disconnect(); observer = null; }
+        if (state.candleSeries && series.length && !state._chartPainted) {
+          applySetData();
+        }
+      }, 1500);
     }
     await renderChartOverlays();
   }
