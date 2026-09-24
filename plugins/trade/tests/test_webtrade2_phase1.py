@@ -203,12 +203,19 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertEqual(html_with_lib.status_code, 200)
         self.assertIn("LightweightCharts", html_with_lib.text)
 
-        # Timeframe selector 1m 5m 15m 1h 4h 1D; default 1m; chart container has id chart
-        for tf in ("1m", "5m", "15m", "1h", "4h", "1D"):
+        # Timeframe selector 15m 1h 4h 1D; default 15m; chart container has id chart.
+        # Backend candle support stays for 1m and 5m but those buttons
+        # are intentionally not shown in WebTrade2.
+        for tf in ("15m", "1h", "4h", "1D"):
             self.assertIn(f'data-timeframe="{tf}"', html)
+        for tf in ("1m", "5m"):
+            self.assertNotIn(f'data-timeframe="{tf}"', html,
+                             f"WebTrade2 UI must not show {tf}; ranking/display only")
         self.assertIn('id="chart"', html)
         self.assertIn('id="timeframes"', html)
-        self.assertIn('defaultTimeframe', js_text)
+        # Default timeframe is 15m
+        self.assertIn("defaultTimeframe: '15m'", js_text)
+        self.assertIn("selectedTimeframe: '15m'", js_text)
         # Should NOT use the old placeholder chart routine anymore
         self.assertNotIn("drawPlaceholderChart", js_text)
         # Initial load + incremental update paths present
@@ -386,7 +393,11 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertIn("position:sticky", css)
         self.assertIn("formatDynamicPrice", js)
         self.assertIn("formatSignedMoney", js)
-        self.assertIn("formatCompactVolume", js)
+        # WebTrade2 market panel is intentionally minimal — no compact volume
+        # formatter is needed because 24h volume is internal ranking only.
+        self.assertNotIn("formatCompactVolume", js)
+        self.assertNotIn("formatPctChange", js)
+        self.assertNotIn("formatOpenInterest", js)
         self.assertIn("p.mark", js)
         self.assertNotIn("orderbook", js.lower())
         self.assertNotIn("recent-trades", js.lower())
@@ -450,12 +461,17 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertNotIn("font-size:32px", css)
         self.assertNotIn("font-size:30px", css)
 
-    def test_visual_market_rows_are_table_like_not_cards(self) -> None:
+    def test_visual_market_rows_are_two_columns_instrument_price(self) -> None:
+        """WebTrade2 markets panel is intentionally minimal:
+        INSTRUMENT | PRICE only — no 24h change, no volume, no OI.
+        """
         css_path = Path(__file__).resolve().parents[1] / "webtrade2" / "static" / "style.css"
         html_path = Path(__file__).resolve().parents[1] / "webtrade2" / "static" / "index.html"
+        js_path = Path(__file__).resolve().parents[1] / "webtrade2" / "static" / "app.js"
         css = css_path.read_text(encoding="utf-8")
         html = html_path.read_text(encoding="utf-8")
-        # market head + market-row grid columns symbolize tabular layout
+        js = js_path.read_text(encoding="utf-8")
+        # market head + market-row 2-column grid in CSS
         self.assertIn(".market-head", css)
         self.assertIn(".market-row", css)
         # selected market uses subtle blue highlight, not big filled block
@@ -464,11 +480,39 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         self.assertIn('data-market-tab="favorites"', html)
         self.assertIn('data-market-tab="all"', html)
         self.assertIn('class="tabs market-tabs"', html)
-        # HTML preserves Symbols|Price|24h|Volume header
-        self.assertIn(">Symbol<", html)
-        self.assertIn(">Price<", html)
-        self.assertIn(">24h<", html)
-        self.assertIn(">Volume<", html)
+        # market list container present
+        self.assertIn('id="markets"', html)
+        self.assertIn('class="market-list"', html)
+        # markets panel shows ONLY search input (no sort dropdown anymore)
+        self.assertIn('id="marketSearch"', html)
+        self.assertNotIn('id="marketSort"', html)
+        # Render path emits Instrument + Price cells only (no 24h / Volume / OI cells).
+        self.assertIn("Instrument", js)
+        self.assertIn("Price", js)
+        # 24h change / volume / OI must NOT be used in the market row template
+        # (those columns are intentionally removed from the UI).
+        self.assertNotIn("class=\"chg", js)
+        self.assertNotIn("class=\"vol\"", js)
+        self.assertNotIn("class=\"oi\"", js)
+        self.assertNotIn("formatPctChange", js)
+        self.assertNotIn("formatOpenInterest", js)
+        # Tabular numeric alignment in the row CSS.
+        self.assertIn("font-variant-numeric:tabular-nums", css)
+        # Grid template uses exactly 2 columns: instrument | price.
+        # Column shape: 1fr auto (price hugs the right edge).
+        import re
+        # Match any value tokens like "1fr", "auto", "240px", "min-content".
+        m = re.search(r"\.market-row\s*\{[^}]*grid-template-columns:\s*([^;]+?)\s*(?:;|\})", css)
+        self.assertIsNotNone(m, "market-row grid-template-columns must be defined in CSS")
+        cols = m.group(1).split()
+        # Count all grid template columns (1fr, auto, px, etc.).
+        column_count = len(cols)
+        self.assertEqual(column_count, 2,
+                         f"market-row must be exactly 2-column (INSTRUMENT|PRICE), got {column_count}: {cols}")
+        # First column must be flexible (1fr or fr units); second is auto/fixed.
+        self.assertTrue(cols[0].endswith("fr"),
+                        f"first column should be flexible, got {cols[0]}")
+        self.assertIn(cols[1], ("auto", "max-content", "min-content", "fit-content"))
 
     def test_visual_positions_table_is_terminal_style(self) -> None:
         css_path = Path(__file__).resolve().parents[1] / "webtrade2" / "static" / "style.css"

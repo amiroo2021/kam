@@ -13,7 +13,6 @@
     mobile: 'markets',
     ladderSide: 'buy',
     orderSide: 'buy',
-    marketSort: 'volume',
     chart: null,
     candleSeries: null,
     volumeSeries: null,
@@ -46,17 +45,6 @@
     const sign = n > 0 ? '+' : '';
     return `${sign}$${n.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`;
   }
-  function formatCompactVolume(raw) {
-    if (raw === null || raw === undefined || raw === '') return null;
-    const n = num(raw);
-    if (n === null || n === 0) return null;
-    const abs = Math.abs(n);
-    const sign = n < 0 ? '-' : '';
-    if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2).replace(/\.?0+$/, '')}B`;
-    if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
-    if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1).replace(/\.0$/, '')}K`;
-    return `${sign}$${abs.toFixed(2).replace(/\.?0+$/, '') || '0'}`;
-  }
   function formatDynamicPrice(raw) {
     if (raw === null || raw === undefined || raw === '') return '—';
     const n = num(raw);
@@ -79,14 +67,6 @@
       out = Number(out).toLocaleString();
     }
     return out;
-  }
-  function formatPctChange(raw) {
-    if (raw === null || raw === undefined || raw === '') return '—';
-    const s = String(raw).replace('%', '');
-    const n = num(s);
-    if (n === null) return '—';
-    const sign = n > 0 ? '+' : '';
-    return `${sign}${n.toFixed(2)}%`;
   }
   function formatFunding(raw) {
     if (raw === null || raw === undefined || raw === '') return '—';
@@ -362,48 +342,30 @@
   }
 
   // ---------------------------- Markets list --------------------------
-  function formatOpenInterest(market) {
-    // Apex returns openInterest in BASE quantity. Show the raw count
-    // plus a $ notional computed from price for cross-instrument ranking.
-    const o = num(market.openInterest);
-    if (o === null) return null;
-    const p = num(market.price || market.markPrice || market.lastPrice);
-    const qty = o.toLocaleString(undefined, { maximumFractionDigits: 4 });
-    if (p === null || p <= 0) return qty;
-    const notional = o * p;
-    return `${qty} (${formatMoney(notional)})`;
-  }
-
+  //
+  // The market browser is intentionally minimal: INSTRUMENT | PRICE.
+  // 24h notional volume is internal ranking data only (known-volume rows
+  // first, descending; unknown-volume rows after).
+  // OI, 24h change, and the sort dropdown are NOT surfaced — WebTrade2
+  // is a Web-native trading surface, not a stats dashboard.
   function renderMarkets(rows) {
     const box = $('#markets');
     if (!box) return;
     const visible = (rows || []).slice(0, 100);
     const selectedSymbol = state.market?.symbol;
-    const sortMode = state.marketSort || 'volume';
-    const oiHeaderLabel = sortMode === 'open_interest' ? 'OI (Notional)' : 'OI';
     box.innerHTML = `
       <div class="market-head">
         <span>Instrument</span>
         <span>Price</span>
-        <span>24h</span>
-        <span>Vol 24h</span>
-        <span>${oiHeaderLabel}</span>
       </div>
       <div class="market-list-inner">${visible.map(r => {
         const priceTxt = formatDynamicPrice(r.price);
-        const chgTxt = formatPctChange(r.change_24h);
-        const volTxt = formatCompactVolume(r.turnover24h || r.volume_24h);
-        const oiTxt = formatOpenInterest(r) ?? '—';
-        const chgCls = pnlClass(r.change_24h);
         const selected = r.symbol === selectedSymbol ? ' selected' : '';
         return `<button class="market-row${selected}" data-symbol="${fmt(r.symbol)}" title="${fmt(r.display_name || r.symbol)}">
           <span class="sym">${fmt(r.symbol)}</span>
           <span class="px">${priceTxt}</span>
-          <span class="chg ${chgCls}">${chgTxt}</span>
-          <span class="vol">${volTxt ?? '—'}</span>
-          <span class="oi">${oiTxt}</span>
         </button>`;
-      }).join('') || `<div class="market-row empty"><span class="sym">No markets loaded</span><span class="px">—</span><span class="chg">—</span><span class="vol">—</span><span class="oi">—</span></div>`}</div>
+      }).join('') || `<div class="market-row empty"><span class="sym">No markets loaded</span><span class="px">—</span></div>`}</div>
     `;
     box.querySelectorAll('[data-symbol]').forEach(btn => btn.addEventListener('click', () => selectMarket(btn.dataset.symbol)));
   }
@@ -419,27 +381,17 @@
       priceEl.textContent = formatDynamicPrice(price);
       priceEl.classList.remove('pos', 'neg');
     }
-    const chgEl = $('#change24h');
-    if (chgEl) {
-      chgEl.textContent = formatPctChange(state.market?.change_24h);
-      chgEl.className = 'val ' + pnlClass(state.market?.change_24h);
-    }
-    const volEl = $('#volume24h');
-    if (volEl) {
-      const txt = formatCompactVolume(state.market?.volume_24h);
-      volEl.textContent = txt || '—';
-      volEl.className = 'val';
-    }
+    // Funding only — no 24h Change, no 24h Volume, no OI.
     const fEl = $('#funding');
+    if (!fEl) return;
     if (state.marketType === 'spot') {
-      if (fEl) { fEl.textContent = '—'; fEl.className = 'val muted'; }
-    } else {
-      const fVal = priceData?.funding || state.market?.funding;
-      if (fEl) {
-        fEl.textContent = formatFunding(fVal);
-        fEl.className = 'val';
-      }
+      fEl.textContent = '—';
+      fEl.className = 'val muted';
+      return;
     }
+    const fVal = priceData?.funding || state.market?.funding;
+    fEl.textContent = formatFunding(fVal);
+    fEl.className = 'val';
   }
 
   function renderAccountState(data) {
@@ -505,8 +457,9 @@
   async function loadMarkets() {
     if (!state.exchange || !state.account) return;
     const search = $('#marketSearch')?.value || '';
-    const sort = state.marketSort || 'volume';
-    const data = await api(`/api/markets?${new URLSearchParams({ exchange: state.exchange, account: state.account, market_type: state.marketType, search, sort })}`);
+    // sort=volume (server default) keeps known-volume rows first desc,
+    // unknown-volume rows after. Same ranking applied to search/favorites.
+    const data = await api(`/api/markets?${new URLSearchParams({ exchange: state.exchange, account: state.account, market_type: state.marketType, search })}`);
     state.markets = data.markets || [];
     renderMarkets(state.markets);
     if (!state.market && state.markets.length) selectMarket(state.markets[0].symbol);
@@ -1126,10 +1079,8 @@
     $('#account')?.addEventListener('change', async (e) => { state.account = e.target.value; invalidateActivePreviews('account changed'); persistAccount(state.exchange, state.account); await refreshAll(); });
     $('#marketType')?.addEventListener('change', async (e) => { state.marketType = e.target.value; localStorage.setItem("webtrade2.marketType", state.marketType); await refreshAll(); });
     $('#marketSearch')?.addEventListener('input', () => loadMarkets().catch(() => {}));
-    $('#marketSort')?.addEventListener('change', (e) => {
-      state.marketSort = e.target.value || 'volume';
-      loadMarkets().catch(() => {});
-    });
+    // (No explicit sort selector — the server defaults to volume-desc
+    // ranking for all markets including search/favorites results.)
     $('#previewLadder')?.addEventListener('click', () => previewLadder().catch(err => { const meta = $('#ladderPreview .preview-meta'); if (meta) meta.textContent = err.message; }));
     $('#previewOrderBtn')?.addEventListener('click', () => previewOrder().catch(err => alert('Preview failed: ' + err.message)));
     $('#orderBuy')?.addEventListener('click', () => { setOrderSide('buy'); invalidateActivePreviews('order side changed to buy'); });
@@ -1166,7 +1117,7 @@
       await refreshAll();
     } catch (err) {
       showLogin(true, 'Sign in to load read-only data');
-      renderMarkets([{symbol:'Login required', price:'—', change_24h:'—', volume_24h:'—'}]);
+      renderMarkets([{symbol:'Login required', price:'—'}]);
     }
   }
 

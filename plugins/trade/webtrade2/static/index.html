@@ -33,11 +33,6 @@
         <div class="tabs market-tabs"><button class="active" data-market-tab="favorites">Favorites</button><button data-market-tab="all">All</button></div>
         <div class="market-controls">
           <input id="marketSearch" class="search" placeholder="Search markets" />
-          <select id="marketSort" class="market-sort" title="Sort markets">
-            <option value="volume">Vol 24h</option>
-            <option value="open_interest">Open Interest</option>
-            <option value="alpha">A–Z</option>
-          </select>
         </div>
         <div id="markets" class="market-list"></div>
       </aside>
@@ -46,8 +41,6 @@
         <div id="marketHeader" class="market-header">
           <div><span class="lbl">Instrument</span><strong id="marketSymbol" class="val">Select market</strong></div>
           <div><span class="lbl">Current</span><strong id="currentPrice" class="val">—</strong></div>
-          <div><span class="lbl">24h Change</span><strong id="change24h" class="val">—</strong></div>
-          <div><span class="lbl">24h Volume</span><strong id="volume24h" class="val">—</strong></div>
           <div><span class="lbl">Funding</span><strong id="funding" class="val">—</strong></div>
         </div>
         <div id="timeframes" class="timeframes" role="tablist" aria-label="Chart timeframe">
