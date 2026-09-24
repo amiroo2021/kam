@@ -12,6 +12,7 @@
     bottomTab: 'positions',
     mobile: 'markets',
     ladderSide: 'buy',
+    orderSide: 'buy',
     chart: null,
     candleSeries: null,
     volumeSeries: null,
@@ -690,12 +691,9 @@
       if (e.target?.matches?.(sel)) invalidateActivePreviews(`${sel.replace('#','')} changed`);
     });
   });
-  // Order side buttons (Buy/Sell)
-  document.addEventListener('click', (e) => {
-    if (e.target?.classList?.contains('seg') && e.target.closest('.side-row')) {
-      invalidateActivePreviews('side changed');
-    }
-  });
+  // Order side buttons (#orderBuy / #orderSell) and ladder side buttons
+  // (#ladderBuy / #ladderSell) are wired directly below in wire(); this
+  // generic delegated listener is no longer needed for side toggling.
   // Ladder inputs
   ['#ladderStart', '#ladderEnd', '#ladderSize', '#ladderCount', '#ladderDistribution'].forEach(sel => {
     document.addEventListener('input', (e) => {
@@ -744,6 +742,37 @@
     previewCountdownTimer = setInterval(tick, 1000);
   }
 
+  // ---- Authoritative order-side state -------------------------------
+  //
+  // The order BUY/SELL buttons were previously a DOM-as-state anti-pattern:
+  // the click handler invalidated previews but never mutated state, and
+  // previewOrder() derived side from `$('.side-row .seg.buy.active')` —
+  // i.e. from CSS classes on the DOM. Because the .active class was only
+  // set in the initial HTML and never toggled, the side was permanently
+  // 'buy' regardless of which button the user tapped.
+  //
+  // Fix: single authoritative state.orderSide = 'buy' | 'sell'; click
+  // handlers update state AND DOM in lockstep; previewOrder reads state
+  // only — never the DOM.
+
+  function setOrderSide(side) {
+    const normalized = (side === 'sell') ? 'sell' : 'buy';
+    state.orderSide = normalized;
+    const buyBtn = $('#orderBuy');
+    const sellBtn = $('#orderSell');
+    if (buyBtn) buyBtn.classList.toggle('active', normalized === 'buy');
+    if (sellBtn) sellBtn.classList.toggle('active', normalized === 'sell');
+  }
+
+  function setLadderSide(side) {
+    const normalized = (side === 'sell') ? 'sell' : 'buy';
+    state.ladderSide = normalized;
+    const buyBtn = $('#ladderBuy');
+    const sellBtn = $('#ladderSell');
+    if (buyBtn) buyBtn.classList.toggle('active', normalized === 'buy');
+    if (sellBtn) sellBtn.classList.toggle('active', normalized === 'sell');
+  }
+
   async function previewOrder() {
     if (!state.exchange || !state.account) {
       alert('Pick an exchange and account first.');
@@ -752,7 +781,7 @@
     const price = $('#orderPrice')?.value || '';
     const size = $('#orderSize')?.value || '';
     const reduceOnly = !!$('#reduceOnly')?.checked;
-    const side = ($('.side-row .seg.buy.active') ? 'buy' : 'sell');
+    const side = (state.orderSide === 'sell') ? 'sell' : 'buy';
     const orderType = 'limit';
     let body;
     try {
@@ -1018,8 +1047,10 @@
     $('#marketSearch')?.addEventListener('input', () => loadMarkets().catch(() => {}));
     $('#previewLadder')?.addEventListener('click', () => previewLadder().catch(err => { const meta = $('#ladderPreview .preview-meta'); if (meta) meta.textContent = err.message; }));
     $('#previewOrderBtn')?.addEventListener('click', () => previewOrder().catch(err => alert('Preview failed: ' + err.message)));
-    $('#ladderBuy')?.addEventListener('click', () => { state.ladderSide = 'buy'; $('#ladderBuy')?.classList.add('active-side'); $('#ladderSell')?.classList.remove('active-side'); });
-    $('#ladderSell')?.addEventListener('click', () => { state.ladderSide = 'sell'; $('#ladderSell')?.classList.add('active-side'); $('#ladderBuy')?.classList.remove('active-side'); });
+    $('#orderBuy')?.addEventListener('click', () => { setOrderSide('buy'); invalidateActivePreviews('order side changed to buy'); });
+    $('#orderSell')?.addEventListener('click', () => { setOrderSide('sell'); invalidateActivePreviews('order side changed to sell'); });
+    $('#ladderBuy')?.addEventListener('click', () => { setLadderSide('buy'); invalidateActivePreviews('ladder side changed to buy'); });
+    $('#ladderSell')?.addEventListener('click', () => { setLadderSide('sell'); invalidateActivePreviews('ladder side changed to sell'); });
     $('#loginForm')?.addEventListener('submit', async (e) => {
       e.preventDefault();
       const password = $('#loginPassword')?.value || '';
@@ -1035,6 +1066,10 @@
     setTimeframe(state.defaultTimeframe);
     setTradeTab(state.tradeTab);
     setMobileSection(state.mobile);
+    // Sync side-button DOM with authoritative state (defensive: in case
+    // the HTML default diverges from state.orderSide on load).
+    setOrderSide(state.orderSide);
+    setLadderSide(state.ladderSide);
     try {
       const session = await api('/api/session');
       state.csrf = session.csrf;

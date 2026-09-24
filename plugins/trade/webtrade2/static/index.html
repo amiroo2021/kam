@@ -63,7 +63,7 @@
         </div>
 
         <section id="orderPanel" class="trade-pane" role="tabpanel">
-          <div class="side-row"><button class="seg buy active">Buy</button><button class="seg sell">Sell</button></div>
+          <div class="side-row" id="orderSideRow"><button id="orderBuy" class="seg buy active" type="button">Buy</button><button id="orderSell" class="seg sell" type="button">Sell</button></div>
           <label>Order Type<select id="orderType"><option>Limit</option><option disabled>Market</option></select></label>
           <label>Price<input id="orderPrice" inputmode="decimal" placeholder="0.00" /></label>
           <label>Size<input id="orderSize" inputmode="decimal" placeholder="0.00" /></label>
@@ -78,7 +78,7 @@
         </section>
 
         <section id="ladderPanel" class="trade-pane" role="tabpanel" hidden>
-          <div class="side-row"><button id="ladderBuy" class="seg buy active-side">Buy</button><button id="ladderSell" class="seg sell">Sell</button></div>
+          <div class="side-row" id="ladderSideRow"><button id="ladderBuy" class="seg buy active" type="button">Buy</button><button id="ladderSell" class="seg sell" type="button">Sell</button></div>
           <label>Start Price<input id="ladderStart" inputmode="decimal" placeholder="0.00" /></label>
           <label>End Price<input id="ladderEnd" inputmode="decimal" placeholder="0.00" /></label>
           <label>Total Size<input id="ladderSize" inputmode="decimal" placeholder="0.00" /></label>
