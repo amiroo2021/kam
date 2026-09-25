@@ -236,6 +236,68 @@ class WebTrade2Phase1Tests(unittest.TestCase):
         searched = service.markets("hyperliquid", "FIBO", "futures", search="e")
         self.assertEqual([m["symbol"] for m in searched["markets"]], ["ETH", "ZED"])
 
+    def test_market_sort_kwarg_accepted_and_ranking_preserved(self) -> None:
+        """Interface compatibility fix: ``service.markets`` must accept
+        the ``sort=...`` keyword argument that ``app.py``'s
+        ``/api/markets`` handler always passes without raising
+        ``TypeError``. The existing ranking semantics must remain
+        unchanged regardless of which ``sort`` value is passed in this
+        checkpoint (no new sorting behavior is added).
+        """
+        svc_mod = importlib.import_module("plugins.trade.webtrade2.service")
+        service = svc_mod.WebTrade2Service(desk=FakeDesk())
+
+        # 1. Keyword-arg call with the production default must not raise.
+        out_default = service.markets(
+            "hyperliquid", "FIBO", "futures", sort="volume"
+        )
+        self.assertTrue(out_default.get("success"), out_default)
+        # Ranking is quote-turnover descending with unknown-volume rows
+        # in alphabetical tail — this MUST be preserved by the minimal fix.
+        self.assertEqual(
+            [m["symbol"] for m in out_default["markets"]],
+            ["BTC", "ETH", "ABC", "ZED"],
+        )
+        self.assertEqual(
+            [m["volume_24h"] for m in out_default["markets"]],
+            ["1000", "500", None, None],
+        )
+
+        # 2. Keyword-arg call with a non-default value must also not raise
+        #    and must produce the SAME ranking (no new behavior this
+        #    checkpoint).
+        for sort_value in ("volume", "name", "change", "funding", ""):
+            out_x = service.markets(
+                "hyperliquid", "FIBO", "futures", sort=sort_value
+            )
+            self.assertTrue(
+                out_x.get("success"),
+                f"sort={sort_value!r} returned {out_x}",
+            )
+            self.assertEqual(
+                [m["symbol"] for m in out_x["markets"]],
+                ["BTC", "ETH", "ABC", "ZED"],
+                f"ranking changed for sort={sort_value!r}",
+            )
+
+        # 3. Positional call (back-compat) still works without TypeError.
+        out_pos = service.markets("hyperliquid", "FIBO", "futures")
+        self.assertTrue(out_pos.get("success"), out_pos)
+        self.assertEqual(
+            [m["symbol"] for m in out_pos["markets"]],
+            ["BTC", "ETH", "ABC", "ZED"],
+        )
+
+        # 4. Search combined with sort=... still works.
+        out_search = service.markets(
+            "hyperliquid", "FIBO", "futures", search="e", sort="volume"
+        )
+        self.assertTrue(out_search.get("success"), out_search)
+        self.assertEqual(
+            [m["symbol"] for m in out_search["markets"]],
+            ["ETH", "ZED"],
+        )
+
     def test_ladder_preview_display_vwap_and_final_normalized_children(self) -> None:
         svc_mod = importlib.import_module("plugins.trade.webtrade2.service")
         service = svc_mod.WebTrade2Service(desk=FakeDesk(), session_secret="unit-secret")

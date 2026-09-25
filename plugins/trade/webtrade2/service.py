@@ -230,7 +230,15 @@ class WebTrade2Service:
             raise ValueError("WRITE_OPERATION_DISABLED")
         return self.desk.execute(request)
 
-    def markets(self, exchange: str, account: str, market_type: str = "futures", search: str = "") -> Dict[str, Any]:
+    def markets(self, exchange: str, account: str, market_type: str = "futures", search: str = "",
+                sort: str = "volume") -> Dict[str, Any]:
+        # NOTE: ``sort`` is accepted for interface compatibility with
+        # ``app.py``'s ``/api/markets`` handler, which always passes
+        # ``sort=sort`` as a keyword argument. The existing ranking
+        # semantics (quote/notional turnover descending, unknown-volume
+        # rows in alphabetical tail, never base-volume fallback) are
+        # preserved EXACTLY by the downstream ``_rank_markets`` call.
+        # We do not add new sorting behavior in this checkpoint.
         caps = set(self.desk.capabilities(exchange) or [])
         rows: List[Dict[str, Any]] = []
 
