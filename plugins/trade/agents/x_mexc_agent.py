@@ -25,6 +25,7 @@ TradeDesk and the Telegram wizard MUST remain exchange-agnostic.
 """
 
 from __future__ import annotations
+from datetime import datetime, timezone
 from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import hashlib
@@ -54,6 +55,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -240,6 +242,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -2294,6 +2297,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _list_instruments(account, request)
         if operation == "market_price":
             return _market_price(account, request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(account, request)
         if operation == "candles":
             return handle_candles_operation(name, account, request)
     except Exception as exc:  # noqa: BLE001
@@ -2310,4 +2315,250 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         account=account,
         code="NOT_IMPLEMENTED",
         message=f"MEXC does not implement '{operation}' yet.",
+    )
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Canonical get_tickers (Batch 4a — MEXC BULK_NATIVE)
+# ---------------------------------------------------------------------------
+# Reuses the existing MEXC contract catalog cache (``_CONTRACT_CACHE``) and
+# fetches all dynamic ticker rows in ONE bulk request
+# (``GET /api/v1/contract/ticker`` with NO ``symbol`` parameter).
+# No per-symbol fan-out. Mixed quote currencies (USDT/USDC/USD/USD1) are
+# preserved as distinct instruments. Catalog rows that lack a ticker row are
+# still emitted (with dynamic fields set to ``None``) so identity is never
+# lost. ``volume_24h_base`` is NEVER a WebTrade2 ranking fallback.
+
+
+MEXC_GET_TICKERS_TTL_SECONDS = 30
+MEXC_GET_TICKERS_SOURCE = "mexc_contract_ticker_bulk"
+
+
+def _now_iso() -> str:
+    try:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    except Exception:  # noqa: BLE001
+        return None  # type: ignore[return-value]
+
+
+def _mexc_safe_decimal(value: Any) -> Optional[Decimal]:
+    """Convert a raw MEXC value to ``Decimal`` if non-zero, else ``None``.
+
+    MEXC returns ``0`` / ``"0"`` for absent numeric fields; we map those to
+    ``None`` so WebTrade2 can render ``—`` rather than fabricating a ``0``.
+    """
+    if value is None:
+        return None
+    try:
+        d = Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return None
+    if d == 0:
+        return None
+    return d
+
+
+def _fetch_ticker_bulk(credentials: Mapping[str, str]) -> List[Dict[str, Any]]:
+    """Bulk ticker fetch — one HTTP call returns ALL contracts.
+
+    Endpoint: ``GET /api/v1/contract/ticker`` with NO ``symbol`` parameter.
+    Returns the list of dynamic rows from ``data[]``.
+    """
+    payload = _contract_request(credentials, "GET", "/api/v1/contract/ticker")
+    if not _contract_ok(payload):
+        raise RuntimeError(
+            str(payload.get("message") or payload.get("msg") or payload.get("code")
+                or "ticker bulk failed")
+        )
+    rows = payload.get("data") or []
+    if not isinstance(rows, list):
+        return []
+    return [dict(r) for r in rows if isinstance(r, Mapping)]
+
+
+def _mexc_decimal_to_str(value: Any) -> Optional[str]:
+    """Convert a raw MEXC numeric value to canonical str (or None)."""
+    d = _mexc_safe_decimal(value)
+    if d is None:
+        return None
+    return _format_decimal(d)
+
+
+def _mexc_build_market_price(
+    symbol: str,
+    meta: Mapping[str, Any],
+    raw: Optional[Mapping[str, Any]],
+) -> CanonicalMarketPrice:
+    """Compose the canonical CanonicalMarketPrice for one MEXC contract."""
+    base = str(meta.get("base") or "")
+    quote = str(meta.get("quote") or "")
+    contract_size = meta.get("contract_size")
+    if contract_size is None or contract_size == 0:
+        contract_size = Decimal("1")
+    vol_unit = meta.get("vol_unit")
+    if vol_unit is None or vol_unit == 0:
+        vol_unit = Decimal("1")
+    price_unit = meta.get("price_unit")
+    min_vol = meta.get("min_vol")
+    if min_vol is None or min_vol == 0:
+        min_vol = Decimal("1")
+
+    size_increment = contract_size * vol_unit
+    minimum_size = min_vol * contract_size
+
+    price_inc_dec = price_unit if price_unit and price_unit > 0 else None
+
+    display_name = str(meta.get("display") or "").strip() or f"{base}/{quote}"
+
+    if raw is None:
+        return CanonicalMarketPrice(
+            requested_symbol=symbol,
+            market=symbol,
+            symbol=symbol,
+            native_symbol=symbol,
+            display_symbol=base or symbol,
+            display_name=display_name,
+            base=base,
+            quote=quote,
+            market_type="perp",
+            price_increment=_format_decimal(price_inc_dec) if price_inc_dec else None,
+            size_increment=_format_decimal(size_increment),
+            minimum_size=_format_decimal(minimum_size),
+            minimum_notional=None,
+            mark_price=None,
+            oracle_price=None,
+            last_external_price=None,
+            last_updated_time=None,
+            price=None,
+            volume_24h_base=None,
+            volume_24h_quote=None,
+            turnover_24h=None,
+            change_24h_pct=None,
+            funding_rate=None,
+            open_interest=None,
+        )
+
+    fair = _mexc_decimal_to_str(raw.get("fairPrice"))
+    last = _mexc_decimal_to_str(raw.get("lastPrice"))
+    index = _mexc_decimal_to_str(raw.get("indexPrice"))
+    turnover = _mexc_decimal_to_str(raw.get("amount24"))
+    vol_base = _mexc_decimal_to_str(raw.get("volume24"))
+    oi = _mexc_decimal_to_str(raw.get("holdVol"))
+    funding = _mexc_decimal_to_str(raw.get("fundingRate"))
+
+    rise = raw.get("riseFallRate")
+    if rise is None or str(rise) == "0":
+        change_pct: Optional[str] = None
+    else:
+        try:
+            d = Decimal(str(rise))
+            change_pct = _format_decimal(d * Decimal("100")) if d != 0 else None
+        except Exception:  # noqa: BLE001
+            change_pct = None
+
+    return CanonicalMarketPrice(
+        requested_symbol=symbol,
+        market=symbol,
+        symbol=symbol,
+        native_symbol=symbol,
+        display_symbol=base or symbol,
+        display_name=display_name,
+        base=base,
+        quote=quote,
+        market_type="perp",
+        price_increment=_format_decimal(price_inc_dec) if price_inc_dec else None,
+        size_increment=_format_decimal(size_increment),
+        minimum_size=_format_decimal(minimum_size),
+        minimum_notional=None,
+        mark_price=fair,
+        oracle_price=index,
+        last_external_price=last,
+        last_updated_time=None,
+        price=fair,
+        volume_24h_base=vol_base,
+        volume_24h_quote=turnover,
+        turnover_24h=turnover,
+        change_24h_pct=change_pct,
+        funding_rate=funding,
+        open_interest=oi,
+    )
+
+
+def _execute_get_tickers(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Canonical ``get_tickers`` dispatcher.
+
+    1. Reuse ``_ensure_contracts`` (catalog, cached for ``_CONTRACT_CACHE_TTL``).
+    2. ONE bulk ticker request via ``_fetch_ticker_bulk``.
+    3. Join on venue-native contract symbol.
+    4. Preserve quote currencies and catalog rows even when no ticker row.
+    """
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set MEXC_<ACCOUNT>_ACCESSKEY and MEXC_<ACCOUNT>_SECRETKEY.",
+        )
+
+    try:
+        by_symbol, by_base = _ensure_contracts(credentials)
+        bulk_rows = _fetch_ticker_bulk(credentials)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=credentials["account"],
+            code="MEXC_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+
+    bulk_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for row in bulk_rows:
+        sym = str(row.get("symbol") or "").strip()
+        if sym:
+            bulk_by_symbol[sym] = row
+            compact = sym.replace("_", "")
+            if compact and compact not in bulk_by_symbol:
+                bulk_by_symbol[compact] = row
+
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    failed: List[str] = []
+    seen: set[str] = set()
+
+    # Iterate catalog by symbol (canonical join key).
+    for sym_key, meta in sorted(by_symbol.items()):
+        if not isinstance(meta, Mapping):
+            continue
+        venue_symbol = str(meta.get("symbol") or "").strip()
+        if not venue_symbol or venue_symbol in seen:
+            continue
+        # Skip by_base-style alias entries (e.g. bare "BTC" key).
+        if "_" not in venue_symbol:
+            continue
+        seen.add(venue_symbol)
+        raw = bulk_by_symbol.get(venue_symbol) or bulk_by_symbol.get(
+            venue_symbol.replace("_", "")
+        )
+        mp = _mexc_build_market_price(venue_symbol, meta, raw)
+        tickers[venue_symbol] = mp
+
+    batch = CanonicalTickersBatch(
+        tickers=tickers,
+        failed_symbols=tuple(failed),
+        fetched_at=_now_iso(),
+        ttl_seconds=MEXC_GET_TICKERS_TTL_SECONDS,
+        stale_symbols=(),
+        refresh_status="ok",
+        source=MEXC_GET_TICKERS_SOURCE,
+        served_from_cache=False,
+    )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=credentials["account"],
+        tickers_batch=batch,
     )
