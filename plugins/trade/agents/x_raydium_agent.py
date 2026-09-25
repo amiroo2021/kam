@@ -36,14 +36,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
-    CanonicalMarketPrice,
     CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -164,6 +165,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -1645,6 +1647,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _raydium_resolve_instrument(account, request)
     if operation == "list_instruments":
         return _raydium_list_instruments(account, request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(account, request)
     if operation == "market_price":
         return _raydium_market_price(account, request)
     if operation == "candles":
@@ -1655,4 +1659,247 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         account=account,
         code="NOT_IMPLEMENTED",
         message=f"Raydium does not support operation '{operation}' yet.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical ``get_tickers`` (Batch 3)
+# ---------------------------------------------------------------------------
+#
+# Raydium (Orderly) exposes its full perp catalog via ``/v1/public/info``
+# and its bulk dynamic data via ``/v1/public/futures``. ``list_instruments``
+# already composes both; ``get_tickers`` reuses the same join key
+# (the venue-native Orderly symbol like ``PERP_BTC_USDC``) so identity
+# cannot drift between the catalog and the canonical ticker snapshot.
+#
+# Field mapping (verified by code-evidence + single bulk probe):
+#   /v1/public/info: symbol, display_symbol_name, quote_tick, base_tick,
+#                    base_min, min_notional, price_scope
+#   /v1/public/futures: mark_price, index_price, last_funding_rate,
+#                       open_interest, 24h_open/close/high/low/volume/amount
+#
+# Semantics:
+#   * 24h_amount → quote/USDC volume → turnover_24h (also mapped to
+#     volume_24h_quote because the canonical contract treats them as
+#     aliases). NOT fabricated from base volume.
+#   * 24h_volume → base-asset volume → volume_24h_base (surfaced but
+#     never used for WebTrade2 ranking).
+#   * change_24h_pct is derived from the venue-provided 24h_open and
+#     24h_close anchor prices — a direct arithmetic on real venue data,
+#     not a fabrication from a current snapshot.
+#   * Zero / blank values map to ``None`` so WebTrade2 renders "—"
+#     rather than "0".
+#   * Orderly does not publish a per-market current funding rate as a
+#     raw decimal field — the funding_* values in /v1/public/info are
+#     config (clamp/multiplier). ``funding_rate`` is therefore populated
+#     from ``last_funding_rate`` in /v1/public/futures, which is the
+#     venue-published last-settled funding rate.
+
+
+def _raydium_decimal_or_none(value: Any) -> Optional["Decimal"]:
+    from decimal import Decimal as _Decimal
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _Decimal(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _raydium_decimal_text(value: Any) -> Optional[str]:
+    decimal_value = _raydium_decimal_or_none(value)
+    if decimal_value is None or decimal_value <= 0:
+        return None
+    rendered = format(decimal_value.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".") or "0"
+    return rendered
+
+
+def _raydium_first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _raydium_filter_symbols(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Bulk canonical ticker snapshot for Raydium (Orderly).
+
+    Two upstream calls per invocation, identical to ``_raydium_list_instruments``:
+
+    * ``/v1/public/info``     — catalog + ticks + minimums + min_notional.
+    * ``/v1/public/futures``  — mark / index / funding / OI / 24h metrics.
+
+    Join key is the native Orderly ``symbol`` (e.g. ``PERP_BTC_USDC``);
+    no per-symbol fan-out, no per-symbol ``/v1/public/info/{symbol}`` calls.
+    """
+    try:
+        info_payload = _public_get("/v1/public/info")
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account or "",
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    info_data = info_payload.get("data") if isinstance(info_payload, dict) else None
+    info_rows: List[Dict[str, Any]] = []
+    if isinstance(info_data, dict):
+        raw_rows = info_data.get("rows") or []
+        if isinstance(raw_rows, list):
+            info_rows = [r for r in raw_rows if isinstance(r, dict)]
+    elif isinstance(info_data, list):
+        info_rows = [r for r in info_data if isinstance(r, dict)]
+    if not info_rows:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account or "",
+            code="MARKETS_READ_FAILED",
+            message="Raydium public info missing rows.",
+        )
+
+    # Optional dynamic futures snapshot. We treat this as best-effort;
+    # missing or failed call yields rows with None dynamic fields
+    # rather than a hard failure.
+    fut_by_symbol: Dict[str, Dict[str, Any]] = {}
+    try:
+        fut_payload = _public_get("/v1/public/futures")
+        fut_data = fut_payload.get("data") if isinstance(fut_payload, dict) else None
+        fut_rows: List[Dict[str, Any]] = []
+        if isinstance(fut_data, dict):
+            raw_rows = fut_data.get("rows") or []
+            if isinstance(raw_rows, list):
+                fut_rows = [r for r in raw_rows if isinstance(r, dict)]
+        elif isinstance(fut_data, list):
+            fut_rows = [r for r in fut_data if isinstance(r, dict)]
+        for row in fut_rows:
+            sym = str(row.get("symbol") or "").strip()
+            if sym:
+                fut_by_symbol[sym] = row
+    except Exception:  # noqa: BLE001
+        pass
+
+    filters = _raydium_filter_symbols(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for row in info_rows:
+        native = str(row.get("symbol") or "").strip()
+        if not native:
+            continue
+        if filters and native not in filters:
+            continue
+        display = str(
+            row.get("display_symbol_name")
+            or _symbol_from_orderly(native)
+            or native
+        ).strip() or native
+        # Quote ticker: prefer the info row's quote_ticker/quote_token,
+        # default to USDC since these are all USDC-settled perps on
+        # Orderly.
+        quote = str(
+            row.get("quote_ticker")
+            or row.get("quote_token")
+            or "USDC"
+        ).strip().upper() or "USDC"
+        base = str(
+            row.get("base_ticker")
+            or row.get("base_token")
+            or display
+        ).strip().upper() or display
+        quote_tick = _raydium_decimal_text(row.get("quote_tick"))
+        base_tick = _raydium_decimal_text(row.get("base_tick"))
+        min_size = _raydium_decimal_text(_raydium_first_present(
+            row.get("base_min"), row.get("min_quantity"),
+        ))
+        min_notional = _raydium_decimal_text(row.get("min_notional"))
+
+        fut = fut_by_symbol.get(native) or {}
+        mark = _raydium_decimal_text(_raydium_first_present(
+            fut.get("mark_price"), fut.get("markPrice"),
+        ))
+        oracle = _raydium_decimal_text(_raydium_first_present(
+            fut.get("index_price"), fut.get("indexPrice"),
+        ))
+        funding = _raydium_decimal_text(_raydium_first_present(
+            fut.get("last_funding_rate"), fut.get("est_funding_rate"),
+        ))
+        open_interest = _raydium_decimal_text(fut.get("open_interest"))
+        # Quote-volume alias (24h_amount is USDC turnover).
+        turnover = _raydium_decimal_text(fut.get("24h_amount"))
+        quote_volume = turnover
+        base_volume = _raydium_decimal_text(fut.get("24h_volume"))
+        # change_24h_pct derived from venue-provided 24h anchors.
+        change_decimal: Optional["Decimal"] = None
+        try:
+            from decimal import Decimal as _Decimal
+            open_d = fut.get("24h_open")
+            close_d = fut.get("24h_close")
+            if open_d is not None and close_d is not None:
+                op = _Decimal(str(open_d))
+                cl = _Decimal(str(close_d))
+                if op > 0:
+                    change_decimal = (cl - op) / op * _Decimal("100")
+        except Exception:  # noqa: BLE001
+            change_decimal = None
+        change_text: Optional[str] = None
+        if change_decimal is not None and change_decimal.is_finite():
+            rendered = format(change_decimal.normalize(), "f")
+            if "." in rendered:
+                rendered = rendered.rstrip("0").rstrip(".") or "0"
+            change_text = rendered
+
+        tickers[native] = CanonicalMarketPrice(
+            requested_symbol=native,
+            market=native,
+            symbol=native,
+            native_symbol=native,
+            display_symbol=display,
+            display_name=display,
+            base=base,
+            quote=quote,
+            market_type="perp",
+            mark_price=mark,
+            price=mark,
+            oracle_price=oracle,
+            funding_rate=funding,
+            open_interest=open_interest,
+            turnover_24h=turnover,
+            volume_24h_quote=quote_volume,
+            volume_24h_base=base_volume,
+            change_24h_pct=change_text,
+            price_increment=quote_tick,
+            size_increment=base_tick,
+            minimum_size=min_size,
+            minimum_notional=min_notional,
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account or "",
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            source="raydium_orderly_public",
+            refresh_status="ok",
+        ),
     )

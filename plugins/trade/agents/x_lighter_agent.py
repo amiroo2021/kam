@@ -42,6 +42,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -798,6 +799,7 @@ def capabilities() -> List[str]:
         "candles",
         # Public instrument resolve + Phase 2.4 catalog/price readers.
         "resolve_instrument", "list_instruments", "market_price",
+        "get_tickers",
     ]
 
 
@@ -5865,7 +5867,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Missing operation.",
         )
-    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "list_instruments", "market_price", "candles", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order"}:
+    if operation not in {"balance", "positions_orders", "positions_management", "set_tp", "set_sl", "close_position", "new_order", "ladder", "cancel_order_group", "resolve_instrument", "list_instruments", "market_price", "candles", "position_state", "get_order_state", "get_order_state_by_client_id", "market_constraints", "cancel_order", "get_tickers"}:
         return make_failure(
             operation=operation,
             exchange=name,
@@ -5902,6 +5904,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_resolve_instrument(request)
         if operation == "list_instruments":
             return _execute_list_instruments(request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(request)
         if operation == "market_price":
             return _execute_market_price(request)
         if operation == "candles":
@@ -5934,3 +5938,215 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             code="LIGHTER_ERROR",
             message=sanitize_error_message(str(exc) or "Lighter request failed."),
         )
+
+
+# ---------------------------------------------------------------------------
+# Canonical ``get_tickers`` (Batch 3)
+# ---------------------------------------------------------------------------
+#
+# Lighter's existing ``_fetch_market_catalog`` returns the merged
+# ``order_book_details`` + ``spot_order_book_details`` payload — one
+# bulk HTTP call. Crucially, every entry already carries the venue-native
+# ``market_type`` ("perp" or "spot"), so we do NOT need the current
+# ``list_instruments`` re-fetch dance (which does a second + third call
+# to tag entries by symbol membership). ``get_tickers`` reads the
+# ``market_type`` field directly from each row, preserving spot/perp
+# identity without per-symbol fan-out.
+#
+# Dynamic data lives in the same payload: ``mark_price`` / ``index_price``
+# / ``last_trade_price`` (real mark + index + last), ``daily_*_volume``
+# (24h quote and base), ``daily_price_change`` (24h change percent,
+# already a percentage on the venue), and ``open_interest``. Lighter
+# does NOT publish a per-row current funding rate — ``funding_*`` fields
+# are config (clamp/multiplier). So ``funding_rate`` stays ``None``.
+# Unavailable / zero / blank values are mapped to ``None`` rather than
+# left as the string "0" so WebTrade2 renders "—".
+
+
+def _lighter_first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _lighter_decimal_or_none(value: Any) -> Optional["Decimal"]:
+    from decimal import Decimal as _Decimal
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _Decimal(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _lighter_decimal_text(value: Any) -> Optional[str]:
+    decimal_value = _lighter_decimal_or_none(value)
+    if decimal_value is None or decimal_value <= 0:
+        return None
+    rendered = format(decimal_value.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".") or "0"
+    return rendered
+
+
+def _lighter_filter_symbols(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().upper()
+        if text:
+            out.append(text)
+    return out
+
+
+def _lighter_market_type_from_entry(entry: Dict[str, Any]) -> Optional[str]:
+    """Read ``market_type`` from a single catalog row verbatim.
+
+    Lighter's payload carries the venue-native value ("perp" or "spot");
+    we never infer it from symbol membership — that would collapse
+    spot/perp rows that share the same base symbol.
+    """
+    value = entry.get("market_type")
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("perp", "perpetual"):
+            return "perp"
+        if cleaned in ("spot",):
+            return "spot"
+    return None
+
+
+def _execute_get_tickers(request: Dict[str, Any]) -> CanonicalResponse:
+    """Bulk canonical ticker snapshot for Lighter.
+
+    Single upstream call: ``/api/v1/orderBookDetails`` (already used by
+    ``_execute_list_instruments`` and ``_resolve_market``). All per-row
+    mark/index/last price, 24h quote & base volume, 24h change, open
+    interest, and spot/perp identity come from the same response — no
+    per-symbol fan-out, no extra fetch.
+
+    Lighter does not publish per-row funding rate, so ``funding_rate``
+    stays ``None`` per the brief.
+    """
+    account = str(request.get("account") or "").strip()
+    credentials = _lookup_credentials(account) if account else None
+    if credentials is not None:
+        base_url = credentials["base_url"]
+    else:
+        base_url = _LIGHTER_DEFAULT_BASE_URL
+    try:
+        catalog = _fetch_market_catalog(base_url)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    if not isinstance(catalog, list):
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message="Lighter catalog returned an unexpected payload shape.",
+        )
+    filters = _lighter_filter_symbols(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for entry in catalog:
+        if not isinstance(entry, dict):
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        if filters and symbol not in filters:
+            continue
+        market_type = _lighter_market_type_from_entry(entry)
+        # Quote / base: Lighter uses bare-base symbols for perps
+        # ("ETH", "BTC") and "BASE/QUOTE" form for spot ("UNI/USDC").
+        # Preserve symbol verbatim as ``base`` / ``display_symbol``.
+        if market_type == "spot" and "/" in symbol:
+            base_part, _, quote_part = symbol.partition("/")
+            base = base_part.strip().upper() or None
+            quote = quote_part.strip().upper() or None
+        else:
+            base = symbol
+            quote = "USD" if market_type == "perp" else None
+        display_name = symbol
+        display_symbol = base or symbol
+        # Per-row dynamic data. Zero / blank → None (no fake 0).
+        mark = _lighter_decimal_text(_lighter_first_present(
+            entry.get("mark_price"),
+            entry.get("markPrice"),
+        ))
+        oracle = _lighter_decimal_text(_lighter_first_present(
+            entry.get("index_price"),
+            entry.get("indexPrice"),
+        ))
+        last_external = _lighter_decimal_text(_lighter_first_present(
+            entry.get("last_trade_price"),
+            entry.get("lastTradePrice"),
+        ))
+        # Lighter aliases:
+        #   daily_quote_token_volume -> turnover_24h / volume_24h_quote
+        #   daily_base_token_volume  -> volume_24h_base
+        #   daily_price_change       -> change_24h_pct
+        turnover = _lighter_decimal_text(entry.get("daily_quote_token_volume"))
+        quote_volume = _lighter_decimal_text(entry.get("daily_quote_token_volume"))
+        base_volume = _lighter_decimal_text(entry.get("daily_base_token_volume"))
+        change_24h = _lighter_decimal_text(entry.get("daily_price_change"))
+        open_interest = _lighter_decimal_text(entry.get("open_interest"))
+        # Lighter publishes size_decimals / price_decimals, not ticks. We
+        # do not fabricate a tick string from decimals here; ``None`` is
+        # safer than a wrong-derived step. ``minimum_size`` and
+        # ``minimum_notional`` come from ``min_base_amount`` and
+        # ``min_quote_amount`` respectively — preserve as text without
+        # numeric coercion so a fixture like "0.0001" survives verbatim.
+        def _tick_text(value: Any) -> Optional[str]:
+            d = _lighter_decimal_or_none(value)
+            if d is None or d <= 0:
+                return None
+            return format(d.normalize(), "f")
+        tickers[symbol] = CanonicalMarketPrice(
+            requested_symbol=symbol,
+            market=str(entry.get("market_id") or symbol),
+            symbol=symbol,
+            native_symbol=symbol,
+            display_symbol=display_symbol,
+            display_name=display_name,
+            base=base,
+            quote=quote,
+            market_type=market_type,
+            mark_price=mark,
+            price=mark,
+            oracle_price=oracle,
+            last_external_price=last_external,
+            turnover_24h=turnover,
+            volume_24h_quote=quote_volume,
+            volume_24h_base=base_volume,
+            change_24h_pct=change_24h,
+            open_interest=open_interest,
+            minimum_size=_lighter_decimal_text(entry.get("min_base_amount")),
+            minimum_notional=_lighter_decimal_text(entry.get("min_quote_amount")),
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            source="lighter_order_book_details",
+            refresh_status="ok",
+        ),
+    )
