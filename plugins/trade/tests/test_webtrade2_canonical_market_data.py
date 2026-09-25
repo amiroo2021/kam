@@ -148,6 +148,7 @@ class WebTrade2CanonicalMarketDataTests(unittest.TestCase):
             "nado": ["list_instruments", "get_tickers"],
             "lighter": ["list_instruments", "get_tickers"],
             "raydium": ["list_instruments", "get_tickers"],
+            "edgex": ["list_instruments", "get_tickers"],
         }
         responses: Dict[str, Any] = {}
         for venue, caps in venues.items():
@@ -190,11 +191,13 @@ class WebTrade2CanonicalMarketDataTests(unittest.TestCase):
                 r"exchange\s*==\s*['\"]nado['\"]",
                 r"exchange\s*==\s*['\"]lighter['\"]",
                 r"exchange\s*==\s*['\"]raydium['\"]",
+                r"exchange\s*==\s*['\"]edgex['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]arcus['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]ondoperps['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]nado['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]lighter['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]raydium['\"]",
+                r"exchange\.lower\(\)\s*==\s*['\"]edgex['\"]",
             ):
                 for match in re.finditer(needle, text):
                     line_start = text.rfind("\n", 0, match.start()) + 1

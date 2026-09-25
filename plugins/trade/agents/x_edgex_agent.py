@@ -41,14 +41,15 @@ from edgex_sdk.quote.client import PriceType
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
-    CanonicalMarketPrice,
     CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -136,6 +137,7 @@ def capabilities() -> List[str]:
         # Phase 2.4: catalog + public ticker/mark price.
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -1356,9 +1358,557 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(account, request)
     if operation == "candles":
         return handle_candles_operation(name, account, request)
     return make_failure(
         operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED",
         message=f"EdgeX does not implement '{operation}' yet.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical get_tickers (Batch 4b — EdgeX FANOUT_REQUIRED)
+# ---------------------------------------------------------------------------
+# EdgeX does not publish a verified bulk dynamic ticker endpoint. We
+# fan-out per-contract ``GET /api/v2/public/quote/getTicker?contractId=X``
+# behind an agent-owned snapshot layer with:
+#
+#   * TTL snapshot cache (30s)         -> warm request requires ZERO fan-out
+#   * Coalesced concurrent refresh     -> at most ONE refresh in flight
+#   * Bounded concurrency (8)          -> never 180 simultaneous requests
+#   * Per-symbol timeout/failure isolation
+#   * Stale retention                  -> prior usable values are kept
+#                                         when a refresh is degraded
+#   * Rate-limit detection + circuit-breaker + cooldown
+#   * Canonical metadata: source, refresh_status, served_from_cache,
+#                          stale_symbols, failed_symbols, ttl_seconds
+#
+# Catalog still sourced from the existing cached ``/api/v2/public/meta/getMetaData``.
+# ``list_instruments`` / ``market_price`` / ``resolve_instrument`` / wizard /
+# candles / trading behavior is UNCHANGED.
+
+import threading
+
+_EDGEX_GET_TICKERS_TTL_SECONDS = 30
+_EDGEX_GET_TICKERS_FANOUT_MAX = 8
+_EDGEX_GET_TICKERS_FANOUT_TIMEOUT = 15
+_EDGEX_GET_TICKERS_CIRCUIT_COOLDOWN = 30.0
+_EDGEX_GET_TICKERS_RATE_LIMIT_THRESHOLD = 1  # one rate-limit opens the circuit
+_EDGEX_GET_TICKERS_SOURCE = "edgex_quote_getTicker_fanout"
+
+
+# Module-level cache + circuit state.
+_EDGEX_GET_TICKERS_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "tickers": {},          # symbol -> CanonicalMarketPrice
+    "stale_symbols": [],    # symbols whose prior value was retained
+    "failed_symbols": [],   # symbols whose refresh failed with no usable prior value
+    "refresh_status": "no_data",
+    "source": _EDGEX_GET_TICKERS_SOURCE,
+    "fetched_at": None,
+    "served_from_cache": False,
+}
+_EDGEX_GET_TICKERS_INFLIGHT: Optional[threading.Event] = None
+_EDGEX_GET_TICKERS_INFLIGHT_RESULT: Dict[str, Any] = {}
+_EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL: float = 0.0
+_EDGEX_GET_TICKERS_LAST_RATE_LIMIT_AT: float = 0.0
+_EDGEX_GET_TICKERS_INFLIGHT_LOCK = threading.Lock()
+
+
+def _edgex_now() -> float:
+    return time.time()
+
+
+def _edgex_safe_str(value: Any) -> Optional[str]:
+    """Return ``value`` as a Decimal string if non-zero, else ``None``.
+
+    EdgeX returns ``"0"`` or empty strings for absent numeric fields. We
+    map those to ``None`` so WebTrade2 renders ``—`` rather than a fake 0.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    try:
+        from decimal import Decimal, InvalidOperation
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if d == 0:
+        return None
+    return _format_edgex_decimal(d)
+
+
+def _format_edgex_decimal(value: Any) -> Optional[str]:
+    """Render a Decimal as the canonical short string."""
+    from decimal import Decimal, ROUND_HALF_UP
+    try:
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return None
+    if d == 0:
+        return None
+    q = d.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+    text = format(q.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or None
+
+
+def _edgex_build_market_price(
+    contract: Dict[str, Any],
+    coin_name_by_id: Dict[str, str],
+    raw: Optional[Dict[str, Any]],
+) -> CanonicalMarketPrice:
+    """Compose a CanonicalMarketPrice for one EdgeX contract row."""
+    cid = str(contract.get("contractId") or "").strip()
+    native = str(contract.get("contractName") or "").strip()
+    base_coin_id = str(contract.get("baseCoinId") or "").strip()
+    quote_coin_id = str(contract.get("quoteCoinId") or "").strip()
+    base = coin_name_by_id.get(base_coin_id, "")
+    quote = coin_name_by_id.get(quote_coin_id, "")
+    tick_size = _edgex_safe_str(contract.get("tickSize"))
+    step_size = _edgex_safe_str(contract.get("stepSize"))
+    min_order_size = _edgex_safe_str(contract.get("minOrderSize"))
+
+    display_name = native or cid or base or ""
+    if not display_name and base:
+        display_name = base
+
+    if raw is None:
+        return CanonicalMarketPrice(
+            requested_symbol=native or cid,
+            market=native or cid,
+            symbol=native or cid,
+            native_symbol=native or cid,
+            display_symbol=base or native or cid,
+            display_name=display_name,
+            base=base or None,
+            quote=quote or None,
+            market_type="perp",
+            price_increment=tick_size,
+            size_increment=step_size,
+            minimum_size=min_order_size,
+            minimum_notional=None,
+            mark_price=None,
+            oracle_price=None,
+            last_external_price=None,
+            last_updated_time=None,
+            price=None,
+            volume_24h_base=None,
+            volume_24h_quote=None,
+            turnover_24h=None,
+            change_24h_pct=None,
+            funding_rate=None,
+            open_interest=None,
+        )
+
+    fair = _edgex_safe_str(raw.get("markPrice"))
+    last = _edgex_safe_str(raw.get("lastPrice"))
+    oracle = _edgex_safe_str(raw.get("oraclePrice"))
+    index = _edgex_safe_str(raw.get("indexPrice"))
+    oi = _edgex_safe_str(raw.get("openInterest"))
+    funding = _edgex_safe_str(raw.get("fundingRate"))
+    value = _edgex_safe_str(raw.get("value"))
+    vol_base = _edgex_safe_str(raw.get("size"))
+
+    # priceChangePercent is a ratio (e.g. -0.007057 = -0.7057%). Multiply by 100.
+    from decimal import Decimal
+    pcp = raw.get("priceChangePercent")
+    change_pct: Optional[str] = None
+    if pcp is not None and str(pcp) != "":
+        try:
+            d = Decimal(str(pcp))
+            if d != 0:
+                change_pct = _format_edgex_decimal(d * Decimal("100"))
+        except Exception:  # noqa: BLE001
+            change_pct = None
+
+    return CanonicalMarketPrice(
+        requested_symbol=native or cid,
+        market=native or cid,
+        symbol=native or cid,
+        native_symbol=native or cid,
+        display_symbol=base or native or cid,
+        display_name=display_name,
+        base=base or None,
+        quote=quote or None,
+        market_type="perp",
+        price_increment=tick_size,
+        size_increment=step_size,
+        minimum_size=min_order_size,
+        minimum_notional=None,
+        mark_price=fair,
+        oracle_price=oracle,
+        last_external_price=index,  # EdgeX 'indexPrice' is the external reference
+        last_updated_time=None,
+        price=last,  # 'price' = current trading/last value, consistent with existing semantics
+        volume_24h_base=vol_base,
+        volume_24h_quote=value,
+        turnover_24h=value,
+        change_24h_pct=change_pct,
+        funding_rate=funding,
+        open_interest=oi,
+    )
+
+
+_edgex_fetch_ticker_raising = None  # patched in tests; default forwards to _edgex_fanout_one
+
+
+def _edgex_fanout_one(
+    contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fetch one contract's ticker. Raises on rate-limit / transport failure.
+
+    Returns ``{}`` on a normal 404 / no-data response (treated as
+    'no dynamic data available for this symbol').
+
+    The helper is intentionally RAISING (unlike ``_edgex_fetch_ticker``
+    which swallows) so the snapshot provider can distinguish failures
+    from "venue returned no data".
+    """
+    cid = str(contract.get("contractId") or "").strip()
+    if not cid:
+        return {}
+    try:
+        req = urllib.request.Request(
+            BASE_URL + "/api/v2/public/quote/getTicker?" + urllib.parse.urlencode({"contractId": cid}),
+            headers={"User-Agent": "curl/8.0", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=_EDGEX_GET_TICKERS_FANOUT_TIMEOUT) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # 429 / 5xx -> raise so caller can record rate-limit or transient failure
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        text = f"HTTP {exc.code} {body}".lower()
+        raise RuntimeError(text) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Wrap transport errors so rate-limit detection works.
+        raise RuntimeError(str(exc).lower()) from exc
+    if not isinstance(payload, dict) or payload.get("code") != "SUCCESS":
+        return {}
+    data = payload.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _edgex_fanout_bounded(
+    contracts: List[Dict[str, Any]],
+    ticker_by_cid: Dict[str, Dict[str, Any]],
+    failed_symbols: List[str],
+    rate_limit_hit: List[bool],
+) -> None:
+    global _EDGEX_GET_TICKERS_INFLIGHT, _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL
+    """Bound fan-out: max ``_EDGEX_GET_TICKERS_FANOUT_MAX`` in flight at once.
+
+    Workers write into ``ticker_by_cid``. ``failed_symbols`` and
+    ``rate_limit_hit`` are mutated to reflect per-symbol outcomes.
+    """
+    if not contracts:
+        return
+    sem = threading.Semaphore(_EDGEX_GET_TICKERS_FANOUT_MAX)
+    barrier_lock = threading.Lock()
+
+    def worker(contract: Dict[str, Any]) -> None:
+        cid = str(contract.get("contractId") or "").strip()
+        native = str(contract.get("contractName") or cid)
+        try:
+            sem.acquire()
+            try:
+                # Routed through the aliasable name so tests can patch the
+                # single-call helper without touching the worker loop.
+                ticker = _edgex_fetch_ticker_raising(contract) if _edgex_fetch_ticker_raising is not None else _edgex_fanout_one(contract)
+            finally:
+                sem.release()
+        except Exception as exc:  # noqa: BLE001
+            with barrier_lock:
+                failed_symbols.append(native)
+                if _edgex_is_rate_limited(exc):
+                    rate_limit_hit[0] = True
+            return
+        with barrier_lock:
+            ticker_by_cid[cid] = ticker
+
+    threads: List[threading.Thread] = []
+    for contract in contracts:
+        t = threading.Thread(target=worker, args=(contract,), daemon=True)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def _edgex_get_tickers_snapshot(force: bool = False) -> Dict[str, Any]:
+    global _EDGEX_GET_TICKERS_INFLIGHT, _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _EDGEX_GET_TICKERS_LAST_RATE_LIMIT_AT
+    """Return the canonical batch metadata + tickers dict.
+
+    Honours TTL, coalescing, and circuit-breaker. Does NOT issue
+    trading or write calls of any kind.
+    """
+    now = _edgex_now()
+    cache = _EDGEX_GET_TICKERS_CACHE
+    circuit_open = now < _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL
+
+    # --- Coalesce: join in-flight refresh if one is running.
+    inflight = _EDGEX_GET_TICKERS_INFLIGHT
+    if inflight is not None and not force:
+        inflight.wait(timeout=_EDGEX_GET_TICKERS_FANOUT_TIMEOUT + 5)
+        return _edgex_serve_from_cache(served_from_cache=True)
+
+    # --- Fresh check: if cache is still warm AND circuit is closed AND
+    #     we are NOT forced, serve the cache.
+    if not force and not circuit_open and cache.get("tickers"):
+        age = now - float(cache.get("ts") or 0.0)
+        if age < _EDGEX_GET_TICKERS_TTL_SECONDS:
+            return _edgex_serve_from_cache(served_from_cache=True)
+
+    # --- Circuit-open path: do not launch a fan-out. Serve whatever
+    #     stale data is in the cache, marking the batch accordingly.
+    if circuit_open:
+        return _edgex_serve_from_cache(
+            served_from_cache=True,
+            override_status="circuit_open",
+        )
+
+    # --- Acquire the in-flight slot; coalesce subsequent callers.
+    inflight_event = threading.Event()
+    with _EDGEX_GET_TICKERS_INFLIGHT_LOCK:
+        # Double-check after acquiring the lock — another thread may have
+        # already started.
+        existing = _EDGEX_GET_TICKERS_INFLIGHT
+        if existing is not None and not force:
+            existing.wait(timeout=_EDGEX_GET_TICKERS_FANOUT_TIMEOUT + 5)
+            return _edgex_serve_from_cache(served_from_cache=True)
+        _EDGEX_GET_TICKERS_INFLIGHT = inflight_event
+        _EDGEX_GET_TICKERS_INFLIGHT_RESULT.clear()
+
+    try:
+        result = _edgex_refresh_snapshot_locked(now=now)
+        _EDGEX_GET_TICKERS_INFLIGHT_RESULT.update(result)
+        return _edgex_serve_from_cache(served_from_cache=False, result_override=result)
+    finally:
+        inflight_event.set()
+        _EDGEX_GET_TICKERS_INFLIGHT = None
+
+
+def _edgex_refresh_snapshot_locked(now: float) -> Dict[str, Any]:
+    global _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _EDGEX_GET_TICKERS_LAST_RATE_LIMIT_AT
+    try:
+        meta = _metadata_full()
+    except Exception as exc:  # noqa: BLE001
+        # Catalog unavailable — mark cache as degraded and return.
+        is_rl = _edgex_is_rate_limited(exc)
+        if is_rl:
+            _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL = (
+                now + _EDGEX_GET_TICKERS_CIRCUIT_COOLDOWN
+            )
+        return {
+            "tickers": _EDGEX_GET_TICKERS_CACHE.get("tickers", {}),
+            "stale_symbols": [],
+            "failed_symbols": [],
+            "refresh_status": "rate_limited" if is_rl else "no_data",
+            "source": _EDGEX_GET_TICKERS_SOURCE,
+            "fetched_at": _edgex_now(),
+            "served_from_cache": True,
+            "error": str(exc),
+        }
+
+    if not isinstance(meta, dict):
+        return {
+            "tickers": _EDGEX_GET_TICKERS_CACHE.get("tickers", {}),
+            "stale_symbols": [],
+            "failed_symbols": [],
+            "refresh_status": "no_data",
+            "source": _EDGEX_GET_TICKERS_SOURCE,
+            "fetched_at": _edgex_now(),
+            "served_from_cache": True,
+        }
+
+    contracts = [
+        c for c in (meta.get("contractList") or [])
+        if isinstance(c, dict) and c.get("contractId") and c.get("contractName")
+    ]
+    coin_list = meta.get("coinList") or []
+    coin_name_by_id: Dict[str, str] = {}
+    for coin in coin_list:
+        if not isinstance(coin, dict):
+            continue
+        cid_coin = str(coin.get("coinId") or "").strip()
+        name = str(coin.get("coinName") or "").strip()
+        if cid_coin and name:
+            coin_name_by_id[cid_coin] = name
+
+    prior = _EDGEX_GET_TICKERS_CACHE.get("tickers") or {}
+
+    # Fan-out bounded.
+    ticker_by_cid: Dict[str, Dict[str, Any]] = {}
+    failed_symbols: List[str] = []
+    rate_limit_hit = [False]
+    _edgex_fanout_bounded(contracts, ticker_by_cid, failed_symbols, rate_limit_hit)
+
+    if rate_limit_hit[0]:
+        _EDGEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL = now + _EDGEX_GET_TICKERS_CIRCUIT_COOLDOWN
+        _EDGEX_GET_TICKERS_LAST_RATE_LIMIT_AT = now
+        # Partial failure path: retain prior usable values where present.
+        retained: Dict[str, CanonicalMarketPrice] = {}
+        new_stale: List[str] = []
+        for c in contracts:
+            cid = str(c.get("contractId") or "").strip()
+            native = str(c.get("contractName") or cid)
+            raw = ticker_by_cid.get(cid)
+            if raw:
+                mp = _edgex_build_market_price(c, coin_name_by_id, raw)
+                retained[native] = mp
+            elif native in prior and isinstance(prior[native], CanonicalMarketPrice):
+                # keep prior usable row, mark stale
+                retained[native] = prior[native]
+                new_stale.append(native)
+            elif cid in prior and isinstance(prior[cid], CanonicalMarketPrice):
+                retained[native] = prior[cid]
+                new_stale.append(native)
+            else:
+                # no data, no prior — emit catalog-only row
+                mp = _edgex_build_market_price(c, coin_name_by_id, None)
+                retained[native] = mp
+                new_stale.append(native)
+        _EDGEX_GET_TICKERS_CACHE["tickers"] = retained
+        _EDGEX_GET_TICKERS_CACHE["stale_symbols"] = new_stale
+        _EDGEX_GET_TICKERS_CACHE["failed_symbols"] = list(failed_symbols)
+        _EDGEX_GET_TICKERS_CACHE["refresh_status"] = "rate_limited"
+        _EDGEX_GET_TICKERS_CACHE["source"] = _EDGEX_GET_TICKERS_SOURCE
+        _EDGEX_GET_TICKERS_CACHE["fetched_at"] = _edgex_now()
+        _EDGEX_GET_TICKERS_CACHE["ts"] = now
+        _EDGEX_GET_TICKERS_CACHE["served_from_cache"] = True
+        return dict(_EDGEX_GET_TICKERS_CACHE)
+
+    # Normal path (possibly partial).
+    new_tickers: Dict[str, CanonicalMarketPrice] = {}
+    new_stale: List[str] = []
+    new_failed: List[str] = []
+    for c in contracts:
+        cid = str(c.get("contractId") or "").strip()
+        native = str(c.get("contractName") or cid)
+        raw = ticker_by_cid.get(cid)
+        if raw:
+            mp = _edgex_build_market_price(c, coin_name_by_id, raw)
+            new_tickers[native] = mp
+        elif native in prior and isinstance(prior[native], CanonicalMarketPrice):
+            # symbol still exists, no fresh data, but we have a prior row
+            new_tickers[native] = prior[native]
+            new_stale.append(native)
+        else:
+            # No data, no prior — emit catalog-only row with None dynamics
+            mp = _edgex_build_market_price(c, coin_name_by_id, None)
+            new_tickers[native] = mp
+
+    new_failed = list(failed_symbols)
+    refresh_status = "ok"
+    if new_failed or new_stale:
+        refresh_status = "partial"
+
+    _EDGEX_GET_TICKERS_CACHE["tickers"] = new_tickers
+    _EDGEX_GET_TICKERS_CACHE["stale_symbols"] = new_stale
+    _EDGEX_GET_TICKERS_CACHE["failed_symbols"] = new_failed
+    _EDGEX_GET_TICKERS_CACHE["refresh_status"] = refresh_status
+    _EDGEX_GET_TICKERS_CACHE["source"] = _EDGEX_GET_TICKERS_SOURCE
+    _EDGEX_GET_TICKERS_CACHE["fetched_at"] = _edgex_now()
+    _EDGEX_GET_TICKERS_CACHE["ts"] = now
+    _EDGEX_GET_TICKERS_CACHE["served_from_cache"] = False
+    return dict(_EDGEX_GET_TICKERS_CACHE)
+
+
+def _edgex_serve_from_cache(
+    served_from_cache: bool,
+    override_status: Optional[str] = None,
+    result_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Render the module cache as a canonical-batch dict."""
+    src = result_override if result_override is not None else _EDGEX_GET_TICKERS_CACHE
+    raw_tickers = src.get("tickers") or {}
+    tickers_dict: Dict[str, Any] = {}
+    for sym, mp in raw_tickers.items():
+        if isinstance(mp, CanonicalMarketPrice):
+            tickers_dict[sym] = mp.to_dict()
+        else:
+            tickers_dict[sym] = mp
+    stale = list(src.get("stale_symbols") or [])
+    failed = list(src.get("failed_symbols") or [])
+    refresh_status = src.get("refresh_status") or "ok"
+    if override_status is not None:
+        refresh_status = override_status
+    source = src.get("source") or _EDGEX_GET_TICKERS_SOURCE
+    fetched_at = src.get("fetched_at")
+    return {
+        "tickers": tickers_dict,
+        "stale_symbols": stale,
+        "failed_symbols": failed,
+        "refresh_status": refresh_status,
+        "source": source,
+        "fetched_at": fetched_at,
+        "ttl_seconds": _EDGEX_GET_TICKERS_TTL_SECONDS,
+        "served_from_cache": bool(served_from_cache),
+    }
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Canonical ``get_tickers`` dispatcher for EdgeX.
+
+    Behavior:
+      1. Honors TTL snapshot cache (30s). A request within TTL → 0 fan-out.
+      2. Coalesces concurrent callers behind one in-flight refresh.
+      3. Caps fan-out concurrency at 8.
+      4. Detects rate-limit responses and opens a 30s circuit.
+      5. Circuit-open requests serve the prior usable snapshot, marking
+         ``refresh_status="circuit_open"`` and ``served_from_cache=True``.
+      6. Preserves catalog rows even when per-symbol ticker fails.
+      7. Preserves prior usable dynamic values for symbols whose current
+         refresh is degraded (stale retention).
+      8. Symbols no longer in the catalog are NOT resurrected from stale cache.
+    """
+    if not account:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    force = bool(request.get("force_refresh"))
+    snapshot = _edgex_get_tickers_snapshot(force=force)
+    raw_tickers = snapshot.get("tickers") or {}
+    # Convert rendered dicts back into CanonicalMarketPrice objects for
+    # the canonical batch payload (so .to_dict() canonicalisation works).
+    mp_by_sym: Dict[str, CanonicalMarketPrice] = {}
+    for sym, payload in raw_tickers.items():
+        if isinstance(payload, CanonicalMarketPrice):
+            mp_by_sym[sym] = payload
+        elif isinstance(payload, dict):
+            try:
+                mp_by_sym[sym] = CanonicalMarketPrice(**payload)
+            except Exception:  # noqa: BLE001
+                continue
+    batch = CanonicalTickersBatch(
+        tickers=mp_by_sym,
+        failed_symbols=tuple(snapshot.get("failed_symbols") or []),
+        fetched_at=snapshot.get("fetched_at"),
+        ttl_seconds=_EDGEX_GET_TICKERS_TTL_SECONDS,
+        stale_symbols=tuple(snapshot.get("stale_symbols") or []),
+        refresh_status=snapshot.get("refresh_status") or "ok",
+        source=snapshot.get("source") or _EDGEX_GET_TICKERS_SOURCE,
+        served_from_cache=bool(snapshot.get("served_from_cache")),
+    )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=batch,
     )
