@@ -475,6 +475,8 @@ const ctx = {
   document: document_,
   window: { addEventListener: () => {}, _charts: {} },
   setTimeout, clearTimeout, setInterval, clearInterval,
+  requestAnimationFrame: (cb) => setTimeout(cb, 0),
+  cancelAnimationFrame: (id) => clearTimeout(id),
   console,
   localStorage: {
     _data: {},

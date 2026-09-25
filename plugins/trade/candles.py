@@ -193,50 +193,75 @@ def _apex_symbol_meta(symbol: str, *, base: str = "https://omni.apex.exchange") 
 def fetch_apex(symbol: str, tf: str, limit: int = 300, *, base: str = "https://omni.apex.exchange") -> List[Dict[str, Any]]:
     if tf not in _TF_SECONDS:
         raise ValueError("UNSUPPORTED_TIMEFRAME")
-    meta = _apex_symbol_meta(symbol, base=base)
-    if not meta:
-        raise RuntimeError(f"CANDLES_UNAVAILABLE: Apex contract not found for {symbol}")
-    wire_symbol = str(meta.get("crossSymbolName") or meta.get("symbolDisplayName") or meta.get("symbol") or "").strip().upper()
-    if not wire_symbol:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise RuntimeError("CANDLES_UNAVAILABLE: Apex symbol missing")
+    # Apex upstream publishes contract metadata for ~138 instruments via
+    # /api/v3/symbols, but many actively-traded instruments (NVDA, QQQ,
+    # AAPL, XYZ100, BRENTOIL, ...) have working kline endpoints without
+    # a matching contract metadata row. Treat the metadata lookup as a
+    # HINT for resolving alternate symbol forms (crossSymbolName /
+    # symbolDisplayName) rather than a gate — if metadata is missing or
+    # its resolved wire_symbol fails, fall back to the user's symbol
+    # verbatim and let the upstream decide.
+    meta = None
+    try:
+        meta = _apex_symbol_meta(sym, base=base)
+    except Exception:
+        meta = None
+    candidates: List[str] = []
+    if meta:
+        for k in ("crossSymbolName", "symbolDisplayName", "symbol"):
+            v = str(meta.get(k) or "").strip().upper()
+            if v:
+                candidates.append(v)
+    if sym not in candidates:
+        candidates.append(sym)
+    if not candidates:
         raise RuntimeError(f"CANDLES_UNAVAILABLE: Apex symbol missing for {symbol}")
     interval = _apex_interval(tf)
     count = max(1, min(int(limit), 200))
     end_s = int(time.time())
     start_s = max(0, end_s - count * _TF_SECONDS[tf])
-    params = {
-        "symbol": wire_symbol,
-        "interval": interval,
-        "start": str(start_s),
-        "end": str(end_s),
-        "limit": str(count),
-    }
-    data = _http_json(f"{base.rstrip('/')}/api/v3/klines?{urllib.parse.urlencode(params)}", timeout=30)
-    rows: List[Any] = []
-    if isinstance(data, dict):
-        payload = data.get("data") or data.get("klines") or data.get("rows") or {}
-        if isinstance(payload, dict):
-            rows = (
-                payload.get(wire_symbol)
-                or payload.get(wire_symbol.replace("-", ""))
-                or payload.get("klines")
-                or payload.get("dataList")
-                or payload.get("rows")
-                or payload.get("data")
-                or []
-            )
-        elif isinstance(payload, list):
-            rows = payload
-    elif isinstance(data, list):
-        rows = data
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        if isinstance(row, list) and len(row) >= 6:
-            out.append(normalize_candle(row[0], row[1], row[2], row[3], row[4], row[5]))
-        elif isinstance(row, dict):
-            out.append(normalize_candle(row.get("start") or row.get("time") or row.get("t") or row.get("openTime"), row.get("open") or row.get("o"), row.get("high") or row.get("h"), row.get("low") or row.get("l"), row.get("close") or row.get("c"), row.get("volume") or row.get("v") or row.get("turnover") or 0))
-    if not out:
-        raise RuntimeError(f"CANDLES_UNAVAILABLE: Apex returned no klines for {symbol}")
-    return finalize_candles(out, limit)
+    last_err: Optional[Exception] = None
+    for wire_symbol in candidates:
+        params = {
+            "symbol": wire_symbol,
+            "interval": interval,
+            "start": str(start_s),
+            "end": str(end_s),
+            "limit": str(count),
+        }
+        data = _http_json(f"{base.rstrip('/')}/api/v3/klines?{urllib.parse.urlencode(params)}", timeout=30)
+        rows: List[Any] = []
+        if isinstance(data, dict):
+            payload = data.get("data") or data.get("klines") or data.get("rows") or {}
+            if isinstance(payload, dict):
+                rows = (
+                    payload.get(wire_symbol)
+                    or payload.get(wire_symbol.replace("-", ""))
+                    or payload.get("klines")
+                    or payload.get("dataList")
+                    or payload.get("rows")
+                    or payload.get("data")
+                    or []
+                )
+            elif isinstance(payload, list):
+                rows = payload
+        elif isinstance(data, list):
+            rows = data
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 6:
+                out.append(normalize_candle(row[0], row[1], row[2], row[3], row[4], row[5]))
+            elif isinstance(row, dict):
+                out.append(normalize_candle(row.get("start") or row.get("time") or row.get("t") or row.get("openTime"), row.get("open") or row.get("o"), row.get("high") or row.get("h"), row.get("low") or row.get("l"), row.get("close") or row.get("c"), row.get("volume") or row.get("v") or row.get("turnover") or 0))
+        if out:
+            return finalize_candles(out, limit)
+        last_err = RuntimeError(f"Apex returned no klines for {wire_symbol}")
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"CANDLES_UNAVAILABLE: Apex returned no klines for {symbol}")
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,10 @@
     volumeSeries: null,
     chartReady: false,
     chartPollTimer: null,
+    // Monotonic counter incremented on every new chart-load trigger.
+    // loadChartHistory() captures the current value at start and drops
+    // any response whose captured gen != state.chartLoadGen.
+    chartLoadGen: 0,
     selectedTimeframe: '15m',
     defaultTimeframe: '15m',
     priceLines: [],
@@ -123,6 +127,19 @@
     state.mobile = section;
     document.querySelectorAll('[data-mobile-target]').forEach(btn => btn.classList.toggle('active', btn.dataset.mobileTarget === section));
     document.querySelectorAll('[data-mobile-section]').forEach(el => el.classList.toggle('mobile-active', el.dataset.mobileSection === section));
+    // Switching to the chart panel on mobile changes its effective
+    // clientWidth/clientHeight (the panel was display:none moments ago).
+    // Wait one frame for the layout to commit, then explicitly drive
+    // chart.resize() so the canvas matches the now-visible container.
+    requestAnimationFrame(() => {
+      if (state.chart && state.chartReady) applyChartResize();
+    });
+    // And again after two RAFs to cover iOS Safari's deferred layout
+    // pass when an element becomes visible (it batches layout). The
+    // ResizeObserver will also catch any further change.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (state.chart && state.chartReady) applyChartResize();
+    }));
   }
 
   function setTimeframe(tf) {
@@ -130,23 +147,54 @@
     state.selectedTimeframe = tf;
     document.querySelectorAll('[data-timeframe]').forEach(btn => btn.classList.toggle('active', btn.dataset.timeframe === tf));
     if (state.exchange && state.account && state.market?.symbol) {
+      // Bump the load generation so any in-flight candle request from
+      // the previous timeframe is invalidated and dropped on response.
+      state.chartLoadGen = (state.chartLoadGen || 0) + 1;
       loadChartHistory().catch(() => {});
       startChartPolling();
     }
   }
 
   // ---------------------------- Chart ---------------------------------
+  // Lightweight Charts v4.2 standalone + Safari interaction:
+  //
+  //   - On mobile Safari (and iOS WebKit generally) autoSize:true can
+  //     size the canvases to a CSS measurement that was captured too
+  //     early, before the chart panel finished laying out. The result
+  //     is that LWC paints into the bitmap correctly but the canvas's
+  //     CSS box ends up smaller than the chart container, so the user
+  //     sees an empty area. The robust fix is: turn autoSize OFF and
+  //     drive chart.resize() ourselves using the actual computed
+  //     width/height of the container at the moment the chart is
+  //     first shown.
+  //   - We still let ResizeObserver resync on later layout changes
+  //     (e.g. orientation / mobile-nav / scroll-driven resize) but we
+  //     do it via chart.resize() with the explicit measurement, not
+  //     letting LWC capture a transient 0×0 size.
+  //
+  // See plugins/trade/webtrade2/static/app.js for the resize logic.
   function initChart() {
     const container = $('#chart');
     if (!container) return false;
     if (!window.LightweightCharts || typeof window.LightweightCharts.createChart !== 'function') return false;
+    // Read the container size synchronously. If the panel isn't laid
+    // out yet (true on mobile when the page boots with the markets tab
+    // active), fall back to a sensible default so createChart doesn't
+    // start with a 0×0 internal size.
+    let cssWidth = container.clientWidth;
+    let cssHeight = container.clientHeight;
+    if (!cssWidth || !cssHeight) {
+      cssWidth = Math.max(cssWidth || 0, 320);
+      cssHeight = Math.max(cssHeight || 0, 280);
+    }
     const chart = window.LightweightCharts.createChart(container, {
+      width: cssWidth,
+      height: cssHeight,
       layout: { background: { color: '#0b0e14' }, textColor: '#e6ecf5', fontFamily: 'Inter, system-ui, sans-serif' },
       grid: { vertLines: { color: '#161d2f' }, horzLines: { color: '#161d2f' } },
       rightPriceScale: { borderColor: '#1c2438', textColor: '#8a9bb5' },
       timeScale: { borderColor: '#1c2438', timeVisible: true, secondsVisible: false },
       crosshair: { mode: 1 },
-      autoSize: true,
       handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
       handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true, axisDoubleClickReset: true },
     });
@@ -162,9 +210,61 @@
     state.chart = chart;
     state.candleSeries = candleSeries;
     state.chartReady = true;
-    chart.timeScale().fitContent();
-    exposeChartTelemetry();
+
+    // Install a ResizeObserver so that when the chart panel actually
+    // becomes visible (mobile tab switch, orientation change, etc.) we
+    // immediately drive chart.resize() to the current container size.
+    // We use ResizeObserver because it is what real Safari supports;
+    // we never fall back to autoSize:true because that's what was
+    // causing the missing-canvas-render on iPhone.
+    if (typeof ResizeObserver !== 'undefined' && container) {
+      if (state._chartResizeObserver) {
+        try { state._chartResizeObserver.disconnect(); } catch (_) {}
+      }
+      const ro = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const w = Math.round(entry.contentRect.width);
+          const h = Math.round(entry.contentRect.height);
+          if (w > 0 && h > 0 && state.chart) {
+            state.chart.resize(w, h);
+            state.chart.timeScale().fitContent();
+          }
+        }
+      });
+      ro.observe(container);
+      state._chartResizeObserver = ro;
+    }
+
+    // Also schedule one explicit resize on the next animation frame so
+    // a freshly-mounted chart (where the panel just became visible)
+    // gets sized correctly even before ResizeObserver's first tick.
+    requestAnimationFrame(() => {
+      if (state.chart && container) {
+        const w = Math.round(container.clientWidth || 0);
+        const h = Math.round(container.clientHeight || 0);
+        if (w > 0 && h > 0) {
+          state.chart.resize(w, h);
+          state.chart.timeScale().fitContent();
+        }
+      }
+    });
+
     return true;
+  }
+
+  // Public resize API used by loadChartHistory() and by mobile tab
+  // switches that change the chart panel's effective size. We
+  // idempotently set the chart size to the current #chart client size
+  // (rounded) and then run fitContent once.
+  function applyChartResize() {
+    if (!state.chart || !state.chartReady) return;
+    const container = document.getElementById('chart');
+    if (!container) return;
+    const w = Math.round(container.clientWidth || 0);
+    const h = Math.round(container.clientHeight || 0);
+    if (w <= 0 || h <= 0) return;
+    try { state.chart.resize(w, h); } catch (_) {}
+    try { state.chart.timeScale().fitContent(); } catch (_) {}
   }
 
   function clearChartOverlays() {
@@ -187,128 +287,134 @@
     state.candleSeries.applyOptions({ priceFormat: { type: 'price', precision, minMove: Math.pow(10, -precision) } });
   }
 
-  // Render a small telemetry strip below the chart for live debugging.
-  // Pure DOM — never throws; safe to call from any phase of the chart
-  // pipeline. Stays in production build (very small) because chart
-  // blank-on-mobile was hard to diagnose without it.
-  function renderChartTelemetry() {
-    let el = document.getElementById('chartTelemetry');
+  // showChartMessage(text) — clear or display an error overlay in the
+  // chart panel. Used when a candle load fails or returns zero rows so
+  // the user never sees stale candles from a previous instrument. This is
+  // production UX (not telemetry / debug).
+  function showChartMessage(text) {
+    let el = document.getElementById('chartMessage');
     if (!el) {
       el = document.createElement('div');
-      el.id = 'chartTelemetry';
-      el.style.cssText = 'margin-top:6px;padding:6px 8px;border:1px dashed #555;font:11px ui-monospace,monospace;color:#8a9bb5;background:#0b0f1a;border-radius:4px;white-space:pre-wrap;line-height:1.5';
+      el.id = 'chartMessage';
+      el.style.cssText = 'margin-top:6px;padding:8px 10px;border:1px solid #ef5b67;color:#ef5b67;background:rgba(239,91,103,.08);border-radius:4px;font-size:12px;letter-spacing:.2px';
       const wrap = document.querySelector('.chart-wrap');
       if (wrap && wrap.parentNode) wrap.parentNode.insertBefore(el, wrap.nextSibling);
       else document.body.appendChild(el);
     }
-    const t = state.chartTelemetry || {};
-    const f = (n) => (n == null ? '?' : (Number.isFinite(n) ? n : JSON.stringify(n)));
-    const lines = [
-      `symbol=${t.symbol||'-'} tf=${t.interval||'-'} status=${t.httpStatus||'?'} raw=${f(t.rawCount)} norm=${f(t.normalizedCount)} setData=${f(t.setDataCallCount)}${t.setDataThrew && t.setDataThrew!==false ? ' THROW='+t.setDataThrew : ''}`,
-      `first=${t.normalizedFirst ? JSON.stringify({t:t.normalizedFirst.time,o:t.normalizedFirst.open}) : '?'}`,
-      `last=${t.normalizedLast ? JSON.stringify({t:t.normalizedLast.time,c:t.normalizedLast.close}) : '?'}`,
-      `asc=${t.normalizedAscending==null?'?':t.normalizedAscending} dups=${f(t.normalizedDuplicates)}`,
-      `rect=${t.containerRectBefore ? (t.containerRectBefore.w+'x'+t.containerRectBefore.h) : '?'} canvas=${t.canvasDimsAfter ? (t.canvasDimsAfter.w+'x'+t.canvasDimsAfter.h+' (css:'+Math.round(t.canvasDimsAfter.cssW)+'x'+Math.round(t.canvasDimsAfter.cssH)+')') : '?'}`,
-      `nonBgPx=${f(t.canvasNonBgPixels)} range=${t.visibleRange ? JSON.stringify({from:t.visibleRange.from,to:t.visibleRange.to}) : '?'}`,
-    ];
-    el.textContent = lines.join('\n');
-  }
-
-  const TELEMETRY_KEY = '__webtrade2_chart__';
-  function exposeChartTelemetry() {
-    try {
-      window[TELEMETRY_KEY] = {
-        telemetry: state.chartTelemetry,
-        chartReady: !!state.chartReady,
-        hasChart: !!state.chart,
-        candleSeriesAttached: !!(state.candleSeries && state.candleSeries._internal__dataChangedEvent || true),
-        seriesOptions: (() => {
-          try { return state.candleSeries && state.candleSeries.options && state.candleSeries.options(); } catch (_) { return null; }
-        })(),
-        chartOptions: (() => {
-          try { return state.chart && state.chart.options && state.chart.options(); } catch (_) { return null; }
-        })(),
-        containerRect: (() => {
-          const c = document.getElementById('chart');
-          if (!c) return null;
-          const r = c.getBoundingClientRect();
-          return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
-        })(),
-        canvases: (() => {
-          const c = document.getElementById('chart');
-          if (!c) return null;
-          return Array.from(c.querySelectorAll('canvas')).map(cv => {
-            const r = cv.getBoundingClientRect();
-            return { width: cv.width, height: cv.height, cssW: r.width, cssH: r.height };
-          });
-        })(),
-        selectedMarket: state.market ? state.market.symbol : null,
-        selectedExchange: state.exchange,
-        selectedAccount: state.account,
-        // Capture last setData arg snapshot via probe (the chart poller also calls setData)
-        lastSetDataArgLen: state._lastSetDataArgLen || null,
-        setDataCallsTotal: state._setDataCallsTotal || 0,
-      };
-    } catch (_) { /* never throw */ }
+    if (!text) {
+      el.hidden = true;
+      el.textContent = '';
+    } else {
+      el.hidden = false;
+      el.textContent = text;
+    }
   }
 
   async function loadChartHistory() {
     if (!state.chartReady || !state.market?.symbol || !state.exchange) return;
-    const requestUrl = `/api/candles?${new URLSearchParams({
-      exchange: state.exchange,
-      account: state.account,
-      symbol: state.market.symbol,
-      interval: state.selectedTimeframe,
-      limit: String(HISTORY_LIMIT),
-      market_type: state.marketType,
-    })}`;
-    // ---- telemetry buffer (always-on, for headless diagnostics) ----
-    state.chartTelemetry = {
-      requestUrl, exchange: state.exchange, account: state.account,
-      symbol: state.market.symbol, interval: state.selectedTimeframe,
-      requestStartedAt: Date.now(),
-      httpStatus: null, responseInterval: null, rawCount: null,
-      normalizedCount: 0, normalizedFirst: null, normalizedLast: null,
-      normalizedAscending: null,
-      setDataCallCount: (state.chartTelemetry?.setDataCallCount || 0),
-      setDataThrew: null,
-      containerRectBefore: null, canvasDimsAfter: null,
-      priceScaleRange: null, visibleRange: null,
-      canvasNonBgPixels: null,
-    };
-    let data;
+
+    // ----------------------------------------------------------------
+    // GENERATION / REQUEST-ID
+    // ----------------------------------------------------------------
+    // Every new selection (symbol, timeframe, exchange, account, market
+    // type) bumps state.chartLoadGen. The current call captures myGen at
+    // start. After every await we re-check myGen === state.chartLoadGen
+    // and silently drop the response if it doesn't match — that's the
+    // ONLY way to prevent a slow Apex/HL candle response from
+    // overwriting the chart the user already navigated away from.
+    //
+    // We also clear the previous series synchronously before the network
+    // request so that a stale BTC/ETH chart never remains on screen
+    // while the user waits for a different instrument's data.
+    // ----------------------------------------------------------------
+    state.chartLoadGen = (state.chartLoadGen || 0) + 1;
+    const myGen = state.chartLoadGen;
+    const myExchange = state.exchange;
+    const myAccount = state.account;
+    const myMarketType = state.marketType;
+    const mySymbol = state.market.symbol;
+    const myTimeframe = state.selectedTimeframe;
+
+    function isStale() {
+      return myGen !== state.chartLoadGen
+        || myExchange !== state.exchange
+        || myAccount !== state.account
+        || myMarketType !== state.marketType
+        || mySymbol !== (state.market?.symbol)
+        || myTimeframe !== state.selectedTimeframe;
+    }
+
+    // Reset chart state immediately so a failed/pending request can't
+    // leave stale candles from a previous instrument visible.
     try {
-      data = await api(requestUrl);
-      state.chartTelemetry.httpStatus = 'ok';
+      if (state.candleSeries) state.candleSeries.setData([]);
+      if (state.chart && state.chart.timeScale) state.chart.timeScale().setVisibleRange(null);
+      if (state.chart && state.chart.priceScale) {
+        try { state.chart.priceScale('right').applyOptions({ autoScale: true }); } catch (_) {}
+      }
+    } catch (_) { /* ignore */ }
+    showChartMessage(null);
+
+    // CRITICAL mobile order of operations (Safari explicit resize fix):
+    //   1. Force the chart's CSS box to match the container NOW.
+    //   2. Then push the new data.
+    //   3. Then fitContent ONCE on both time and price scales.
+    applyChartResize();
+
+    const requestUrl = `/api/candles?${new URLSearchParams({
+      exchange: myExchange,
+      account: myAccount,
+      symbol: mySymbol,
+      interval: myTimeframe,
+      limit: String(HISTORY_LIMIT),
+      market_type: myMarketType,
+    })}`;
+
+    let data;
+    let fetchError = null;
+    try {
+      const resp = await fetch(requestUrl, { credentials: 'same-origin', cache: 'no-store' });
+      let body = null;
+      try { body = await resp.json(); } catch (e) { body = null; }
+      data = body;
     } catch (err) {
-      state.chartTelemetry.httpStatus = 'fail:' + (err && err.message || err);
-      renderChartTelemetry();
+      fetchError = err;
+    }
+
+    // Drop stale responses BEFORE any state mutation. A stale response
+    // arriving after the user switched markets must never paint.
+    if (isStale()) {
       return;
     }
-    if (!data || !data.success || data.success === false) {
-      state.chartTelemetry.httpStatus = 'success=false';
-      renderChartTelemetry();
+
+    if (fetchError || !data) {
+      try { state.candleSeries && state.candleSeries.setData([]); } catch (_) {}
+      showChartMessage(`Chart unavailable: ${fetchError ? 'network error' : 'no response'}`);
       return;
     }
+
+    const apiSuccess = data && (data.success === true || data.success === undefined);
+    if (!apiSuccess) {
+      const errCode = (data && data.error && data.error.code) || 'api_error';
+      try { state.candleSeries && state.candleSeries.setData([]); } catch (_) {}
+      showChartMessage(`Chart unavailable: ${errCode}`);
+      return;
+    }
+
     const dataBlock = data.data || {};
-    state.chartTelemetry.responseInterval = dataBlock.interval || null;
-    state.chartTelemetry.rawCount = (dataBlock.candles || []).length;
     const candles = Array.isArray(dataBlock.candles) ? dataBlock.candles : [];
-    // ---- build telemetry overlay as soon as we have raw count ----
-    renderChartTelemetry();
+
     if (candles.length === 0) {
-      console.warn("[chart] /api/candles returned 0 candles for", state.market.symbol, "tf=", state.selectedTimeframe);
+      try { state.candleSeries && state.candleSeries.setData([]); } catch (_) {}
+      showChartMessage('Chart unavailable: no candles returned');
       return;
     }
-    // Lightweight Charts v4.2 candle input:
-    //   { time: UTC seconds (number, integer), open, high, low, close }
+
+    // LWC v4.2 candle input contract:
+    //   { time: UTC seconds (integer), open, high, low, close }
     //   times must be strictly ascending and unique.
-    // Normalize: enforce numbers, drop invalid rows, de-dup by time, sort asc.
     const seen = new Set();
     const series = [];
-    // Server normalizes /api/candles to seconds-since-epoch with de-dup,
-    // ascending sort, and OHLC sanity. Here we only enforce LWC contract:
-    // integer time + finite OHLC. Anything invalid is dropped client-side.
     for (const c of candles) {
       const t = Math.floor(Number(c.time));
       const o = Number(c.open);
@@ -327,116 +433,58 @@
       series.push({ time: t, open: o, high: h, low: l, close: cl });
     }
     series.sort((a, b) => a.time - b.time);
-    // ASC/UNIQUE sanity check
+    // Dedup pass: re-validate ascending+unique (server may have emitted
+    // duplicates that slipped past the seen-set).
     let ascending = true;
     let dupCount = 0;
     for (let i = 1; i < series.length; i++) {
       if (series[i].time <= series[i-1].time) { ascending = false; dupCount++; }
     }
-    state.chartTelemetry.normalizedCount = series.length;
-    state.chartTelemetry.normalizedFirst = series[0] || null;
-    state.chartTelemetry.normalizedLast = series[series.length - 1] || null;
-    state.chartTelemetry.normalizedAscending = !!ascending;
-    state.chartTelemetry.normalizedDuplicates = dupCount;
+
     if (series.length === 0) {
-      console.warn("[chart] 0 valid candle rows after normalization for", state.market.symbol);
-      renderChartTelemetry();
+      try { state.candleSeries && state.candleSeries.setData([]); } catch (_) {}
+      showChartMessage('Chart unavailable: no valid candle rows');
       return;
     }
-    // Apply. If the container has zero size at this moment (boot race),
-    // wait for the chart's first ResizeObserver tick before setData so
-    // LWC actually has a non-zero canvas to draw into.
-    const container = document.getElementById('chart');
-    const containerHasSize = () => {
-      const rect = container?.getBoundingClientRect?.();
-      return !!rect && rect.width >= 1 && rect.height >= 1;
-    };
-    const applySetData = () => {
+
+    // One more staleness check right before applying — the user may
+    // have clicked a different market while we were normalizing.
+    if (isStale()) {
+      return;
+    }
+
+    // Apply. Container already resize()'d above; layout is stable.
+    try {
+      const cont = document.getElementById('chart');
+      // Final pre-setData wipe (defensive): this is the moment we commit
+      // to the new symbol, so any leftover from the previous series is
+      // gone.
+      state.candleSeries.setData([]);
+      state.candleSeries.setData(series);
+      applyChartPrecision(series[series.length - 1].close);
+
+      // RESET both scales explicitly after setData so a previous
+      // instrument's autoscale state never carries over.
+      try { state.chart.timeScale().fitContent(); } catch (_) {}
       try {
-        // Capture container rect just before setData
-        const cont = document.getElementById('chart');
-        state.chartTelemetry.containerRectBefore = (function(){
-          const r = cont?.getBoundingClientRect?.();
-          return r ? { w: Math.round(r.width), h: Math.round(r.height) } : null;
-        })();
-        const rows = series.length;
-        state.chartTelemetry.normalizedCount = rows;
-        state.candleSeries.setData(series);
-        state.chartTelemetry.setDataCallCount = (state.chartTelemetry.setDataCallCount || 0) + 1;
-        state.chartTelemetry.setDataThrew = false;
-        applyChartPrecision(series[series.length - 1].close);
-        state.chart.timeScale().fitContent();
-        // Defer a second fitContent in case the chart container just resized.
-        requestAnimationFrame(() => {
-          try { state.chart && state.chart.timeScale().fitContent(); } catch (_) {}
-          // After rAF, capture canvas dims and pixel count
-          try {
-            const cv = cont?.querySelector('canvas');
-            if (cv) {
-              state.chartTelemetry.canvasDimsAfter = {
-                w: cv.width, h: cv.height,
-                cssW: cv.getBoundingClientRect().width,
-                cssH: cv.getBoundingClientRect().height,
-              };
-              // Count non-background pixels via getImageData
-              try {
-                const ctx = cv.getContext('2d');
-                if (ctx) {
-                  const data = ctx.getImageData(0, 0, cv.width, cv.height).data;
-                  let n = 0;
-                  for (let i = 0; i < data.length; i += 4) {
-                    if (data[i] > 25 || data[i+1] > 25 || data[i+2] > 25) n++;
-                  }
-                  state.chartTelemetry.canvasNonBgPixels = n;
-                }
-              } catch (e) { /* ignore */ }
-              // Price scale + time scale state
-              try {
-                const ps = state.chart.priceScale ? state.chart.priceScale('right') : null;
-                state.chartTelemetry.priceScaleRange = ps ? { mode: 'auto' } : null;
-                state.chartTelemetry.visibleRange = state.chart.timeScale().getVisibleLogicalRange ? state.chart.timeScale().getVisibleLogicalRange() : null;
-              } catch (_) {}
-            }
-          } catch (_) {}
-          renderChartTelemetry();
-        });
-      } catch (err) {
-        state.chartTelemetry.setDataThrew = String(err && err.message || err);
-        console.error("[chart] setData threw for", state.market.symbol, "tf=", state.selectedTimeframe, err);
-        renderChartTelemetry();
-      }
-    };
-    if (containerHasSize()) {
-      applySetData();
-    } else {
-      // Wait for layout. ResizeObserver on the chart container, with
-      // a hard timeout fallback so we never strand the chart.
-      let observed = false;
-      let observer = null;
-      const onResize = () => {
-        if (!containerHasSize()) return;
-        if (observer) { observer.disconnect(); observer = null; }
-        applySetData();
-      };
-      if (typeof ResizeObserver !== 'undefined') {
-        observer = new ResizeObserver(onResize);
-        if (container) { observer.observe(container); observed = true; }
-      }
+        const ps = state.chart.priceScale('right');
+        ps.applyOptions({ autoScale: true });
+        // Force the price scale to forget any manual margins/scale
+        // overrides from the previous instrument.
+        try { ps.setMargins({ top: 0.1, bottom: 0.1 }); } catch (_) {}
+      } catch (_) {}
+      try { state.chart.priceScale('left').applyOptions({ autoScale: true }); } catch (_) {}
+      showChartMessage(null);
+
+      // One rAF later (chart has repainted) re-fit time scale if we're
+      // still the current load. A stale rAF is harmless because setData
+      // is already committed — fitContent is just polish.
       requestAnimationFrame(() => {
-        if (containerHasSize()) {
-          if (observer) { observer.disconnect(); observer = null; }
-          applySetData();
-          return;
-        }
-        if (!observed) applySetData(); // best-effort fallback
+        if (myGen !== state.chartLoadGen) return;
+        try { state.chart && state.chart.timeScale().fitContent(); } catch (_) {}
       });
-      // Hard cap so we don't wait forever.
-      setTimeout(() => {
-        if (observer) { observer.disconnect(); observer = null; }
-        if (state.candleSeries && series.length && !state._chartPainted) {
-          applySetData();
-        }
-      }, 1500);
+    } catch (err) {
+      console.error("[chart] setData threw for", state.market.symbol, "tf=", state.selectedTimeframe, err);
     }
     await renderChartOverlays();
   }
@@ -480,16 +528,33 @@
   // Incremental update: fetch the last 2 candles only, append or replace the last bucket
   async function updateLatestCandle() {
     if (!state.chartReady || !state.market?.symbol || !state.exchange) return;
+    // Capture generation/identity at request start so a poll that races
+    // a market switch can't push stale candles into the new series.
+    const myGen = state.chartLoadGen;
+    const myExchange = state.exchange;
+    const myAccount = state.account;
+    const myMarketType = state.marketType;
+    const mySymbol = state.market.symbol;
+    const myTimeframe = state.selectedTimeframe;
     const params = new URLSearchParams({
-      exchange: state.exchange,
-      account: state.account,
-      symbol: state.market.symbol,
-      interval: state.selectedTimeframe,
+      exchange: myExchange,
+      account: myAccount,
+      symbol: mySymbol,
+      interval: myTimeframe,
       limit: '2',
-      market_type: state.marketType,
+      market_type: myMarketType,
     });
     let data;
     try { data = await api(`/api/candles?${params}`); } catch (_) { return; }
+    // Drop stale poll responses.
+    if (myGen !== state.chartLoadGen
+      || myExchange !== state.exchange
+      || myAccount !== state.account
+      || myMarketType !== state.marketType
+      || mySymbol !== state.market?.symbol
+      || myTimeframe !== state.selectedTimeframe) {
+      return;
+    }
     const candles = (data && data.data && data.data.candles) || [];
     if (!candles.length) return;
     // /api/candles returns seconds; Lightweight Charts update() takes the
@@ -645,6 +710,10 @@
     if (!symbol) return;
     const input = $('#instrument');
     if (input) input.value = symbol;
+    // Bump the load generation BEFORE any await so the in-flight
+    // loadChartHistory() / poll from the previous selection is
+    // immediately marked stale.
+    state.chartLoadGen = (state.chartLoadGen || 0) + 1;
     state.market = state.markets.find(m => m.symbol === symbol) || { symbol };
     renderMarketHeader(state.market);
     renderMarkets(state.markets);
