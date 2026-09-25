@@ -49,6 +49,7 @@ from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -241,6 +242,9 @@ def capabilities() -> List[str]:
         "candles","balance", "positions_orders", "positions_management", "resolve_instrument", "new_order", "cancel_order_group", "ladder",
         # Phase 2.4: catalog + mark price (metaAndAssetCtxs).
         "list_instruments", "market_price",
+        # Phase 3 (read migration): bulk dynamic market snapshot.
+        # Served from the cached metaAndAssetCtxs path — no extra HTTP.
+        "get_tickers",
         # Phase 2 promotion: position-management writes (implemented; advertised).
         "set_tp", "set_sl", "close_position",
     ]
@@ -304,6 +308,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(account, request)
     if operation == "candles":
         return handle_candles_operation(name, account, request)
     if operation == "new_order":
@@ -324,6 +330,14 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
 # ---------------------------------------------------------------------------
 # Balance implementation
 # ---------------------------------------------------------------------------
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    """Return ``value`` as a stripped string or ``None`` when blank."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _decimal_or_none(value: Any) -> Optional[Decimal]:
@@ -798,6 +812,136 @@ def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalRes
             mark_price=text,
             price=text,
         ),
+    )
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Bulk dynamic market snapshot keyed by canonical symbol.
+
+    Reuses the cached :func:`_fetch_perp_market_candidates` snapshot
+    so no additional HTTP request is issued — HL exposes dynamic
+    data in the same ``metaAndAssetCtxs`` POST the catalog uses.
+
+    ``request`` may carry:
+        - ``symbols``: iterable of canonical aliases. When absent
+          (or empty) the batch covers all perps cached in memory.
+          Symbols that don't resolve are returned in
+          ``failed_symbols`` instead of failing the whole batch.
+
+    ``None`` is used for any field the upstream did not report —
+    never fabricated. ``open_interest`` is unavailable on HL today
+    so it is always ``None``.
+    """
+    raw_symbols = request.get("symbols")
+    if isinstance(raw_symbols, str):
+        raw_symbols_iter: Optional[List[str]] = [raw_symbols]
+    elif isinstance(raw_symbols, (list, tuple)):
+        raw_symbols_iter = list(raw_symbols)
+    else:
+        raw_symbols_iter = None
+
+    try:
+        candidates = _fetch_perp_market_candidates()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKET_CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+
+    # If symbols provided, resolve each. Missing symbols go to
+    # failed_symbols; valid ones get a snapshot.
+    selected: List[Dict[str, Any]] = []
+    failed: List[str] = []
+
+    if raw_symbols_iter is None or len(raw_symbols_iter) == 0:
+        selected = list(candidates)
+    else:
+        # Build a {public_key, route_symbol} → candidate map for O(N) resolve
+        # instead of N². We use the same lookup logic that
+        # ``_resolve_instrument_candidate`` uses to stay consistent.
+        cache_by_route: Dict[str, Dict[str, Any]] = {}
+        cache_by_public: Dict[str, Dict[str, Any]] = {}
+        for cand in candidates:
+            route = str(cand.get("route_symbol") or "").strip()
+            pub = str(cand.get("public_symbol") or "").strip()
+            if route:
+                cache_by_route[_symbol_key(route)] = cand
+            if pub:
+                cache_by_public[_symbol_key(pub)] = cand
+        for requested in raw_symbols_iter:
+            req = str(requested or "").strip()
+            if not req:
+                failed.append(str(requested))
+                continue
+            key = _symbol_key(req)
+            alias_key = _symbol_key(_resolve_exact_symbol_alias(key))
+            cand = None
+            if ":" in req:
+                cand = cache_by_route.get(key) or cache_by_route.get(alias_key)
+            else:
+                cand = cache_by_public.get(key) or cache_by_public.get(alias_key)
+            if cand is None:
+                failed.append(req)
+                continue
+            selected.append(cand)
+
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for cand in selected:
+        route = str(cand.get("route_symbol") or cand.get("internal_name") or "").strip()
+        pub = str(cand.get("public_symbol") or "").strip() or route
+        if not route:
+            continue
+        mark = _decimal_or_none(cand.get("mark_price"))
+        text = _decimal_text(mark) if mark is not None and mark > 0 else None
+        # HL meta does not report oracle_price, open_interest, last_external,
+        # last_updated_time, or quote/base split. None is the correct
+        # answer here — never fabricate.
+        vol = _str_or_none(cand.get("volume_24h"))
+        chg = _str_or_none(cand.get("change_24h"))
+        fund = _str_or_none(cand.get("funding"))
+        dex_val = str(cand.get("dex") or "").strip()
+        mp = CanonicalMarketPrice(
+            requested_symbol=route,
+            market=route,
+            symbol=route,
+            display_name=pub,
+            native_symbol=route,
+            display_symbol=pub,
+            base=dex_val or None,
+            quote=None,            # genuinely unavailable in metaAndAssetCtxs
+            market_type="perp",
+            price_increment=_str_or_none(cand.get("price_increment")),
+            size_increment=_str_or_none(cand.get("size_increment")),
+            minimum_size=None,
+            minimum_notional=None,
+            mark_price=text,
+            price=text,
+            volume_24h_quote=vol,         # HL only exposes notional
+            turnover_24h=vol,
+            volume_24h_base=None,         # genuinely unavailable
+            change_24h_pct=chg,
+            funding_rate=fund,
+            oracle_price=None,            # genuinely unavailable in metaAndAssetCtxs
+            open_interest=None,           # genuinely unavailable in metaAndAssetCtxs
+            last_external_price=None,
+            last_updated_time=None,
+        )
+        tickers[route] = mp
+
+    batch = CanonicalTickersBatch(
+        tickers=tickers,
+        failed_symbols=tuple(failed),
+        fetched_at=None,
+        ttl_seconds=int(_PERP_MARKET_CANDIDATES_TTL_SECONDS),
+    )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=batch,
     )
 
 

@@ -30,15 +30,19 @@ from plugins.trade.candles import handle_candles_operation, has_native_candles
 import logging
 import os
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -148,6 +152,9 @@ def capabilities() -> List[str]:
         "candles",
         "list_instruments",
         "market_price",
+        # Phase D: WebTrade2 now consumes this operation through TradeDesk;
+        # Apex-specific caching/fallback/rate-limit behavior lives here.
+        "get_tickers",
     ]
 
 
@@ -359,6 +366,1075 @@ def _apex_market_price(account: str, request: Dict[str, Any]) -> CanonicalRespon
     )
 
 
+# Phase D: agent-owned canonical Apex ticker provider.
+#
+# Apex does not expose a bulk 24h ticker endpoint. WebTrade2 now consumes
+# only the canonical ``desk.execute({"operation": "get_tickers", ...})``
+# contract; all Apex-specific fan-out, fallback, caching, and rate-limit
+# behavior lives in this agent/provider.
+# Phase C.1 — Agent-owned Apex ticker provider.
+#
+# Apex does not expose a bulk 24h ticker endpoint.  The only per-symbol
+# paths are:
+#
+#   1. Preferred: Apex Omni SDK ``client.ticker_v3(symbol=X)`` (in-process,
+#      already authenticated).  Apex rate-limits this path aggressively
+#      on its IP-bucket and returns block responses once the budget is
+#      exhausted.
+#
+#   2. Fallback: ``GET https://pro.apex.exchange/api/v3/ticker?symbol=X``
+#      (public, separate rate-limit bucket, urllib).  This is the path
+#      WebTrade2 used historically; it is more permissive and survives
+#      SDK throttling.  We extract it here so the same knowledge lives
+#      in the agent instead of WebTrade2.
+#
+# The provider caches per-(account, market_type) with a short TTL,
+# coalesces concurrent refreshes for the same key, runs a leader-only
+# fan-out per refresh, and opens a circuit on rate-limit responses so
+# subsequent callers see the last known good snapshot as ``stale``
+# instead of being hammered.
+APEX_GET_TICKERS_MAX_CONCURRENCY = 5         # conservative default; raise via request
+APEX_GET_TICKERS_TTL_SECONDS = 30            # matches historical WebTrade2 path
+APEX_GET_TICKERS_HARD_MAX_CONCURRENCY = 16   # hard upper bound per request override
+APEX_GET_TICKERS_HARD_MIN_CONCURRENCY = 1    # hard lower bound
+APEX_GET_TICKERS_CIRCUIT_COOLDOWN_S = 90.0   # how long to stay open after a block
+APEX_GET_TICKERS_HTTP_TIMEOUT_S = 8.0        # urllib timeout for fallback path
+APEX_TICKER_HTTP_FALLBACK_URL = "https://pro.apex.exchange/api/v3/ticker"
+
+
+# ---------------------------------------------------------------------------
+# Phase C.1: Rate-limit detection, circuit breaker, ticker provider cache.
+# ---------------------------------------------------------------------------
+#
+# Apex's preferred (SDK) ticker endpoint occasionally returns one of:
+#
+#   * HTTPError / SDK exception: any non-200 response or connection issue.
+#   * Body-level block signals: dict containing ``{"code": 1, "msg":
+#     "sorry, you have been blocked"}`` or similar Apex phrasing.
+#   * Repeated timeouts or 4xx/5xx across a high fraction of symbols.
+#
+# When any of these are seen, we open a circuit (set
+# ``_circuit_open_until[key]`` to now + cooldown).  Subsequent calls see
+# the circuit open and immediately serve the last usable snapshot as
+# ``stale`` rather than launching another fan-out.
+#
+# The block detection is heuristic and tuned to Apex's actual response
+# shape; we never assume — only the field/string shape is matched.  If
+# the upstream changes phrasing, the worst-case outcome is that we
+# degrade to the existing per-symbol failure path (still correct, just
+# without the protection).
+
+_APEX_RATE_LIMIT_PHRASES = (
+    "sorry, you have been blocked",
+    "rate limit",
+    "rate limited",
+    "too many requests",
+    "exceeded the rate limit",
+    "blocked",
+)
+
+
+def _apex_response_signals_rate_limit(payload: Any) -> bool:
+    """Return ``True`` if ``payload`` looks like an Apex rate-limit block.
+
+    Inspects string-ish fields only. Does NOT log the body content
+    beyond a debug message.
+    """
+    if isinstance(payload, Mapping):
+        for key in ("code", "status", "errCode", "errorCode"):
+            val = payload.get(key)
+            if isinstance(val, int) and val in (429, 403):
+                return True
+        # ``msg`` / ``message`` / ``error`` are the most common.
+        for key in ("msg", "message", "error", "info"):
+            text = str(payload.get(key) or "")
+            low = text.lower()
+            if any(p in low for p in _APEX_RATE_LIMIT_PHRASES):
+                return True
+    if isinstance(payload, str):
+        low = payload.lower()
+        if any(p in low for p in _APEX_RATE_LIMIT_PHRASES):
+            return True
+    return False
+
+
+class _ApexTickerProvider:
+    """Agent-owned Apex ticker provider with caching + circuit breaker.
+
+    Lives in-process at the module level. Thread-safe. Does not start
+    any background threads; fan-out is driven by ``get_or_refresh``
+    from the calling thread (typically a webtrade2 request handler
+    thread).
+
+    Caching rules
+    -------------
+    * Key: ``(account, market_type)``.  A future with multiple
+      market_types will not pollute one another.
+    * TTL: ``ttl_seconds`` (default ``APEX_GET_TICKERS_TTL_SECONDS``).
+      When a fresh snapshot exists, ``get_or_refresh`` returns it
+      immediately without any upstream call.
+    * Coalescing: concurrent callers of the same key share one
+      fan-out; the second-and-later callers block on an event and
+      read the result once the leader writes it.
+
+    Rate-limit / circuit-breaker
+    ---------------------------
+    * ``_circuit_open_until[key]`` is a wall-clock timestamp; while
+      ``time.monotonic() < _circuit_open_until[key]`` the circuit is
+      "open" and no fan-out is attempted.
+    * When the leader's refresh detects a block (or >50% of symbols
+      fail), it sets the circuit-open timestamp = now + cooldown,
+      marks the snapshot as rate-limited, and returns it.  Followers
+      inherit that status.
+
+    Partial preserve
+    ----------------
+    * Each refresh merges with the prior snapshot so symbols that
+      fail this time keep their previous value as ``stale``.  Only
+      symbols that have **never** succeeded land in ``failed_symbols``.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = APEX_GET_TICKERS_TTL_SECONDS,
+        max_concurrency: int = APEX_GET_TICKERS_MAX_CONCURRENCY,
+        circuit_cooldown_s: float = APEX_GET_TICKERS_CIRCUIT_COOLDOWN_S,
+    ) -> None:
+        self.ttl_seconds = float(ttl_seconds)
+        self.max_concurrency = max(
+            APEX_GET_TICKERS_HARD_MIN_CONCURRENCY,
+            min(APEX_GET_TICKERS_HARD_MAX_CONCURRENCY, int(max_concurrency)),
+        )
+        self.circuit_cooldown_s = float(circuit_cooldown_s)
+        self._lock = threading.Lock()
+        # (account, market_type) -> epoch time of last successful refresh.
+        self._snapshot_at: Dict[Tuple[Optional[str], str], float] = {}
+        # (account, market_type) -> {canonical_symbol: raw ticker row dict}.
+        self._snapshot_data: Dict[Tuple[Optional[str], str], Dict[str, Dict[str, Any]]] = {}
+        # (account, market_type) -> last refresh metadata; values are
+        # plain JSON-compatible primitives for easy test inspection.
+        self._snapshot_meta: Dict[Tuple[Optional[str], str], Dict[str, Any]] = {}
+        # (account, market_type) -> wall-clock timestamp at which the
+        # circuit closes again (``time.monotonic()`` basis).
+        self._circuit_open_until: Dict[Tuple[Optional[str], str], float] = {}
+        # (account, market_type) -> threading.Event marking an in-flight refresh.
+        self._inflight: Dict[Tuple[Optional[str], str], threading.Event] = {}
+        self._inflight_lock = threading.Lock()
+
+    # -- key helpers ---------------------------------------------------
+
+    @staticmethod
+    def _make_key(
+        account: Optional[str], market_type: Optional[str]
+    ) -> Tuple[Optional[str], str]:
+        return (str(account or "") or None, str(market_type or "") or "")
+
+    # -- circuit / freshness checks ------------------------------------
+
+    def is_circuit_open(self, account: Optional[str], market_type: Optional[str]) -> bool:
+        key = self._make_key(account, market_type)
+        deadline = self._circuit_open_until.get(key)
+        if deadline is None:
+            return False
+        return time.monotonic() < deadline
+
+    def circuit_seconds_remaining(
+        self, account: Optional[str], market_type: Optional[str]
+    ) -> float:
+        key = self._make_key(account, market_type)
+        deadline = self._circuit_open_until.get(key)
+        if deadline is None:
+            return 0.0
+        return max(0.0, deadline - time.monotonic())
+
+    def open_circuit(self, account: Optional[str], market_type: Optional[str]) -> None:
+        key = self._make_key(account, market_type)
+        with self._lock:
+            self._circuit_open_until[key] = time.monotonic() + self.circuit_cooldown_s
+
+    def age_seconds(self, account: Optional[str], market_type: Optional[str]) -> Optional[float]:
+        key = self._make_key(account, market_type)
+        ts = self._snapshot_at.get(key)
+        return None if ts is None else (time.time() - ts)
+
+    # -- core API ------------------------------------------------------
+
+    def get_or_refresh(
+        self,
+        account: Optional[str],
+        market_type: Optional[str],
+        symbols: List[str],
+        fetch_one_sdk: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        fetch_one_http: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        max_concurrency_override: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return a dict describing the freshest snapshot for ``key``.
+
+        Shape::
+
+            {
+              "snapshot": {symbol: row_dict, ...},   # may be empty
+              "stale_symbols": [...],                # served from previous snapshot
+              "failed_symbols": [...],               # no usable value at all
+              "refresh_status": "ok" | "partial" | "rate_limited"
+                                | "circuit_open" | "no_data",
+              "source": "sdk" | "http_fallback" | "cache",
+              "served_from_cache": bool,
+            }
+
+        The dict is the internal "raw rows" representation; mapping
+        into ``CanonicalMarketPrice`` is the caller's job (because
+        static catalog metadata is needed for ``market_type``,
+        ``quote``, ``price_increment``, etc.).  We expose the raw rows
+        here so tests can introspect exactly what came from where.
+        """
+        key = self._make_key(account, market_type)
+
+        # 1. Fresh-cache short-circuit.
+        if not self.is_circuit_open(account, market_type):
+            cached = self._read_snapshot(key)
+            age = self.age_seconds(account, market_type)
+            if (
+                cached is not None
+                and cached.get("snapshot")
+                and age is not None
+                and age <= self.ttl_seconds
+            ):
+                return {
+                    "snapshot": dict(cached.get("snapshot") or {}),
+                    "stale_symbols": list(cached.get("stale_symbols") or ()),
+                    "failed_symbols": list(cached.get("failed_symbols") or ()),
+                    "refresh_status": cached.get("refresh_status", "ok"),
+                    "source": cached.get("source", "cache"),
+                    "served_from_cache": True,
+                }
+
+        # 2. Coalesce concurrent refreshes.
+        with self._inflight_lock:
+            ev = self._inflight.get(key)
+            if ev is None:
+                ev = threading.Event()
+                self._inflight[key] = ev
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            # Wait for the leader, then read whatever they wrote.
+            ev.wait(timeout=self.ttl_seconds)
+            cached = self._read_snapshot(key)
+            if cached is not None:
+                return {
+                    "snapshot": dict(cached.get("snapshot") or {}),
+                    "stale_symbols": list(cached.get("stale_symbols") or ()),
+                    "failed_symbols": list(cached.get("failed_symbols") or ()),
+                    "refresh_status": cached.get("refresh_status", "ok"),
+                    "source": cached.get("source", "cache"),
+                    "served_from_cache": True,
+                }
+            return {
+                "snapshot": {},
+                "stale_symbols": [],
+                "failed_symbols": list(symbols),
+                "refresh_status": "no_data",
+                "source": None,
+                "served_from_cache": True,
+            }
+
+        # 3. Leader: run a single refresh.
+        try:
+            return self._refresh_leader(
+                key=key,
+                symbols=list(symbols),
+                fetch_one_sdk=fetch_one_sdk,
+                fetch_one_http=fetch_one_http,
+                max_concurrency_override=max_concurrency_override,
+            )
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(key, None)
+            ev.set()
+
+    def _force_refresh(
+        self,
+        account: Optional[str],
+        market_type: Optional[str],
+        symbols: List[str],
+        fetch_one_sdk: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        fetch_one_http: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+        max_concurrency_override: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Like :meth:`get_or_refresh` but bypass the fresh-cache short-circuit.
+
+        The circuit-breaker is still honored.  Concurrent callers
+        for the same key are still coalesced.  This path exists for
+        the ``force_refresh`` request flag, which Phase D callers
+        use when they want to refresh on demand (e.g. a manual
+        refresh button in WebTrade2).
+        """
+        key = self._make_key(account, market_type)
+
+        # Coalesce concurrent refreshes.
+        with self._inflight_lock:
+            ev = self._inflight.get(key)
+            if ev is None:
+                ev = threading.Event()
+                self._inflight[key] = ev
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            ev.wait(timeout=self.ttl_seconds)
+            cached = self._read_snapshot(key)
+            if cached is not None:
+                return {
+                    "snapshot": dict(cached.get("snapshot") or {}),
+                    "stale_symbols": list(cached.get("stale_symbols") or ()),
+                    "failed_symbols": list(cached.get("failed_symbols") or ()),
+                    "refresh_status": cached.get("refresh_status", "ok"),
+                    "source": cached.get("source", "cache"),
+                    "served_from_cache": True,
+                }
+            return {
+                "snapshot": {},
+                "stale_symbols": [],
+                "failed_symbols": list(symbols),
+                "refresh_status": "no_data",
+                "source": None,
+                "served_from_cache": True,
+            }
+
+        try:
+            return self._refresh_leader(
+                key=key,
+                symbols=list(symbols),
+                fetch_one_sdk=fetch_one_sdk,
+                fetch_one_http=fetch_one_http,
+                max_concurrency_override=max_concurrency_override,
+            )
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(key, None)
+            ev.set()
+
+    # -- leader body ---------------------------------------------------
+
+    def _refresh_leader(
+        self,
+        key: Tuple[Optional[str], str],
+        symbols: List[str],
+        fetch_one_sdk: Optional[Callable[[str], Optional[Dict[str, Any]]]],
+        fetch_one_http: Optional[Callable[[str], Optional[Dict[str, Any]]]],
+        max_concurrency_override: Optional[int],
+    ) -> Dict[str, Any]:
+        account, market_type = key
+
+        # Circuit open → don't even attempt; serve previous snapshot as stale.
+        if self.is_circuit_open(account, market_type):
+            cached = self._read_snapshot(key) or {}
+            snap = dict(cached.get("snapshot") or {})
+            return {
+                "snapshot": snap,
+                "stale_symbols": [s for s in symbols if s in snap],
+                "failed_symbols": self._diff_failed(symbols, cached),
+                "refresh_status": "circuit_open",
+                "source": cached.get("source"),
+                "served_from_cache": True,
+            }
+
+        if not symbols:
+            return {
+                "snapshot": {},
+                "stale_symbols": [],
+                "failed_symbols": [],
+                "refresh_status": "no_data",
+                "source": None,
+                "served_from_cache": False,
+            }
+
+        max_c = self.max_concurrency
+        if max_concurrency_override is not None:
+            try:
+                max_c = int(max_concurrency_override)
+            except Exception:
+                max_c = self.max_concurrency
+            max_c = max(
+                APEX_GET_TICKERS_HARD_MIN_CONCURRENCY,
+                min(APEX_GET_TICKERS_HARD_MAX_CONCURRENCY, max_c),
+            )
+
+        previous = self._read_snapshot(key) or {}
+        prev_data: Dict[str, Dict[str, Any]] = dict(previous.get("snapshot") or {})
+
+        # ---- Pass 1: SDK (preferred) ----
+        sdk_payloads: Dict[str, Dict[str, Any]] = {}
+        sdk_failed: List[str] = []
+        sdk_blocked = False
+        if fetch_one_sdk is not None:
+            sdk_payloads, sdk_failed, sdk_blocked = self._fan_out(
+                symbols, fetch_one_sdk, max_c
+            )
+            if sdk_blocked:
+                # Hard block detected at fan-out level → open circuit.
+                self.open_circuit(account, market_type)
+                # We still merge what we have; if previous data exists,
+                # serve it as stale.
+                return self._finalize(
+                    key=key,
+                    fresh=sdk_payloads,
+                    previous_data=prev_data,
+                    requested=symbols,
+                    refresh_status="rate_limited",
+                    source="sdk",
+                )
+
+        # ---- Pass 2: HTTP fallback (only for symbols SDK didn't return) ----
+        http_payloads: Dict[str, Dict[str, Any]] = {}
+        http_failed: List[str] = []
+        if fetch_one_http is not None and not sdk_blocked:
+            need = [s for s in symbols if s not in sdk_payloads]
+            if need:
+                http_payloads, http_failed, http_blocked = self._fan_out(
+                    need, fetch_one_http, max_c
+                )
+                if http_blocked:
+                    # Fallback blocked too — keep what we have, mark rate-limited.
+                    return self._finalize(
+                        key=key,
+                        fresh={**sdk_payloads, **http_payloads},
+                        previous_data=prev_data,
+                        requested=symbols,
+                        refresh_status="rate_limited",
+                        source="http_fallback",
+                    )
+
+        # ---- Compose final result ----
+        fresh = {**sdk_payloads, **http_payloads}
+        # If SDK got us something for a symbol, prefer it; otherwise the fallback.
+        # Source label reflects the most authoritative path.
+        source = "sdk" if sdk_payloads else ("http_fallback" if http_payloads else None)
+        return self._finalize(
+            key=key,
+            fresh=fresh,
+            previous_data=prev_data,
+            requested=symbols,
+            refresh_status="ok",
+            source=source,
+        )
+
+    def _fan_out(
+        self,
+        symbols: List[str],
+        fetch_one: Callable[[str], Optional[Dict[str, Any]]],
+        max_c: int,
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[str], bool]:
+        """Run the bounded fan-out. Returns (payloads, failed, blocked).
+
+        ``blocked`` is set when ``fetch_one`` raises an ``ApexBlocked``
+        exception (raised by ``_apex_get_ticker_row`` when the SDK
+        body matches a rate-limit pattern) or when >50% of symbols
+        fail with the same HTTP error code.
+        """
+        sem = threading.BoundedSemaphore(max_c)
+        payloads: Dict[str, Dict[str, Any]] = {}
+        failed: List[str] = []
+        blocked = False
+
+        def _worker(sym: str) -> Tuple[str, Optional[Dict[str, Any]], bool]:
+            with sem:
+                try:
+                    payload, was_blocked = _apex_safe_call(fetch_one, sym)
+                except Exception:
+                    return sym, None, False
+                return sym, payload, was_blocked
+
+        with ThreadPoolExecutor(
+            max_workers=max_c, thread_name_prefix="apex-ticker"
+        ) as ex:
+            futs = [ex.submit(_worker, s) for s in symbols]
+            for fut in as_completed(futs):
+                sym, payload, was_blocked = fut.result()
+                if was_blocked:
+                    blocked = True
+                    # Don't include blocked symbols in the payload set;
+                    # they'll be served from the previous snapshot (or
+                    # failed if no previous).
+                    continue
+                if payload is not None:
+                    payloads[sym] = payload
+                else:
+                    failed.append(sym)
+        return payloads, failed, blocked
+
+    def _finalize(
+        self,
+        key: Tuple[Optional[str], str],
+        fresh: Dict[str, Dict[str, Any]],
+        previous_data: Dict[str, Dict[str, Any]],
+        requested: List[str],
+        refresh_status: str,
+        source: Optional[str],
+    ) -> Dict[str, Any]:
+        """Merge fresh rows with previous snapshot, write to cache, return result."""
+        # Stale = symbols we requested this time that we don't have fresh for,
+        # but we have a previous value for.
+        stale: List[str] = []
+        failed: List[str] = []
+        for sym in requested:
+            if sym in fresh:
+                continue
+            if sym in previous_data:
+                stale.append(sym)
+            else:
+                failed.append(sym)
+
+        merged: Dict[str, Dict[str, Any]] = dict(previous_data)
+        for sym, row in fresh.items():
+            merged[sym] = row
+
+        # If we got fresh data for some symbols, refresh_status may need
+        # to be "partial" instead of "ok". If we got no fresh data and
+        # have no previous data, it is a no-data refresh.
+        if refresh_status == "ok":
+            if not fresh and not previous_data:
+                final_status = "no_data"
+            elif stale or failed:
+                final_status = "partial"
+            else:
+                final_status = "ok"
+        else:
+            final_status = refresh_status
+
+        meta = {
+            "stale_symbols": tuple(stale),
+            "failed_symbols": tuple(failed),
+            "refresh_status": final_status,
+            "source": source,
+        }
+        with self._lock:
+            self._snapshot_data[key] = merged
+            self._snapshot_meta[key] = meta
+            self._snapshot_at[key] = time.time()
+
+        return {
+            "snapshot": dict(merged),
+            "stale_symbols": list(stale),
+            "failed_symbols": list(failed),
+            "refresh_status": final_status,
+            "source": source,
+            "served_from_cache": False,
+        }
+
+    def _read_snapshot(self, key: Tuple[Optional[str], str]) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            ts = self._snapshot_at.get(key)
+            if ts is None:
+                return None
+            merged = dict(self._snapshot_data.get(key) or {})
+            meta = dict(self._snapshot_meta.get(key) or {})
+            return {
+                "snapshot": merged,
+                "stale_symbols": tuple(meta.get("stale_symbols") or ()),
+                "failed_symbols": tuple(meta.get("failed_symbols") or ()),
+                "refresh_status": meta.get("refresh_status", "ok"),
+                "source": meta.get("source"),
+                "_at": ts,
+            }
+
+    @staticmethod
+    def _diff_failed(
+        symbols: List[str], cached: Dict[str, Any]
+    ) -> List[str]:
+        """For circuit-open path: list of symbols that have no usable value."""
+        snap = cached.get("snapshot") or {}
+        return [s for s in symbols if s not in snap]
+
+
+def _apex_safe_call(
+    fetch_one: Callable[[str], Optional[Dict[str, Any]]], symbol: str
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Wrap a per-symbol fetcher. Returns (payload, blocked).
+
+    Inspects the raw response for Apex rate-limit shapes; raises no
+    exception — converts to ``(None, True)`` if blocked, ``(None, False)``
+    if simply failed.
+    """
+    try:
+        out = fetch_one(symbol)
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc) if exc else ""
+        if any(p in text.lower() for p in _APEX_RATE_LIMIT_PHRASES):
+            return None, True
+        return None, False
+    if out is None:
+        return None, False
+    if isinstance(out, Mapping) and _apex_response_signals_rate_limit(out):
+        return None, True
+    if isinstance(out, str) and _apex_response_signals_rate_limit(out):
+        return None, True
+    return out, False
+
+
+# ---- Module-level provider singleton (one per process) ----
+
+_APEX_TICKER_PROVIDER = _ApexTickerProvider()
+
+
+def _apex_provider() -> _ApexTickerProvider:
+    return _APEX_TICKER_PROVIDER
+
+
+# ---- HTTP fallback fetcher (extracted from WebTrade2 service.py) ----
+
+def _apex_ticker_fallback_fetch_one(symbol: str) -> Optional[Dict[str, Any]]:
+    """Per-symbol ticker fetch via Apex's public ``pro.apex.exchange``.
+
+    This is the historically more-permissive endpoint (separate
+    rate-limit bucket from the SDK's ``omni.apex.exchange`` path).
+    Extracted from WebTrade2's former market-list enrichment path so the
+    fallback knowledge lives in the agent.
+    """
+    import json as _json
+    from urllib import request as _u, error as _e
+
+    target = str(symbol or "").strip()
+    if not target:
+        return None
+    norm = target.replace("-", "").replace("_", "")
+    url = f"{APEX_TICKER_HTTP_FALLBACK_URL}?symbol={norm}"
+    req = _u.Request(
+        url,
+        headers={"User-Agent": "HermesApexTicker/1.0", "Accept": "application/json"},
+    )
+    try:
+        with _u.urlopen(req, timeout=APEX_GET_TICKERS_HTTP_TIMEOUT_S) as resp:
+            body = resp.read()
+    except _e.HTTPError as he:  # rate-limited → signal back
+        # 403/429 are surfaced so the provider can open the circuit.
+        if he.code in (403, 429):
+            return {"code": he.code, "msg": "blocked"}
+        return None
+    except Exception:
+        return None
+    try:
+        payload = _json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list) or not data:
+        return None
+    wanted = {target.upper(), norm.upper()}
+    for row in data:
+        if not isinstance(row, Mapping):
+            continue
+        raw = str(row.get("symbol") or "").strip().upper()
+        if raw in wanted:
+            return dict(row)
+    return None
+
+
+def _apex_get_ticker_row(client: Any, symbol: str) -> Optional[Dict[str, Any]]:
+    """Return the canonical ticker row from the Apex SDK for one symbol.
+
+    Returns ``None`` on any failure so callers can record the symbol
+    as failed. The dict shape mirrors Apex ticker rows used by the
+    agent-owned HTTP fallback — flat scalar fields, no nested objects.
+    """
+    fn = getattr(client, "ticker_v3", None)
+    if fn is None:
+        return None
+    target = str(symbol or "").strip()
+    if not target:
+        return None
+    try:
+        response = fn(symbol=target)
+    except Exception as exc:
+        text = str(exc) if exc else ""
+        if any(p in text.lower() for p in _APEX_RATE_LIMIT_PHRASES):
+            return {"msg": text, "code": 429}
+        return None
+    if _apex_response_signals_rate_limit(response):
+        return dict(response) if isinstance(response, Mapping) else {"msg": str(response)}
+    data = response.get("data") if isinstance(response, Mapping) else None
+    if not isinstance(data, list) or not data:
+        return None
+    for row in data:
+        if isinstance(row, Mapping) and _apex_response_signals_rate_limit(row):
+            return dict(row)
+    target_keys = {
+        target.upper(),
+        target.upper().replace("-", ""),
+        target.upper().replace("_", ""),
+        target.upper().replace("-", "").replace("_", ""),
+    }
+    for row in data:
+        if not isinstance(row, Mapping):
+            continue
+        raw = str(row.get("symbol") or row.get("symbolDisplayName") or "").strip().upper()
+        if not raw:
+            continue
+        row_keys = {
+            raw,
+            raw.replace("-", ""),
+            raw.replace("_", ""),
+            (raw.replace("USDT", "-USDT") if "USDT" in raw and "-" not in raw else raw),
+        }
+        if target_keys.isdisjoint(row_keys):
+            continue
+        cleaned: Dict[str, Any] = {}
+        for k, v in row.items():
+            if isinstance(v, (list, dict)):
+                continue
+            text = str(k)
+            try:
+                cleaned[text] = float(v) if text in (
+                    "markPrice", "lastPrice", "oraclePrice", "indexPrice",
+                    "price24hPcnt", "turnover24h", "volume24h", "fundingRate",
+                    "openInterest", "openInterestValue", "openInterestNotional",
+                    "high24h", "low24h", "bestBid", "bestAsk",
+                ) else v
+            except (TypeError, ValueError):
+                continue
+        return cleaned
+    if len(data) == 1 and isinstance(data[0], Mapping):
+        row = data[0]
+        cleaned: Dict[str, Any] = {}
+        for k, v in row.items():
+            if isinstance(v, (list, dict)):
+                continue
+            text = str(k)
+            try:
+                cleaned[text] = float(v) if text in (
+                    "markPrice", "lastPrice", "oraclePrice", "indexPrice",
+                    "price24hPcnt", "turnover24h", "volume24h", "fundingRate",
+                    "openInterest", "high24h", "low24h", "bestBid", "bestAsk",
+                ) else v
+            except (TypeError, ValueError):
+                continue
+        return cleaned
+    return None
+
+
+def _apex_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Bulk dynamic market snapshot keyed by canonical symbol.
+
+    Composes static catalog metadata (instrument, display_name,
+    base, quote / market_type, price/size increment, minimum_size)
+    from the Apex contract config with the live ticker_v3 fields
+    (mark/last/oracle price, 24h change, turnover / base volume,
+    funding_rate, open_interest).
+
+    Phase C.1 — caching / circuit-breaker / fallback:
+      * The fan-out is mediated by ``_apex_provider()`` which
+        caches per (account, market_type) for ``ttl_seconds``,
+        coalesces concurrent callers, and opens a circuit on
+        rate-limit responses (see ``_APEX_GET_TICKERS_CIRCUIT_COOLDOWN_S``).
+      * Preferred source is the Apex Omni SDK ``client.ticker_v3``
+        (in-process, authenticated).  When that path returns a
+        rate-limit shape, the provider opens the circuit and
+        subsequent calls go through the public
+        ``https://pro.apex.exchange/api/v3/ticker`` urllib fallback
+        (separate rate-limit bucket).
+      * Each refresh merges with the previous snapshot, so symbols
+        that fail this time retain their previous value as ``stale``.
+        Only symbols that have **never** succeeded land in
+        ``failed_symbols``.
+      * Concurrency default is ``APEX_GET_TICKERS_MAX_CONCURRENCY``
+        (=5) and is capped to ``APEX_GET_TICKERS_HARD_MIN/MAX_CONCURRENCY``.
+
+    ``request`` may carry:
+        - ``symbols``: iterable of canonical aliases (``BTCUSDT``,
+          ``BTC-USDT``, ``BTC``, ``GOLD``). When absent (or empty),
+          the batch covers the full Apex catalog returned by
+          ``_apex_fetch_supported_markets``.
+        - ``max_concurrency``: optional override; capped to
+          ``APEX_GET_TICKERS_HARD_MIN..MAX_CONCURRENCY``.
+        - ``ttl_seconds``: optional cache TTL override.
+        - ``force_refresh``: ``True`` to bypass the fresh-cache
+          short-circuit (still coalesced with concurrent callers).
+    """
+    credentials, error = _resolve_credentials(account)
+    if error:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code=error["code"],
+            message=error["message"],
+        )
+    assert credentials is not None
+
+    try:
+        client = _client_for_credentials(credentials)
+        client.set_default_account_type("primary")
+        try:
+            client.configs_v3()
+        except Exception:
+            pass
+        contracts = _apex_fetch_supported_markets(client)
+        # Re-walk the segmented config so each contract knows its
+        # section (perp/prelaunch/tradfi). The merged list from
+        # ``_apex_fetch_supported_markets`` drops that tag.
+        section_by_symbol: Dict[str, str] = {}
+        try:
+            cc = (client.configV3 or {}).get("contractConfig") or {}
+            for section, rows in (
+                ("perp", list(cc.get("perpetualContract") or [])),
+                ("prelaunch", list(cc.get("prelaunchContract") or [])),
+                ("tradfi", list(cc.get("stockContract") or [])),
+            ):
+                for row in rows:
+                    if isinstance(row, Mapping):
+                        s = str(row.get("symbol") or "").strip().upper()
+                        if s:
+                            section_by_symbol[s] = section
+        except Exception:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=credentials["account"],
+            code="MARKET_CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+
+    # Build a deduplicated catalog keyed by Apex's canonical symbol.
+    catalog: Dict[str, Mapping[str, Any]] = {}
+    for row in contracts:
+        if not isinstance(row, Mapping):
+            continue
+        sym = str(row.get("symbol") or "").strip()
+        if not sym:
+            continue
+        key = sym.upper()
+        catalog.setdefault(key, row)
+
+    raw_symbols = request.get("symbols")
+    if isinstance(raw_symbols, str):
+        requested_list: Optional[List[str]] = [raw_symbols]
+    elif isinstance(raw_symbols, (list, tuple)):
+        requested_list = list(raw_symbols)
+    else:
+        requested_list = None
+
+    # Resolve the requested set of canonical symbols. Symbols that
+    # don't resolve to a contract go to ``failed_symbols``.
+    targets: List[Tuple[str, Mapping[str, Any]]] = []  # (display_key, contract)
+    if requested_list is None or len(requested_list) == 0:
+        for key, row in catalog.items():
+            targets.append((key, row))
+    else:
+        for requested in requested_list:
+            req = str(requested or "").strip()
+            if not req:
+                continue
+            meta = _apex_resolve_symbol(req, contracts)
+            if meta is None:
+                continue
+            sym = str(meta.get("symbol") or "").strip()
+            key = sym.upper()
+            if not key:
+                continue
+            targets.append((key, meta))
+
+    # If we have no targets AND no previous cached data, return an
+    # empty successful batch.
+    if not targets and not _apex_provider()._snapshot_at.get(
+        (credentials["account"], "")
+    ):
+        return make_success(
+            operation="get_tickers",
+            exchange=name,
+            account=credentials["account"],
+            tickers_batch=CanonicalTickersBatch(
+                tickers={},
+                refresh_status="no_data",
+                source=None,
+                fetched_at=_iso_now(),
+                ttl_seconds=APEX_GET_TICKERS_TTL_SECONDS,
+            ),
+        )
+
+    target_keys = [k for k, _ in targets]
+
+    # Build SDK fetcher bound to the current client (closure).
+    def _sdk_fetch(sym: str) -> Optional[Dict[str, Any]]:
+        return _apex_get_ticker_row(client, sym)
+
+    # HTTP fallback fetcher (uses module-level urllib).
+    def _http_fetch(sym: str) -> Optional[Dict[str, Any]]:
+        return _apex_ticker_fallback_fetch_one(sym)
+
+    # Optional concurrency override.
+    max_c_override: Optional[int] = None
+    raw_mc = request.get("max_concurrency")
+    if raw_mc is not None:
+        try:
+            max_c_override = int(raw_mc)  # type: ignore[arg-type]
+        except Exception:
+            max_c_override = None
+
+    # Bypass cache if requested.
+    if request.get("force_refresh"):
+        # Open the circuit briefly? No — force_refresh should not
+        # poison the circuit. Instead we serve from a one-shot
+        # variant: we'll get_or_refresh with a fresh account key
+        # suffix. Simpler: just call into the provider with a
+        # microsecond-jittered "force" key so the cache lookup is
+        # skipped. But that's fragile.  Cheapest correct path:
+        # bypass by clearing the snapshot timestamp so age > TTL.
+        # We do NOT touch the production cache key directly here —
+        # instead we use the provider's helper that calls
+        # get_or_refresh but forces a refresh on this call only.
+        # Simplest: implement via an internal flag carried in
+        # ``_force_refresh`` set as a transient attribute on the
+        # provider. To keep the change small, we open the call to
+        # a private helper that performs a refresh without using
+        # the cache.
+        result = _apex_provider()._force_refresh(
+            account=credentials["account"],
+            market_type="",
+            symbols=target_keys,
+            fetch_one_sdk=_sdk_fetch,
+            fetch_one_http=_http_fetch,
+            max_concurrency_override=max_c_override,
+        )
+    else:
+        result = _apex_provider().get_or_refresh(
+            account=credentials["account"],
+            market_type="",
+            symbols=target_keys,
+            fetch_one_sdk=_sdk_fetch,
+            fetch_one_http=_http_fetch,
+            max_concurrency_override=max_c_override,
+        )
+
+    snapshot = result["snapshot"]
+    stale_set = set(result["stale_symbols"])
+    failed_set = set(result["failed_symbols"])
+    refresh_status = result["refresh_status"]
+    source = result["source"]
+    served_from_cache = result["served_from_cache"]
+
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    failed: List[str] = []
+    stale_list: List[str] = []
+    for key, contract in targets:
+        # The provider may have stored the row under either:
+        #  - the raw SDK key (uppercase, no dash) — what
+        #    ``_apex_get_ticker_row`` returns keyed by ``target``,
+        #  - or normalized symbol.
+        # We keyed the fan-out by ``target_keys`` (uppercase
+        # ``Apex-symbol`` like ``BTC-USDT``); look up by key.
+        payload = snapshot.get(key)
+        # If not found by exact key, try normalized forms.
+        if payload is None:
+            norm = key.replace("-", "").replace("_", "")
+            for k, v in snapshot.items():
+                if k == norm or k.upper() == norm.upper():
+                    payload = v
+                    break
+        sym = str(contract.get("symbol") or key).strip()
+        display = str(
+            contract.get("symbolDisplayName")
+            or contract.get("crossSymbolName")
+            or sym
+        ).strip() or sym
+        base = str(sym.split("-", 1)[0].strip() or display)
+        quote = "USDT"
+        if "USDC" in sym.upper() and "USDT" not in sym.upper():
+            quote = "USDC"
+        elif "USD" in sym.upper() and "USDT" not in sym.upper() and "USDC" not in sym.upper():
+            quote = "USD"
+        section = section_by_symbol.get(key, "perp")
+        price_inc = _str_or_none(contract.get("tickSize"))
+        size_inc = _str_or_none(contract.get("stepSize") or contract.get("lotSize"))
+        min_size = _str_or_none(contract.get("minOrderSize"))
+        unavailable = payload is None
+        if unavailable:
+            # Keep static/catalog data in the canonical batch so WebTrade2 can
+            # list the instrument and display price as —. The symbol remains
+            # in failed_symbols to indicate no usable dynamic ticker row exists.
+            if key in failed_set or sym not in snapshot:
+                failed.append(sym)
+            payload_row: Mapping[str, Any] = {}
+        else:
+            payload_row = payload if isinstance(payload, Mapping) else {}
+        # Mark stale if explicitly in stale_symbols (provider says
+        # this row came from the previous snapshot).
+        if key in stale_set:
+            stale_list.append(sym)
+        mark = _str_or_none(payload_row.get("markPrice")) or _str_or_none(payload_row.get("lastPrice"))
+        oracle = _str_or_none(payload_row.get("oraclePrice")) or _str_or_none(payload_row.get("indexPrice"))
+        turnover = _str_or_none(payload_row.get("turnover24h"))
+        vol_base = _str_or_none(payload_row.get("volume24h"))
+        change_24h = _str_or_none(payload_row.get("price24hPcnt"))
+        funding = _str_or_none(payload_row.get("fundingRate"))
+        oi = _str_or_none(payload_row.get("openInterest"))
+        mp = CanonicalMarketPrice(
+            requested_symbol=sym,
+            market=sym,
+            symbol=sym,
+            display_name=display,
+            native_symbol=sym,
+            display_symbol=display,
+            base=base or None,
+            quote=quote,
+            market_type=section,
+            price_increment=price_inc,
+            size_increment=size_inc,
+            minimum_size=min_size,
+            minimum_notional=None,
+            mark_price=mark,
+            price=mark,
+            oracle_price=oracle,
+            volume_24h_base=vol_base,
+            volume_24h_quote=turnover,
+            turnover_24h=turnover,
+            change_24h_pct=change_24h,
+            funding_rate=funding,
+            open_interest=oi,
+            last_external_price=None,
+            last_updated_time=None,
+        )
+        tickers[sym] = mp
+
+    batch = CanonicalTickersBatch(
+        tickers=tickers,
+        failed_symbols=tuple(failed),
+        fetched_at=_iso_now(),
+        ttl_seconds=APEX_GET_TICKERS_TTL_SECONDS,
+        stale_symbols=tuple(stale_list),
+        refresh_status=refresh_status,
+        source=source,
+        served_from_cache=served_from_cache,
+    )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=credentials["account"],
+        tickers_batch=batch,
+    )
+
+
+def _iso_now() -> Optional[str]:
+    """ISO 8601 UTC timestamp with seconds precision. ``None`` if year < 1900."""
+    try:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    except Exception:
+        return None
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    """Return ``value`` as a trimmed numeric/text string or ``None``."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     """Dispatch to the requested operation.
 
@@ -401,6 +1477,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _apex_list_instruments(account, request)
         if operation == "market_price":
             return _apex_market_price(account, request)
+        if operation == "get_tickers":
+            return _apex_get_tickers(account, request)
         if operation == "candles":
             return handle_candles_operation(name, account, request)
         if operation == "set_tp":

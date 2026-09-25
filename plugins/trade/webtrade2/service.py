@@ -6,7 +6,6 @@ has no execution/cancel/position-modification methods.
 
 from __future__ import annotations
 
-import json
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -118,17 +117,24 @@ def format_pct_change(raw: Any) -> str:
 
 
 def _volume_key(row: Mapping[str, Any]) -> tuple[int, Decimal, str]:
+    # Ranking uses comparable quote/notional volume only:
+    #   1. turnover_24h
+    #   2. volume_24h_quote
+    #   3. legacy volume_24h / quote-volume aliases
+    # Never use volume_24h_base as ranking volume.
     raw = (
-        row.get("volume_24h")
-        or row.get("volume")
-        or row.get("quote_volume")
+        row.get("turnover_24h")
         or row.get("turnover24h")
+        or row.get("volume_24h_quote")
+        or row.get("volume_24h")
+        or row.get("quote_volume")
         or row.get("trading_volume_24h")
     )
+    symbol = str(row.get("symbol") or row.get("instrument") or "")
     if raw is None or raw == "":
-        return (1, Decimal("0"), str(row.get("symbol") or row.get("instrument") or ""))
+        return (1, Decimal("0"), symbol)
     vol = _decimal(raw)
-    return (0, -vol, str(row.get("symbol") or row.get("instrument") or ""))
+    return (0, -vol, symbol)
 
 
 def _bool_feature(caps: set[str], name: str) -> bool:
@@ -226,109 +232,124 @@ class WebTrade2Service:
 
     def markets(self, exchange: str, account: str, market_type: str = "futures", search: str = "") -> Dict[str, Any]:
         caps = set(self.desk.capabilities(exchange) or [])
-        if "list_instruments" not in caps:
-            return {"success": False, "error": {"code": "UNSUPPORTED", "message": "Exchange does not expose instrument lists."}}
-        resp = self._execute_read({"operation": "list_instruments", "exchange": exchange, "account": account, "market_type": market_type})
-        data = resp.to_dict() if hasattr(resp, "to_dict") else _plain(resp)
         rows: List[Dict[str, Any]] = []
-        source = data.get("data", {}) if isinstance(data, dict) else {}
+
+        if "get_tickers" in caps:
+            resp = self._execute_read({
+                "operation": "get_tickers",
+                "exchange": exchange,
+                "account": account,
+                "market_type": market_type,
+            })
+            data = resp.to_dict() if hasattr(resp, "to_dict") else _plain(resp)
+            rows = self._rows_from_tickers_batch(data, market_type=market_type)
+        else:
+            if "list_instruments" not in caps:
+                return {"success": False, "error": {"code": "UNSUPPORTED", "message": "Exchange does not expose instrument lists."}}
+            resp = self._execute_read({"operation": "list_instruments", "exchange": exchange, "account": account, "market_type": market_type})
+            data = resp.to_dict() if hasattr(resp, "to_dict") else _plain(resp)
+            rows = self._rows_from_instrument_list(data, market_type=market_type)
+
+        ranked = self._rank_markets(rows, search=search)
+        return {"success": True, "exchange": exchange, "account": account, "market_type": market_type, "markets": ranked}
+
+    def _rows_from_instrument_list(self, data: Mapping[str, Any], *, market_type: str) -> List[Dict[str, Any]]:
+        """Temporary generic fallback for agents without get_tickers.
+
+        This is exchange-agnostic and preserves the pre-Phase-D behavior
+        for agents that have not advertised the canonical ticker contract yet.
+        """
+        rows: List[Dict[str, Any]] = []
+        source = data.get("data", {}) if isinstance(data, Mapping) else {}
         for raw in source.get("instruments") or source.get("markets") or []:
             if not isinstance(raw, Mapping):
                 continue
             symbol = str(raw.get("symbol") or raw.get("instrument") or raw.get("market") or "").strip()
             if not symbol:
                 continue
-            volume = (
-                raw.get("volume_24h")
-                or raw.get("volume")
-                or raw.get("quote_volume")
-                or raw.get("turnover24h")
-                or raw.get("trading_volume_24h")
-            )
-            # Spot exchanges have no futures funding metric
+            turnover = raw.get("turnover_24h") or raw.get("turnover24h")
+            quote_volume = raw.get("volume_24h_quote") or raw.get("volume_24h") or raw.get("volume") or raw.get("quote_volume") or raw.get("trading_volume_24h")
+            ranking_volume = turnover or quote_volume
             funding = None if str(market_type).lower() == "spot" else (
                 raw.get("funding") or raw.get("funding_rate") or raw.get("fundingRate")
             )
             rows.append({
                 "symbol": symbol,
-                "display_name": raw.get("display_name") or raw.get("name") or symbol,
+                "display_name": raw.get("display_name") or raw.get("display_symbol") or raw.get("name") or symbol,
+                "native_symbol": raw.get("native_symbol") or symbol,
+                "base": raw.get("base"),
+                "quote": raw.get("quote"),
+                "market_type": raw.get("market_type") or market_type,
                 "price": raw.get("price") or raw.get("mark_price") or raw.get("last_price"),
+                "mark_price": raw.get("mark_price"),
+                "price_increment": raw.get("price_increment"),
+                "size_increment": raw.get("size_increment"),
+                "minimum_size": raw.get("minimum_size"),
+                "minimum_notional": raw.get("minimum_notional"),
                 "change_24h": raw.get("change_24h") or raw.get("price_change_24h") or raw.get("price24hPcnt"),
-                "volume_24h": volume,
+                "turnover_24h": turnover,
+                "volume_24h_quote": quote_volume,
+                "volume_24h_base": raw.get("volume_24h_base"),
+                # Keep legacy key so existing frontend/tests can keep using it;
+                # its value is quote/notional-ranking volume, never base volume.
+                "volume_24h": ranking_volume,
                 "funding": funding,
+                "funding_rate": raw.get("funding_rate") or raw.get("fundingRate") or raw.get("funding"),
                 "volume_unit": raw.get("volume_unit") or raw.get("quote") or "quote",
+                "ticker_status": "fallback_list_instruments",
             })
-        # Apex does not expose a bulk 24h ticker endpoint. The list above has
-        # no prices and no volume; we enrich via the cache fan-out so the
-        # browser receives ranked, priced rows.
-        if str(exchange).lower() == "apex":
-            rows = self._apex_enrich(rows, account)
-        ranked = self._rank_markets(rows, search=search)
-        return {"success": True, "exchange": exchange, "account": account, "market_type": market_type, "markets": ranked}
+        return rows
 
-    def _apex_enrich(self, rows: List[Dict[str, Any]], account: str) -> List[Dict[str, Any]]:
-        """Best-effort enrichment via the Apex per-symbol ticker fan-out cache.
-
-        Falls back gracefully: if Apex is unreachable or returns no rows,
-        the catalog rows are returned untouched (price=None, turnover=None).
-        """
-        try:
-            from plugins.trade.webtrade2.apex_ticker_cache import (
-                get_cache, merge_ticker_into_rows,
-            )
-        except Exception as exc:  # pragma: no cover — import guard
-            log.warning("apex_ticker_cache unavailable: %s", exc)
+    def _rows_from_tickers_batch(self, data: Mapping[str, Any], *, market_type: str) -> List[Dict[str, Any]]:
+        """Map CanonicalTickersBatch into the stable WebTrade2 market model."""
+        batch = data.get("tickers_batch", {}) if isinstance(data, Mapping) else {}
+        if not isinstance(batch, Mapping):
+            batch = {}
+        stale = {str(s) for s in (batch.get("stale_symbols") or [])}
+        failed = {str(s) for s in (batch.get("failed_symbols") or [])}
+        status = str(batch.get("refresh_status") or "ok")
+        source = batch.get("source")
+        tickers = batch.get("tickers") or {}
+        rows: List[Dict[str, Any]] = []
+        if not isinstance(tickers, Mapping):
             return rows
-
-        symbols = [str(r.get("symbol") or "").strip() for r in rows if r.get("symbol")]
-        symbols = [s for s in symbols if s]
-        if not symbols:
-            return rows
-
-        cache = get_cache()
-
-        def _fetch_one(sym: str) -> Optional[Dict[str, Any]]:
-            # Apex's /api/v3/ticker is a public endpoint — no auth.
-            import time as _t
-            from urllib import request as _u, error as _e
-            t0 = _t.perf_counter()
-            url = f"https://pro.apex.exchange/api/v3/ticker?symbol={sym.replace('-', '').replace('_', '')}"
-            req = _u.Request(url, headers={"User-Agent": "WebTrade2/1.0", "Accept": "application/json"})
-            try:
-                with _u.urlopen(req, timeout=8) as resp:
-                    body = resp.read()
-            except _e.HTTPError as he:
-                log.info("apex ticker %s HTTP %s", sym, he.code)
-                return None
-            except Exception as exc:
-                log.info("apex ticker %s failed: %s", sym, exc)
-                return None
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except Exception:
-                return None
-            data = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(data, list) or not data:
-                return None
-            # /api/v3/ticker accepts one symbol but the response is always a list;
-            # pick the row whose symbol matches the request (post-sanitization).
-            wanted = {sym.upper(), sym.replace("-", "").upper(), sym.replace("_", "").upper()}
-            for row in data:
-                if not isinstance(row, Mapping):
-                    continue
-                raw = str(row.get("symbol") or "").strip().upper()
-                if raw in wanted:
-                    dt_ms = int((_t.perf_counter() - t0) * 1000)
-                    log.debug("apex ticker %s ok in %dms", sym, dt_ms)
-                    return dict(row)
-            return None
-
-        try:
-            ticker_map = cache.refresh_sync("apex", account, symbols, _fetch_one) or {}
-        except Exception as exc:
-            log.warning("apex_ticker_cache.refresh_sync failed: %s", exc)
-            return rows
-        return merge_ticker_into_rows(rows, ticker_map)
+        for symbol_key, raw in tickers.items():
+            if not isinstance(raw, Mapping):
+                continue
+            symbol = str(raw.get("symbol") or raw.get("market") or symbol_key or "").strip()
+            if not symbol:
+                continue
+            turnover = raw.get("turnover_24h")
+            quote_volume = raw.get("volume_24h_quote")
+            ranking_volume = turnover or quote_volume
+            funding = None if str(market_type).lower() == "spot" else raw.get("funding_rate")
+            row_status = "stale" if symbol in stale or str(symbol_key) in stale else ("unavailable" if symbol in failed or str(symbol_key) in failed else status)
+            rows.append({
+                "symbol": symbol,
+                "display_name": raw.get("display_symbol") or raw.get("display_name") or symbol,
+                "native_symbol": raw.get("native_symbol") or raw.get("market") or symbol,
+                "base": raw.get("base"),
+                "quote": raw.get("quote"),
+                "market_type": raw.get("market_type") or market_type,
+                "price": raw.get("price") or raw.get("mark_price"),
+                "mark_price": raw.get("mark_price"),
+                "price_increment": raw.get("price_increment"),
+                "size_increment": raw.get("size_increment"),
+                "minimum_size": raw.get("minimum_size"),
+                "minimum_notional": raw.get("minimum_notional"),
+                "turnover_24h": turnover,
+                "volume_24h_quote": quote_volume,
+                "volume_24h_base": raw.get("volume_24h_base"),
+                # Legacy/ranking key: quote/notional only. Never base volume.
+                "volume_24h": ranking_volume,
+                "funding": funding,
+                "funding_rate": raw.get("funding_rate"),
+                "volume_unit": raw.get("quote") or "quote",
+                "ticker_status": row_status,
+                "ticker_source": source,
+                "ticker_refresh_status": status,
+            })
+        return rows
 
     def _rank_markets(self, rows: List[Dict[str, Any]], search: str = "") -> List[Dict[str, Any]]:
         """Sort the market universe by 24h notional volume descending with unknown-volume alphabetical tail.

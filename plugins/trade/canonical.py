@@ -178,47 +178,168 @@ class CanonicalOrderGroup:
 
 @dataclass(frozen=True)
 class CanonicalInstrument:
-    """Canonical resolved instrument descriptor."""
+    """Canonical resolved instrument descriptor.
+
+    Static fields stay additive; ``None`` means "unknown" / unavailable.
+    Callers must distinguish ``None`` (provider didn't report the field)
+    from a zero / empty value — never fabricate.
+    """
 
     requested_symbol: str
     symbol: str
     display_name: str
+    # === Static metadata (additive, default None) ============================
+    native_symbol: Optional[str] = None       # exchange wire-format id
+    display_symbol: Optional[str] = None      # user-facing alias
+    base: Optional[str] = None                # BTC, ETH, ... or dex id (HL)
+    quote: Optional[str] = None               # USDT, USDC, ...
+    market_type: Optional[str] = None         # "perp" | "spot" | ...
     price_increment: Optional[str] = None
     size_increment: Optional[str] = None
     minimum_size: Optional[str] = None
+    minimum_notional: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "requested_symbol": self.requested_symbol,
             "symbol": self.symbol,
             "display_name": self.display_name,
+            "native_symbol": self.native_symbol,
+            "display_symbol": self.display_symbol,
+            "base": self.base,
+            "quote": self.quote,
+            "market_type": self.market_type,
             "price_increment": self.price_increment,
             "size_increment": self.size_increment,
             "minimum_size": self.minimum_size,
+            "minimum_notional": self.minimum_notional,
         }
 
 
 @dataclass(frozen=True)
 class CanonicalMarketPrice:
-    """Canonical current market-price snapshot for one instrument."""
+    """Canonical market-price snapshot for one instrument.
+
+    Combines static identity with dynamic snapshot fields. Static fields
+    are inherited from the parent instrument via :meth:`instrument_dict`
+    so consumers can render full rows from a single object.  ``None`` for
+    dynamic fields means the provider did not report it; never fabricate.
+    """
 
     requested_symbol: str
     market: str
+    # === Identity / static (additive) ========================================
+    # When a caller builds a market-price snapshot from a list_instruments
+    # pass, they typically already know these. The maker-fns below thread
+    # them through from ``CanonicalInstrument`` via :func:`make_market_price`.
+    symbol: Optional[str] = None
+    display_name: Optional[str] = None
+    native_symbol: Optional[str] = None
+    display_symbol: Optional[str] = None
+    base: Optional[str] = None
+    quote: Optional[str] = None
+    market_type: Optional[str] = None
+    price_increment: Optional[str] = None
+    size_increment: Optional[str] = None
+    minimum_size: Optional[str] = None
+    minimum_notional: Optional[str] = None
+    # === Dynamic snapshot ====================================================
     mark_price: Optional[str] = None
     oracle_price: Optional[str] = None
     last_external_price: Optional[str] = None
     last_updated_time: Optional[str] = None
     price: Optional[str] = None
+    volume_24h_base: Optional[str] = None
+    volume_24h_quote: Optional[str] = None  # alias: turnover_24h
+    turnover_24h: Optional[str] = None
+    change_24h_pct: Optional[str] = None
+    funding_rate: Optional[str] = None
+    open_interest: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "requested_symbol": self.requested_symbol,
             "market": self.market,
+            "symbol": self.symbol,
+            "display_name": self.display_name,
+            "native_symbol": self.native_symbol,
+            "display_symbol": self.display_symbol,
+            "base": self.base,
+            "quote": self.quote,
+            "market_type": self.market_type,
+            "price_increment": self.price_increment,
+            "size_increment": self.size_increment,
+            "minimum_size": self.minimum_size,
+            "minimum_notional": self.minimum_notional,
             "mark_price": self.mark_price,
             "oracle_price": self.oracle_price,
             "last_external_price": self.last_external_price,
             "last_updated_time": self.last_updated_time,
             "price": self.price,
+            "volume_24h_base": self.volume_24h_base,
+            "volume_24h_quote": self.volume_24h_quote,
+            "turnover_24h": self.turnover_24h,
+            "change_24h_pct": self.change_24h_pct,
+            "funding_rate": self.funding_rate,
+            "open_interest": self.open_interest,
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalTickersBatch:
+    """Canonical bulk ticker snapshot keyed by canonical ``symbol``.
+
+    Returned by the ``get_tickers`` operation across multiple symbols
+    in one exchange-agent call.  ``tickers`` may be partial — if a
+    provider fails to fetch one symbol, it is omitted from the dict
+    rather than the whole batch failing.  ``failed_symbols`` records
+    the per-symbol failures so callers can render the catalog with
+    blanks for missing rows.
+
+    Freshness semantics (Phase C.1):
+      * ``served_from_cache`` — ``True`` when the response was returned
+        without performing a new upstream refresh (fresh-cache
+        short-circuit). ``refresh_status`` then describes what happened
+        during the most recent refresh, NOT the current request.
+      * ``stale_symbols`` — symbols whose current row came from the
+        **previous** successful snapshot because the current refresh
+        did not produce a fresh payload for them. The previous value
+        is preserved rather than dropped.
+      * ``failed_symbols`` — symbols with **no usable value at all**
+        (neither fresh nor a stale prior value). Consumers should
+        render these as ``—``.
+      * ``refresh_status`` — ``"ok"`` (fresh + non-empty),
+        ``"partial"`` (some symbols fresh, some stale or failed),
+        ``"rate_limited"`` (upstream rejected the refresh; cached
+        values served as stale where available),
+        ``"circuit_open"`` (rate-limit cooldown is in effect; no
+        refresh attempted; cached values served where available),
+        ``"no_data"`` (no cache and no upstream data — fully empty
+        tickers dict).
+      * ``source`` — a short label like ``"sdk"`` (preferred),
+        ``"http_fallback"`` (Apex ``pro.apex.exchange`` urllib path),
+        or ``"cache"`` (only when no refresh ran).
+    """
+
+    tickers: Dict[str, CanonicalMarketPrice]  # canonical symbol -> snapshot
+    failed_symbols: tuple = ()
+    fetched_at: Optional[str] = None
+    ttl_seconds: Optional[int] = None
+    stale_symbols: tuple = ()
+    refresh_status: str = "ok"
+    source: Optional[str] = None
+    served_from_cache: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tickers": {k: v.to_dict() for k, v in self.tickers.items()},
+            "failed_symbols": [s for s in self.failed_symbols],
+            "fetched_at": self.fetched_at,
+            "ttl_seconds": self.ttl_seconds,
+            "stale_symbols": [s for s in self.stale_symbols],
+            "refresh_status": self.refresh_status,
+            "source": self.source,
+            "served_from_cache": self.served_from_cache,
         }
 
 
@@ -470,6 +591,7 @@ class CanonicalResponse:
     order_groups: Optional[list[CanonicalOrderGroup]] = None
     instrument: Optional[CanonicalInstrument] = None
     market_price: Optional[CanonicalMarketPrice] = None
+    tickers_batch: Optional[CanonicalTickersBatch] = None
     order: Optional[CanonicalOrderResult] = None
     ladder: Optional[CanonicalLadderResult] = None
     cancel_group: Optional[CanonicalCancelGroupResult] = None
@@ -508,6 +630,8 @@ class CanonicalResponse:
             data["instrument"] = self.instrument.to_dict()
         if self.market_price is not None:
             data["market_price"] = self.market_price.to_dict()
+        if self.tickers_batch is not None:
+            data["tickers_batch"] = self.tickers_batch.to_dict()
         if self.order is not None:
             data["order"] = self.order.to_dict()
         if self.ladder is not None:
@@ -536,6 +660,7 @@ def make_success(
     order_groups: Optional[list[CanonicalOrderGroup]] = None,
     instrument: Optional[CanonicalInstrument] = None,
     market_price: Optional[CanonicalMarketPrice] = None,
+    tickers_batch: Optional[CanonicalTickersBatch] = None,
     order: Optional[CanonicalOrderResult] = None,
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
@@ -555,6 +680,7 @@ def make_success(
         order_groups=order_groups,
         instrument=instrument,
         market_price=market_price,
+        tickers_batch=tickers_batch,
         order=order,
         ladder=ladder,
         cancel_group=cancel_group,
@@ -577,6 +703,7 @@ def make_failure(
     order_groups: Optional[list[CanonicalOrderGroup]] = None,
     instrument: Optional[CanonicalInstrument] = None,
     market_price: Optional[CanonicalMarketPrice] = None,
+    tickers_batch: Optional[CanonicalTickersBatch] = None,
     order: Optional[CanonicalOrderResult] = None,
     ladder: Optional[CanonicalLadderResult] = None,
     cancel_group: Optional[CanonicalCancelGroupResult] = None,
@@ -605,6 +732,7 @@ def make_failure(
         order_groups=order_groups,
         instrument=instrument,
         market_price=market_price,
+        tickers_batch=tickers_batch,
         order=order,
         ladder=ladder,
         cancel_group=cancel_group,
