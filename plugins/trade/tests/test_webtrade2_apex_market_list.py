@@ -240,5 +240,68 @@ class WebTrade2CanonicalMarketListTests(unittest.TestCase):
         self.assertNotIn("pro.apex.exchange", service_text)
 
 
+class WebTrade2Batch1CanonicalPathTests(unittest.TestCase):
+    def test_batch1_agents_make_webtrade2_use_get_tickers_without_exchange_branches(self) -> None:
+        agent_files = {
+            "rise": Path("/root/kam/plugins/trade/agents/x_rise_agent.py"),
+            "perpl": Path("/root/kam/plugins/trade/agents/x_perpl_agent.py"),
+            "pacifica": Path("/root/kam/plugins/trade/agents/x_pacifica_agent.py"),
+        }
+        for exchange, path in agent_files.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('"get_tickers"', text, f"{exchange} must advertise canonical get_tickers")
+
+        agent_caps = {
+            "rise": ["list_instruments", "get_tickers"],
+            "perpl": ["list_instruments", "get_tickers"],
+            "pacifica": ["list_instruments", "get_tickers"],
+        }
+        responses = {
+            "rise:get_tickers": make_success(
+                operation="get_tickers",
+                exchange="rise",
+                account="acct",
+                tickers_batch=CanonicalTickersBatch(tickers={
+                    "RISE-HIGH": _mp("RISE-HIGH", price="10", turnover="1000"),
+                }),
+            ),
+            "perpl:get_tickers": make_success(
+                operation="get_tickers",
+                exchange="perpl",
+                account="acct",
+                tickers_batch=CanonicalTickersBatch(tickers={
+                    "PERPL-QUOTE": _mp("PERPL-QUOTE", price="20", quote_volume="500"),
+                }),
+            ),
+            "pacifica:get_tickers": make_success(
+                operation="get_tickers",
+                exchange="pacifica",
+                account="acct",
+                tickers_batch=CanonicalTickersBatch(tickers={
+                    "PACIFICA-BASE-HUGE": _mp("PACIFICA-BASE-HUGE", price="30", base_volume="999999"),
+                    "PACIFICA-UNKNOWN-A": _mp("PACIFICA-UNKNOWN-A", price="1"),
+                    "PACIFICA-UNKNOWN-Z": _mp("PACIFICA-UNKNOWN-Z", price="1"),
+                }),
+            ),
+        }
+        desk = FakeDesk(agent_caps, responses)
+        svc = WebTrade2Service(desk=desk)
+
+        self.assertEqual(svc.markets("rise", "acct")["markets"][0]["symbol"], "RISE-HIGH")
+        self.assertEqual(svc.markets("perpl", "acct")["markets"][0]["volume_24h"], "500")
+        pacifica_rows = svc.markets("pacifica", "acct")["markets"]
+        self.assertEqual([r["symbol"] for r in pacifica_rows], [
+            "PACIFICA-BASE-HUGE",
+            "PACIFICA-UNKNOWN-A",
+            "PACIFICA-UNKNOWN-Z",
+        ])
+        self.assertIsNone(pacifica_rows[0]["volume_24h"], "base volume must not become ranking volume")
+        self.assertEqual([r["operation"] for r in desk.requests], ["get_tickers", "get_tickers", "get_tickers"])
+
+        service_text = Path("/root/kam/plugins/trade/webtrade2/service.py").read_text(encoding="utf-8")
+        for forbidden in ('exchange == "rise"', 'exchange == "perpl"', 'exchange == "pacifica"', "x_rise_agent", "x_perpl_agent", "x_pacifica_agent"):
+            self.assertNotIn(forbidden, service_text)
+
+
 if __name__ == "__main__":
     unittest.main()

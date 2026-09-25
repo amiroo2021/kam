@@ -63,6 +63,7 @@ from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalLadderResult,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -410,6 +411,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -4061,6 +4063,128 @@ def _execute_list_instruments(account: str, request: Dict[str, Any]) -> Canonica
     )
 
 
+def _pacifica_decimal_text(value: Any) -> Optional[str]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        dec = Decimal(str(value).replace(",", "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if not dec.is_finite():
+        return None
+    return format(dec.normalize(), "f")
+
+
+def _pacifica_symbol_filter(symbols: Any) -> set[str]:
+    if symbols in (None, ""):
+        return set()
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: set[str] = set()
+    for item in raw_items:
+        raw = str(item or "").strip().upper()
+        if not raw:
+            continue
+        out.add(raw)
+        compact = raw.replace("-", "").replace("/", "").replace("_", "")
+        out.add(compact)
+        for suffix in ("USD", "USDT", "USDC", "-PERP", "PERP", ".P"):
+            if raw.endswith(suffix) and len(raw) > len(suffix):
+                out.add(raw[: -len(suffix)].rstrip("-"))
+    return out
+
+
+def _pacifica_ticker_matches_filter(symbol: str, filters: set[str]) -> bool:
+    if not filters:
+        return True
+    sym = str(symbol or "").strip().upper()
+    candidates = {sym, sym.replace("-", "").replace("/", "").replace("_", "")}
+    for suffix in ("USD", "USDT", "USDC", "-PERP", "PERP", ".P"):
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            candidates.add(sym[: -len(suffix)].rstrip("-"))
+    return bool(candidates & filters)
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    if not account:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account="",
+            code="MISSING_ACCOUNT",
+            message="Account is required.",
+        )
+    try:
+        rows = _pacifica_all_market_rows()
+        try:
+            marks = _get_mark_prices()
+        except Exception:  # noqa: BLE001
+            marks = {}
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="CATALOG_UNAVAILABLE",
+            message=sanitize_error_message(str(exc)),
+        )
+    filters = _pacifica_symbol_filter(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    failed: List[str] = []
+    for row in rows:
+        sym = str(row.get("symbol") or row.get("name") or "").strip().upper()
+        if not sym or not _pacifica_ticker_matches_filter(sym, filters):
+            continue
+        mark = marks.get(sym)
+        if mark is None:
+            for k, v in marks.items():
+                if str(k).upper() == sym:
+                    mark = v
+                    break
+        mark_text = _pacifica_decimal_text(mark)
+        if mark_text is None:
+            failed.append(sym)
+        tickers[sym] = CanonicalMarketPrice(
+            requested_symbol=sym,
+            market=sym,
+            symbol=sym,
+            native_symbol=sym,
+            display_symbol=sym,
+            display_name=str(row.get("display_name") or row.get("symbol") or sym),
+            base=sym,
+            quote="USDC",
+            market_type="perp",
+            mark_price=mark_text,
+            price=mark_text,
+            price_increment=_pacifica_decimal_text(row.get("tick_size") or row.get("quote_tick") or row.get("price_increment")),
+            size_increment=_pacifica_decimal_text(row.get("lot_size") or row.get("base_tick") or row.get("size_increment")),
+            minimum_size=_pacifica_decimal_text(row.get("base_min") or row.get("lot_size") or row.get("minimum_size")),
+            minimum_notional=_pacifica_decimal_text(row.get("min_notional")),
+            volume_24h_base=_pacifica_decimal_text(row.get("volume_24h_base")),
+            volume_24h_quote=_pacifica_decimal_text(row.get("volume_24h_quote") or row.get("quote_volume")),
+            turnover_24h=_pacifica_decimal_text(row.get("turnover_24h")),
+            change_24h_pct=_pacifica_decimal_text(row.get("change_24h_pct") or row.get("price_change_24h_pct")),
+            funding_rate=_pacifica_decimal_text(row.get("funding_rate")),
+            open_interest=_pacifica_decimal_text(row.get("open_interest")),
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            failed_symbols=tuple(failed),
+            source="pacifica_info",
+            refresh_status="partial" if failed else "ok",
+        ),
+    )
+
+
 def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
     if not requested:
@@ -4178,6 +4302,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_list_instruments(account, request)
     if operation == "market_price":
         return _execute_market_price(account, request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(account, request)
     if operation == "candles":
         return handle_candles_operation(name, account, request)
 

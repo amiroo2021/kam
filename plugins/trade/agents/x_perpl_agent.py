@@ -40,6 +40,7 @@ from ..canonical import (
     CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -180,6 +181,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "get_tickers",
         "candles",
     ]
 
@@ -1260,6 +1262,144 @@ def _market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         )
 
 
+def _optional_decimal_text(value: Any) -> Optional[str]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        dec = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not dec.is_finite():
+        return None
+    return format(dec.normalize(), "f")
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _perpl_symbol_filter(symbols: Any) -> set[str]:
+    if symbols in (None, ""):
+        return set()
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: set[str] = set()
+    for item in raw_items:
+        raw = str(item or "").strip().upper()
+        if not raw:
+            continue
+        out.add(raw)
+        out.add(raw.replace("-", "").replace("/", "").replace("_", ""))
+        for suffix in ("USD", "USDT", "USDC", "-PERP", "PERP", ".P"):
+            if raw.endswith(suffix) and len(raw) > len(suffix):
+                out.add(raw[: -len(suffix)].rstrip("-"))
+    return out
+
+
+def _perpl_matches_filter(name_s: str, market_id: int, filters: set[str]) -> bool:
+    if not filters:
+        return True
+    name_u = str(name_s or "").strip().upper()
+    candidates = {name_u, str(market_id), name_u.replace("-", "").replace("/", "").replace("_", "")}
+    for suffix in ("USD", "USDT", "USDC", "-PERP", "PERP", ".P"):
+        if name_u.endswith(suffix) and len(name_u) > len(suffix):
+            candidates.add(name_u[: -len(suffix)].rstrip("-"))
+    return bool(candidates & filters)
+
+
+def _perpl_increment_from_decimals(decimals: Any) -> Optional[str]:
+    try:
+        places = int(decimals)
+    except Exception:  # noqa: BLE001
+        return None
+    if places < 0:
+        return None
+    return format((Decimal(10) ** -places).normalize(), "f")
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    creds = _credentials(account)
+    if not creds:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="UNKNOWN_ACCOUNT",
+            message="Unknown or invalid Perpl account configuration",
+        )
+    try:
+        ctx = _fetch_context(str(creds["api_url"]))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=creds["account"],
+            code="PERPL_ERROR",
+            message=sanitize_error_message(str(exc)),
+        )
+    filters = _perpl_symbol_filter(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for market in ctx.get("markets") or []:
+        if not isinstance(market, dict):
+            continue
+        try:
+            mid = int(market.get("id"))
+        except Exception:  # noqa: BLE001
+            continue
+        cfg_obj = market.get("config")
+        cfg: Dict[str, Any] = cfg_obj if isinstance(cfg_obj, dict) else {}
+        state_obj = market.get("state")
+        state: Dict[str, Any] = state_obj if isinstance(state_obj, dict) else {}
+        symbol = str(market.get("name") or cfg.get("name") or cfg.get("symbol") or f"MKT{mid}").strip().upper()
+        if not _perpl_matches_filter(symbol, mid, filters):
+            continue
+        try:
+            price_decimals = int(cfg.get("price_decimals") or 0)
+        except Exception:  # noqa: BLE001
+            price_decimals = 0
+        mark_scaled = _first_present(state.get("mrk"), state.get("mid"), state.get("lst"))
+        mark = None
+        if mark_scaled is not None:
+            mark_dec = _from_scaled(mark_scaled, price_decimals)
+            if mark_dec > 0:
+                mark = format(mark_dec.normalize(), "f")
+        tickers[symbol] = CanonicalMarketPrice(
+            requested_symbol=symbol,
+            market=str(mid),
+            symbol=symbol,
+            native_symbol=str(mid),
+            display_symbol=symbol,
+            display_name=symbol,
+            base=symbol,
+            quote="USDC",
+            market_type="perp",
+            mark_price=mark,
+            price=mark,
+            price_increment=_perpl_increment_from_decimals(cfg.get("price_decimals")),
+            size_increment=_perpl_increment_from_decimals(cfg.get("size_decimals")),
+            turnover_24h=_optional_decimal_text(_first_present(state.get("turnover_24h"), state.get("turnover24h"))),
+            volume_24h_quote=_optional_decimal_text(_first_present(state.get("vol24h_quote"), state.get("volume_24h_quote"), state.get("quote_volume"))),
+            volume_24h_base=_optional_decimal_text(_first_present(state.get("vol24h_base"), state.get("volume_24h_base"), state.get("base_volume"))),
+            change_24h_pct=_optional_decimal_text(_first_present(state.get("change24h"), state.get("change_24h_pct"), state.get("price_change_24h_pct"))),
+            funding_rate=_optional_decimal_text(_first_present(state.get("funding"), state.get("funding_rate"), state.get("fundingRate"))),
+            open_interest=_optional_decimal_text(_first_present(state.get("open_interest"), state.get("openInterest"), state.get("oi"))),
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=creds["account"],
+        tickers_batch=CanonicalTickersBatch(tickers=tickers, source="perpl_context", ttl_seconds=int(_CONTEXT_TTL)),
+    )
+
+
 def _order_type_for_side(side: str, *, reduce_only: bool = False) -> int:
     s = side.lower().strip()
     if reduce_only:
@@ -2210,6 +2350,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _list_instruments(account, request)
     if operation == "market_price":
         return _market_price(account, request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(account, request)
     if operation == "candles":
         return handle_candles_operation(name, account, request)
     if operation == "new_order":

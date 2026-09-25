@@ -41,6 +41,7 @@ from ..canonical import (
     CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -239,6 +240,8 @@ def capabilities() -> List[str]:
         "close_position",
         # Phase 2.4: read-only catalog enumeration.
         "list_instruments",
+        # Canonical bulk market-data snapshot for WebTrade2 market lists.
+        "get_tickers",
     ]
 
 
@@ -639,6 +642,137 @@ def _normalize_rise_market(market: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
     return out
+
+
+def _optional_decimal_text(value: Any) -> Optional[str]:
+    decimal_value = _decimal_or_none(value)
+    if decimal_value is None:
+        return None
+    return _decimal_text(decimal_value)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _canonical_ticker_symbol_filter(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().upper()
+        if text:
+            out.append(text)
+    return out
+
+
+def _rise_ticker_matches_filter(market: Dict[str, Any], symbol: str, filters: List[str]) -> bool:
+    if not filters:
+        return True
+    cfg = market.get("config") if isinstance(market.get("config"), dict) else {}
+    base = str(market.get("base_asset_symbol") or cfg.get("base_asset_symbol") or "").strip().upper()
+    candidates = {
+        str(symbol or "").strip().upper(),
+        str(market.get("display_name") or cfg.get("display_name") or "").strip().upper(),
+        base,
+    }
+    for candidate in list(candidates):
+        if candidate:
+            candidates.update(_rise_alias_keys(candidate))
+    wanted = set(filters)
+    for filt in filters:
+        wanted.update(_rise_alias_keys(filt))
+    return bool(candidates & wanted)
+
+
+def _execute_get_tickers(request: Dict[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    try:
+        payload = _fetch_markets_payload()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    raw_markets = payload.get("markets") if isinstance(payload, dict) else None
+    if not isinstance(raw_markets, list):
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message="Rise markets payload missing 'markets' list.",
+        )
+    filters = _canonical_ticker_symbol_filter(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for market in raw_markets:
+        if not isinstance(market, dict):
+            continue
+        raw_cfg = market.get("config")
+        cfg: Dict[str, Any] = raw_cfg if isinstance(raw_cfg, dict) else {}
+        symbol = str(cfg.get("name") or market.get("name") or market.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        if not _rise_ticker_matches_filter(market, symbol, filters):
+            continue
+        raw_base = _first_present(market.get("base_asset_symbol"), cfg.get("base_asset_symbol"), symbol)
+        base = _rise_symbol(raw_base)
+        quote = str(market.get("quote_asset_symbol") or cfg.get("quote_asset_symbol") or "").strip().upper() or None
+        display_name = str(market.get("display_name") or cfg.get("display_name") or base or symbol).strip() or symbol
+        display_symbol = base or display_name or symbol
+        market_type = str(cfg.get("market_type") or market.get("market_type") or "").strip().lower() or None
+        raw_mark = _first_present(
+            market.get("last_price"),
+            market.get("last_traded_price"),
+            market.get("mark_price"),
+            market.get("mid_price"),
+            market.get("index_price"),
+            market.get("oracle_price"),
+        )
+        mark_decimal = _decimal_or_none(raw_mark)
+        mark = _decimal_text(mark_decimal) if mark_decimal is not None and mark_decimal > 0 else None
+        tickers[symbol] = CanonicalMarketPrice(
+            requested_symbol=symbol,
+            market=str(market.get("market_id") or symbol),
+            symbol=symbol,
+            native_symbol=symbol,
+            display_symbol=display_symbol,
+            display_name=display_name,
+            base=base,
+            quote=quote,
+            market_type=market_type,
+            mark_price=mark,
+            price=mark,
+            price_increment=_optional_decimal_text(_first_present(cfg.get("step_price"), market.get("step_price"), market.get("price_increment"))),
+            size_increment=_optional_decimal_text(_first_present(cfg.get("step_size"), market.get("step_size"), market.get("size_increment"))),
+            minimum_size=_optional_decimal_text(_first_present(cfg.get("min_order_size"), market.get("min_order_size"), market.get("minimum_size"))),
+            minimum_notional=_optional_decimal_text(_first_present(cfg.get("min_notional"), market.get("min_notional"), market.get("minimum_notional"))),
+            turnover_24h=_optional_decimal_text(_first_present(market.get("turnover_24h"), market.get("turnover24h"))),
+            volume_24h_quote=_optional_decimal_text(_first_present(market.get("volume_24h_quote"), market.get("quote_volume"), market.get("trading_volume_24h"))),
+            volume_24h_base=_optional_decimal_text(_first_present(market.get("volume_24h_base"), market.get("base_volume"))),
+            change_24h_pct=_optional_decimal_text(_first_present(market.get("change_24h_pct"), market.get("price_change_24h_pct"), market.get("price24hPcnt"))),
+            funding_rate=_optional_decimal_text(_first_present(market.get("funding_rate"), market.get("fundingRate"), market.get("funding"))),
+            open_interest=_optional_decimal_text(_first_present(market.get("open_interest"), market.get("openInterest"))),
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=CanonicalTickersBatch(tickers=tickers, source="rise_markets"),
+    )
 
 
 def _execute_list_instruments(
@@ -4006,6 +4140,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_resolve_instrument(normalized_request)
     if operation == "list_instruments":
         return _execute_list_instruments(normalized_request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(normalized_request)
     if operation == "market_constraints":
         return _execute_market_constraints(normalized_request)
     if operation == "market_price":
