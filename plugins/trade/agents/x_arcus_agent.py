@@ -47,6 +47,7 @@ from ..canonical import (
     CanonicalPortfolioSummary,
     CanonicalPosition,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -323,6 +324,7 @@ def capabilities() -> List[str]:
         "get_order_state_by_client_id",
         # Phase 2.4: read-only catalog enumeration.
         "list_instruments",
+        "get_tickers",
     ]
 
 
@@ -3751,6 +3753,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         return _execute_resolve_instrument(request)
     if operation == "list_instruments":
         return _execute_list_instruments(request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(request)
     if operation == "market_constraints":
         return _execute_market_constraints(request)
     if operation == "market_price":
@@ -3764,3 +3768,152 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
     if operation == "get_order_state_by_client_id":
         return _execute_get_order_state_by_client_id(request)
     return make_failure(operation=operation, exchange=name, account=account, code="NOT_IMPLEMENTED", message=f"Arcus does not implement '{operation}' yet.")
+
+# ---------------------------------------------------------------------------
+# Canonical ``get_tickers`` (Batch 2)
+# ---------------------------------------------------------------------------
+#
+# Arcus exposes its mark / oracle / last / mid prices inside the public
+# ``/v1/markets`` payload (the same payload already cached behind
+# ``_ArcusGetGate`` for ``list_instruments`` and ``resolve_instrument``).
+# To avoid introducing a second acquisition path or a per-symbol fan-out
+# we simply walk that cached list once and emit one
+# :class:`CanonicalMarketPrice` per market.  Dynamic 24h metrics
+# (turnover / volume / funding / open_interest / change_24h_pct) are NOT
+# published on ``/v1/markets`` so we deliberately leave them ``None`` —
+# per the brief WebTrade2 only needs them when genuinely available, and
+# inventing them from unrelated fields is explicitly forbidden.
+#
+# Static identity (symbol / display_symbol / display_name / base / quote /
+# market_type) is derived from the same fields ``_normalize_arcus_market``
+# already uses, so ``list_instruments`` and ``get_tickers`` cannot drift.
+# ``0`` and blank price values are mapped to ``None`` (per the brief, no
+# 0-as-fake-price substitution) so WebTrade2's price column renders "—"
+# rather than "0" for missing rows.
+
+
+def _arcus_decimal_or_none(value: Any) -> Optional["Decimal"]:
+    from decimal import Decimal as _Decimal
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _Decimal(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _arcus_decimal_text(value: Any) -> Optional[str]:
+    from decimal import Decimal as _Decimal
+    decimal_value = _arcus_decimal_or_none(value)
+    if decimal_value is None or decimal_value <= 0:
+        return None
+    rendered = format(decimal_value.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".") or "0"
+    return rendered
+
+
+def _arcus_first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _arcus_filter_symbols(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().upper()
+        if text:
+            out.append(text)
+    return out
+
+
+def _execute_get_tickers(request: Dict[str, Any]) -> CanonicalResponse:
+    """Read-only bulk ticker snapshot built from the cached ``/v1/markets`` payload.
+
+    Routes through :func:`_fetch_arcus_markets_payload` so the existing
+    ``_ArcusGetGate`` (TTL 30s + 429 backoff + stale-on-backoff) protects
+    every caller — WebTrade2, the wizard, and any other client — uniformly.
+    No per-symbol HTTP is performed.
+    """
+    account = str(request.get("account") or "").strip()
+    try:
+        raw_markets = _fetch_arcus_markets_payload()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    filters = _arcus_filter_symbols(request.get("symbols"))
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for market in raw_markets:
+        if not isinstance(market, dict):
+            continue
+        symbol = _normalize_symbol(market.get("marketDisplayName"))
+        if not symbol or symbol == "UNKNOWN":
+            continue
+        if filters and symbol not in filters:
+            continue
+        base = _normalize_symbol(market.get("baseAsset"))
+        if base == "UNKNOWN":
+            base = None
+        quote = _normalize_symbol(market.get("quoteAsset"))
+        if quote == "UNKNOWN":
+            quote = None
+        display_name = str(market.get("quoteDisplayName") or market.get("description") or "").strip() or None
+        if market.get("marketType") in ("perp", "perpetual"):
+            market_type = "perp"
+        elif market.get("marketType") in ("spot",):
+            market_type = "spot"
+        else:
+            market_type = None
+        mark = _arcus_decimal_text(_arcus_first_present(
+            market.get("markPx"),
+            market.get("markPrice"),
+            market.get("oraclePrice"),
+            market.get("indexPrice"),
+            market.get("lastPrice"),
+            market.get("midPrice"),
+        ))
+        oracle = _arcus_decimal_text(market.get("oraclePrice"))
+        # Static identity rows must remain present even when price data is
+        # zero / blank / missing. ``mark_price`` is left ``None`` in that
+        # case; WebTrade2 renders it as "—" without removing the row.
+        tickers[symbol] = CanonicalMarketPrice(
+            requested_symbol=symbol,
+            market=str(market.get("marketId") or symbol),
+            symbol=symbol,
+            native_symbol=symbol,
+            display_symbol=base or symbol,
+            display_name=display_name,
+            base=base,
+            quote=quote,
+            market_type=market_type,
+            mark_price=mark,
+            price=mark,
+            oracle_price=oracle,
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            source="arcus_markets",
+            refresh_status="ok",
+        ),
+    )

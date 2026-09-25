@@ -65,6 +65,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -431,6 +432,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         # Phase 2.4: read-only catalog enumeration.
         "list_instruments",
+        "get_tickers",
     ]
 
 
@@ -527,6 +529,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_candles(account, request)
         if operation == "list_instruments":
             return _execute_list_instruments(account, request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(account, request)
         if operation == "close_position":
             return _close_position(account, request)
     except Exception as exc:  # noqa: BLE001
@@ -4475,4 +4479,165 @@ def _close_position(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         code="VERIFICATION_FAILED",
         message="Close order was accepted but the position is still reported open.",
         position_action=action_result,
+    )
+
+# ---------------------------------------------------------------------------
+# Canonical ``get_tickers`` (Batch 2)
+# ---------------------------------------------------------------------------
+#
+# Ondo Perps exposes its trading-pair catalog via ``/v1/markets`` and its
+# bulk mark-price snapshot via ``/v1/perps/mark_prices``. The existing
+# per-symbol ``market_price`` already calls ``/v1/perps/mark_prices`` once
+# and then reads one key from the dict — so to assemble the full catalog
+# we just keep the entire bulk response and key it by ``market`` (the
+# venue-native trading-pair id, e.g. ``ETH-USD.P``). No per-symbol HTTP.
+#
+# Dynamic 24h metrics (turnover / volume / funding / open_interest /
+# change_24h_pct) are NOT published on ``/v1/markets`` and Ondo does not
+# expose them via ``/v1/perps/mark_prices`` either, so they are left
+# ``None`` per the brief. ``0`` and missing entries map to ``None``.
+
+
+def _ondoperps_decimal_or_none(value: Any) -> Optional["Decimal"]:
+    from decimal import Decimal as _Decimal
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _Decimal(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ondoperps_decimal_text(value: Any) -> Optional[str]:
+    decimal_value = _ondoperps_decimal_or_none(value)
+    if decimal_value is None or decimal_value <= 0:
+        return None
+    rendered = format(decimal_value.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".") or "0"
+    return rendered
+
+
+def _ondoperps_first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _ondoperps_filter_symbols(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().upper()
+        if text:
+            out.append(text)
+    return out
+
+
+def _execute_get_tickers(account: str, request: Dict[str, Any]) -> CanonicalResponse:
+    """Bulk canonical ticker snapshot for Ondo Perps.
+
+    Two bulk upstream calls per invocation (both already in use by other
+    read operations; no new HTTP shape introduced):
+
+    * ``/v1/markets`` — cached via the existing ``_market_cache`` keyed
+      by the agent's existing trading-pairs fetch helper.
+    * ``/v1/perps/mark_prices`` — single bulk response reused for every
+      catalog row.
+
+    Dynamic 24h metrics that Ondo does not publish are left ``None``.
+    Static identity rows remain present even when the bulk mark-price
+    response has no entry for a given trading-pair.
+    """
+    filters = _ondoperps_filter_symbols(request.get("symbols"))
+    try:
+        pairs = _fetch_ondoperps_trading_pairs_for(account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARKETS_READ_FAILED",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    # One bulk mark-price fetch — never per-symbol.
+    mark_prices_payload: Dict[str, Any] = {}
+    try:
+        mark_prices_raw = _signed_get(_lookup_credentials(account) or {}, _PATH_PERPS_MARK_PRICES)
+    except OndoHTTPError as exc:
+        return _map_http_error_to_failure(exc, operation="get_tickers", account=account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="MARK_PRICES_UNAVAILABLE",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+    if isinstance(mark_prices_raw, dict):
+        nested = mark_prices_raw.get("result")
+        if isinstance(nested, dict):
+            mark_prices_payload = nested
+        else:
+            mark_prices_payload = mark_prices_raw
+
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    for entry in pairs:
+        if not isinstance(entry, dict):
+            continue
+        market_id = str(entry.get("market") or "").strip()
+        if not market_id:
+            continue
+        if filters and market_id.upper() not in filters:
+            continue
+        base = str(entry.get("baseCurrency") or "").strip().upper() or None
+        quote = str(entry.get("quoteCurrency") or "").strip().upper() or None
+        if entry.get("marketType") in ("perp", "perpetual"):
+            market_type = "perp"
+        elif entry.get("marketType") in ("spot",):
+            market_type = "spot"
+        else:
+            market_type = None
+        desc = str(entry.get("description") or entry.get("displayName") or "").strip() or None
+        raw_mark = mark_prices_payload.get(market_id) if isinstance(mark_prices_payload, dict) else None
+        if isinstance(raw_mark, dict):
+            mark = _ondoperps_decimal_text(raw_mark.get("markPrice"))
+            oracle = _ondoperps_decimal_text(raw_mark.get("oraclePrice"))
+        else:
+            mark = None
+            oracle = None
+        tickers[market_id] = CanonicalMarketPrice(
+            requested_symbol=market_id,
+            market=market_id,
+            symbol=market_id,
+            native_symbol=market_id,
+            display_symbol=base or market_id,
+            display_name=desc,
+            base=base,
+            quote=quote,
+            market_type=market_type,
+            mark_price=mark,
+            price=mark,
+            oracle_price=oracle,
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account,
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            source="ondoperps_markets",
+            refresh_status="ok",
+        ),
     )

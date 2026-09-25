@@ -54,6 +54,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -205,6 +206,7 @@ def capabilities() -> List[str]:
         "list_instruments",
         "market_price",
         "candles",
+        "get_tickers",
     ]
 
 
@@ -1834,7 +1836,7 @@ def _list_instruments(account: str, request: Mapping[str, Any]) -> CanonicalResp
             operation="list_instruments",
             exchange=name,
             account=credentials["account"],
-            instruments=out,
+            data={"instruments": [instrument.to_dict() for instrument in out]},
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(
@@ -2711,6 +2713,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _list_instruments(account, request)
         if operation == "market_price":
             return _market_price(account, request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(account, request)
         if operation == "candles":
             return handle_candles_operation(name, account, request)
     except Exception as exc:  # noqa: BLE001
@@ -2727,4 +2731,150 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
         account=account,
         code="NOT_IMPLEMENTED",
         message=f"Nado does not implement '{operation}' yet.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical ``get_tickers`` (Batch 2)
+# ---------------------------------------------------------------------------
+#
+# Nado's symbol catalog comes from ``{"type": "symbols"}`` and the per-
+# product oracle price from ``{"type": "all_products"}``. Both are bulk
+# sources; the existing per-symbol ``_oracle_price`` already calls
+# ``all_products`` once per symbol — we deliberately avoid that fan-out
+# by calling ``all_products`` ONCE for the whole catalog and indexing it
+# by ``product_id``. Static identity is sourced from the same symbols
+# cache ``_list_instruments`` already uses, so the catalog cannot drift.
+#
+# Per the brief, ``mark_price`` is left ``None`` at the catalog level —
+# Nado does not publish a venue-native mark; its reference price is the
+# oracle. The bid/ask-mid fallback is a per-symbol convenience used only
+# by ``market_price`` and is intentionally not replicated here. This
+# keeps the canonical contract clean: ``oracle_price`` carries the
+# authoritative Nado price; ``mark_price`` is only set when an actual
+# venue mark exists in the bulk payload (it does not today).
+
+
+def _nado_filter_symbols(symbols: Any) -> List[str]:
+    if symbols in (None, ""):
+        return []
+    if isinstance(symbols, (str, bytes)):
+        raw_items = [symbols]
+    else:
+        try:
+            raw_items = list(symbols)
+        except TypeError:
+            raw_items = [symbols]
+    out: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip().upper()
+        if text:
+            out.append(text)
+    return out
+
+
+def _execute_get_tickers(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Bulk canonical ticker snapshot for Nado.
+
+    Two bulk upstream calls per invocation (the symbols call is cache-
+    gated with ``_CACHE_TTL`` so warm-cache invocations are effectively
+    one upstream call — the ``all_products`` price snapshot):
+
+    * ``{"type": "symbols"}`` — provides the catalog (perp filtering and
+      SYMBOL-PERP key mirroring reused from ``_list_instruments``).
+    * ``{"type": "all_products"}`` — provides ``oracle_price_x18`` for
+      every perp product. One fetch for the entire catalog; never per
+      symbol.
+
+    Dynamic 24h metrics that Nado does not publish in either bulk source
+    are left ``None``. Static identity rows remain present even when the
+    oracle is 0 / missing.
+    """
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set NADO_<ACCOUNT>_SUBACCOUNT_OWNER.",
+        )
+    filters = _nado_filter_symbols(request.get("symbols"))
+    try:
+        by_symbol, _ = _ensure_symbols(credentials)
+        all_products = _gateway_query(credentials, {"type": "all_products"})
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="NADO_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+    if str(all_products.get("status") or "").lower() != "success":
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="ALL_PRODUCTS_FAILED",
+            message=_redact(sanitize_error_message(str(all_products.get("error") or "all_products failed")), credentials),
+        )
+    oracle_by_pid: Dict[int, Decimal] = {}
+    data = all_products.get("data") or {}
+    for bucket in ("perp_products", "spot_products"):
+        for row in data.get(bucket) or []:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                pid = int(row.get("product_id"))
+            except Exception:  # noqa: BLE001
+                continue
+            oracle_by_pid[pid] = _x18_to_decimal(row.get("oracle_price_x18"))
+
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    seen: set = set()
+    for key, meta in sorted(by_symbol.items()):
+        if meta.get("type") != "perp":
+            continue
+        sym = str(meta.get("symbol") or "").strip()
+        if not sym.endswith("-PERP"):
+            continue
+        if key != sym.upper():
+            continue
+        disp = _display_symbol(meta)
+        if disp in seen:
+            continue
+        if filters and key not in filters and disp.upper() not in filters:
+            continue
+        seen.add(disp)
+        pid = int(meta.get("product_id") or 0)
+        oracle_decimal = oracle_by_pid.get(pid)
+        oracle = _format_decimal(oracle_decimal) if oracle_decimal is not None and oracle_decimal > 0 else None
+        tickers[sym] = CanonicalMarketPrice(
+            requested_symbol=sym,
+            market=sym,
+            symbol=sym,
+            native_symbol=sym,
+            display_symbol=disp,
+            display_name=disp,
+            base=disp,
+            quote="USD",
+            market_type="perp",
+            mark_price=None,  # Nado has no venue-native mark in bulk; oracle carries the authoritative price.
+            oracle_price=oracle,
+            price=oracle,
+            price_increment=_format_decimal(meta["tick_size"]),
+            size_increment=_format_decimal(meta["qty_step"]),
+            minimum_size=_format_decimal(meta["qty_step"]),
+            minimum_notional=_format_decimal(meta["min_notional"]) if meta.get("min_notional") else None,
+        )
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=credentials["account"],
+        tickers_batch=CanonicalTickersBatch(
+            tickers=tickers,
+            source="nado_all_products",
+            refresh_status="ok",
+        ),
     )
