@@ -314,6 +314,10 @@ function buildShellDom() {
   // Login panel (initially visible until /api/session responds OK).
   const login = new FakeElement("DIV", { id: "loginPanel", class: "login-panel" });
   const lcard = new FakeElement("DIV", { class: "login-card" });
+  const loginForm = new FakeElement("FORM", { id: "loginForm" });
+  const loginPw = new FakeElement("INPUT", { id: "loginPassword", type: "password" });
+  loginForm.appendChild(loginPw);
+  lcard.appendChild(loginForm);
   login.appendChild(lcard);
   body.appendChild(login);
 
@@ -375,7 +379,10 @@ function buildShellDom() {
   body.appendChild(tradePane);
 
   // Bottom + account strip.
-  body.appendChild(new FakeElement("DIV", { class: "panel bottom" }));
+  const bottomPanel = new FakeElement("DIV", { class: "panel bottom" });
+  const dataPanel = new FakeElement("DIV", { id: "dataPanel", class: "data-table" });
+  bottomPanel.appendChild(dataPanel);
+  body.appendChild(bottomPanel);
   body.appendChild(new FakeElement("DIV", { class: "account-strip" }));
 
   // CSRF hidden input
@@ -399,11 +406,18 @@ function makeSeries() {
     setData(data) {
       const last = (data && data.length) ? data[data.length - 1] : null;
       const first = (data && data.length) ? data[0] : null;
+      // The most recent candle request gives us the canonical key
+      // (exchange/account/symbol/tf) this setData was triggered by.
+      // For empty setData (failure / clear), there may be no recent
+      // candle request — fall back to "unknown".
+      const lastCandleReq = candleRequests[candleRequests.length - 1];
+      const key = lastCandleReq ? lastCandleReq.key : "unknown";
       setDataCalls.push({
         count: data ? data.length : 0,
         first,
         last,
         empty: !data || data.length === 0,
+        key,
       });
     },
     update(c) { updateCalls.push(c); },
@@ -438,9 +452,35 @@ function makeChart() {
 
 // Mock Lightweight Charts factory. We replace window.LightweightCharts later.
 function makeLwcFactory() {
-  const chart = makeChart();
+  // Each createChart() call must create and append a fresh
+  // .tv-lightweight-charts root to the container, just like the real
+  // library does. The app's idempotency fix removes any prior root
+  // before calling createChart, so we count this so tests can verify
+  // there is never more than one root in the DOM.
   return {
-    createChart() { return chart; },
+    createChart(container /*, opts */) {
+      const chart = makeChart();
+      // Mirror what real LWC does: append a div.tv-lightweight-charts
+      // to the container. We use the runner's createElement so
+      // querySelectorAll sees it consistently with the rest of the DOM.
+      const root = document_.createElement("DIV");
+      root._classes.add("tv-lightweight-charts");
+      root.style.position = "relative";
+      root.style.overflow = "hidden";
+      root.style.width = "100%";
+      root.style.height = "100%";
+      container.appendChild(root);
+      // Stash the root on the chart object so the test can verify
+      // idempotency via root.parentNode === null after the app calls
+      // chart.remove() + container.removeChild() chains.
+      chart._mockLwcRoot = root;
+      const origRemove = chart.remove;
+      chart.remove = function() {
+        if (root.parent) root.parent.removeChild(root);
+        return origRemove.apply(this, arguments);
+      };
+      return chart;
+    },
   };
 }
 
@@ -534,7 +574,8 @@ async function handleFetch(url, opts) {
   if (path === "/api/market_price") {
     return okResp({ market_price: { mark_price: "100", index_price: "100" } });
   }
-  if (path === "/api/account_state") return okResp({ balances: [], positions: [], orders: [] });
+  if (path === "/api/account/state") return okResp({ balances: [], positions: mockState.accountPositions || [], order_groups: mockState.accountOrders || [] });
+  if (path === "/api/account_state") return okResp({ balances: [], positions: mockState.accountPositions || [], order_groups: mockState.accountOrders || [] });
   if (path === "/api/positions_orders") return okResp({ positions: [], orders: [] });
   if (path === "/api/trade/execute") {
     executedTrades.push(JSON.parse(opts.body));
@@ -547,6 +588,15 @@ async function handleFetch(url, opts) {
 // ---------- Build sandbox --------------------------------------------------
 
 const appJs = fs.readFileSync(APP_JS_PATH, "utf-8");
+
+// Test-only hook: after the IIFE sets up state and the chart, expose
+// them on a sandboxed global so the runner can drive scenarios that
+// would otherwise be hidden behind the IIFE boundary (e.g. setting
+// state.accountState to inject position/order rows for the new
+// position-row → instrument-selection test scenarios). This hook is
+// appended to the IIFE source, NOT shipped in production. The runner
+// can opt in by reading window.__wt2_test__.
+const testHook = "\n  ;window.__wt2_test__ = { state, renderAccountState, renderBottom, selectMarket };\n";
 
 const docListeners = {};
 const document_ = {
@@ -578,11 +628,24 @@ const ctx = {
 
 vm.createContext(ctx);
 try {
-  vm.runInContext(appJs, ctx, { filename: "app.js" });
+  // Inject the test hook just before the IIFE's closing `})();` so the
+  // exposed symbols (state, renderAccountState, renderBottom,
+  // selectMarket) are valid when the runner reads them.
+  const lastIIFEClose = appJs.lastIndexOf("})();");
+  if (lastIIFEClose < 0) throw new Error("could not find IIFE close in app.js");
+  const appJsWithHook = appJs.slice(0, lastIIFEClose) + testHook + appJs.slice(lastIIFEClose);
+  vm.runInContext(appJsWithHook, ctx, { filename: "app.js" });
 } catch (e) {
   console.error("FATAL: app.js failed to load:", e.message);
   process.exit(3);
 }
+
+const t2 = ctx.window.__wt2_test__;
+if (!t2) {
+  console.error("FATAL: app.js did not expose __wt2_test__");
+  process.exit(4);
+}
+const { state, renderAccountState, renderBottom, selectMarket } = t2;
 
 // ---------- helpers --------------------------------------------------------
 
@@ -602,6 +665,11 @@ async function settle(ms = 0) {
   if (ms > 0) await delay(ms);
   // run all queued microtasks
   for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r));
+}
+function countLWCRoots() {
+  const container = $("#chart");
+  if (!container) return 0;
+  return container.querySelectorAll(".tv-lightweight-charts").length;
 }
 
 function makeCandles(center, count, stepSec, jitter) {
@@ -814,9 +882,341 @@ function getChartMessage() {
   assert(lastXrp.first && lastXrp.first.open < 5,
     `S6: first setData after XRP switch is in XRP range (open < 5), got ${lastXrp.first && lastXrp.first.open}`);
 
+  // -- Scenarios 8-13: position / order row → instrument selection,
+  //                     action-button isolation, fills-removal guard.
+  // These scenarios live in the SAME render path as the chart-state
+  // scenarios above, so the underlying selectMarket() / chartLoadGen /
+  // setData pipeline is the same code path that ships to production.
+
+  // Helper: renderBottom reads state.accountState. We populate it
+  // via the app's own renderAccountState() so we exercise the same
+  // code path the production /api/account/state response triggers.
+  function setAccountState(positions, orderGroups) {
+    renderAccountState({
+      balances: [],
+      positions,
+      order_groups: orderGroups,
+      account_summary: { equity: null, available: null, unrealized_pnl: null },
+    });
+  }
+
+  function clickPosRow(symbol) {
+    // _matches() in this stub doesn't understand compound attribute
+    // selectors ([a][b]); use a custom walker that checks both.
+    const row = findByAttrs({ "data-symbol": symbol, "data-pos-row": "*" });
+    if (!row) throw new Error("position row not found: " + symbol);
+    fireOnElement(row, "click");
+  }
+
+  function clickOrdRow(symbol) {
+    const row = findByAttrs({ "data-symbol": symbol, "data-ord-row": "*" });
+    if (!row) throw new Error("order row not found: " + symbol);
+    fireOnElement(row, "click");
+  }
+
+  function clickPosAction(symbol, action) {
+    const row = findByAttrs({ "data-symbol": symbol, "data-pos-row": "*" });
+    if (!row) throw new Error("position row not found: " + symbol);
+    const btn = row.querySelector(`[data-pos-action="${action}"]`);
+    if (!btn) throw new Error("position action " + action + " not found on " + symbol);
+    fireOnElement(btn, "click");
+  }
+
+  function clickOrdAction(symbol, action) {
+    const row = findByAttrs({ "data-symbol": symbol, "data-ord-row": "*" });
+    if (!row) throw new Error("order row not found: " + symbol);
+    const btn = row.querySelector(`[data-ord-action="${action}"]`);
+    if (!btn) throw new Error("order action " + action + " not found on " + symbol);
+    fireOnElement(btn, "click");
+  }
+
+  // Like fire() but accepts an already-resolved element instead of a
+  // selector string. fire() does $(sel) which calls .split() and
+  // breaks if you pass an element directly.
+  function fireOnElement(el, type, init = {}) {
+    const evt = Object.assign({ type, target: el, currentTarget: el, returnValue: true, preventDefault() {}, stopPropagation() {} }, init);
+    el.dispatchEvent(evt);
+  }
+
+  // Custom walker that matches a node whose attributes match every
+  // (name -> "*" | value) pair. Used by the position/order row helpers
+  // because the FakeElement stub doesn't handle compound attribute
+  // selectors ([a][b]) correctly.
+  function findByAttrs(attrs) {
+    function walk(node) {
+      for (const child of (node.children || [])) {
+        if (matchesAttrs(child, attrs)) return child;
+        const deeper = walk(child);
+        if (deeper) return deeper;
+      }
+      return null;
+    }
+    return walk(body);
+  }
+  function matchesAttrs(el, attrs) {
+    for (const [name, val] of Object.entries(attrs)) {
+      const camel = name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      const actual = el.attrs[name] !== undefined ? el.attrs[name] : el.dataset[camel];
+      if (val === "*") {
+        if (actual === undefined || actual === "") return false;
+      } else {
+        if (actual !== val) return false;
+      }
+    }
+    return true;
+  }
+
+  // -- S8: fills tab/panel removed --
+  const fillsButtons = document_.querySelectorAll('[data-bottom-tab="fills"]');
+  assert(fillsButtons.length === 0,
+    `S8: FILLS tab removed from DOM (count=${fillsButtons.length})`);
+  // The branch that drew the fills placeholder is also gone: renderBottom
+  // never enters an `else { ... fills placeholder ... }` arm. We verify
+  // by feeding a non-positions, non-orders bottomTab value and ensuring
+  // no fills-specific text appears in #dataPanel.
+  const prevBottomTab = state.bottomTab;
+  state.bottomTab = "fills";
+  renderBottom();
+  const dpHtml = $("#dataPanel").innerHTML;
+  assert(!/fills are shown/i.test(dpHtml),
+    `S8: renderBottom() never produces the "Fills are shown" placeholder (got: ${JSON.stringify(dpHtml).slice(0, 80)})`);
+  state.bottomTab = prevBottomTab;
+  renderBottom();
+
+  // -- S9: position row click selects that position's instrument --
+  resetState();
+  state.bottomTab = "positions";
+  setAccountState(
+    [
+      { symbol: "BTCUSDT", side: "buy", size: "0.1", entry_price: "84000", pnl: "12.34" },
+    ],
+    []
+  );
+  renderBottom();
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = makeCandles(84000, 60, 900, 0.002);
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickPosRow("BTCUSDT");
+  await settle(80);
+  const lastSetAfterPos = setDataCalls[setDataCalls.length - 1];
+  assert(lastSetAfterPos && lastSetAfterPos.count === 60,
+    `S9: clicking BTCUSDT position row triggers candle load (count=${lastSetAfterPos && lastSetAfterPos.count})`);
+  assert(lastSetAfterPos && /BTCUSDT/.test(lastSetAfterPos.key || ""),
+    `S9: candle request is for BTCUSDT (key=${lastSetAfterPos && lastSetAfterPos.key})`);
+  assert(lastSetAfterPos && Math.abs(lastSetAfterPos.last.close - 84000) / 84000 < 0.01,
+    "S9: BTCUSDT position-row click loaded BTC-range candles");
+
+  // -- S10: position row → another position → chart switches --
+  state.bottomTab = "positions"; // explicit; S9 left it set
+  setAccountState(
+    [
+      { symbol: "BTCUSDT", side: "buy", size: "0.1", entry_price: "84000", pnl: "0" },
+      { symbol: "ETHUSDT", side: "buy", size: "1.0", entry_price: "2690", pnl: "0" },
+    ],
+    []
+  );
+  renderBottom();
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = makeCandles(84000, 60, 900, 0.002);
+  mockState.candles["apex/BITGET/ETHUSDT/15m"] = makeCandles(2690, 60, 900, 0.002);
+  // Re-select BTCUSDT first to reset state.
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickPosRow("BTCUSDT");
+  await settle(80);
+  const btcSet = setDataCalls[setDataCalls.length - 1];
+  assert(btcSet && Math.abs(btcSet.last.close - 84000) / 84000 < 0.01,
+    "S10: starting at BTCUSDT position");
+  // Now switch to ETHUSDT via position row.
+  clickPosRow("ETHUSDT");
+  await settle(80);
+  const ethSet = setDataCalls[setDataCalls.length - 1];
+  assert(ethSet && /ETHUSDT/.test(ethSet.key || ""),
+    `S10: clicking ETHUSDT position row switches candle load to ETHUSDT (key=${ethSet && ethSet.key})`);
+  assert(ethSet && ethSet.last.close < 5000,
+    `S10: ETHUSDT position-row click loaded ETH-range candles (close=${ethSet && ethSet.last && ethSet.last.close})`);
+  // chartLoadGen must have bumped at least twice (once per click).
+  assert(state.chartLoadGen >= 3,
+    `S10: chartLoadGen bumped on each position-row click (got ${state.chartLoadGen})`);
+
+  // -- S11: open-order row click selects that order's instrument --
+  resetState();
+  // S10 left bottomTab on "positions"; the OPEN ORDERS rows only render
+  // when bottomTab === "orders". Switch tabs first.
+  state.bottomTab = "orders";
+  setAccountState([], [
+    { symbol: "BTCUSDT", side: "buy", order_count: 1, status: "open" },
+  ]);
+  renderBottom();
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = makeCandles(84000, 60, 900, 0.002);
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickOrdRow("BTCUSDT");
+  await settle(80);
+  const ordSet = setDataCalls[setDataCalls.length - 1];
+  assert(ordSet && ordSet.count === 60,
+    `S11: clicking open-order row triggers candle load (count=${ordSet && ordSet.count})`);
+  assert(ordSet && /BTCUSDT/.test(ordSet.key || ""),
+    `S11: open-order row click selects BTCUSDT (key=${ordSet && ordSet.key})`);
+
+  // -- S12: timeframe preserved through row-click selection --
+  // Switch timeframe to 1h, then click a different position row and
+  // verify the chart request is for 1h.
+  resetState();
+  state.bottomTab = "positions"; // S11 left it on "orders"
+  setAccountState(
+    [
+      { symbol: "BTCUSDT", side: "buy", size: "0.1", entry_price: "84000", pnl: "0" },
+      { symbol: "ETHUSDT", side: "buy", size: "1.0", entry_price: "2690", pnl: "0" },
+    ],
+    []
+  );
+  renderBottom();
+  // Set timeframe via fire (click on the timeframe button).
+  fire('[data-timeframe="1h"]', "click");
+  await settle(20);
+  mockState.candles["apex/BITGET/BTCUSDT/1h"] = makeCandles(84000, 60, 3600, 0.002);
+  mockState.candles["apex/BITGET/ETHUSDT/1h"] = makeCandles(2690, 60, 3600, 0.002);
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickPosRow("ETHUSDT");
+  await settle(80);
+  const tfReq = candleRequests[candleRequests.length - 1];
+  assert(tfReq && /\/1h/.test(tfReq.key),
+    `S12: timeframe preserved (expected /1h, got key=${tfReq && tfReq.key})`);
+  assert(tfReq && /ETHUSDT/.test(tfReq.key),
+    `S12: position row click uses new instrument with preserved timeframe (got ${tfReq && tfReq.key})`);
+
+  // -- S13: rapid row-click cannot allow stale response to win --
+  resetState();
+  state.bottomTab = "positions"; // S12 left it on "positions" already, but be explicit.
+  setAccountState(
+    [
+      { symbol: "BTCUSDT", side: "buy", size: "0.1", entry_price: "84000", pnl: "0" },
+      { symbol: "ETHUSDT", side: "buy", size: "1.0", entry_price: "2690", pnl: "0" },
+      { symbol: "SOLUSDT", side: "buy", size: "10", entry_price: "200", pnl: "0" },
+    ],
+    []
+  );
+  renderBottom();
+  // BTC = slow (100ms), ETH = fast (10ms), SOL = fast (10ms).
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = (() => {
+    const arr = makeCandles(84000, 60, 900, 0.002);
+    arr.__slow = true;
+    return arr;
+  })();
+  mockState.candles["apex/BITGET/ETHUSDT/15m"] = makeCandles(2690, 60, 900, 0.002);
+  mockState.candles["apex/BITGET/SOLUSDT/15m"] = makeCandles(200, 60, 900, 0.002);
+  // Wire slow BTC response through onRequest — slow only the BTC key.
+  mockState.onRequest = (key) => {
+    if (key === "apex/BITGET/BTCUSDT/15m") mockState.delayMs = 80;
+    else mockState.delayMs = 0;
+  };
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickPosRow("BTCUSDT"); // starts slow
+  clickPosRow("ETHUSDT"); // fast, drops slow BTC via chartLoadGen
+  clickPosRow("SOLUSDT"); // final
+  await settle(150);
+  mockState.onRequest = null;
+  // The last non-empty setData should be for SOLUSDT (final selection).
+  const lastNonEmpty = [...setDataCalls].reverse().find(c => !c.empty);
+  assert(lastNonEmpty && /SOLUSDT/.test(lastNonEmpty.key || ""),
+    `S13: rapid row-click — final chart shows SOLUSDT, got key=${lastNonEmpty && lastNonEmpty.key}`);
+  // BTC's slow response must NOT have ended up as the final setData.
+  // (Even if BTC's setData was called, it was for an in-flight request
+  // that should have been dropped — the chartLoadGen / isStale path
+  // ensures the data is stale and the chart doesn't paint it.)
+  // We assert: count the setData calls for BTC — if BTC's setData ran,
+  // its key would have been "apex/BITGET/BTCUSDT/15m" but the chart
+  // shows SOLUSDT. That's the staleness guarantee. We verify by
+  // checking the LAST applied setData's key.
+  const final = setDataCalls[setDataCalls.length - 1];
+  assert(final && /SOLUSDT/.test(final.key || ""),
+    `S13: final applied setData is SOLUSDT (slow BTC was dropped), got key=${final && final.key}`);
+
+  // -- S14: TP / SL / CLOSE clicks do NOT trigger row navigation --
+  // Reset and set state to a single BTCUSDT position. The TP/SL/CLOSE
+  // handlers do `prompt()` which returns null in the runner ctx, so the
+  // handlers short-circuit without changing state. We assert that the
+  // chart's selected symbol does NOT change after clicking each action.
+  resetState();
+  state.bottomTab = "positions";
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = makeCandles(84000, 60, 900, 0.002);
+  setAccountState(
+    [{ symbol: "BTCUSDT", side: "buy", size: "0.1", entry_price: "84000", tp: "90000", sl: "80000", pnl: "0" }],
+    []
+  );
+  renderBottom();
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  // Pre-load BTCUSDT so we have a known selection.
+  clickPosRow("BTCUSDT");
+  await settle(80);
+  const beforeKey = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  // Click TP. prompt() returns null → handler returns early.
+  clickPosAction("BTCUSDT", "tp");
+  await settle(20);
+  const afterTp = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  assert(afterTp === beforeKey,
+    `S14: clicking TP does not change chart selection (before=${beforeKey} after=${afterTp})`);
+  // Click SL.
+  clickPosAction("BTCUSDT", "sl");
+  await settle(20);
+  const afterSl = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  assert(afterSl === beforeKey,
+    `S14: clicking SL does not change chart selection (before=${beforeKey} after=${afterSl})`);
+  // Click CLOSE.
+  clickPosAction("BTCUSDT", "close");
+  await settle(20);
+  const afterClose = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  assert(afterClose === beforeKey,
+    `S14: clicking CLOSE does not change chart selection (before=${beforeKey} after=${afterClose})`);
+
+  // -- S15: CANCEL order click does NOT trigger row navigation --
+  resetState();
+  state.bottomTab = "orders";
+  mockState.candles["apex/BITGET/BTCUSDT/15m"] = makeCandles(84000, 60, 900, 0.002);
+  setAccountState([], [
+    { symbol: "BTCUSDT", side: "buy", order_count: 1, status: "open" },
+  ]);
+  renderBottom();
+  setDataCalls.length = 0;
+  candleRequests.length = 0;
+  clickOrdRow("BTCUSDT");
+  await settle(80);
+  const beforeOrdKey = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  clickOrdAction("BTCUSDT", "cancel");
+  await settle(20);
+  const afterCancel = (setDataCalls[setDataCalls.length - 1] || {}).key || "";
+  assert(afterCancel === beforeOrdKey,
+    `S15: clicking CANCEL order does not change chart selection (before=${beforeOrdKey} after=${afterCancel})`);
+
+  // -- S16: exactly ONE LWC root still after login/reboot --
+  // Already covered by S7, but we double-check at the end so the test
+  // file catches regressions introduced by later chart edits.
+  const rootCountFinal = countLWCRoots();
+  assert(rootCountFinal === 1,
+    `S16: exactly one LWC root after the entire run (got ${rootCountFinal})`);
+
   // -- Live safety: no /api/trade/execute calls during the entire run --
   assert(executedTrades.length === 0,
     "LIVE SAFETY: zero /api/trade/execute calls");
+
+  // -- Scenario 7: boot/initChart is idempotent (desktop chart layout) --
+  // Before this fix, when boot() ran twice (e.g. unauthenticated boot
+  // failed on /api/session, then login triggered boot() again), initChart()
+  // would call createChart() without removing the prior LWC root. Two
+  // .tv-lightweight-charts roots stacked inside #chart: the first
+  // rendered empty at the top of #chart, the second — the real one —
+  // overflowed ~492px below. This is the desktop "huge blank area
+  // below the timeframe buttons" bug.
+  const rootCountBefore = countLWCRoots();
+  // Trigger a second init via boot() by faking a login submit event.
+  await fire("#loginForm", "submit");
+  await settle(60);
+  const rootCountAfter = countLWCRoots();
+  assert(rootCountBefore === 1 && rootCountAfter === 1,
+    `S7: initChart idempotent — 1 LWC root before boot() and 1 after, got ${rootCountBefore} → ${rootCountAfter}`);
 
   console.log(failed === 0 ? "ALL PASS" : `FAILURES: ${failed}`);
   process.exit(failed === 0 ? 0 : 1);

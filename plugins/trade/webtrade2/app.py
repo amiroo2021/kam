@@ -61,7 +61,17 @@ def create_app(
 
     @app.get("/")
     def root() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        # index.html must not be cached: it's the entry point that pulls in
+        # all CSS/JS. When the app changes, iOS Safari will hold onto a
+        # cached copy otherwise, and the user sees the old markup (e.g. a
+        # removed FILLS tab) even after the disk file is updated. The
+        # bundled CSS / JS files are version-controlled by content hash
+        # queries and stay cacheable on their own.
+        resp = FileResponse(STATIC_DIR / "index.html")
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
 
     @app.get("/health")
     @app.get("/api/health")

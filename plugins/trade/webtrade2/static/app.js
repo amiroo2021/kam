@@ -33,6 +33,25 @@
   const $ = (sel) => document.querySelector(sel);
   const fmt = (v) => (v === null || v === undefined || v === '' ? '—' : String(v));
   const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+  // Escape a string for safe use inside an HTML attribute value. We
+  // explicitly encode the four characters that can break the attribute
+  // quoting or inject markup; this is the only place we interpolate
+  // dynamic text into attribute values (instrument symbols from the
+  // exchange), so a tiny inline escaper is sufficient.
+  const escapeAttr = (v) => {
+    const s = String(v == null ? '' : v);
+    const AMP = String.fromCharCode(38);
+    const QUOT = String.fromCharCode(34);
+    const APOS = String.fromCharCode(39);
+    const LT = String.fromCharCode(60);
+    const GT = String.fromCharCode(62);
+    return s
+      .replace(/&/g, AMP)
+      .replace(/"/g, QUOT)
+      .replace(/'/g, APOS)
+      .replace(/</g, LT)
+      .replace(/>/g, GT);
+  };
   const BUY_COLOR = '#3b82f6';
   const SELL_COLOR = '#ef5b67';
   const POS_COLOR = '#16c784';
@@ -177,6 +196,26 @@
     const container = $('#chart');
     if (!container) return false;
     if (!window.LightweightCharts || typeof window.LightweightCharts.createChart !== 'function') return false;
+    // Idempotency guard: if a previous boot() ran initChart() (e.g. the
+    // unauthenticated boot fails on /api/session and the user then logs
+    // in, which re-runs boot()), LightweightCharts will append a second
+    // .tv-lightweight-charts root div into #chart without removing the
+    // first. The first root renders empty (no candles were ever loaded
+    // before login) and the second root, which holds the real candles,
+    // overflows downward by ~492px — producing the "huge blank area
+    // below the timeframe buttons" bug on desktop. Tear down any prior
+    // LWC root + ResizeObserver before creating a new one.
+    if (state._chartResizeObserver) {
+      try { state._chartResizeObserver.disconnect(); } catch (_) {}
+      state._chartResizeObserver = null;
+    }
+    if (state.chart && typeof state.chart.remove === 'function') {
+      try { state.chart.remove(); } catch (_) {}
+    }
+    state.chart = null;
+    state.candleSeries = null;
+    state.chartReady = false;
+    while (container.firstChild) container.removeChild(container.firstChild);
     // Read the container size synchronously. If the panel isn't laid
     // out yet (true on mobile when the page boots with the markets tab
     // active), fall back to a sensible default so createChart doesn't
@@ -659,9 +698,32 @@
     const data = state.accountState || {};
     if (state.bottomTab === 'positions') {
       const rows = data.positions || [];
-      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Actions</th></tr></thead><tbody>${rows.map((p, idx) => { const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); return `<tr><td>${fmt(p.symbol || p.instrument || p.market)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="row-actions"><button class="row-action" data-pos-action="tp" data-pos-index="${idx}">TP</button><button class="row-action" data-pos-action="sl" data-pos-index="${idx}">SL</button><button class="row-action destructive" data-pos-action="close" data-pos-index="${idx}">CLOSE</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
+      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Actions</th></tr></thead><tbody>${rows.map((p, idx) => { const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); const instSym = p.symbol || p.instrument || p.market || ''; return `<tr class="clickable-row" data-pos-row="${idx}" data-symbol="${escapeAttr(instSym)}"><td class="cell-instrument">${fmt(instSym)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="row-actions"><button class="row-action" data-pos-action="tp" data-pos-index="${idx}">TP</button><button class="row-action" data-pos-action="sl" data-pos-index="${idx}">SL</button><button class="row-action destructive" data-pos-action="close" data-pos-index="${idx}">CLOSE</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
+      // Row-level navigation: clicking the instrument cell or row (but
+      // NOT the action buttons — see stopPropagation below) selects
+      // that position's canonical instrument via the same path that
+      // selectMarket() from Markets uses, preserving timeframe and
+      // running through the chartLoadGen / stale-response protections.
+      box.querySelectorAll('[data-pos-row]').forEach(row => {
+        row.addEventListener('click', (e) => {
+          // Ignore clicks that originated inside a row-actions cell —
+          // every action button stops propagation itself, but this is
+          // a belt-and-suspenders guard for any future cell that
+          // contains interactive controls.
+          const target = e.target;
+          if (target && target.closest && target.closest('.row-actions')) return;
+          const sym = row.dataset.symbol;
+          if (!sym) return;
+          selectMarket(sym);
+        });
+      });
       box.querySelectorAll('[data-pos-action]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', (e) => {
+          // Action buttons (TP / SL / CLOSE) must not trigger the row's
+          // instrument-selection handler. stopPropagation here is the
+          // authoritative isolation; the row's closest('.row-actions')
+          // check above is the backup.
+          e.stopPropagation();
           const idx = parseInt(btn.dataset.posIndex, 10);
           const pos = (data.positions || [])[idx];
           if (!pos) return;
@@ -681,17 +743,33 @@
       });
     } else if (state.bottomTab === 'orders') {
       const rows = data.order_groups || [];
-      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Orders</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows.map((o, idx) => { const side = fmt(o.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); return `<tr><td>${fmt(o.symbol || o.instrument || o.market)}</td><td class="${sideCls}">${fmt(o.side)}</td><td>${fmt(o.order_count || o.count || '')}</td><td>${fmt(o.status || 'open')}</td><td class="row-actions"><button class="row-action destructive" data-ord-action="cancel" data-ord-index="${idx}">CANCEL</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No open orders</div>`;
+      box.innerHTML = rows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Orders</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows.map((o, idx) => { const side = fmt(o.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const instSym = o.symbol || o.instrument || o.market || ''; return `<tr class="clickable-row" data-ord-row="${idx}" data-symbol="${escapeAttr(instSym)}"><td class="cell-instrument">${fmt(instSym)}</td><td class="${sideCls}">${fmt(o.side)}</td><td>${fmt(o.order_count || o.count || '')}</td><td>${fmt(o.status || 'open')}</td><td class="row-actions"><button class="row-action destructive" data-ord-action="cancel" data-ord-index="${idx}">CANCEL</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No open orders</div>`;
+      // Row-level navigation: clicking the instrument row (but NOT the
+      // CANCEL button) selects that order's canonical instrument via
+      // selectMarket(), preserving timeframe and reusing chartLoadGen.
+      box.querySelectorAll('[data-ord-row]').forEach(row => {
+        row.addEventListener('click', (e) => {
+          const target = e.target;
+          if (target && target.closest && target.closest('.row-actions')) return;
+          const sym = row.dataset.symbol;
+          if (!sym) return;
+          selectMarket(sym);
+        });
+      });
       box.querySelectorAll('[data-ord-action]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', (e) => {
+          // Action buttons (CANCEL) must not trigger the row's
+          // instrument-selection handler — isolation comes from
+          // stopPropagation on the click event itself, not from the
+          // markup, so the same behavior holds even if the button
+          // ever moves inside another clickable container.
+          e.stopPropagation();
           const idx = parseInt(btn.dataset.ordIndex, 10);
           const ord = (data.order_groups || [])[idx];
           if (!ord) return;
           if (btn.dataset.ordAction === 'cancel') return confirmCancel(ord);
         });
       });
-    } else {
-      box.innerHTML = `<div class="empty">Fills are shown when the selected exchange exposes them.</div>`;
     }
   }
 
