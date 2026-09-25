@@ -91,6 +91,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -393,6 +394,7 @@ def capabilities() -> List[str]:
         # Phase 2.4: catalog + public mark price.
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -455,6 +457,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _execute_list_instruments(account, request)
         if operation == "market_price":
             return _execute_market_price(account, request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(account, request)
         if operation == "candles":
             return handle_candles_operation(name, account, request)
     except Exception as exc:  # noqa: BLE001
@@ -997,6 +1001,632 @@ def _fetch_hibachi_mark_price(venue_symbol: str) -> Optional[str]:
         if d.is_finite() and d > 0:
             return format(d.normalize(), "f")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical get_tickers (Batch 4d — Hibachi)
+#
+# Hibachi publishes a finite (~15-contract) perpetual catalog via
+# /market/exchange-info and per-symbol prices via
+# /market/data/prices?symbol=<venue symbol>. There is no verified
+# bulk dynamic endpoint that returns the catalog + dynamic fields in
+# a single call, so get_tickers fans out across the catalog's
+# ``symbol`` (venue-native ``<BASE>/<QUOTE>-P`` wire form) using a
+# bounded concurrent worker pool.
+#
+# Source-of-truth reuse (no speculative mapping):
+#   * Catalog   = /market/exchange-info via existing _fetch_exchange_info()
+#                 + existing _extract_future_contracts() + existing
+#                 _hibachi_live_descriptors() (already filters live=True
+#                 and surfaces the fields used by list_instruments +
+#                 resolve_instrument).
+#   * Symbol    = the venue-native ``symbol`` field on each descriptor
+#                 (e.g. "BTC/USDT-P"); this is the same value the
+#                 existing ``_fetch_hibachi_mark_price`` accepts via
+#                 ``_hibachi_venue_symbol_for_price``.
+#   * Price     = /market/data/prices?symbol=<venue symbol>, parsed by
+#                 reusing the existing per-key fallback chain
+#                 (``markPrice`` → ``tradePrice`` → ``spotPrice`` →
+#                 ``bidPrice`` → ``askPrice``) so the canonical row
+#                 never invents a value the upstream did not publish.
+#
+# Canonical fields intentionally None because Hibachi does not publish
+# them through this source (per brief):
+#   oracle_price, last_external_price, turnover_24h, volume_24h_quote,
+#   volume_24h_base, change_24h_pct, funding_rate, open_interest,
+#   last_updated_time.
+#
+# Because volume / turnover / OI / funding are all None, every Hibachi
+# row falls into WebTrade2's alphabetical unknown-volume tail; the
+# ``_rows_from_tickers_batch`` service-layer flattening MUST NOT
+# fabricate a base-volume ranking fallback. That service-layer
+# flattening issue is a future-generic WebTrade2 fix and remains out
+# of scope here.
+# ---------------------------------------------------------------------------
+
+_HIBACHI_GET_TICKERS_TTL_SECONDS = 30.0
+_HIBACHI_GET_TICKERS_FANOUT_MAX = 4
+_HIBACHI_GET_TICKERS_CIRCUIT_COOLDOWN = 30.0
+_HIBACHI_GET_TICKERS_PER_SYMBOL_TIMEOUT = 10.0
+_HIBACHI_GET_TICKERS_SOURCE = "hibachi_market_data_prices_fanout"
+_HIBACHI_RATE_LIMIT_TOKENS = ("429", "rate limit", "too many requests", "too many")
+
+_HIBACHI_GET_TICKERS_INFLIGHT: Optional[threading.Event] = None
+_HIBACHI_GET_TICKERS_INFLIGHT_LOCK = threading.Lock()
+_HIBACHI_GET_TICKERS_CIRCUIT_OPEN_UNTIL: float = 0.0
+_HIBACHI_GET_TICKERS_LAST_RATE_LIMIT_AT: float = 0.0
+_HIBACHI_GET_TICKERS_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "tickers": {},          # symbol -> CanonicalMarketPrice
+    "stale_symbols": [],    # symbols whose prior value was retained
+    "failed_symbols": [],   # symbols whose refresh failed with no usable prior value
+    "refresh_status": "no_data",
+    "source": _HIBACHI_GET_TICKERS_SOURCE,
+    "fetched_at": None,
+    "served_from_cache": False,
+}
+
+
+def _hibachi_now() -> float:
+    return time.time()
+
+
+def _hibachi_is_rate_limited(exc_or_msg: Any) -> bool:
+    """Return True if a Hibachi transport / exception / payload signals a rate-limit.
+
+    Accepts an Exception, raw str, or an HTTP-style message produced by
+    the existing ``_request_json`` helper (e.g. ``"HTTP 429 on /..."``).
+    """
+    if isinstance(exc_or_msg, Mapping):
+        msg = str(exc_or_msg.get("msg") or "")
+        code = exc_or_msg.get("code")
+        if code in (429, "429"):
+            return True
+    elif isinstance(exc_or_msg, BaseException):
+        msg = str(exc_or_msg)
+    elif exc_or_msg is None:
+        return False
+    else:
+        msg = str(exc_or_msg)
+    lower = msg.lower()
+    return any(tok in lower for tok in _HIBACHI_RATE_LIMIT_TOKENS)
+
+
+def _hibachi_format_decimal(value: Any) -> Optional[str]:
+    """Return the canonical decimal-string form or ``None`` for missing/zero/non-numeric.
+
+    Mirrors the ``_decimal_or_none`` + ``_format_decimal`` pair used by
+    the other KAM agents so canonical rows render consistently across
+    exchanges. Hibachi publishes very small ``stepSize`` /
+    ``minOrderSize`` values (e.g. ``"0.0000000001"`` — the venue's
+    internal step rounding); the canonical form preserves the actual
+    string without truncating or fabricating a non-zero value.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        d = Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return None
+    if not d.is_finite() or d == 0:
+        return None
+    # ``normalize()`` drops trailing zeros but keeps the exponent's
+    # natural magnitude (so 0.0000000001 stays 1E-10 rather than
+    # collapsing to 0). We then format with ``f`` to get a plain
+    # decimal string. Quantization to 8 decimals would round these
+    # tiny values to 0 — not what upstream published — so we do NOT
+    # quantize here.
+    try:
+        text = format(d.normalize(), "f")
+    except Exception:  # noqa: BLE001
+        return None
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or None
+
+
+def _hibachi_canonical_row(
+    descriptor: Mapping[str, Any],
+    price_payload: Optional[Mapping[str, Any]],
+) -> CanonicalMarketPrice:
+    """Build a CanonicalMarketPrice row from one Hibachi descriptor + price payload.
+
+    Identity and static fields come from the existing
+    ``_hibachi_live_descriptors`` shape (which already matches the
+    ``/market/exchange-info`` payload and reuses the same normalization
+    the rest of the agent applies). Dynamic fields come from the
+    /market/data/prices response using the same per-key fallback chain
+    the existing ``_fetch_hibachi_mark_price`` uses; ``price`` follows
+    ``tradePrice`` with the ``markPrice`` fallback documented by the
+    brief. All fields Hibachi does not publish through this source are
+    explicitly ``None`` (never 0 / never fabricated).
+    """
+    native_symbol = str(descriptor.get("symbol") or "").strip()
+    base = str(descriptor.get("underlying_symbol") or "").strip().upper() or None
+    quote = str(descriptor.get("settlement_symbol") or "").strip().upper() or None
+    display_name = str(descriptor.get("display_name") or "").strip() or native_symbol
+    # Brief: ``display_symbol/display_name from displayName with existing
+    # sensible fallback``. Existing ``_fetch_hibachi_mark_price`` accepts
+    # the venue-native ``symbol`` (``<BASE>/<QUOTE>-P``) as the price
+    # payload key, so display_symbol mirrors the native symbol (the form
+    # the upstream price endpoint actually understands).
+    display_symbol = native_symbol
+
+    mark_price: Optional[str] = None
+    price: Optional[str] = None
+    last_external_price: Optional[str] = None
+
+    if isinstance(price_payload, Mapping):
+        status = str(price_payload.get("status") or "").strip().lower()
+        if status != "failed":
+            # Order: tradePrice first (per brief), then markPrice fallback.
+            trade = _hibachi_format_decimal(price_payload.get("tradePrice"))
+            mark = _hibachi_format_decimal(price_payload.get("markPrice"))
+            spot = _hibachi_format_decimal(price_payload.get("spotPrice"))
+            bid = _hibachi_format_decimal(price_payload.get("bidPrice"))
+            ask = _hibachi_format_decimal(price_payload.get("askPrice"))
+            # Brief: do NOT substitute bid/ask midpoint unless already part
+            # of existing Hibachi semantics. The existing
+            # _fetch_hibachi_mark_price returns whichever key first yields
+            # a finite positive Decimal; we mirror that here but split
+            # ``mark`` out of the chain so ``price`` can prefer trade.
+            price = trade or mark
+            mark_price = mark or trade
+            last_external_price = spot
+
+    return CanonicalMarketPrice(
+        requested_symbol=native_symbol,
+        market=native_symbol,
+        symbol=native_symbol,
+        display_name=display_name,
+        native_symbol=native_symbol,
+        display_symbol=display_symbol,
+        base=base,
+        quote=quote,
+        market_type="perp",
+        price_increment=_hibachi_format_decimal(descriptor.get("tick_size")),
+        size_increment=_hibachi_format_decimal(descriptor.get("step_size")),
+        minimum_size=_hibachi_format_decimal(descriptor.get("min_order_size")),
+        minimum_notional=_hibachi_format_decimal(descriptor.get("min_notional")),
+        mark_price=mark_price,
+        oracle_price=None,
+        last_external_price=last_external_price,
+        last_updated_time=None,
+        price=price,
+        volume_24h_base=None,
+        volume_24h_quote=None,
+        turnover_24h=None,
+        change_24h_pct=None,
+        funding_rate=None,
+        open_interest=None,
+    )
+
+
+def _hibachi_universe() -> List[Dict[str, Any]]:
+    """Return the supported live Hibachi contract universe as descriptor dicts.
+
+    Reuses the existing ``_fetch_exchange_info`` + ``_extract_future_contracts``
+    + ``_hibachi_live_descriptors`` helpers (already used by
+    ``_execute_list_instruments``) so the canonical get_tickers universe
+    is the same set of contracts the rest of the agent advertises. No
+    additional HTTP discovery is performed.
+    """
+    try:
+        payload = _fetch_exchange_info()
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    return list(_hibachi_live_descriptors(payload))
+
+
+def _hibachi_fetch_one_price(venue_symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch one Hibachi price payload via /market/data/prices?symbol=<venue symbol>.
+
+    Mirrors the URL and parsing of the existing ``_fetch_hibachi_mark_price``
+    helper but returns the parsed JSON dict (or ``None``) so the fan-out
+    worker can hand it to ``_hibachi_canonical_row`` without re-parsing.
+    Per-request timeout is 10s (the brief's "reasonable existing Hibachi
+    transport timeout"; the existing transport's 20s ceiling would be
+    needlessly long for an in-process fan-out).
+    """
+    symbol = str(venue_symbol or "").strip()
+    if not symbol:
+        return None
+    base = _market_api_base().rstrip("/")
+    url = f"{base}/market/data/prices?{urllib.parse.urlencode({'symbol': symbol})}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "kam-trade/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_HIBACHI_GET_TICKERS_PER_SYMBOL_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode() or "{}")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip().lower() == "failed":
+        return None
+    return payload
+
+
+def _hibachi_fanout_bounded(
+    descriptors: List[Dict[str, Any]],
+    ticker_by_sym: Dict[str, CanonicalMarketPrice],
+    failed_symbols: List[str],
+    rate_limit_hit: List[bool],
+) -> None:
+    """Bounded concurrent fan-out across ``descriptors``.
+
+    Maximum ``_HIBACHI_GET_TICKERS_FANOUT_MAX`` concurrent price reads
+    via a ``threading.Semaphore``. Each worker fetches one symbol,
+    catches per-symbol exceptions, and records:
+      - success → row written into ``ticker_by_sym[symbol]``
+      - rate-limit (any) → ``rate_limit_hit[0] = True`` AND symbol
+        appended to ``failed_symbols``
+      - other failure → symbol appended to ``failed_symbols``
+    """
+    sem = threading.Semaphore(_HIBACHI_GET_TICKERS_FANOUT_MAX)
+    barrier_lock = threading.Lock()
+
+    def worker(descriptor: Mapping[str, Any]) -> None:
+        sym = str(descriptor.get("symbol") or "")
+        if not sym:
+            return
+        try:
+            sem.acquire()
+            try:
+                payload = _hibachi_fetch_one_price(sym)
+            finally:
+                sem.release()
+        except BaseException as exc:  # noqa: BLE001
+            with barrier_lock:
+                failed_symbols.append(sym)
+                if _hibachi_is_rate_limited(exc):
+                    rate_limit_hit[0] = True
+            return
+        if payload is None:
+            with barrier_lock:
+                failed_symbols.append(sym)
+            return
+        try:
+            row = _hibachi_canonical_row(descriptor, payload)
+        except Exception:  # noqa: BLE001
+            with barrier_lock:
+                failed_symbols.append(sym)
+            return
+        # Only emit rows that have a usable mark or trade price; an
+        # "ok" response with no parseable price is treated as a soft
+        # failure for the symbol so we don't flood consumers with empty
+        # rows. Catalog identity is preserved elsewhere (list_instruments).
+        if row.mark_price is None and row.price is None:
+            with barrier_lock:
+                failed_symbols.append(sym)
+            return
+        with barrier_lock:
+            ticker_by_sym[sym] = row
+
+    threads = [
+        threading.Thread(target=worker, args=(d,), name=f"hibachi-price-{d.get('symbol')}")
+        for d in descriptors
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def _hibachi_refresh_snapshot_locked(
+    now: float,
+    descriptors: List[Dict[str, Any]],
+    catalog_symbols: set,
+) -> Dict[str, Any]:
+    """Run a single refresh and return a new cache dict (caller swaps it in).
+
+    Mirrors the Batch 4b/4c pattern:
+      * bounded concurrent fan-out
+      * partial-failure isolation (per-symbol)
+      * rate-limit → circuit-open for ``_HIBACHI_GET_TICKERS_CIRCUIT_COOLDOWN``
+      * stale-value retention for symbols that still exist in the
+        current catalog but whose current refresh failed
+      * symbols removed from the current catalog are NEVER resurrected
+    """
+    global _HIBACHI_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _HIBACHI_GET_TICKERS_LAST_RATE_LIMIT_AT
+    ticker_by_sym: Dict[str, CanonicalMarketPrice] = {}
+    failed_symbols: List[str] = []
+    rate_limit_hit: List[bool] = [False]
+    if descriptors:
+        try:
+            _hibachi_fanout_bounded(
+                descriptors, ticker_by_sym, failed_symbols, rate_limit_hit
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _hibachi_is_rate_limited(exc):
+                rate_limit_hit[0] = True
+
+    prior = _HIBACHI_GET_TICKERS_CACHE
+    prior_tickers: Dict[str, CanonicalMarketPrice] = prior.get("tickers") or {}
+
+    new_cache: Dict[str, Any] = {
+        "ts": now,
+        "tickers": dict(prior_tickers),
+        "stale_symbols": [],
+        "failed_symbols": [],
+        "refresh_status": "ok",
+        "source": _HIBACHI_GET_TICKERS_SOURCE,
+        "fetched_at": None,
+        "served_from_cache": False,
+    }
+
+    if rate_limit_hit[0]:
+        _HIBACHI_GET_TICKERS_CIRCUIT_OPEN_UNTIL = now + _HIBACHI_GET_TICKERS_CIRCUIT_COOLDOWN
+        _HIBACHI_GET_TICKERS_LAST_RATE_LIMIT_AT = now
+        kept = {s: row for s, row in prior_tickers.items() if s in catalog_symbols}
+        new_cache["tickers"] = kept
+        new_cache["stale_symbols"] = sorted(catalog_symbols)
+        new_cache["failed_symbols"] = sorted(
+            set(failed_symbols) | (catalog_symbols - set(kept.keys()))
+        )
+        new_cache["refresh_status"] = "rate_limited"
+        new_cache["fetched_at"] = prior.get("fetched_at")
+        return new_cache
+
+    merged: Dict[str, CanonicalMarketPrice] = {}
+    stale: List[str] = []
+    failed: List[str] = []
+    requested = {str(d.get("symbol") or "") for d in descriptors}
+    for sym in requested:
+        if not sym:
+            continue
+        if sym in ticker_by_sym:
+            merged[sym] = ticker_by_sym[sym]
+        elif sym in prior_tickers:
+            merged[sym] = prior_tickers[sym]
+            stale.append(sym)
+        else:
+            failed.append(sym)
+
+    # Catalog pruning: any prior row whose symbol is no longer in the
+    # current catalog is dropped — we do NOT resurrect removed products.
+    for sym in list(prior_tickers.keys()):
+        if sym not in catalog_symbols:
+            merged.pop(sym, None)
+
+    for sym in failed_symbols:
+        if sym not in failed and sym not in stale and sym in catalog_symbols:
+            failed.append(sym)
+
+    new_cache["tickers"] = merged
+    new_cache["stale_symbols"] = sorted(set(stale))
+    new_cache["failed_symbols"] = sorted(set(failed))
+    if failed or stale:
+        new_cache["refresh_status"] = "partial"
+    else:
+        new_cache["refresh_status"] = "ok"
+    new_cache["fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    return new_cache
+
+
+def _hibachi_serve_from_cache(
+    served_from_cache: bool,
+    override_status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Render the module-level cache as a JSON-safe dict.
+
+    ``CanonicalMarketPrice`` instances are converted via ``to_dict()``
+    so consumers receive plain strings/None per the canonical contract.
+    """
+    cache = _HIBACHI_GET_TICKERS_CACHE
+    tickers_out: Dict[str, Dict[str, Any]] = {
+        s: row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        for s, row in (cache.get("tickers") or {}).items()
+    }
+    out = {
+        "tickers": tickers_out,
+        "failed_symbols": list(cache.get("failed_symbols") or []),
+        "stale_symbols": list(cache.get("stale_symbols") or []),
+        "refresh_status": override_status if override_status is not None else cache.get("refresh_status") or "no_data",
+        "source": cache.get("source"),
+        "fetched_at": cache.get("fetched_at"),
+        "ttl_seconds": int(_HIBACHI_GET_TICKERS_TTL_SECONDS),
+        "served_from_cache": served_from_cache,
+    }
+    return out
+
+
+def _hibachi_prune_cache_to_catalog(catalog_symbols: set) -> None:
+    """Drop cached rows for symbols no longer in the current catalog.
+
+    Same rationale as Batches 4b / 4c: warm-serve paths must prune so
+    removed contracts are never resurrected after a catalog removal.
+    """
+    cache = _HIBACHI_GET_TICKERS_CACHE
+    tickers: Dict[str, Any] = cache.get("tickers") or {}
+    mutated = False
+    for sym in list(tickers.keys()):
+        if sym not in catalog_symbols:
+            tickers.pop(sym, None)
+            mutated = True
+    if mutated:
+        cache["tickers"] = tickers
+
+
+def _hibachi_serve_from_cache_with_prune(
+    catalog_symbols: set,
+    served_from_cache: bool,
+    override_status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Serve-from-cache with catalog pruning applied."""
+    _hibachi_prune_cache_to_catalog(catalog_symbols)
+    return _hibachi_serve_from_cache(
+        served_from_cache=served_from_cache,
+        override_status=override_status,
+    )
+
+
+def _hibachi_get_tickers_snapshot(force: bool = False) -> Dict[str, Any]:
+    """Return a fresh or cached snapshot for the Hibachi universe.
+
+    Cache rules (mirror Batch 4b / 4c):
+      1. Coalesce: if another refresh is in flight, wait on it and
+         re-read the cache.
+      2. Warm window: cache age < 30s and not ``force`` → serve from
+         cache with ``served_from_cache=True`` and catalog pruning.
+      3. Circuit-open: if rate-limit cooldown is active, serve from
+         cache with ``refresh_status=circuit_open`` and do NOT launch
+         another fan-out.
+      4. Otherwise acquire the in-flight slot and run a refresh.
+    """
+    global _HIBACHI_GET_TICKERS_INFLIGHT, _HIBACHI_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _HIBACHI_GET_TICKERS_CACHE
+
+    now = _hibachi_now()
+    descriptors = _hibachi_universe()
+    catalog_symbols = {str(d.get("symbol") or "") for d in descriptors if d.get("symbol")}
+
+    # Coalesce path: wait on the in-flight refresh if one is active.
+    with _HIBACHI_GET_TICKERS_INFLIGHT_LOCK:
+        inflight = _HIBACHI_GET_TICKERS_INFLIGHT
+    if inflight is not None and not force:
+        inflight.wait(timeout=_HIBACHI_GET_TICKERS_TTL_SECONDS + 5.0)
+        # After waiting, fall through to the warm-window check below
+        # (which itself prunes against the current catalog).
+
+    cache = _HIBACHI_GET_TICKERS_CACHE
+    age = now - float(cache.get("ts") or 0.0)
+    circuit_open = now < _HIBACHI_GET_TICKERS_CIRCUIT_OPEN_UNTIL
+
+    if not force and not circuit_open and age < _HIBACHI_GET_TICKERS_TTL_SECONDS:
+        if cache.get("tickers") or cache.get("fetched_at"):
+            return _hibachi_serve_from_cache_with_prune(
+                catalog_symbols=catalog_symbols,
+                served_from_cache=True,
+            )
+
+    if circuit_open:
+        return _hibachi_serve_from_cache_with_prune(
+            catalog_symbols=catalog_symbols,
+            served_from_cache=True,
+            override_status="circuit_open",
+        )
+
+    # Acquire in-flight slot for coalescing concurrent callers.
+    with _HIBACHI_GET_TICKERS_INFLIGHT_LOCK:
+        if _HIBACHI_GET_TICKERS_INFLIGHT is None:
+            evt = threading.Event()
+            _HIBACHI_GET_TICKERS_INFLIGHT = evt
+            acquired = True
+        else:
+            evt = _HIBACHI_GET_TICKERS_INFLIGHT
+            acquired = False
+    try:
+        if not acquired and not force:
+            evt.wait(timeout=_HIBACHI_GET_TICKERS_TTL_SECONDS + 5.0)
+            return _hibachi_serve_from_cache_with_prune(
+                catalog_symbols=catalog_symbols,
+                served_from_cache=True,
+            )
+        new_cache = _hibachi_refresh_snapshot_locked(
+            now=now,
+            descriptors=descriptors,
+            catalog_symbols=catalog_symbols,
+        )
+    finally:
+        if acquired:
+            with _HIBACHI_GET_TICKERS_INFLIGHT_LOCK:
+                _HIBACHI_GET_TICKERS_INFLIGHT = None
+            evt.set()
+    _HIBACHI_GET_TICKERS_CACHE = new_cache
+    return _hibachi_serve_from_cache(served_from_cache=False)
+
+
+def _execute_get_tickers(
+    account: str, request: Mapping[str, Any]
+) -> CanonicalResponse:
+    """Canonical ``get_tickers`` dispatcher for Hibachi.
+
+    Behavior:
+      1. Loads the existing live catalog (uses ``_fetch_exchange_info``
+         + ``_hibachi_live_descriptors`` — the same helpers
+         ``_execute_list_instruments`` uses).
+      2. Calls ``_hibachi_get_tickers_snapshot`` which applies the
+         cache / coalescing / circuit logic and the bounded fan-out.
+      3. Returns a ``CanonicalTickersBatch`` in ``tickers_batch`` plus
+         a JSON-safe mirror in ``data`` for legacy consumers.
+
+    Safety:
+      - read-only; no /api/trade/execute.
+      - no exchange writes.
+      - bounded fan-out (max 4 concurrent price reads).
+      - 30-second TTL; warm requests perform zero upstream reads.
+      - uses the existing Hibachi public catalog + price endpoints
+        only; never invents fields the upstream did not publish.
+    """
+    force = bool(request.get("force") or False)
+    try:
+        snapshot = _hibachi_get_tickers_snapshot(force=force)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account or "",
+            code="HIBACHI_ERROR",
+            message=_redact(sanitize_error_message(str(exc))),
+        )
+
+    tickers_dict = snapshot.get("tickers") or {}
+    canonical_tickers: Dict[str, CanonicalMarketPrice] = {}
+    for sym, row in tickers_dict.items():
+        if not isinstance(row, Mapping):
+            continue
+        canonical_tickers[str(sym)] = CanonicalMarketPrice(
+            requested_symbol=str(row.get("requested_symbol") or row.get("symbol") or sym),
+            market=str(row.get("market") or row.get("symbol") or sym),
+            symbol=row.get("symbol"),
+            display_name=row.get("display_name"),
+            native_symbol=row.get("native_symbol"),
+            display_symbol=row.get("display_symbol"),
+            base=row.get("base"),
+            quote=row.get("quote"),
+            market_type=row.get("market_type"),
+            price_increment=row.get("price_increment"),
+            size_increment=row.get("size_increment"),
+            minimum_size=row.get("minimum_size"),
+            minimum_notional=row.get("minimum_notional"),
+            mark_price=row.get("mark_price"),
+            oracle_price=row.get("oracle_price"),
+            last_external_price=row.get("last_external_price"),
+            last_updated_time=row.get("last_updated_time"),
+            price=row.get("price"),
+            volume_24h_base=row.get("volume_24h_base"),
+            volume_24h_quote=row.get("volume_24h_quote"),
+            turnover_24h=row.get("turnover_24h"),
+            change_24h_pct=row.get("change_24h_pct"),
+            funding_rate=row.get("funding_rate"),
+            open_interest=row.get("open_interest"),
+        )
+
+    batch = CanonicalTickersBatch(
+        tickers=canonical_tickers,
+        failed_symbols=tuple(snapshot.get("failed_symbols") or ()),
+        fetched_at=snapshot.get("fetched_at"),
+        ttl_seconds=int(_HIBACHI_GET_TICKERS_TTL_SECONDS),
+        stale_symbols=tuple(snapshot.get("stale_symbols") or ()),
+        refresh_status=snapshot.get("refresh_status") or "ok",
+        source=snapshot.get("source") or _HIBACHI_GET_TICKERS_SOURCE,
+        served_from_cache=bool(snapshot.get("served_from_cache")),
+    )
+
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=account or "",
+        tickers_batch=batch,
+        data=snapshot,
+    )
 
 
 def _execute_market_price(account: str, request: Dict[str, Any]) -> CanonicalResponse:
