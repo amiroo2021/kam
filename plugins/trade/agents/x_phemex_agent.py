@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -51,6 +52,7 @@ from ..canonical import (
     CanonicalInstrument,
     CanonicalLadderResult,
     CanonicalMarketPrice,
+    CanonicalTickersBatch,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
@@ -91,6 +93,140 @@ _PATH_G_FUTURES_ORDERS = "/api-data/g-futures/orders"
 
 _PRODUCT_CACHE: Dict[str, Any] = {"ts": 0.0, "by_symbol": {}, "by_base": {}}
 _PRODUCT_CACHE_TTL = 300.0
+
+
+# ---------------------------------------------------------------------------
+# Canonical get_tickers (Batch 4c — Phemex)
+#
+# Phemex has no verified complete bulk dynamic endpoint. The legacy all-ticker
+# endpoint is documented to be incomplete (does not represent the full perpetual
+# catalog) and the brief forbids treating it as such. Per Phemex's own public
+# /md/v2/ticker/24hr?symbol=<native> contract, the supported perpetual
+# universe is the set of PerpetualV2 USDT-margined products enumerated in
+# /public/products (live: 123 active contracts; 0 spot fan-out). The fan-out
+# below is bounded to that same universe; spot products are excluded by the
+# filter ``settleCurrency == 'USDT' and type in {PerpetualV2, Perpetual} and
+# status not in {Delisted, Closed}``.
+#
+# Rp/Rr/Rv/Rq scaling evidence: the existing agent treats all Rp/Rq/Rv/Rr
+# ticker fields as raw decimal strings. _fetch_mark_price (lines around 942)
+# reads ``markPriceRp`` / ``indexPriceRp`` / ``closeRp`` / ``lastRp`` /
+# ``priceRp`` via ``_decimal_or_zero`` with no scaling; _load_products (lines
+# around 420) reads ``minOrderQtyRq`` / ``minOrderValueRv`` /
+# ``maxOrderQtyRq`` the same way. The brief's "do not guess scaling" rule is
+# preserved by using ``_decimal_or_none`` for every Rp/Rr/Rv/Rq field and
+# emitting None when the upstream field is missing/blank/non-numeric.
+# ---------------------------------------------------------------------------
+
+_PHEMEX_GET_TICKERS_TTL_SECONDS = 60.0
+_PHEMEX_GET_TICKERS_FANOUT_MAX = 8
+_PHEMEX_GET_TICKERS_CIRCUIT_COOLDOWN = 30.0
+_PHEMEX_GET_TICKERS_PER_SYMBOL_TIMEOUT = 10.0
+_PHEMEX_GET_TICKERS_SOURCE = "phemex_md_v2_ticker_24hr_fanout"
+# Phemex rate-limit payloads commonly use ``code: 429`` or
+# ``code: '429'`` with ``msg`` containing ``"Too Many Requests"`` /
+# ``"rate limit"``. We also recognize any HTTP 429 surfaced via
+# RuntimeError by _signed_request, and the message tokens ``"429"`` /
+# ``"rate limit"`` / ``"too many"`` as a defensive fallback.
+_PHEMEX_RATE_LIMIT_TOKENS = ("429", "rate limit", "too many requests", "too many")
+
+_PHEMEX_GET_TICKERS_INFLIGHT: Optional[threading.Event] = None
+_PHEMEX_GET_TICKERS_INFLIGHT_LOCK = threading.Lock()
+_PHEMEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL: float = 0.0
+_PHEMEX_GET_TICKERS_LAST_RATE_LIMIT_AT: float = 0.0
+_PHEMEX_GET_TICKERS_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "tickers": {},          # symbol -> CanonicalMarketPrice
+    "stale_symbols": [],    # symbols whose prior value was retained
+    "failed_symbols": [],   # symbols whose refresh failed with no usable prior value
+    "refresh_status": "no_data",
+    "source": _PHEMEX_GET_TICKERS_SOURCE,
+    "fetched_at": None,
+    "served_from_cache": False,
+}
+
+
+def _phemex_now() -> float:
+    return time.time()
+
+
+def _phemex_is_rate_limited(exc_or_msg: Any) -> bool:
+    """Return True if a Phemex transport/exception/payload signals a rate-limit.
+
+    Accepts an Exception (whose ``str()`` carries the upstream message), a
+    raw ``str``, or a Phemex error-payload dict (``{"code": ..., "msg": ...}``).
+    """
+    if isinstance(exc_or_msg, Mapping):
+        msg = str(exc_or_msg.get("msg") or "")
+        code = exc_or_msg.get("code")
+        if code in (429, "429"):
+            return True
+    elif isinstance(exc_or_msg, BaseException):
+        msg = str(exc_or_msg)
+    elif exc_or_msg is None:
+        return False
+    else:
+        msg = str(exc_or_msg)
+    lower = msg.lower()
+    return any(tok in lower for tok in _PHEMEX_RATE_LIMIT_TOKENS)
+
+
+def _phemex_perpetual_universe(
+    products: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the supported USDT-margined perpetual contracts (catalog rows).
+
+    Mirrors the filter the existing ``_list_instruments`` already applies
+    (settleCurrency == 'USDT', active status). Returns a list of dicts with
+    keys ``symbol``, ``type``, ``display``, ``tick_size``, ``qty_step``,
+    ``min_qty``, ``min_notional`` so downstream workers don't need to
+    re-load products. Spot products are NOT included.
+    """
+    out: List[Dict[str, Any]] = []
+    for sym, meta in products.items():
+        if not isinstance(meta, Mapping):
+            continue
+        if str(meta.get("settle") or "").upper() != "USDT":
+            continue
+        ptype = str(meta.get("type") or "")
+        if ptype not in ("PerpetualV2", "Perpetual"):
+            continue
+        status = str(meta.get("status") or "").lower()
+        if status in ("delisted", "closed", "halted"):
+            continue
+        out.append(
+            {
+                "symbol": sym,
+                "type": ptype,
+                "display": str(meta.get("display") or sym),
+                "tick_size": meta.get("tick_size"),
+                "qty_step": meta.get("qty_step"),
+                "min_qty": meta.get("min_qty"),
+                "min_notional": meta.get("min_notional"),
+                "qty_precision": meta.get("qty_precision"),
+                "price_precision": meta.get("price_precision"),
+            }
+        )
+    out.sort(key=lambda r: r["symbol"])
+    return out
+
+
+def _phemex_split_base_quote(symbol: str) -> Tuple[Optional[str], Optional[str]]:
+    """Phemex contract symbols are concatenated ``<BASE><QUOTE>``.
+
+    USDT-margined perp products use quote ``USDT`` (the agent's existing
+    universe filter above guarantees that). For a USDT-settled contract we
+    strip ``USDT`` and treat the remainder as the base. Non-USDT suffixes
+    are not produced by the universe filter above, so we return ``(None, None)``
+    rather than guess.
+    """
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return (None, None)
+    for suffix in ("USDT",):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return (s[: -len(suffix)], suffix)
+    return (None, None)
 
 _OPEN_STATUS = {
     "new",
@@ -210,6 +346,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -1123,6 +1260,533 @@ def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalRe
         account=credentials["account"],
         instrument=instrument,
         data={"native_symbol": native, "settle": meta.get("settle"), "type": meta.get("type")},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical get_tickers (Batch 4c — Phemex) dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _phemex_fetch_ticker(
+    credentials: Mapping[str, str],
+    symbol: str,
+) -> Dict[str, Any]:
+    """Fetch one Phemex per-symbol ticker via ``/md/v2/ticker/24hr?symbol=<native>``.
+
+    Uses the existing transport (``_signed_request`` with ``auth=False``)
+    because the public ticker endpoint does not require credentials. Returns
+    the parsed ``result`` dict from Phemex; raises on transport / HTTP /
+    rate-limit / non-dict failure. The same retry/back-off loop in
+    ``_signed_request`` is preserved so transient transport errors recover
+    without amplifying a fan-out.
+
+    Per-request timeout defaults to ``API_TIMEOUT_SECONDS = 20`` (the
+    Phemex transport's established ceiling). This is the existing
+    transport's established timeout; using a tighter value here would
+    conflict with the brief's ``unless existing Phemex transport requires
+    its established timeout`` clause.
+    """
+    query = f"symbol={urllib.parse.quote(str(symbol))}"
+    payload = _signed_request(credentials, "GET", _PATH_TICKER, query=query, auth=False)
+    if payload.get("error"):
+        # retry with auth (matches _fetch_mark_price pattern)
+        payload = _signed_request(credentials, "GET", _PATH_TICKER, query=query, auth=True)
+    if not _phemex_ok(payload):
+        # Phemex error envelopes: {"code": <int>, "msg": "<text>"}
+        raise RuntimeError(f"Phemex ticker rejected: {payload}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Phemex ticker returned non-dict result")
+    sym_back = str(result.get("symbol") or "").strip().upper()
+    if sym_back and sym_back != str(symbol).strip().upper():
+        # Defensive: refuse a mismatched echo so a rate-limited wrong-symbol
+        # response cannot poison another contract's row.
+        raise RuntimeError(
+            f"Phemex ticker symbol mismatch (asked {symbol}, got {sym_back})"
+        )
+    return result
+
+
+def _phemex_canonical_row_from_ticker(
+    contract: Mapping[str, Any],
+    ticker: Mapping[str, Any],
+) -> CanonicalMarketPrice:
+    """Build a CanonicalMarketPrice row from one contract meta + ticker payload.
+
+    Identity fields come from the catalog (contract). Dynamic fields come
+    from the ticker payload using the exact Rp/Rr/Rv/Rq keys documented by
+    Phemex. ``None`` is emitted when a field is missing/blank/non-numeric
+    so consumers can render blanks rather than fabricating values.
+
+    Percent change is computed from open/close only when both are valid
+    and open is non-zero; otherwise ``None`` (never 0%).
+    """
+    sym = str(contract.get("symbol") or ticker.get("symbol") or "").strip().upper()
+    base, quote = _phemex_split_base_quote(sym)
+    tick_size = contract.get("tick_size")
+    qty_step = contract.get("qty_step")
+    min_qty = contract.get("min_qty")
+    min_notional = contract.get("min_notional")
+
+    def _s(v: Any) -> Optional[str]:
+        d = _decimal_or_none(v)
+        if d is None or d == 0:
+            return None
+        return _format_decimal(d)
+
+    mark_price = _s(ticker.get("markPriceRp"))
+    oracle_price = _s(ticker.get("indexPriceRp"))
+    # ``price`` follows mark with an already-established legitimate fallback
+    # to closeRp (last settled price). If both are unavailable, price=None.
+    price = mark_price or _s(ticker.get("closeRp"))
+    funding_rate = _s(ticker.get("fundingRateRr"))
+    open_interest = _s(ticker.get("openInterestRv"))
+    turnover_24h = _s(ticker.get("turnoverRv"))
+    volume_24h_base = _s(ticker.get("volumeRq"))
+
+    # 24h percent change from open/close only.
+    open_d = _decimal_or_none(ticker.get("openRp"))
+    close_d = _decimal_or_none(ticker.get("closeRp"))
+    change_24h_pct: Optional[str] = None
+    if open_d is not None and close_d is not None and open_d != 0:
+        delta = (close_d - open_d) / open_d * Decimal("100")
+        change_24h_pct = _format_decimal(delta)
+
+    last_updated_time = _s(ticker.get("timestamp"))
+
+    return CanonicalMarketPrice(
+        requested_symbol=sym,
+        market=sym,
+        symbol=sym,
+        display_name=str(contract.get("display") or sym),
+        native_symbol=sym,
+        display_symbol=sym,
+        base=base,
+        quote=quote,
+        market_type="perp",
+        price_increment=_format_decimal(tick_size) if isinstance(tick_size, Decimal) and tick_size > 0 else None,
+        size_increment=_format_decimal(qty_step) if isinstance(qty_step, Decimal) and qty_step > 0 else None,
+        minimum_size=_format_decimal(min_qty) if isinstance(min_qty, Decimal) and min_qty > 0 else None,
+        minimum_notional=_format_decimal(min_notional) if isinstance(min_notional, Decimal) and min_notional > 0 else None,
+        mark_price=mark_price,
+        oracle_price=oracle_price,
+        last_external_price=None,
+        last_updated_time=last_updated_time,
+        price=price,
+        volume_24h_base=volume_24h_base,
+        volume_24h_quote=turnover_24h,
+        turnover_24h=turnover_24h,
+        change_24h_pct=change_24h_pct,
+        funding_rate=funding_rate,
+        open_interest=open_interest,
+    )
+
+
+def _phemex_fanout_bounded(
+    credentials: Mapping[str, str],
+    contracts: List[Dict[str, Any]],
+    ticker_by_sym: Dict[str, CanonicalMarketPrice],
+    failed_symbols: List[str],
+    rate_limit_hit: List[bool],
+) -> None:
+    """Bounded concurrent fan-out across ``contracts``.
+
+    Maximum ``_PHEMEX_GET_TICKERS_FANOUT_MAX`` concurrent ticker reads via
+    a ``threading.Semaphore``. Each worker fetches one symbol, catches
+    per-symbol exceptions, and records:
+      - success → row written into ``ticker_by_sym[symbol]``
+      - rate-limit (any) → ``rate_limit_hit[0] = True`` AND symbol appended
+        to ``failed_symbols`` (so the snapshot path can decide whether to
+        retain the prior row)
+      - other failure → symbol appended to ``failed_symbols``
+    """
+    sem = threading.Semaphore(_PHEMEX_GET_TICKERS_FANOUT_MAX)
+    barrier_lock = threading.Lock()
+
+    def worker(contract: Mapping[str, Any]) -> None:
+        sym = str(contract.get("symbol") or "")
+        if not sym:
+            return
+        try:
+            sem.acquire()
+            try:
+                ticker = _phemex_fetch_ticker(credentials, sym)
+            finally:
+                sem.release()
+        except BaseException as exc:  # noqa: BLE001
+            with barrier_lock:
+                failed_symbols.append(sym)
+                if _phemex_is_rate_limited(exc):
+                    rate_limit_hit[0] = True
+            return
+        try:
+            row = _phemex_canonical_row_from_ticker(contract, ticker)
+        except Exception:
+            with barrier_lock:
+                failed_symbols.append(sym)
+            return
+        with barrier_lock:
+            ticker_by_sym[sym] = row
+
+    threads = [
+        threading.Thread(target=worker, args=(c,), name=f"phemex-ticker-{c.get('symbol')}")
+        for c in contracts
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def _phemex_refresh_snapshot_locked(
+    credentials: Mapping[str, str],
+    now: float,
+    contracts: List[Dict[str, Any]],
+    catalog_symbols: set,
+) -> Dict[str, Any]:
+    """Run a single refresh and return a new cache dict (caller swaps it in).
+
+    Mirrors the EdgeX pattern but is Phemex-owned and synchronous over the
+    Phemex transport's existing retry/back-off:
+      * bounded concurrent fan-out
+      * partial-failure isolation (per-symbol)
+      * rate-limit → circuit-open for ``_PHEMEX_GET_TICKERS_CIRCUIT_COOLDOWN``
+      * stale-value retention for symbols that still exist in the current
+        catalog but whose current refresh failed
+      * symbols removed from the current catalog are NEVER resurrected
+    """
+    global _PHEMEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _PHEMEX_GET_TICKERS_LAST_RATE_LIMIT_AT
+    ticker_by_sym: Dict[str, CanonicalMarketPrice] = {}
+    failed_symbols: List[str] = []
+    rate_limit_hit: List[bool] = [False]
+    if contracts:
+        try:
+            _phemex_fanout_bounded(
+                credentials, contracts, ticker_by_sym, failed_symbols, rate_limit_hit
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _phemex_is_rate_limited(exc):
+                rate_limit_hit[0] = True
+
+    prior = _PHEMEX_GET_TICKERS_CACHE
+    prior_tickers: Dict[str, CanonicalMarketPrice] = prior.get("tickers") or {}
+
+    new_cache: Dict[str, Any] = {
+        "ts": now,
+        "tickers": dict(prior_tickers),
+        "stale_symbols": [],
+        "failed_symbols": [],
+        "refresh_status": "ok",
+        "source": _PHEMEX_GET_TICKERS_SOURCE,
+        "fetched_at": None,
+        "served_from_cache": False,
+    }
+
+    if rate_limit_hit[0]:
+        # Open the circuit. Mark every currently-listed symbol as stale so
+        # consumers see the "kept from prior refresh" signal even though we
+        # could not refresh any of them. Symbols not in the current catalog
+        # are dropped from the cache entirely.
+        _PHEMEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL = now + _PHEMEX_GET_TICKERS_CIRCUIT_COOLDOWN
+        _PHEMEX_GET_TICKERS_LAST_RATE_LIMIT_AT = now
+        kept = {s: row for s, row in prior_tickers.items() if s in catalog_symbols}
+        new_cache["tickers"] = kept
+        new_cache["stale_symbols"] = sorted(catalog_symbols)
+        new_cache["failed_symbols"] = sorted(set(failed_symbols) | catalog_symbols - set(kept.keys()))
+        new_cache["refresh_status"] = "rate_limited"
+        new_cache["fetched_at"] = prior.get("fetched_at")
+        return new_cache
+
+    merged: Dict[str, CanonicalMarketPrice] = {}
+    stale: List[str] = []
+    failed: List[str] = []
+    requested = {str(c.get("symbol") or "") for c in contracts}
+    for sym in requested:
+        if sym in ticker_by_sym:
+            merged[sym] = ticker_by_sym[sym]
+        elif sym in prior_tickers:
+            # Stale retention: prior usable row for a still-listed symbol.
+            merged[sym] = prior_tickers[sym]
+            stale.append(sym)
+        else:
+            failed.append(sym)
+
+    # Catalog pruning: any prior row whose symbol is no longer in the current
+    # catalog is dropped — we do NOT resurrect removed products.
+    for sym in list(prior_tickers.keys()):
+        if sym not in catalog_symbols:
+            merged.pop(sym, None)
+
+    # Add any catalog symbols that weren't requested (defensive — should not
+    # happen since the universe filter above mirrors the catalog) as None.
+    for sym in catalog_symbols - set(merged.keys()):
+        # Symbol is in catalog but not requested (e.g. universe filter
+        # excluded it). Drop silently; do not fabricate.
+        pass
+
+    # Surface failed_symbols that came from fan-out (separate from stale).
+    for sym in failed_symbols:
+        if sym not in failed and sym not in stale and sym in catalog_symbols:
+            failed.append(sym)
+
+    new_cache["tickers"] = merged
+    new_cache["stale_symbols"] = sorted(set(stale))
+    new_cache["failed_symbols"] = sorted(set(failed))
+    if failed or stale:
+        new_cache["refresh_status"] = "partial"
+    else:
+        new_cache["refresh_status"] = "ok"
+    new_cache["fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    return new_cache
+
+
+def _phemex_serve_from_cache(
+    served_from_cache: bool,
+    override_status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Render the module-level cache as a JSON-safe dict.
+
+    ``CanonicalMarketPrice`` instances are converted via ``to_dict()`` so
+    consumers receive plain strings/None per the canonical contract.
+    """
+    cache = _PHEMEX_GET_TICKERS_CACHE
+    tickers_out: Dict[str, Dict[str, Any]] = {
+        s: row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        for s, row in (cache.get("tickers") or {}).items()
+    }
+    out = {
+        "tickers": tickers_out,
+        "failed_symbols": list(cache.get("failed_symbols") or []),
+        "stale_symbols": list(cache.get("stale_symbols") or []),
+        "refresh_status": override_status if override_status is not None else cache.get("refresh_status") or "no_data",
+        "source": cache.get("source"),
+        "fetched_at": cache.get("fetched_at"),
+        "ttl_seconds": int(_PHEMEX_GET_TICKERS_TTL_SECONDS),
+        "served_from_cache": served_from_cache,
+    }
+    return out
+
+
+def _phemex_prune_cache_to_catalog(
+    products: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Drop cached rows for symbols no longer in the current catalog.
+
+    The brief requires that "stale rows are not resurrected after catalog
+    removal". Without this helper, a warm-serve would still return rows for
+    contracts that disappeared from the catalog between refreshes. The
+    helper is invoked on every warm-serve path (warm window + circuit-open
+    + post-coalesce-wait). The module-level cache is mutated in place to
+    keep the same dict reference and avoid a race with the in-flight slot.
+    """
+    universe = _phemex_perpetual_universe(products)
+    catalog_symbols = {c["symbol"] for c in universe}
+    cache = _PHEMEX_GET_TICKERS_CACHE
+    tickers: Dict[str, Any] = cache.get("tickers") or {}
+    mutated = False
+    for sym in list(tickers.keys()):
+        if sym not in catalog_symbols:
+            tickers.pop(sym, None)
+            mutated = True
+    if mutated:
+        cache["tickers"] = tickers
+
+
+def _phemex_serve_from_cache_with_prune(
+    credentials: Mapping[str, str],
+    products: Mapping[str, Mapping[str, Any]],
+    served_from_cache: bool,
+    override_status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Serve-from-cache with catalog pruning applied.
+
+    Mirrors :func:`_phemex_serve_from_cache` but prunes rows whose symbols
+    are no longer in the current catalog before rendering the snapshot.
+    """
+    _phemex_prune_cache_to_catalog(products)
+    return _phemex_serve_from_cache(
+        served_from_cache=served_from_cache,
+        override_status=override_status,
+    )
+
+
+def _phemex_get_tickers_snapshot(
+    credentials: Mapping[str, str],
+    products: Mapping[str, Mapping[str, Any]],
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Return a fresh or cached snapshot for the supported Phemex universe.
+
+    Cache rules (mirrors EdgeX Batch 4b):
+      1. Coalesce: if another refresh is in flight, wait on it and re-read
+         the cache (single refresh per TTL window).
+      2. Warm window: if cache age < ``_PHEMEX_GET_TICKERS_TTL_SECONDS`` and
+         not ``force``, serve from cache with ``served_from_cache=True``.
+      3. Circuit-open: if the rate-limit cooldown is active, serve from
+         cache with ``refresh_status=circuit_open`` and do NOT launch a
+         new fan-out.
+      4. Otherwise acquire the in-flight slot and run a refresh.
+    """
+    global _PHEMEX_GET_TICKERS_INFLIGHT, _PHEMEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL, _PHEMEX_GET_TICKERS_CACHE
+
+    now = _phemex_now()
+    universe = _phemex_perpetual_universe(products)
+    catalog_symbols = {c["symbol"] for c in universe}
+
+    # Coalesce path: wait on the in-flight refresh if one is active.
+    with _PHEMEX_GET_TICKERS_INFLIGHT_LOCK:
+        inflight = _PHEMEX_GET_TICKERS_INFLIGHT
+    if inflight is not None and not force:
+        inflight.wait(timeout=_PHEMEX_GET_TICKERS_TTL_SECONDS + 5.0)
+        # After waiting, fall through to the warm-window check below
+        # (which itself prunes against the current catalog).
+
+    cache = _PHEMEX_GET_TICKERS_CACHE
+    age = now - float(cache.get("ts") or 0.0)
+    circuit_open = now < _PHEMEX_GET_TICKERS_CIRCUIT_OPEN_UNTIL
+
+    if not force and not circuit_open and age < _PHEMEX_GET_TICKERS_TTL_SECONDS:
+        if cache.get("tickers") or cache.get("fetched_at"):
+            return _phemex_serve_from_cache_with_prune(
+                credentials=credentials,
+                products=products,
+                served_from_cache=True,
+            )
+
+    if circuit_open:
+        return _phemex_serve_from_cache_with_prune(
+            credentials=credentials,
+            products=products,
+            served_from_cache=True,
+            override_status="circuit_open",
+        )
+
+    # Acquire in-flight slot for coalescing concurrent callers.
+    with _PHEMEX_GET_TICKERS_INFLIGHT_LOCK:
+        if _PHEMEX_GET_TICKERS_INFLIGHT is None:
+            evt = threading.Event()
+            _PHEMEX_GET_TICKERS_INFLIGHT = evt
+            acquired = True
+        else:
+            evt = _PHEMEX_GET_TICKERS_INFLIGHT
+            acquired = False
+    try:
+        if not acquired and not force:
+            evt.wait(timeout=_PHEMEX_GET_TICKERS_TTL_SECONDS + 5.0)
+            return _phemex_serve_from_cache_with_prune(
+                credentials=credentials,
+                products=products,
+                served_from_cache=True,
+            )
+        new_cache = _phemex_refresh_snapshot_locked(
+            credentials, now, universe, catalog_symbols
+        )
+    finally:
+        if acquired:
+            with _PHEMEX_GET_TICKERS_INFLIGHT_LOCK:
+                _PHEMEX_GET_TICKERS_INFLIGHT = None
+            evt.set()
+    # Swap the new cache in atomically.
+    _PHEMEX_GET_TICKERS_CACHE = new_cache
+    return _phemex_serve_from_cache(served_from_cache=False)
+
+
+def _execute_get_tickers(
+    account: str, request: Mapping[str, Any]
+) -> CanonicalResponse:
+    """Canonical ``get_tickers`` dispatcher for Phemex.
+
+    Behavior:
+      1. Resolves credentials; ACCOUNT_NOT_FOUND if missing.
+      2. Loads the existing product cache (read-only; uses ``_load_products``
+         so the same catalog the rest of the agent uses is the universe
+         source of truth).
+      3. Calls ``_phemex_get_tickers_snapshot`` which applies the cache /
+         coalescing / circuit logic.
+      4. Returns a CanonicalTickersBatch in ``tickers_batch`` and renders
+         ``data`` for legacy consumers.
+
+    Safety:
+      - read-only; no /api/trade/execute.
+      - no exchange writes.
+      - bounded fan-out (max 8 concurrent ticker reads).
+      - 60-second TTL; warm requests perform zero upstream reads.
+    """
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=account,
+            code="ACCOUNT_NOT_FOUND",
+            message="Set PHEMEX_<ACCOUNT>_ID and PHEMEX_<ACCOUNT>_APISECRET.",
+        )
+    force = bool(request.get("force") or False)
+    try:
+        products = _load_products(credentials)
+        snapshot = _phemex_get_tickers_snapshot(credentials, products, force=force)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="get_tickers",
+            exchange=name,
+            account=credentials.get("account") or account,
+            code="PHEMEX_ERROR",
+            message=sanitize_error_message(str(exc)),
+        )
+
+    tickers_dict = snapshot.get("tickers") or {}
+    # Convert JSON-safe snapshot dict back into CanonicalMarketPrice objects
+    # so the canonical wrapper is honored; rebuild a minimal instance from
+    # the known fields.
+    canonical_tickers: Dict[str, CanonicalMarketPrice] = {}
+    for sym, row in tickers_dict.items():
+        if not isinstance(row, Mapping):
+            continue
+        canonical_tickers[str(sym)] = CanonicalMarketPrice(
+            requested_symbol=str(row.get("requested_symbol") or row.get("symbol") or sym),
+            market=str(row.get("market") or row.get("symbol") or sym),
+            symbol=row.get("symbol"),
+            display_name=row.get("display_name"),
+            native_symbol=row.get("native_symbol"),
+            display_symbol=row.get("display_symbol"),
+            base=row.get("base"),
+            quote=row.get("quote"),
+            market_type=row.get("market_type"),
+            price_increment=row.get("price_increment"),
+            size_increment=row.get("size_increment"),
+            minimum_size=row.get("minimum_size"),
+            minimum_notional=row.get("minimum_notional"),
+            mark_price=row.get("mark_price"),
+            oracle_price=row.get("oracle_price"),
+            last_external_price=row.get("last_external_price"),
+            last_updated_time=row.get("last_updated_time"),
+            price=row.get("price"),
+            volume_24h_base=row.get("volume_24h_base"),
+            volume_24h_quote=row.get("volume_24h_quote"),
+            turnover_24h=row.get("turnover_24h"),
+            change_24h_pct=row.get("change_24h_pct"),
+            funding_rate=row.get("funding_rate"),
+            open_interest=row.get("open_interest"),
+        )
+
+    batch = CanonicalTickersBatch(
+        tickers=canonical_tickers,
+        failed_symbols=tuple(snapshot.get("failed_symbols") or ()),
+        fetched_at=snapshot.get("fetched_at"),
+        ttl_seconds=int(_PHEMEX_GET_TICKERS_TTL_SECONDS),
+        stale_symbols=tuple(snapshot.get("stale_symbols") or ()),
+        refresh_status=snapshot.get("refresh_status") or "ok",
+        source=snapshot.get("source") or _PHEMEX_GET_TICKERS_SOURCE,
+        served_from_cache=bool(snapshot.get("served_from_cache")),
+    )
+
+    return make_success(
+        operation="get_tickers",
+        exchange=name,
+        account=credentials.get("account") or account,
+        tickers_batch=batch,
+        data=snapshot,
     )
 
 
@@ -2351,6 +3015,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _list_instruments(account, request)
         if operation == "market_price":
             return _market_price(account, request)
+        if operation == "get_tickers":
+            return _execute_get_tickers(account, request)
         if operation == "candles":
             return handle_candles_operation(name, account, request)
     except Exception as exc:  # noqa: BLE001
