@@ -279,7 +279,7 @@ class ExecuteContractTests(_MetaTraderEnvMixin, unittest.TestCase):
     def test_unimplemented_mutating_operations_are_blocked(self) -> None:
         from plugins.trade.agents import x_metatrader_agent as mt
 
-        for op in ("cancel_order_group", "positions_management", "modify_order", "place_order"):
+        for op in ("modify_order", "place_order"):
             with self.subTest(op=op):
                 with mock.patch.object(mt, "_bridge_post") as post:
                     resp = mt.execute({"operation": op, "account": "LITE7486706MT5"})

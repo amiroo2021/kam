@@ -188,6 +188,15 @@ def _display_protection(value: Any, count: Any = None) -> str:
     return text
 
 
+def _request_side(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"buy", "long", "b"}:
+        return "buy"
+    if text in {"sell", "short", "s"}:
+        return "sell"
+    return text
+
+
 def _account_option_parts(entry: Any) -> Tuple[Optional[str], Optional[str]]:
     if isinstance(entry, str):
         alias = entry.strip()
@@ -2143,19 +2152,43 @@ class TradeWizard:
         response: CanonicalResponse = self._desk.execute(request)
         state.state = "ladder_result"
         lines = ["Ladder"]
-        if response.success and response.ladder is not None:
-            ladder = response.ladder
-            lines.extend([
-                "",
-                "Submitted.",
-                f"Status: {ladder.status}",
-                f"Requested orders: {ladder.requested_order_count}",
-                f"Submitted orders: {ladder.submitted_order_count}",
-                f"Requested volume: {ladder.requested_volume}",
-                f"Submitted volume: {ladder.submitted_volume}",
-                f"Batches: {ladder.batch_count}",
-                f"Verified: {'Yes' if ladder.verified else 'No'}",
-            ])
+        data = response.data if isinstance(response.data, dict) else {}
+        requested = data.get("requested")
+        succeeded = data.get("succeeded")
+        failed = data.get("failed")
+        if requested is None and getattr(response, "ladder", None) is not None:
+            requested = response.ladder.requested_order_count
+        if succeeded is None and getattr(response, "ladder", None) is not None:
+            succeeded = response.ladder.submitted_order_count
+            if failed is None and response.ladder.requested_order_count is not None:
+                failed = max(0, int(response.ladder.requested_order_count) - int(response.ladder.submitted_order_count or 0))
+        if response.success and (response.ladder is not None or requested is not None or succeeded is not None):
+            lines.extend(["", "Submitted."])
+            if requested is not None:
+                lines.append(f"Requested: {requested}")
+            if succeeded is not None:
+                lines.append(f"Succeeded: {succeeded}")
+            if failed is not None:
+                lines.append(f"Failed: {failed}")
+            failures = data.get("failures") if isinstance(data, dict) else None
+            if isinstance(failures, list) and failures:
+                shown = failures[:5]
+                lines.append(f"Failures ({len(failures)}):")
+                for item in shown:
+                    if isinstance(item, dict):
+                        code = item.get("error") or item.get("code") or item.get("retcode") or "failed"
+                        lines.append(f"- {code}")
+                    else:
+                        lines.append(f"- {item}")
+            if response.ladder is not None and not (requested is not None or succeeded is not None):
+                ladder = response.ladder
+                lines.extend(
+                    [
+                        f"Status: {ladder.status}",
+                        f"Requested orders: {ladder.requested_order_count}",
+                        f"Submitted orders: {ladder.submitted_order_count}",
+                    ]
+                )
         else:
             error = response.error
             lines.extend(_render_error_lines(error, "Ladder submission failed."))
@@ -2204,7 +2237,14 @@ class TradeWizard:
                     buttons.append([
                         _button_row(
                             _order_group_button_text(group),
-                            f"cancel_group:{quote(str(group.symbol), safe='')}:{group.side}",
+                            (
+                                f"cancel_group:{quote(str(group.symbol), safe='')}:{group.side}"
+                                + (
+                                    f":{quote(str(group.display_type), safe='')}"
+                                    if str(getattr(group, "display_type", "") or "").strip()
+                                    else ""
+                                )
+                            ),
                         )
                     ])
                 if lines and not lines[-1]:
@@ -2239,6 +2279,7 @@ class TradeWizard:
         account = state.account or ""
         symbol = str(state.cancel.get("symbol") or "").strip()
         side = str(state.cancel.get("side") or "").strip().lower()
+        order_type = str(state.cancel.get("order_type") or "").strip()
         if not exchange or not account or not symbol or side not in {"buy", "sell"}:
             return None
         response = self._desk.execute(
@@ -2251,8 +2292,15 @@ class TradeWizard:
         if not getattr(response, "success", False):
             return None
         for group in response.order_groups or []:
-            if str(getattr(group, "symbol", "")).strip() == symbol and str(getattr(group, "side", "")).strip().lower() == side:
-                return group
+            if str(getattr(group, "symbol", "")).strip() != symbol:
+                continue
+            if str(getattr(group, "side", "")).strip().lower() != side:
+                continue
+            if order_type:
+                display_type = str(getattr(group, "display_type", "") or "").strip()
+                if display_type and display_type != order_type:
+                    continue
+            return group
         return None
 
     def _render_cancel_confirm(self, chat_key: Tuple[Any, ...]) -> Screen:
@@ -2307,11 +2355,16 @@ class TradeWizard:
             self.reset(chat_key)
             return Screen(text="Trade closed.", buttons=[], state="closed")
         if suffix.startswith("cancel_group:"):
-            parts = suffix.split(":", 2)
-            if len(parts) != 3:
+            parts = suffix.split(":", 3)
+            if len(parts) < 3:
                 return self._render_cancel_orders(chat_key, refresh=False)
-            _, symbol, side = parts
-            state.cancel = {"symbol": unquote(symbol), "side": side}
+            _prefix, symbol, side = parts[0], parts[1], parts[2]
+            order_type = parts[3] if len(parts) == 4 else ""
+            state.cancel = {
+                "symbol": unquote(symbol),
+                "side": side,
+                "order_type": unquote(order_type) if order_type else "",
+            }
             return self._render_cancel_confirm(chat_key)
         return self._render_cancel_orders(chat_key, refresh=False)
 
@@ -2331,6 +2384,9 @@ class TradeWizard:
             "symbol": state.cancel.get("symbol") or "",
             "side": state.cancel.get("side") or "",
         }
+        order_type = str(state.cancel.get("order_type") or "").strip()
+        if order_type:
+            request["order_type"] = order_type
         response: CanonicalResponse = self._desk.execute(request)
         state.state = "cancel_result"
         lines = ["Cancel Orders"]
@@ -2835,7 +2891,8 @@ class TradeWizard:
             "exchange": state.exchange or "",
             "account": state.account or "",
             "symbol": state.position.get("symbol") or "",
-            "price": state.position.get("tp_price_input") or "",
+            "side": _request_side(state.position.get("side")),
+            "price": state.position.get("tp_price_input") if state.position.get("tp_price_input") is not None else "",
         }
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "set_tp")
@@ -2862,7 +2919,8 @@ class TradeWizard:
             "exchange": state.exchange or "",
             "account": state.account or "",
             "symbol": state.position.get("symbol") or "",
-            "price": state.position.get("sl_price_input") or "",
+            "side": _request_side(state.position.get("side")),
+            "price": state.position.get("sl_price_input") if state.position.get("sl_price_input") is not None else "",
         }
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "set_sl")
@@ -2881,6 +2939,7 @@ class TradeWizard:
             "exchange": state.exchange or "",
             "account": state.account or "",
             "symbol": state.position.get("symbol") or "",
+            "side": _request_side(state.position.get("side")),
         }
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "close_position")

@@ -24,10 +24,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from ..ladder_math import build_ladder_children
 from ..canonical import (
+    CanonicalCancelGroupResult,
+    CanonicalInstrument,
+    CanonicalLadderResult,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -43,8 +48,6 @@ _ACCOUNT_KEY_RE = re.compile(r"^MT_([A-Z0-9_]+)_ACCOUNT$")
 _ALIAS_RE = re.compile(r"^[A-Z0-9_]+$")
 _MUTATING_OPS = frozenset(
     {
-        "cancel_order_group",
-        "positions_management",
         "modify_order",
         "place_order",
         "position_close",
@@ -136,10 +139,12 @@ def capabilities() -> List[str]:
     return [
         "balance",
         "positions_orders",
+        "positions_management",
         "ping",
         "new_order",
         "cancel_order",
         "cancel_orders",
+        "cancel_order_group",
         "close_position",
         "set_tp",
         "set_sl",
@@ -147,6 +152,9 @@ def capabilities() -> List[str]:
         "symbols",
         "ticker",
         "candles",
+        "list_instruments",
+        "resolve_instrument",
+        "market_price",
     ]
 
 
@@ -440,7 +448,17 @@ def _position_from_group(row: Mapping[str, Any]) -> CanonicalPosition:
     size = _decimal_text(row.get("total_volume", row.get("volume", row.get("size", 0))))
     entry = _decimal_text(row.get("vwap", row.get("entry_price", row.get("avg_entry_price", 0))))
     pnl = _decimal_text(row.get("floating_pl", row.get("pnl", 0)))
-    return CanonicalPosition(symbol=symbol, side=side, size=size, entry_price=entry, pnl=pnl)
+    tp = row.get("tp")
+    sl = row.get("sl")
+    return CanonicalPosition(
+        symbol=symbol,
+        side=side,
+        size=size,
+        entry_price=entry,
+        pnl=pnl,
+        tp=None if tp is None else _decimal_text(tp),
+        sl=None if sl is None else _decimal_text(sl),
+    )
 
 
 def _order_group_from_row(row: Mapping[str, Any]) -> CanonicalOrderGroup:
@@ -466,7 +484,7 @@ def _order_group_from_row(row: Mapping[str, Any]) -> CanonicalOrderGroup:
     )
 
 
-def _execute_positions_orders(account: str) -> CanonicalResponse:
+def _execute_positions_orders(account: str, operation: str = "positions_orders") -> CanonicalResponse:
     response, failure = _call_ea("positions_orders", account)
     if failure is not None:
         return failure
@@ -474,14 +492,14 @@ def _execute_positions_orders(account: str) -> CanonicalResponse:
     raw_positions = response.get("positions") or response.get("position_groups") or []
     raw_orders = response.get("pending_orders") or response.get("order_groups") or response.get("orders") or []
     if not isinstance(raw_positions, list):
-        return _failure("positions_orders", str(account).strip().upper(), "POSITIONS_MALFORMED", "EA positions payload was not a list.")
+        return _failure(operation, str(account).strip().upper(), "POSITIONS_MALFORMED", "EA positions payload was not a list.")
     if not isinstance(raw_orders, list):
-        return _failure("positions_orders", str(account).strip().upper(), "ORDERS_MALFORMED", "EA pending_orders payload was not a list.")
+        return _failure(operation, str(account).strip().upper(), "ORDERS_MALFORMED", "EA pending_orders payload was not a list.")
     try:
         positions = [_position_from_group(row) for row in raw_positions if isinstance(row, Mapping)]
         order_groups = [_order_group_from_row(row) for row in raw_orders if isinstance(row, Mapping)]
     except Exception as exc:  # noqa: BLE001
-        return _failure("positions_orders", str(account).strip().upper(), "SUMMARY_MALFORMED", sanitize_error_message(str(exc)))
+        return _failure(operation, str(account).strip().upper(), "SUMMARY_MALFORMED", sanitize_error_message(str(exc)))
     open_count = response.get("open_order_count")
     if open_count is None:
         open_count = _sum_counts(row for row in raw_orders if isinstance(row, Mapping))
@@ -490,7 +508,7 @@ def _execute_positions_orders(account: str) -> CanonicalResponse:
     except (TypeError, ValueError):
         open_count_int = len(order_groups)
     return make_success(
-        operation="positions_orders",
+        operation=operation,
         exchange=name,
         account=str(account).strip().upper(),
         positions=positions,
@@ -662,13 +680,89 @@ def _execute_cancel_order(request: Mapping[str, Any]) -> CanonicalResponse:
     return make_success(operation="cancel_order", exchange=name, account=alias_upper, data=dict(response))
 
 
-def _batch_success(operation: str, alias: str, response: Mapping[str, Any]) -> CanonicalResponse:
-    data = dict(response)
+def _batch_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compact_batch_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("orders", "tickets", "children", "results", "position_tickets"):
+        rows = data.get(key)
+        if isinstance(rows, list) and len(rows) > 20:
+            data.pop(key, None)
+    return data
+
+
+def _batch_success(
+    operation: str,
+    alias: str,
+    response: Mapping[str, Any],
+    extra: Optional[Mapping[str, Any]] = None,
+) -> CanonicalResponse:
+    data = _compact_batch_data(dict(response))
     failures = data.get("failures")
     if isinstance(failures, list) and len(failures) > 20:
         data["failures"] = failures[:20]
         data["failures_omitted"] = len(failures) - 20
-    return make_success(operation=operation, exchange=name, account=alias, data=data)
+    extra = dict(extra or {})
+    requested = _batch_int(data.get("requested", data.get("matched")))
+    succeeded = _batch_int(data.get("succeeded"))
+    failed = _batch_int(data.get("failed"))
+    data.setdefault("requested", requested)
+    data.setdefault("matched", requested)
+    data.setdefault("succeeded", succeeded)
+    data.setdefault("failed", failed)
+    kwargs: Dict[str, Any] = {}
+    if operation == "ladder":
+        kwargs["ladder"] = CanonicalLadderResult(
+            symbol=str(data.get("symbol") or extra.get("symbol") or ""),
+            side=str(data.get("side") or extra.get("side") or "").lower(),
+            distribution=str(extra.get("distribution") or data.get("distribution") or ""),
+            requested_order_count=requested,
+            submitted_order_count=succeeded,
+            requested_volume=str(extra.get("requested_volume") or data.get("requested_volume") or ""),
+            submitted_volume=str(data.get("submitted_volume") or extra.get("submitted_volume") or ""),
+            batch_count=1,
+            verified=failed == 0,
+            partial=bool(failed and succeeded),
+            status="partial" if failed else "success",
+            accepted_child_count=succeeded,
+        )
+    elif operation in {"cancel_orders", "cancel_order_group"}:
+        remaining = max(0, requested - succeeded)
+        kwargs["cancel_group"] = CanonicalCancelGroupResult(
+            symbol=str(data.get("symbol") or extra.get("symbol") or ""),
+            side=str(data.get("side") or extra.get("side") or "").lower(),
+            targeted_order_count=requested,
+            cancelled_order_count=succeeded,
+            confirmed_absent_count=succeeded,
+            remaining_target_count=remaining,
+            verified=failed == 0,
+            partial=bool(failed and succeeded),
+            status="partial" if failed else "success",
+            requested_cancel_count=requested,
+            verified_cancel_count=succeeded,
+        )
+    elif operation in {"close_position", "set_tp", "set_sl"}:
+        raw_price = extra.get("price")
+        if raw_price is None:
+            raw_price = data.get("tp") if operation == "set_tp" else data.get("sl") if operation == "set_sl" else None
+        removed = False
+        if operation in {"set_tp", "set_sl"} and raw_price is not None:
+            parsed = _decimal_field(raw_price)
+            removed = parsed is not None and parsed == 0
+        kwargs["position_action"] = CanonicalPositionActionResult(
+            operation=operation,
+            symbol=str(extra.get("symbol") or data.get("symbol") or ""),
+            verified=failed == 0,
+            price=None if raw_price is None else _decimal_text(raw_price),
+            removed=removed if operation in {"set_tp", "set_sl"} else None,
+            current_side=str(extra.get("side") or data.get("side") or "").lower() or None,
+            message=f"matched {requested} · succeeded {succeeded} · failed {failed}",
+        )
+    return make_success(operation=operation, exchange=name, account=alias, data=data, **kwargs)
 
 
 def _side_value(value: Any) -> Optional[str]:
@@ -774,11 +868,21 @@ def _execute_ladder(request: Mapping[str, Any]) -> CanonicalResponse:
     if failure is not None:
         return failure
     assert response is not None
-    return _batch_success(operation, alias_upper, response)
+    return _batch_success(
+        operation,
+        alias_upper,
+        response,
+        extra={
+            "symbol": symbol,
+            "side": side,
+            "distribution": distribution,
+            "requested_volume": _decimal_text(total),
+        },
+    )
 
 
 def _execute_grouped_cancel(request: Mapping[str, Any]) -> CanonicalResponse:
-    operation = "cancel_orders"
+    operation = str(request.get("operation") or "cancel_orders").strip() or "cancel_orders"
     account = str(request.get("account") or "").strip()
     alias_upper, account_login = _alias_to_account(account)
     if account_login is None:
@@ -789,7 +893,7 @@ def _execute_grouped_cancel(request: Mapping[str, Any]) -> CanonicalResponse:
     payload: Dict[str, Any] = {
         "request_id": _coerce_request_id(request.get("request_id")),
         "account": account_login,
-        "action": operation,
+        "action": "cancel_orders",
         "symbol": symbol,
     }
     if str(request.get("side") or "").strip():
@@ -797,16 +901,17 @@ def _execute_grouped_cancel(request: Mapping[str, Any]) -> CanonicalResponse:
         if side is None:
             return _failure(operation, alias_upper, "INVALID_SIDE", "Side must be buy or sell.")
         payload["side"] = side
-    if str(request.get("order_type") or request.get("type") or "").strip():
-        order_type = _order_type_value(request.get("order_type", request.get("type")))
+    raw_type = str(request.get("order_type") or request.get("type") or request.get("display_type") or "").strip()
+    if raw_type:
+        order_type = _order_type_value(raw_type)
         if order_type is None:
             return _failure(operation, alias_upper, "UNSUPPORTED_ORDER_TYPE", "Grouped cancel supports limit pending orders only.")
         payload["order_type"] = order_type
-    response, failure = _call_ea_payload(operation, alias_upper, payload, ambiguous_on_transport_error=True)
+    response, failure = _call_ea_payload("cancel_orders", alias_upper, payload, ambiguous_on_transport_error=True)
     if failure is not None:
         return failure
     assert response is not None
-    return _batch_success(operation, alias_upper, response)
+    return _batch_success(operation, alias_upper, response, extra={"symbol": symbol, "side": payload.get("side")})
 
 
 def _execute_grouped_position_action(request: Mapping[str, Any], operation: str) -> CanonicalResponse:
@@ -844,7 +949,139 @@ def _execute_grouped_position_action(request: Mapping[str, Any], operation: str)
     if failure is not None:
         return failure
     assert response is not None
-    return _batch_success(operation, alias_upper, response)
+    extra: Dict[str, Any] = {"symbol": symbol, "side": side}
+    if operation in {"set_tp", "set_sl"}:
+        extra["price"] = payload.get("tp") if operation == "set_tp" else payload.get("sl")
+    return _batch_success(operation, alias_upper, response, extra=extra)
+
+
+def _symbol_records(raw: Any) -> List[Dict[str, Any]]:
+    records: List[Any]
+    if isinstance(raw, dict):
+        records = raw.get("symbols") or raw.get("instruments") or []
+    elif isinstance(raw, list):
+        records = raw
+    else:
+        records = []
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in records:
+        if isinstance(item, str):
+            symbol = item.strip()
+            row: Dict[str, Any] = {"symbol": symbol}
+        elif isinstance(item, Mapping):
+            symbol = str(item.get("symbol") or item.get("name") or "").strip()
+            row = dict(item)
+            row["symbol"] = symbol
+        else:
+            continue
+        key = symbol.upper()
+        if not symbol or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _ticker_increments(ticker: Mapping[str, Any]) -> Dict[str, str]:
+    tick = _decimal_text(ticker.get("tick_size", ticker.get("point", ticker.get("price_increment"))))
+    step = _decimal_text(ticker.get("volume_step", ticker.get("size_increment", ticker.get("lot_step"))))
+    minimum = _decimal_text(ticker.get("volume_min", ticker.get("minimum_size", ticker.get("lot_min"))))
+    meta: Dict[str, str] = {}
+    if tick and tick != "0":
+        meta["price_increment"] = tick
+    if step and step != "0":
+        meta["size_increment"] = step
+    if minimum and minimum != "0":
+        meta["minimum_size"] = minimum
+    return meta
+
+
+def _ticker_last_price(ticker: Mapping[str, Any]) -> Optional[str]:
+    for key in ("last", "mark", "bid", "ask"):
+        parsed = _decimal_field(ticker.get(key))
+        if parsed is not None and parsed > 0:
+            return _decimal_text(parsed)
+    bid = _decimal_field(ticker.get("bid"))
+    ask = _decimal_field(ticker.get("ask"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        return _decimal_text((bid + ask) / 2)
+    return None
+
+
+def _execute_list_instruments(request: Mapping[str, Any]) -> CanonicalResponse:
+    response = _execute_bridge_read_action(request, "symbols")
+    if not response.success:
+        return response
+    data = dict(response.data or {})
+    items = []
+    for row in _symbol_records(data.get("symbols") or data):
+        symbol = str(row.get("symbol") or "").strip()
+        items.append(
+            {
+                "symbol": symbol,
+                "native_symbol": symbol,
+                "display_name": symbol,
+            }
+        )
+    return make_success(
+        operation="list_instruments",
+        exchange=name,
+        account=str(request.get("account") or "").strip().upper(),
+        data={"instruments": items, "count": len(items)},
+    )
+
+
+def _execute_resolve_instrument(request: Mapping[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    alias_upper, account_login = _alias_to_account(account)
+    if account_login is None:
+        return _failure("resolve_instrument", account, "ACCOUNT_NOT_CONFIGURED", "MetaTrader account alias is not configured.")
+    if not requested:
+        return _failure("resolve_instrument", alias_upper, "MISSING_SYMBOL", "Symbol is required.")
+    ticker_resp = _execute_bridge_read_action({"account": account, "symbol": requested, "request_id": request.get("request_id")}, "ticker")
+    if not ticker_resp.success:
+        return _failure("resolve_instrument", alias_upper, "INSTRUMENT_NOT_FOUND", f"Instrument {requested!r} was not found.")
+    ticker = dict(ticker_resp.data or {})
+    native = str(ticker.get("symbol") or requested).strip() or requested
+    meta = _ticker_increments(ticker)
+    instrument = CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=native,
+        display_name=native,
+        native_symbol=native,
+        price_increment=meta.get("price_increment"),
+        size_increment=meta.get("size_increment"),
+        minimum_size=meta.get("minimum_size"),
+    )
+    return make_success(operation="resolve_instrument", exchange=name, account=alias_upper, instrument=instrument, data=dict(ticker))
+
+
+def _execute_market_price(request: Mapping[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    requested = str(request.get("symbol") or "").strip()
+    alias_upper, _account_login = _alias_to_account(account)
+    ticker_resp = _execute_bridge_read_action(request, "ticker")
+    if not ticker_resp.success:
+        return ticker_resp
+    ticker = dict(ticker_resp.data or {})
+    native = str(ticker.get("symbol") or requested).strip() or requested
+    meta = _ticker_increments(ticker)
+    price = _ticker_last_price(ticker)
+    market_price = CanonicalMarketPrice(
+        requested_symbol=requested or native,
+        market=name,
+        symbol=native,
+        native_symbol=native,
+        price_increment=meta.get("price_increment"),
+        size_increment=meta.get("size_increment"),
+        minimum_size=meta.get("minimum_size"),
+        mark_price=price,
+        price=price,
+        last_external_price=price,
+    )
+    return make_success(operation="market_price", exchange=name, account=alias_upper, market_price=market_price, data=dict(ticker))
 
 
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
@@ -864,15 +1101,23 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _execute_balance(account)
     if operation == "positions_orders":
         return _execute_positions_orders(account)
+    if operation == "positions_management":
+        return _execute_positions_orders(account, operation="positions_management")
     if operation == "new_order":
         return _execute_new_order(request)
     if operation in {"symbols", "ticker", "candles"}:
         return _execute_bridge_read_action(request, operation)
+    if operation == "list_instruments":
+        return _execute_list_instruments(request)
+    if operation == "resolve_instrument":
+        return _execute_resolve_instrument(request)
+    if operation == "market_price":
+        return _execute_market_price(request)
     if operation == "cancel_order":
         return _execute_cancel_order(request)
     if operation == "ladder":
         return _execute_ladder(request)
-    if operation == "cancel_orders":
+    if operation in {"cancel_orders", "cancel_order_group"}:
         return _execute_grouped_cancel(request)
     if operation in {"close_position", "set_tp", "set_sl"}:
         return _execute_grouped_position_action(request, operation)
