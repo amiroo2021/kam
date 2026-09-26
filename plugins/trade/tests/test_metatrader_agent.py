@@ -491,6 +491,77 @@ class MarketDataAndCancelTests(_MetaTraderEnvMixin, unittest.TestCase):
         self.assertEqual(captured[2]["timeframe"], "M1")
         self.assertEqual(captured[2]["count"], 10)
 
+    def test_list_resolve_market_price_use_live_canonical_fields(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        def fake_post(payload):
+            action = payload["action"]
+            if action == "symbols":
+                return {
+                    "type": "response",
+                    "request_id": payload["request_id"],
+                    "account": payload["account"],
+                    "action": action,
+                    "status": "COMPLETED",
+                    "ok": True,
+                    "symbols": [
+                        {
+                            "symbol": "ZECUSD",
+                            "tick_size": 0.01,
+                            "volume_step": 0.01,
+                            "volume_min": 0.01,
+                        }
+                    ],
+                }
+            return {
+                "type": "response",
+                "request_id": payload["request_id"],
+                "account": payload["account"],
+                "action": action,
+                "status": "COMPLETED",
+                "ok": True,
+                "symbol": "ZECUSD",
+                "bid": 1656.40,
+                "ask": 1656.46,
+                "last": 1656.43,
+                "tick_size": 0.01,
+                "volume_min": 0.01,
+                "volume_step": 0.01,
+            }
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            listed = mt.execute({"operation": "list_instruments", "account": "LITE7486706MT5"})
+            resolved = mt.execute({"operation": "resolve_instrument", "account": "LITE7486706MT5", "symbol": "ZECUSD"})
+            priced = mt.execute({"operation": "market_price", "account": "LITE7486706MT5", "symbol": "ZECUSD"})
+
+        self.assertTrue(listed.success)
+        instruments = (listed.data or {}).get("instruments") or []
+        self.assertEqual(instruments[0]["symbol"], "ZECUSD")
+        self.assertEqual(instruments[0]["native_symbol"], "ZECUSD")
+        self.assertEqual(instruments[0]["price_increment"], "0.01")
+        self.assertEqual(instruments[0]["size_increment"], "0.01")
+        self.assertEqual(instruments[0]["minimum_size"], "0.01")
+
+        self.assertTrue(resolved.success)
+        inst = resolved.instrument
+        self.assertEqual(inst.requested_symbol, "ZECUSD")
+        self.assertEqual(inst.symbol, "ZECUSD")
+        self.assertEqual(inst.display_name, "ZECUSD")
+        self.assertEqual(inst.price_increment, "0.01")
+        self.assertEqual(inst.size_increment, "0.01")
+        self.assertEqual(inst.minimum_size, "0.01")
+
+        self.assertTrue(priced.success)
+        mp = priced.market_price
+        self.assertEqual(mp.requested_symbol, "ZECUSD")
+        self.assertEqual(mp.market, "ZECUSD")
+        self.assertEqual(mp.price, "1656.43")
+        self.assertEqual(mp.mark_price, "1656.43")
+        self.assertEqual(mp.last_external_price, "1656.43")
+        self.assertEqual((priced.data or {}).get("price_increment"), "0.01")
+        self.assertEqual((priced.data or {}).get("size_increment"), "0.01")
+        self.assertEqual((priced.data or {}).get("minimum_size"), "0.01")
+
     def test_cancel_order_mapping_and_timeout_ambiguity(self) -> None:
         from plugins.trade.agents import x_metatrader_agent as mt
 

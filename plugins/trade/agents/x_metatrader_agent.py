@@ -1022,6 +1022,7 @@ def _execute_list_instruments(request: Mapping[str, Any]) -> CanonicalResponse:
                 "symbol": symbol,
                 "native_symbol": symbol,
                 "display_name": symbol,
+                **_ticker_increments(row),
             }
         )
     return make_success(
@@ -1050,7 +1051,6 @@ def _execute_resolve_instrument(request: Mapping[str, Any]) -> CanonicalResponse
         requested_symbol=requested,
         symbol=native,
         display_name=native,
-        native_symbol=native,
         price_increment=meta.get("price_increment"),
         size_increment=meta.get("size_increment"),
         minimum_size=meta.get("minimum_size"),
@@ -1071,17 +1071,15 @@ def _execute_market_price(request: Mapping[str, Any]) -> CanonicalResponse:
     price = _ticker_last_price(ticker)
     market_price = CanonicalMarketPrice(
         requested_symbol=requested or native,
-        market=name,
-        symbol=native,
-        native_symbol=native,
-        price_increment=meta.get("price_increment"),
-        size_increment=meta.get("size_increment"),
-        minimum_size=meta.get("minimum_size"),
+        market=native,
         mark_price=price,
         price=price,
         last_external_price=price,
     )
-    return make_success(operation="market_price", exchange=name, account=alias_upper, market_price=market_price, data=dict(ticker))
+    data = dict(ticker)
+    data.setdefault("symbol", native)
+    data.update(meta)
+    return make_success(operation="market_price", exchange=name, account=alias_upper, market_price=market_price, data=data)
 
 
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:

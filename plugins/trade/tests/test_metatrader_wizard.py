@@ -186,7 +186,6 @@ class MetaTraderDesk:
                     requested_symbol=symbol,
                     symbol=symbol,
                     display_name=symbol,
-                    native_symbol=symbol,
                     price_increment="0.01",
                     size_increment="0.01",
                     minimum_size="0.01",
@@ -201,12 +200,10 @@ class MetaTraderDesk:
                 acct,
                 market_price=CanonicalMarketPrice(
                     requested_symbol=str(request.get("symbol") or ""),
-                    market=ex,
+                    market=str(request.get("symbol") or ""),
                     price="1656.43",
                     mark_price="1656.43",
-                    price_increment="0.01",
-                    size_increment="0.01",
-                    minimum_size="0.01",
+                    last_external_price="1656.43",
                 ),
             )
         return make_failure(op, ex, acct, "NOT_IMPLEMENTED", op)
