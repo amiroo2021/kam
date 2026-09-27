@@ -276,6 +276,119 @@ class ExecuteContractTests(_MetaTraderEnvMixin, unittest.TestCase):
         self.assertEqual(resp.order_groups[0].vwap, "60025.00")
         self.assertEqual(resp.order_groups[1].display_type, "SELL_STOP")
 
+    def _positions_payload(self, tickets, extra_group=None):
+        group = extra_group or {
+            "symbol": "ZECUSD",
+            "direction": "SELL",
+            "count": len(tickets),
+            "total_volume": "9.07",
+            "vwap": "1660.17640573",
+            "floating_pl": "12.34",
+        }
+        return {
+            "type": "response",
+            "request_id": "ignored",
+            "account": 7486706,
+            "action": "positions_orders",
+            "status": "COMPLETED",
+            "ok": True,
+            "positions": [group],
+            "position_tickets": tickets,
+            "pending_orders": [],
+            "open_order_count": 0,
+        }
+
+    def _execute_with_tickets(self, tickets, extra_group=None, operation="positions_orders"):
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        def fake_post(payload):
+            body = self._positions_payload(tickets, extra_group=extra_group)
+            body["request_id"] = payload["request_id"]
+            body["account"] = payload["account"]
+            body["action"] = payload["action"]
+            return body
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            return mt.execute({"operation": operation, "account": "LITE7486706MT5"})
+
+    def test_grouped_protection_all_tp_500_sl_zero_displays_tp_only(self) -> None:
+        tickets = [
+            {"ticket": 1000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 0.0}
+            for i in range(19)
+        ]
+        resp = self._execute_with_tickets(tickets)
+        self.assertTrue(resp.success)
+        self.assertEqual(len(resp.positions), 1)
+        self.assertEqual(resp.positions[0].tp, "500")
+        self.assertIsNone(resp.positions[0].sl)
+
+    def test_grouped_protection_all_unset_is_blank(self) -> None:
+        tickets = [
+            {"ticket": 2000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 0.0, "sl": 0.0}
+            for i in range(19)
+        ]
+        resp = self._execute_with_tickets(tickets)
+        self.assertIsNone(resp.positions[0].tp)
+        self.assertIsNone(resp.positions[0].sl)
+
+    def test_grouped_protection_same_tp_and_sl_are_displayed(self) -> None:
+        tickets = [
+            {"ticket": 3000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": "1573.60", "sl": "1740.67"}
+            for i in range(4)
+        ]
+        resp = self._execute_with_tickets(tickets)
+        self.assertEqual(resp.positions[0].tp, "1573.6")
+        self.assertEqual(resp.positions[0].sl, "1740.67")
+
+    def test_grouped_protection_mixed_tp(self) -> None:
+        tickets = [
+            {"ticket": 4000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 0.0}
+            for i in range(18)
+        ]
+        tickets.append({"ticket": 4099, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 400.0, "sl": 0.0})
+        resp = self._execute_with_tickets(tickets)
+        self.assertEqual(resp.positions[0].tp, "Mixed")
+        self.assertIsNone(resp.positions[0].sl)
+
+    def test_grouped_protection_mixed_sl(self) -> None:
+        tickets = [
+            {"ticket": 5000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 1800.0}
+            for i in range(18)
+        ]
+        tickets.append({"ticket": 5099, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 1700.0})
+        resp = self._execute_with_tickets(tickets)
+        self.assertEqual(resp.positions[0].tp, "500")
+        self.assertEqual(resp.positions[0].sl, "Mixed")
+
+    def test_single_ticket_uses_its_tp_sl(self) -> None:
+        tickets = [
+            {"ticket": 5257798644, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.54, "tp": 1573.6, "sl": 1740.67}
+        ]
+        resp = self._execute_with_tickets(tickets)
+        self.assertEqual(resp.positions[0].tp, "1573.6")
+        self.assertEqual(resp.positions[0].sl, "1740.67")
+
+    def test_float_equivalent_protection_is_not_mixed(self) -> None:
+        tickets = [
+            {"ticket": 1, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 0.0},
+            {"ticket": 2, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.00, "sl": 0},
+            {"ticket": 3, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": "500", "sl": "0.0"},
+        ]
+        resp = self._execute_with_tickets(tickets)
+        self.assertEqual(resp.positions[0].tp, "500")
+        self.assertIsNone(resp.positions[0].sl)
+
+    def test_positions_management_uses_ticket_consensus(self) -> None:
+        tickets = [
+            {"ticket": 6000 + i, "symbol": "ZECUSD", "direction": "SELL", "volume": 0.5, "tp": 500.0, "sl": 0.0}
+            for i in range(19)
+        ]
+        resp = self._execute_with_tickets(tickets, operation="positions_management")
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.operation, "positions_management")
+        self.assertEqual(resp.positions[0].tp, "500")
+        self.assertIsNone(resp.positions[0].sl)
+
     def test_unimplemented_mutating_operations_are_blocked(self) -> None:
         from plugins.trade.agents import x_metatrader_agent as mt
 

@@ -263,6 +263,61 @@ class MetaTraderWizardReadTests(unittest.TestCase):
         self.assertNotIn("ticket", screen.text.lower())
 
 
+class MetaTraderProtectionDisplayTests(unittest.TestCase):
+    def _screen_for(self, position: CanonicalPosition) -> str:
+        class _PosDesk:
+            def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
+                return make_success(
+                    operation=str(request.get("operation") or "positions_management"),
+                    exchange="metatrader",
+                    account="LITE7486706MT5",
+                    positions=[position],
+                )
+
+        wizard = TradeWizard(tradedesk=_PosDesk())  # type: ignore[arg-type]
+        key = ("chat", "protection")
+        state = wizard._state_for(key)
+        state.exchange = "metatrader"
+        state.account = "LITE7486706MT5"
+        return wizard._render_positions_management(key, False).text
+
+    def test_display_uniform_tp_and_blank_sl(self) -> None:
+        text = self._screen_for(
+            CanonicalPosition(symbol="ZECUSD", side="SELL", size="9.07", entry_price="1660.17640573", pnl="12.34", tp="500", sl=None)
+        )
+        self.assertIn("TP: 500", text)
+        self.assertIn("SL: —", text)
+        self.assertNotIn("ticket", text.lower())
+
+    def test_display_both_unset(self) -> None:
+        text = self._screen_for(
+            CanonicalPosition(symbol="ZECUSD", side="SELL", size="9.07", entry_price="1660.17640573", pnl="12.34", tp=None, sl=None)
+        )
+        self.assertIn("TP: —", text)
+        self.assertIn("SL: —", text)
+
+    def test_display_same_tp_and_sl(self) -> None:
+        text = self._screen_for(
+            CanonicalPosition(symbol="ZECUSD", side="SELL", size="9.07", entry_price="1660.17640573", pnl="12.34", tp="1573.60", sl="1740.67")
+        )
+        self.assertIn("TP: 1,573.60", text)
+        self.assertIn("SL: 1,740.67", text)
+
+    def test_display_mixed_tp(self) -> None:
+        text = self._screen_for(
+            CanonicalPosition(symbol="ZECUSD", side="SELL", size="9.07", entry_price="1660.17640573", pnl="12.34", tp="Mixed", sl=None)
+        )
+        self.assertIn("TP: Mixed", text)
+        self.assertIn("SL: —", text)
+
+    def test_display_mixed_sl(self) -> None:
+        text = self._screen_for(
+            CanonicalPosition(symbol="ZECUSD", side="SELL", size="9.07", entry_price="1660.17640573", pnl="12.34", tp="500", sl="Mixed")
+        )
+        self.assertIn("TP: 500", text)
+        self.assertIn("SL: Mixed", text)
+
+
 class MetaTraderWizardWriteRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.desk = MetaTraderDesk()

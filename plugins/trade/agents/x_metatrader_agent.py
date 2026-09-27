@@ -440,7 +440,55 @@ def _execute_balance(account: str) -> CanonicalResponse:
     )
 
 
-def _position_from_group(row: Mapping[str, Any]) -> CanonicalPosition:
+def _ticket_direction(row: Mapping[str, Any]) -> str:
+    side = str(row.get("direction") or row.get("side") or row.get("type") or "").strip().upper()
+    if side in {"BUY", "LONG"}:
+        return "BUY"
+    if side in {"SELL", "SHORT"}:
+        return "SELL"
+    return side
+
+
+def _matching_position_tickets(tickets: Iterable[Any], symbol: str, side: str) -> List[Mapping[str, Any]]:
+    wanted_symbol = str(symbol or "").strip().upper()
+    wanted_side = str(side or "").strip().upper()
+    matched: List[Mapping[str, Any]] = []
+    for item in tickets:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("symbol") or "").strip().upper() != wanted_symbol:
+            continue
+        if _ticket_direction(item) != wanted_side:
+            continue
+        matched.append(item)
+    return matched
+
+
+def _consensus_protection(values: Iterable[Any]) -> Optional[str]:
+    """Logical-group TP/SL: same >0 value, all unset/0 → None, otherwise Mixed."""
+    buckets: List[Optional[Decimal]] = []
+    for value in values:
+        parsed = _decimal_field(value)
+        if parsed is None or parsed == 0:
+            buckets.append(None)
+        else:
+            buckets.append(parsed)
+    if not buckets:
+        return None
+    set_values = [item for item in buckets if item is not None]
+    if not set_values:
+        return None
+    if any(item is None for item in buckets):
+        return "Mixed"
+    first = set_values[0]
+    epsilon = Decimal("1e-8")
+    for other in set_values[1:]:
+        if (first - other).copy_abs() > epsilon:
+            return "Mixed"
+    return _decimal_text(first)
+
+
+def _position_from_group(row: Mapping[str, Any], tickets: Optional[Iterable[Any]] = None) -> CanonicalPosition:
     side = str(row.get("direction") or row.get("side") or "").strip().upper()
     if side not in {"BUY", "SELL"}:
         side = side or "UNKNOWN"
@@ -448,16 +496,21 @@ def _position_from_group(row: Mapping[str, Any]) -> CanonicalPosition:
     size = _decimal_text(row.get("total_volume", row.get("volume", row.get("size", 0))))
     entry = _decimal_text(row.get("vwap", row.get("entry_price", row.get("avg_entry_price", 0))))
     pnl = _decimal_text(row.get("floating_pl", row.get("pnl", 0)))
-    tp = row.get("tp")
-    sl = row.get("sl")
+    matched = _matching_position_tickets(tickets or [], symbol, side)
+    if matched:
+        tp = _consensus_protection(item.get("tp", item.get("take_profit")) for item in matched)
+        sl = _consensus_protection(item.get("sl", item.get("stop_loss")) for item in matched)
+    else:
+        tp = _consensus_protection([row.get("tp")]) if row.get("tp") is not None else None
+        sl = _consensus_protection([row.get("sl")]) if row.get("sl") is not None else None
     return CanonicalPosition(
         symbol=symbol,
         side=side,
         size=size,
         entry_price=entry,
         pnl=pnl,
-        tp=None if tp is None else _decimal_text(tp),
-        sl=None if sl is None else _decimal_text(sl),
+        tp=tp,
+        sl=sl,
     )
 
 
@@ -495,8 +548,11 @@ def _execute_positions_orders(account: str, operation: str = "positions_orders")
         return _failure(operation, str(account).strip().upper(), "POSITIONS_MALFORMED", "EA positions payload was not a list.")
     if not isinstance(raw_orders, list):
         return _failure(operation, str(account).strip().upper(), "ORDERS_MALFORMED", "EA pending_orders payload was not a list.")
+    raw_tickets = response.get("position_tickets") or []
+    if not isinstance(raw_tickets, list):
+        raw_tickets = []
     try:
-        positions = [_position_from_group(row) for row in raw_positions if isinstance(row, Mapping)]
+        positions = [_position_from_group(row, raw_tickets) for row in raw_positions if isinstance(row, Mapping)]
         order_groups = [_order_group_from_row(row) for row in raw_orders if isinstance(row, Mapping)]
     except Exception as exc:  # noqa: BLE001
         return _failure(operation, str(account).strip().upper(), "SUMMARY_MALFORMED", sanitize_error_message(str(exc)))
