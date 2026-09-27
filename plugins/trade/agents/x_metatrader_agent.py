@@ -508,6 +508,20 @@ def _position_from_group(row: Mapping[str, Any], tickets: Optional[Iterable[Any]
     entry = _decimal_text(row.get("vwap", row.get("entry_price", row.get("avg_entry_price", 0))))
     pnl = _decimal_text(row.get("floating_pl", row.get("pnl", 0)))
     matched = _matching_position_tickets(tickets or [], symbol, side)
+    matched_count = len(matched)
+    # Ticket count comes ONLY from the bridge-supplied group `count` when
+    # it is a positive integer; we never derive it from total_volume,
+    # pending orders, or the row list, and never fabricate count=1.
+    raw_count = row.get("count")
+    count: Optional[int]
+    try:
+        parsed = int(raw_count) if raw_count is not None else None
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, int) and parsed > 0:
+        count = parsed
+    else:
+        count = None
     if matched:
         tp = _consensus_protection(item.get("tp", item.get("take_profit")) for item in matched)
         sl = _consensus_protection(item.get("sl", item.get("stop_loss")) for item in matched)
@@ -522,6 +536,7 @@ def _position_from_group(row: Mapping[str, Any], tickets: Optional[Iterable[Any]
         pnl=pnl,
         tp=tp,
         sl=sl,
+        count=count,
     )
 
 

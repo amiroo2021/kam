@@ -879,11 +879,13 @@ class HedgingPositionDesk(FakeDesk):
                     "symbol": "BTCUSD", "side": "BUY",
                     "size": "3.42", "entry_price": "67500",
                     "pnl": "0", "tp": "89000", "sl": "60000",
+                    "count": 12,
                 },
                 {
                     "symbol": "BTCUSD", "side": "SELL",
                     "size": "4.15", "entry_price": "85500",
                     "pnl": "0", "tp": "60000", "sl": "89000",
+                    "count": 17,
                 },
             ],
             "order_groups": [
@@ -947,6 +949,50 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         self.assertEqual(sell.get("sl"), "89000")
         # Pending orders remain separate.
         self.assertEqual(len(r.json().get("order_groups") or []), 1)
+
+    def test_account_state_count_propagates_through_http(self) -> None:
+        """Ticket count supplied by the agent/desk must reach the JSON
+        response under each position's ``count`` key. This is the
+        contract the frontend reads to render ``BTCUSD (12) BUY``.
+        Without this, the count was previously dropped silently."""
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        svc_mod = _import("plugins.trade.webtrade2.service")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = HedgingPositionDesk()
+        svc = svc_mod.WebTrade2Service(desk=desk)
+        app = app_mod.create_app(config=cfg, service=svc)
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf))
+        self.assertEqual(r.status_code, 200, r.text)
+        positions = r.json().get("positions") or []
+        buy = next(p for p in positions if p.get("side") == "BUY")
+        sell = next(p for p in positions if p.get("side") == "SELL")
+        # Counts survive end-to-end through WebTrade2Service._plain.
+        self.assertEqual(buy.get("count"), 12)
+        self.assertEqual(sell.get("count"), 17)
+        # When the desk omits count, the field is null (not 1, not 0,
+        # not missing) so the frontend knows to hide the parenthesized
+        # number.
+        desk_no_count = type("NoCountDesk", (HedgingPositionDesk,), {
+            "__init__": lambda self: HedgingPositionDesk.__init__(self),
+        })()
+        no_count_positions = [
+            {"symbol": "BTCUSD", "side": "BUY", "size": "3.42",
+             "entry_price": "67500", "pnl": "0", "tp": "89000", "sl": "60000"},
+        ]
+        desk_no_count.account_state_payload["positions"] = no_count_positions
+        svc2 = svc_mod.WebTrade2Service(desk=desk_no_count)
+        app2 = app_mod.create_app(config=cfg, service=svc2)
+        client2 = TestClient(app2)
+        csrf2 = _login(client2)
+        r2 = client2.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf2))
+        self.assertEqual(r2.status_code, 200, r2.text)
+        out_positions = r2.json().get("positions") or []
+        out_buy = next(p for p in out_positions if p.get("side") == "BUY")
+        self.assertIsNone(out_buy.get("count"),
+                          "missing count must serialize as null, never 1")
 
     def test_hedging_set_tp_sends_symbol_and_side_per_group(self) -> None:
         cfg_mod = _import("plugins.trade.webtrade2.config")

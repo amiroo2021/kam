@@ -230,6 +230,41 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
         # But the position-management payload (TP/SL/close) must use structured side.
         self.assertIn("side: positionSideForRequest(position)", app_js)
 
+    def test_positions_tab_renders_count_and_sorts_alphabetical(self) -> None:
+        """MetaTrader is a hedging venue: the Positions tab must:
+
+        - render ``BTCUSD (12) BUY`` when ``count`` is a positive integer
+        - NOT render a parenthesized number when ``count`` is null
+        - sort rows by symbol alphabetical, then BUY before SELL for the
+          same symbol
+        - keep ``data-pos-key`` as ``symbol|side`` (so the existing
+          hedge-aware identity from the previous checkpoint is preserved)
+        """
+        app_js = Path("/root/kam/plugins/trade/webtrade2/static/app.js").read_text(encoding="utf-8")
+        # 1) Ticket-count rendering
+        self.assertIn("pos-count", app_js)
+        # The numeric guard must reject None / 0 / NaN / non-numbers.
+        self.assertIn("Number.isFinite(c) && c > 0", app_js)
+        # 2) Display-order sort: symbol alphabetical, BUY before SELL.
+        self.assertIn(".localeCompare(", app_js)
+        self.assertIn("positionSideForRequest(a)", app_js)
+        self.assertIn("positionSideForRequest(b)", app_js)
+        # 3) data-pos-key MUST remain symbol|side (no regression of the
+        # previous checkpoint's hedge identity).
+        self.assertIn("data-pos-key=", app_js)
+        self.assertIn(
+            "${p.symbol || p.instrument || p.market || ''}|${positionSideForRequest(p)}",
+            app_js,
+        )
+        # 4) The new sort must NOT touch market-list ranking. Spot-check
+        # by ensuring the new sortedRows is declared only inside the
+        # positions branch (so the markets ranking code path is
+        # untouched).
+        positions_marker = "state.bottomTab === 'positions'"
+        positions_block = app_js.split(positions_marker, 1)[1].split("} else if (state.bottomTab === 'orders')", 1)[0]
+        self.assertIn("sortedRows", positions_block)
+        self.assertIn("localeCompare", positions_block)
+
 
 if __name__ == "__main__":
     unittest.main()

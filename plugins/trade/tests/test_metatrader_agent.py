@@ -1406,3 +1406,208 @@ class MetaTraderHedgingFixtureTests(unittest.TestCase):
         self.assertEqual(sell_pos.get("entry_price"), "85500")
         self.assertEqual(sell_pos.get("tp"), "60000")
         self.assertEqual(sell_pos.get("sl"), "89000")
+
+    # ------------------------------------------------------------------
+    # Hedged-position UI presentation: end-to-end account_state carries
+    # ticket count, size, VWAP, TP/SL, P/L independently for BUY/SELL.
+    # ------------------------------------------------------------------
+    def test_account_state_count_propagates_through_to_dict(self) -> None:
+        """Bridge ticket count must survive agent -> CanonicalPosition
+        -> WebTrade2Service.account_state -> JSON dict under key
+        ``count``. This is the contract the frontend reads."""
+        buy = self._build_tickets(symbol="BTCUSD", side="BUY", count=12,
+                                  base_volume="0.2", base_entry="67500",
+                                  step_volume="0.01", step_entry="0",
+                                  tp=89000, sl=60000)
+        sell = self._build_tickets(symbol="BTCUSD", side="SELL", count=17,
+                                   base_volume="0.2", base_entry="85500",
+                                   step_volume="0.01", step_entry="0",
+                                   tp=60000, sl=89000)
+        payload = self._hedging_payload(buy, sell, "3.42", "67500",
+                                        "4.15", "85500")
+
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        def fake_post(req):
+            body = dict(payload)
+            body["request_id"] = req.get("request_id")
+            body["account"] = req.get("account")
+            body["action"] = req.get("action")
+            return body
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "positions_orders",
+                               "account": "LITE7486706MT5"})
+        self.assertTrue(resp.success)
+        # The agent itself is the canonical guarantee; the WebTrade2
+        # service is a thin pass-through whose _plain(...) recursion
+        # honors CanonicalPosition.to_dict().
+        positions = resp.positions or []
+        buy_pos = next(p for p in positions if p.side == "BUY")
+        sell_pos = next(p for p in positions if p.side == "SELL")
+        # direct canonical surface
+        self.assertEqual(buy_pos.count, 12)
+        self.assertEqual(sell_pos.count, 17)
+        # serialized through to_dict()
+        buy_d = buy_pos.to_dict()
+        sell_d = sell_pos.to_dict()
+        self.assertEqual(buy_d.get("count"), 12)
+        self.assertEqual(sell_d.get("count"), 17)
+        # Idempotent serialization (the dict IS what account_state
+        # hands to the frontend via _plain).
+        import json
+        roundtrip = json.loads(json.dumps([buy_d, sell_d]))
+        self.assertEqual(roundtrip[0]["count"], 12)
+        self.assertEqual(roundtrip[1]["count"], 17)
+
+    # ------------------------------------------------------------------
+    # MetaTrader hedged-position UI presentation: ticket count survives
+    # bridge -> x_metatrader_agent -> CanonicalPosition.to_dict.
+    # ------------------------------------------------------------------
+    def test_bridge_ticket_count_survives_into_canonical_position(self) -> None:
+        """Live bridge supplies per-group ``count``; agent must propagate
+        it to ``CanonicalPosition.count`` so the UI can render
+        ``BTCUSD (12) BUY``. Falling back to ``None`` (i.e. dropping the
+        value silently) is not acceptable."""
+        buy = self._build_tickets(symbol="BTCUSD", side="BUY", count=12,
+                                  base_volume="0.2", base_entry="67500",
+                                  step_volume="0.01", step_entry="0",
+                                  tp=89000, sl=60000)
+        sell = self._build_tickets(symbol="BTCUSD", side="SELL", count=17,
+                                   base_volume="0.2", base_entry="85500",
+                                   step_volume="0.01", step_entry="0",
+                                   tp=60000, sl=89000)
+        payload = self._hedging_payload(buy, sell, "3.42", "67500", "4.15", "85500")
+        resp = self._run_positions_orders(payload)
+        self.assertTrue(resp.success)
+        positions = resp.positions or []
+        self.assertEqual(len(positions), 2)
+        buy_pos = next(p for p in positions if p.side == "BUY")
+        sell_pos = next(p for p in positions if p.side == "SELL")
+        self.assertEqual(buy_pos.count, 12)
+        self.assertEqual(sell_pos.count, 17)
+        # to_dict() must include count, otherwise the field is invisible
+        # to the WebTrade2 service / frontend.
+        self.assertEqual(buy_pos.to_dict().get("count"), 12)
+        self.assertEqual(sell_pos.to_dict().get("count"), 17)
+
+    def test_count_omitted_when_provider_does_not_supply_one(self) -> None:
+        """Non-MetaTrader agents / older MetaTrader payloads that omit
+        ``count`` must yield ``count is None`` -- never ``count = 1`` or
+        a value derived from size or pending orders. Builds a payload
+        whose group rows have no ``count`` key at all."""
+        from plugins.trade.agents import x_metatrader_agent as mt
+        payload = {
+            "type": "response",
+            "ok": True,
+            "status": "COMPLETED",
+            "positions": [
+                {"symbol": "BTCUSD", "direction": "BUY",
+                 "total_volume": "3.42", "vwap": "67500",
+                 "floating_pl": "0.0"},
+            ],
+            "position_tickets": [],
+            "pending_orders": [],
+            "open_order_count": 0,
+        }
+
+        def fake_post(req):
+            body = dict(payload)
+            body["request_id"] = req.get("request_id")
+            body["account"] = req.get("account")
+            body["action"] = req.get("action")
+            return body
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "positions_orders",
+                               "account": "LITE7486706MT5"})
+        self.assertTrue(resp.success)
+        positions = resp.positions or []
+        self.assertEqual(len(positions), 1)
+        pos = positions[0]
+        self.assertIsNone(pos.count)
+        # And it must serialize as null, not as 1 / 0 / "".
+        self.assertIsNone(pos.to_dict().get("count"))
+
+    def test_pending_orders_do_not_inflate_position_count(self) -> None:
+        """Pending orders must not be counted toward positions, must not
+        change total_volume/vwap/tp/sl/pnl. The count of the position
+        row, when supplied, is the bridge-supplied group count only."""
+        from plugins.trade.agents import x_metatrader_agent as mt
+        payload = {
+            "type": "response",
+            "ok": True,
+            "status": "COMPLETED",
+            "positions": [
+                {"symbol": "BTCUSD", "direction": "BUY", "count": 7,
+                 "total_volume": "2.10", "vwap": "67500",
+                 "floating_pl": "0.0", "tp": "89000", "sl": "60000"},
+            ],
+            "position_tickets": [
+                {"symbol": "BTCUSD", "direction": "BUY",
+                 "tp": "89000", "sl": "60000"},
+            ],
+            "pending_orders": [
+                {"symbol": "BTCUSD", "order_type": "BUY_LIMIT",
+                 "count": 9, "total_volume": "0.90",
+                 "vwap": "60025", "min_price": "59900",
+                 "max_price": "60100"},
+            ],
+            "open_order_count": 9,
+        }
+
+        def fake_post(req):
+            body = dict(payload)
+            body["request_id"] = req.get("request_id")
+            body["account"] = req.get("account")
+            body["action"] = req.get("action")
+            return body
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "positions_orders",
+                               "account": "LITE7486706MT5"})
+        positions = resp.positions or []
+        order_groups = resp.order_groups or []
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].count, 7)  # NOT 7+9, NOT 16
+        self.assertEqual(positions[0].size, "2.10")  # NOT 3.00
+        self.assertEqual(len(order_groups), 1)
+        self.assertEqual(order_groups[0].order_count, 9)
+
+    def test_invalid_count_value_does_not_fabricate(self) -> None:
+        """Bridge-supplied count values that are zero / negative / blank
+        / strings must never be coerced to 1 by the agent. ``None`` is
+        the only safe representation."""
+        from plugins.trade.agents import x_metatrader_agent as mt
+        bad_values = [0, -1, "", "  ", None, "abc", [], {}]
+        for bad in bad_values:
+            payload = {
+                "type": "response",
+                "ok": True,
+                "status": "COMPLETED",
+                "positions": [
+                    {"symbol": "BTCUSD", "direction": "BUY", "count": bad,
+                     "total_volume": "3.42", "vwap": "67500",
+                     "floating_pl": "0.0", "tp": "89000", "sl": "60000"},
+                ],
+                "position_tickets": [],
+                "pending_orders": [],
+                "open_order_count": 0,
+            }
+
+            def fake_post(req, _payload=payload):
+                body = dict(_payload)
+                body["request_id"] = req.get("request_id")
+                body["account"] = req.get("account")
+                body["action"] = req.get("action")
+                return body
+
+            with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+                resp = mt.execute({"operation": "positions_orders",
+                                   "account": "LITE7486706MT5"})
+            positions = resp.positions or []
+            self.assertEqual(len(positions), 1)
+            self.assertIsNone(
+                positions[0].count,
+                msg=f"count={bad!r} must serialize as None, not be coerced",
+            )
