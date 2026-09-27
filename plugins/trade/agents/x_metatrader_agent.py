@@ -836,6 +836,14 @@ def _batch_success(
         )
     elif operation in {"cancel_orders", "cancel_order_group"}:
         remaining = max(0, requested - succeeded)
+        # Step E fix: verified now requires (a) the broker matched at least
+        # one order, (b) every matched order was actually cancelled, and
+        # (c) zero failed. Previously, requested=0 + succeeded=0 + failed=0
+        # produced verified=True and status="success", which silently
+        # presented a no-op as a successful cancellation. Now a zero-match
+        # is verified=False and status="no_match".
+        cancel_verified = (requested > 0) and (succeeded == requested) and (failed == 0)
+        cancel_status = "no_match" if requested == 0 else ("partial" if failed else "success")
         kwargs["cancel_group"] = CanonicalCancelGroupResult(
             symbol=str(data.get("symbol") or extra.get("symbol") or ""),
             side=str(data.get("side") or extra.get("side") or "").lower(),
@@ -843,9 +851,9 @@ def _batch_success(
             cancelled_order_count=succeeded,
             confirmed_absent_count=succeeded,
             remaining_target_count=remaining,
-            verified=failed == 0,
+            verified=cancel_verified,
             partial=bool(failed and succeeded),
-            status="partial" if failed else "success",
+            status=cancel_status,
             requested_cancel_count=requested,
             verified_cancel_count=succeeded,
         )
@@ -994,6 +1002,28 @@ def _execute_grouped_cancel(request: Mapping[str, Any]) -> CanonicalResponse:
     symbol = str(request.get("symbol") or "").strip()
     if not symbol:
         return _failure(operation, alias_upper, "MISSING_SYMBOL", "Symbol is required.")
+    # Step E fix: the canonical group identity is (symbol, side, order_type).
+    # The MetaTrader EA stores pending orders with order_type as the full
+    # side-prefixed form (BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP), and
+    # the broker's grouped-cancel matcher compares against that exact
+    # string. Sending a bare "LIMIT" never matches BUY_LIMIT rows. The
+    # fix below combines (side, base_type) into the full form before the
+    # request goes to the bridge. Limited to the grouped-cancel path so
+    # new_order, ladder, and other ops are unaffected.
+    raw_type = str(request.get("order_type") or request.get("type") or request.get("display_type") or "").strip()
+    base_type = ""
+    if raw_type:
+        normalized = raw_type.upper().replace("-", "_").replace(" ", "_")
+        # Strip a leading side prefix if the caller already supplied one
+        # (e.g. "BUY_LIMIT" -> base="LIMIT") so we can rebuild deterministically.
+        for prefix in ("BUY_", "SELL_"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                break
+        if normalized in {"LIMIT", "STOP"}:
+            base_type = normalized
+        else:
+            return _failure(operation, alias_upper, "UNSUPPORTED_ORDER_TYPE", "Grouped cancel supports LIMIT and STOP only.")
     payload: Dict[str, Any] = {
         "request_id": _coerce_request_id(request.get("request_id")),
         "account": account_login,
@@ -1005,12 +1035,12 @@ def _execute_grouped_cancel(request: Mapping[str, Any]) -> CanonicalResponse:
         if side is None:
             return _failure(operation, alias_upper, "INVALID_SIDE", "Side must be buy or sell.")
         payload["side"] = side
-    raw_type = str(request.get("order_type") or request.get("type") or request.get("display_type") or "").strip()
-    if raw_type:
-        order_type = _order_type_value(raw_type)
-        if order_type is None:
-            return _failure(operation, alias_upper, "UNSUPPORTED_ORDER_TYPE", "Grouped cancel supports limit pending orders only.")
-        payload["order_type"] = order_type
+    else:
+        return _failure(operation, alias_upper, "MISSING_SIDE", "Grouped cancel requires an explicit side (buy or sell).")
+    if base_type:
+        # Combine (side, base_type) into the full EA representation.
+        # This is what the broker's matcher actually compares against.
+        payload["order_type"] = f"{payload['side']}_{base_type}"
     response, failure = _call_ea_payload("cancel_orders", alias_upper, payload, ambiguous_on_transport_error=True)
     if failure is not None:
         return failure

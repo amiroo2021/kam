@@ -175,6 +175,60 @@ def _normalize_live_accounts(value: Any) -> "frozenset[tuple[str, str]]":
     return frozenset(out)
 
 
+# Canonical operation names that can ever be LIVE-eligible.
+# "ladder" is here so the LIVE_OPERATIONS env var can reference it, but
+# it is additionally gated by LADDER_ENABLED (a separate boolean flag).
+# The helper accepts it; the LIVE execute path enforces both conditions.
+LIVE_OPERATION_NAMES: "frozenset[str]" = frozenset({
+    "new_order",
+    "cancel_order",
+    "cancel_orders",
+    "cancel_order_group",
+    "set_tp",
+    "set_sl",
+    "close_position",
+    "ladder",
+})
+
+
+def _normalize_live_operations(value: Any) -> "frozenset[str]":
+    """Parse the LIVE_OPERATIONS allowlist into a frozenset of canonical
+    operation names. Empty input -> empty frozenset (means: NOTHING may
+    dispatch in LIVE mode). Invalid tokens raise ValueError."""
+    raw: List[str] = []
+    if value is None or value == "":
+        return frozenset()
+    if isinstance(value, str):
+        for token in value.split(","):
+            token = token.strip()
+            if token:
+                raw.append(token)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                raw.append(item.strip())
+            else:
+                raise ValueError(
+                    f"Invalid live_operations entry: {item!r}; expected string operation name."
+                )
+    else:
+        raise ValueError(
+            f"Invalid live_operations type: {type(value).__name__}; expected string, list, or None."
+        )
+    out: set[str] = set()
+    for token in raw:
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token not in LIVE_OPERATION_NAMES:
+            raise ValueError(
+                f"Invalid live_operations token: {token!r}; "
+                f"must be one of {sorted(LIVE_OPERATION_NAMES)}."
+            )
+        out.add(token)
+    return frozenset(out)
+
+
 # --- capability gate ------------------------------------------------------
 
 _WRITE_OPS = {
@@ -201,12 +255,13 @@ class WebTrade2Phase2Service:
         preview_ttl_seconds: int = 300,
         ladder_enabled: bool = False,
         live_accounts: Any = None,
+        live_operations: Any = None,
     ) -> None:
         self.desk = desk or get_tradedesk()
         self.write_enabled = bool(write_enabled)
         self.dry_run = bool(dry_run)
-        # Step 7: controlled LIVE ladder activation. Defaults to False so
-        # the server refuses LIVE ladder dispatches unless explicitly opted
+        # Step 7: ladder opt-in. Defaults to False; in LIVE mode the
+        # server refuses LIVE ladder dispatches unless explicitly opted
         # in via env (WEBTRADE2_LADDER_ENABLED=1).
         self.ladder_enabled = bool(ladder_enabled)
         # Step 8 (Pre-LIVE hardening): account-level LIVE allowlist.
@@ -215,6 +270,12 @@ class WebTrade2Phase2Service:
         # NOT a preview blocker — previews still run regardless of LIVE
         # eligibility so DRY_RUN tests can validate behavior.
         self.live_accounts: "frozenset[tuple[str, str]]" = _normalize_live_accounts(live_accounts)
+        # Step 9 (Pre-LIVE hardening): operation-level LIVE allowlist.
+        # Empty set means NO mutation operation may dispatch in LIVE mode
+        # regardless of the account allowlist. Ladders remain governed
+        # by ladder_enabled + the "ladder in live_operations" rule, which
+        # is implemented inside the ladder execute path.
+        self.live_operations: "frozenset[str]" = _normalize_live_operations(live_operations)
         self.previews = PreviewPlanStore(session_secret, ttl_seconds=int(preview_ttl_seconds))
 
     # ---- status helpers -------------------------------------------------
@@ -231,6 +292,13 @@ class WebTrade2Phase2Service:
             # per-account LIVE-eligible hint WITHOUT exposing the rest of
             # the allowlist or any secret material.
             "live_allowlist_active": bool(self.live_accounts),
+            # Step 9: True iff at least one mutation operation has been
+            # explicitly allowlisted via WEBTRADE2_LIVE_OPERATIONS.
+            "live_operations_active": bool(self.live_operations),
+            # Step 9: list of LIVE-eligible operation names (canonical).
+            # Never contains wildcards. Empty list -> NO operation may
+            # dispatch in LIVE mode.
+            "live_operations": sorted(self.live_operations),
         }
 
     def phase2_capabilities(self, exchange: str, account: str = "") -> Dict[str, Any]:
@@ -312,6 +380,39 @@ class WebTrade2Phase2Service:
             "error": {
                 "code": "LIVE_ACCOUNT_NOT_ALLOWED",
                 "message": f"LIVE mutations are not allowed for {exchange}/{account}.",
+            },
+        }
+
+    def _gate_live_operation(self, operation: str) -> Optional[Dict[str, Any]]:
+        """Operation-level LIVE gate (Step 9).
+
+        Return a structured rejection when ``operation`` is NOT in the
+        LIVE_OPERATIONS allowlist. This gate is INDEPENDENT of
+        ``_gate_live_account``: BOTH must pass for a LIVE dispatch.
+
+        Ladders are NOT covered here — the ladder execute path enforces
+        the "ladder in LIVE_OPERATIONS" rule separately because ladders
+        also require ``ladder_enabled=True``.
+        """
+        op = str(operation or "").strip().lower()
+        if op in self.live_operations:
+            return None
+        return {
+            "success": False,
+            "status": "REJECTED",
+            "operation": "live_operation_not_allowed",
+            "mode": "LIVE",
+            "exchange_order_ids": [],
+            "accepted": 0,
+            "requested": 0,
+            "partial": False,
+            "message": (
+                f"LIVE {op!r} is not allowed. "
+                f"Add {op!r} to WEBTRADE2_LIVE_OPERATIONS to enable."
+            ),
+            "error": {
+                "code": "LIVE_OPERATION_NOT_ALLOWED",
+                "message": f"LIVE {op!r} is not in the LIVE_OPERATIONS allowlist.",
             },
         }
 
@@ -790,6 +891,25 @@ class WebTrade2Phase2Service:
                     error_code="LIVE_ACCOUNT_NOT_ALLOWED",
                 )
                 return live_gate
+            # LIVE-path gate (Step 9): operation-level allowlist. Even if
+            # the account is allowlisted, new_order requires explicit
+            # membership in WEBTRADE2_LIVE_OPERATIONS.
+            op_gate = self._gate_live_operation("new_order")
+            if op_gate:
+                self._audit(
+                    operation="new_order",
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=side,
+                    preview_id=preview_id,
+                    mode="LIVE",
+                    status="REJECTED",
+                    accepted=0,
+                    requested=1,
+                    error_code="LIVE_OPERATION_NOT_ALLOWED",
+                )
+                return op_gate
             req = {
                 "operation": "new_order",
                 "exchange": exchange,
@@ -932,6 +1052,24 @@ class WebTrade2Phase2Service:
                     error_code="LIVE_ACCOUNT_NOT_ALLOWED",
                 )
                 return live_gate
+            # LIVE-path gate (Step 9): ladders require BOTH ladder_enabled
+            # AND explicit "ladder" membership in WEBTRADE2_LIVE_OPERATIONS.
+            op_gate = self._gate_live_operation("ladder")
+            if op_gate:
+                self._audit(
+                    operation="ladder",
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=side,
+                    preview_id=preview_id,
+                    mode="LIVE",
+                    status="REJECTED",
+                    accepted=0,
+                    requested=int(plan.get("order_count") or 0),
+                    error_code="LIVE_OPERATION_NOT_ALLOWED",
+                )
+                return op_gate
             exec_body = plan.get("exec") or {}
             req = {
                 "operation": "ladder",
@@ -1112,6 +1250,27 @@ class WebTrade2Phase2Service:
                 error_code="LIVE_ACCOUNT_NOT_ALLOWED",
             )
             return live_gate
+        # LIVE-path gate (Step 9): operation-level allowlist. Each of
+        # set_tp, set_sl, close_position, cancel_order, cancel_order_group,
+        # cancel_orders must be explicitly in WEBTRADE2_LIVE_OPERATIONS
+        # to dispatch in LIVE mode. The check is per-operation so a
+        # allowlist that contains only new_order cannot accidentally
+        # enable TP/SL/Close/Cancel.
+        op_gate = self._gate_live_operation(operation)
+        if op_gate:
+            self._audit(
+                operation=operation,
+                exchange=exchange,
+                account=account,
+                symbol=symbol,
+                side=normalized_side,
+                mode="LIVE",
+                status="REJECTED",
+                accepted=0,
+                requested=1,
+                error_code="LIVE_OPERATION_NOT_ALLOWED",
+            )
+            return op_gate
         t0 = time.perf_counter()
         resp = self.desk.execute(req)
         desk_ms = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -1149,6 +1308,16 @@ class WebTrade2Phase2Service:
                 error_code=err_obj.get("code", ""),
             )
         else:
+            # Step E fix: audit must describe what actually happened.
+            # For cancel operations, deferred to the cancel_group block
+            # below where the real targeted/cancelled counts are known.
+            audit_accepted = 1
+            audit_requested = 1
+            if operation in {"cancel_orders", "cancel_order_group"}:
+                _cg_audit = _to_plain(getattr(resp, "cancel_group", None))
+                if isinstance(_cg_audit, dict):
+                    audit_accepted = int(_cg_audit.get("cancelled_order_count") or 0)
+                    audit_requested = int(_cg_audit.get("targeted_order_count") or 1) or 1
             self._audit(
                 operation=operation,
                 exchange=exchange,
@@ -1157,8 +1326,9 @@ class WebTrade2Phase2Service:
                 side=normalized_side,
                 mode="LIVE",
                 status=status,
-                accepted=1,
-                requested=1,
+                accepted=audit_accepted,
+                requested=audit_requested,
+                error_code="" if audit_accepted == audit_requested else "PARTIAL_OR_NO_MATCH",
             )
         # For cancel group, surface counts.
         cg = _to_plain(getattr(resp, "cancel_group", None))
@@ -1166,12 +1336,56 @@ class WebTrade2Phase2Service:
             out["cancel_group"] = cg
             cancelled = int(cg.get("cancelled_order_count") or 0)
             targeted = int(cg.get("targeted_order_count") or cancelled)
+            cg_verified = bool(cg.get("verified"))
+            cg_status = str(cg.get("status") or "").lower()
             out["requested"] = targeted or 1
             out["accepted"] = cancelled
-            if targeted and cancelled < targeted:
+            if targeted == 0:
+                # Fail-closed: zero matches is NOT a successful cancellation.
+                out["success"] = False
+                out["status"] = "NO_MATCH"
+                out["partial"] = False
+                out["message"] = (
+                    f"Group cancel for {symbol}/{normalized_side}/{cg.get('side','')} matched 0 orders. "
+                    "Verify the broker still has this group."
+                )
+                out["error"] = {
+                    "code": "CANCEL_NO_MATCH",
+                    "message": out["message"],
+                }
+                # Override the audit for this NO_MATCH case so the trail
+                # records what actually happened.
+                self._audit(
+                    operation=operation,
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=normalized_side,
+                    mode="LIVE",
+                    status="REJECTED",
+                    accepted=0,
+                    requested=1,
+                    error_code="CANCEL_NO_MATCH",
+                )
+            elif targeted and cancelled < targeted:
                 out["partial"] = True
-                out["status"] = "PARTIALLY_SUBMITTED"
+                out["success"] = cg_verified  # partial is verified=False
+                out["status"] = "PARTIALLY_SUBMITTED" if cg_verified else "PARTIAL_FAILURE"
                 out["message"] = f"Cancelled {cancelled}/{targeted} orders; no automatic retry performed."
+            elif not cg_verified:
+                # targeted>0 and cancelled==targeted but verified flag is
+                # still false (e.g. agent flagged the broker outcome as
+                # ambiguous). Surface as not-success but reported counts.
+                out["success"] = False
+                out["status"] = "UNVERIFIED"
+                out["message"] = (
+                    f"Cancelled {cancelled}/{targeted} orders but the broker outcome "
+                    "could not be independently verified."
+                )
+                out["error"] = {
+                    "code": "CANCEL_UNVERIFIED",
+                    "message": out["message"],
+                }
             else:
                 out["message"] = f"Cancelled {cancelled} orders."
         return out

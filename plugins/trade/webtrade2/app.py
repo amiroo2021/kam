@@ -33,6 +33,7 @@ def create_app(
         preview_ttl_seconds=cfg.preview_ttl_seconds,
         ladder_enabled=cfg.ladder_enabled,
         live_accounts=cfg.live_accounts,
+        live_operations=cfg.live_operations,
     )
     sessions = SessionManager(cfg)
     limiter = LoginRateLimiter(cfg.login_max_failures, cfg.login_lockout_seconds)

@@ -63,6 +63,14 @@ class WebTrade2Config:
     # string of "exchange:account" tokens, or an iterable of (ex, acc)
     # tuples. Never wildcards; never implicitly expands.
     live_accounts: Any = None
+    # Step 9: operation-level LIVE allowlist. Empty default -> NO mutation
+    # operation may reach TradeDesk.execute in LIVE mode, regardless of the
+    # account allowlist. Accepted formats: comma-separated canonical
+    # operation name string, or an iterable of canonical operation strings.
+    # Canonical operation names: new_order, cancel_order, cancel_orders,
+    # cancel_order_group, set_tp, set_sl, close_position. Ladder is gated
+    # SEPARATELY by LADDER_ENABLED and is NOT included here.
+    live_operations: Any = None
 
     def __post_init__(self) -> None:
         self.password = self.password or str(_env("WEBTRADE2_PASSWORD") or _env("TRADE_WEB_PASSWORD") or _env("WEB_PASSWORD") or "")
@@ -87,6 +95,12 @@ class WebTrade2Config:
             self.live_accounts = env_raw
         elif self.live_accounts is None:
             self.live_accounts = ""
+        # Step 9: same pattern for operations.
+        env_ops = _env("WEBTRADE2_LIVE_OPERATIONS", None)
+        if env_ops is not None:
+            self.live_operations = env_ops
+        elif self.live_operations is None:
+            self.live_operations = ""
 
     @classmethod
     def from_values(
@@ -101,6 +115,7 @@ class WebTrade2Config:
         preview_ttl_seconds: int = 300,
         ladder_enabled: bool = False,
         live_accounts: Any = None,
+        live_operations: Any = None,
     ) -> "WebTrade2Config":
         return cls(
             password=password,
@@ -112,6 +127,7 @@ class WebTrade2Config:
             preview_ttl_seconds=preview_ttl_seconds,
             ladder_enabled=ladder_enabled,
             live_accounts=live_accounts,
+            live_operations=live_operations,
         )
 
     @classmethod

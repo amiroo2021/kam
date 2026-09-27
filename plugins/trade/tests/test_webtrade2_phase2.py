@@ -549,9 +549,9 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, live_accounts=[("hyperliquid", "fibo")])
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, live_accounts=[("hyperliquid", "fibo")], live_operations=["new_order"])
         desk = FakeDesk()
-        svc = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, live_accounts=[("hyperliquid", "fibo")])
+        svc = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, live_accounts=[("hyperliquid", "fibo")], live_operations=["new_order"])
         app = app_mod.create_app(config=cfg, service=svc)
         client = TestClient(app)
         csrf = _login(client)
@@ -581,9 +581,9 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
         desk = FakeDesk()
-        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)
@@ -619,7 +619,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
         desk = FakeDesk()
 
         class PartialDesk(FakeDesk):
@@ -629,7 +629,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
                     return FakeCanonical(success=True, ladder=FakeLadder(requested_order_count=8, accepted_child_count=5, submitted_order_count=5, partial=True))
                 return super().execute(request)
 
-        p2 = p2_mod.WebTrade2Phase2Service(desk=PartialDesk(), session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        p2 = p2_mod.WebTrade2Phase2Service(desk=PartialDesk(), session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)
@@ -653,7 +653,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         cfg_mod = _import("plugins.trade.webtrade2.config")
         app_mod = _import("plugins.trade.webtrade2.app")
         p2_mod = _import("plugins.trade.webtrade2.phase2")
-        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
 
         class PartialDesk(FakeDesk):
             def execute(self, request):
@@ -663,7 +663,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
                 return super().execute(request)
 
         partial = PartialDesk()
-        p2 = p2_mod.WebTrade2Phase2Service(desk=partial, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")])
+        p2 = p2_mod.WebTrade2Phase2Service(desk=partial, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=True, live_accounts=[("hyperliquid", "fibo")], live_operations=["ladder"])
         app = app_mod.create_app(config=cfg, phase2=p2)
         client = TestClient(app)
         csrf = _login(client)

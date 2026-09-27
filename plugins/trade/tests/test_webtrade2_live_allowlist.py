@@ -72,7 +72,8 @@ class FakeDesk:
 
 
 def _build_app(*, dry_run: bool, write_enabled: bool = True,
-               ladder_enabled: bool = False, live_accounts: Any = None):
+               ladder_enabled: bool = False, live_accounts: Any = None,
+               live_operations: Any = None):
     cfg_mod = _import("plugins.trade.webtrade2.config")
     app_mod = _import("plugins.trade.webtrade2.app")
     p2_mod = _import("plugins.trade.webtrade2.phase2")
@@ -81,6 +82,7 @@ def _build_app(*, dry_run: bool, write_enabled: bool = True,
         port=9009, write_enabled=write_enabled, dry_run=dry_run,
         preview_ttl_seconds=300, ladder_enabled=ladder_enabled,
         live_accounts=live_accounts,
+        live_operations=live_operations,
     )
     desk = FakeDesk()
     p2 = p2_mod.WebTrade2Phase2Service(
@@ -88,6 +90,7 @@ def _build_app(*, dry_run: bool, write_enabled: bool = True,
         write_enabled=write_enabled, dry_run=dry_run,
         preview_ttl_seconds=300, ladder_enabled=ladder_enabled,
         live_accounts=live_accounts,
+        live_operations=live_operations,
     )
     app = app_mod.create_app(config=cfg, phase2=p2, service=None)
     return app, p2, desk
@@ -215,7 +218,8 @@ class WebTrade2AllowlistHardSafetyTests(unittest.TestCase):
         """E. DRY_RUN=0, WRITE_ENABLED=1, account allowlisted -> dispatch
         reaches fake desk. Uses a FAKE desk only."""
         app, _, desk = _build_app(dry_run=False, write_enabled=True,
-                                   live_accounts=[("metatrader", "acc1")])
+                                   live_accounts=[("metatrader", "acc1")],
+                                   live_operations=["new_order"])
         client = TestClient(app)
         csrf = _login(client)
         r = client.post("/api/trade/preview_order",
@@ -266,12 +270,17 @@ class WebTrade2AllowlistHardSafetyTests(unittest.TestCase):
     # --------------------------------------------------------------- G
     def test_G_set_tp_set_sl_close_cancel_obey_allowlist(self) -> None:
         """G. set_tp / set_sl / close_position / cancel_order_group all obey
-        the LIVE account allowlist."""
-        app, _, desk = _build_app(dry_run=False, write_enabled=True,
-                                   live_accounts=[("metatrader", "OTHER")])
+        the LIVE account allowlist AND the operation allowlist.
+        """
+        # G.1: non-allowlisted account + operations allowlisted -> rejection
+        # is LIVE_ACCOUNT_NOT_ALLOWED.
+        app, _, desk = _build_app(
+            dry_run=False, write_enabled=True,
+            live_accounts=[("metatrader", "OTHER")],
+            live_operations=["set_tp", "set_sl", "close_position", "cancel_order_group"],
+        )
         client = TestClient(app)
         csrf = _login(client)
-        # Each operation targets "metatrader/acc1" which is NOT allowlisted.
         for path, body, op in [
             ("/api/position/set_tp", {"exchange": "metatrader", "account": "acc1",
                                        "symbol": "BTCUSD", "side": "sell",
@@ -289,14 +298,60 @@ class WebTrade2AllowlistHardSafetyTests(unittest.TestCase):
             self.assertFalse(r.json().get("success"), path)
             self.assertEqual(r.json().get("error", {}).get("code"),
                              "LIVE_ACCOUNT_NOT_ALLOWED", path)
-        # No mutation calls reached the desk.
         mutation_calls = [c for c in desk.calls if c.get("operation") in FakeDesk.MUTATIONS]
         self.assertEqual(mutation_calls, [],
                          f"non-allowlisted mutations reached desk: {mutation_calls}")
 
-        # Now switch to an allowlisted account and verify set_tp accepts.
-        app2, _, desk2 = _build_app(dry_run=False, write_enabled=True,
-                                     live_accounts=[("metatrader", "acc1")])
+        # G.2: allowlisted account + EMPTY operations -> rejection is
+        # LIVE_OPERATION_NOT_ALLOWED.
+        app3, _, desk3 = _build_app(
+            dry_run=False, write_enabled=True,
+            live_accounts=[("metatrader", "acc1")],
+            live_operations=[],
+        )
+        client3 = TestClient(app3)
+        csrf3 = _login(client3)
+        r = client3.post("/api/position/set_tp",
+                         json={"exchange": "metatrader", "account": "acc1",
+                               "symbol": "BTCUSD", "side": "buy", "price": "110"},
+                         headers=_hdr(csrf3))
+        self.assertFalse(r.json().get("success"))
+        self.assertEqual(r.json().get("error", {}).get("code"),
+                         "LIVE_OPERATION_NOT_ALLOWED")
+
+        # G.3: allowlisted account + only "new_order" in operations ->
+        # set_tp must still be rejected with LIVE_OPERATION_NOT_ALLOWED.
+        app4, _, desk4 = _build_app(
+            dry_run=False, write_enabled=True,
+            live_accounts=[("metatrader", "acc1")],
+            live_operations=["new_order"],
+        )
+        client4 = TestClient(app4)
+        csrf4 = _login(client4)
+        for path, body, op in [
+            ("/api/position/set_tp", {"exchange": "metatrader", "account": "acc1",
+                                       "symbol": "BTCUSD", "side": "sell",
+                                       "price": "110"}, "set_tp"),
+            ("/api/position/set_sl", {"exchange": "metatrader", "account": "acc1",
+                                       "symbol": "BTCUSD", "side": "sell",
+                                       "price": "90"}, "set_sl"),
+            ("/api/position/close", {"exchange": "metatrader", "account": "acc1",
+                                      "symbol": "BTCUSD", "side": "sell"}, "close_position"),
+        ]:
+            r = client4.post(path, json=body, headers=_hdr(csrf4))
+            self.assertFalse(r.json().get("success"), path)
+            self.assertEqual(r.json().get("error", {}).get("code"),
+                             "LIVE_OPERATION_NOT_ALLOWED", path)
+        mutation_calls = [c for c in desk4.calls if c.get("operation") in FakeDesk.MUTATIONS]
+        self.assertEqual(mutation_calls, [],
+                         f"non-allowlisted ops reached desk: {mutation_calls}")
+
+        # G.4: allowlisted account + set_tp allowed -> set_tp dispatches.
+        app2, _, desk2 = _build_app(
+            dry_run=False, write_enabled=True,
+            live_accounts=[("metatrader", "acc1")],
+            live_operations=["set_tp"],
+        )
         client2 = TestClient(app2)
         csrf2 = _login(client2)
         r = client2.post("/api/position/set_tp",
@@ -319,7 +374,8 @@ class WebTrade2AllowlistHardSafetyTests(unittest.TestCase):
         every position-management endpoint.
         """
         app, _, desk = _build_app(dry_run=False, write_enabled=True,
-                                   live_accounts=[("metatrader", "acc1")])
+                                   live_accounts=[("metatrader", "acc1")],
+                                   live_operations=["set_tp", "set_sl", "close_position"])
         client = TestClient(app)
         csrf = _login(client)
         # Hedging fixture: BTCUSD BUY and BTCUSD SELL are independent.
