@@ -151,6 +151,7 @@ class WebTrade2CanonicalMarketDataTests(unittest.TestCase):
             "edgex": ["list_instruments", "get_tickers"],
             "phemex": ["list_instruments", "get_tickers"],
             "hibachi": ["list_instruments", "get_tickers"],
+            "metatrader": ["list_instruments", "get_tickers"],
         }
         responses: Dict[str, Any] = {}
         for venue, caps in venues.items():
@@ -196,6 +197,7 @@ class WebTrade2CanonicalMarketDataTests(unittest.TestCase):
                 r"exchange\s*==\s*['\"]edgex['\"]",
                 r"exchange\s*==\s*['\"]phemex['\"]",
                 r"exchange\s*==\s*['\"]hibachi['\"]",
+                r"exchange\s*==\s*['\"]metatrader['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]arcus['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]ondoperps['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]nado['\"]",
@@ -204,6 +206,7 @@ class WebTrade2CanonicalMarketDataTests(unittest.TestCase):
                 r"exchange\.lower\(\)\s*==\s*['\"]edgex['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]phemex['\"]",
                 r"exchange\.lower\(\)\s*==\s*['\"]hibachi['\"]",
+                r"exchange\.lower\(\)\s*==\s*['\"]metatrader['\"]",
             ):
                 for match in re.finditer(needle, text):
                     line_start = text.rfind("\n", 0, match.start()) + 1

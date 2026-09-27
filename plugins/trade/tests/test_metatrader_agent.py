@@ -604,6 +604,32 @@ class MarketDataAndCancelTests(_MetaTraderEnvMixin, unittest.TestCase):
         self.assertEqual(captured[2]["timeframe"], "M1")
         self.assertEqual(captured[2]["count"], 10)
 
+    def test_candles_accept_webtrade2_interval_and_limit_aliases(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        captured = []
+
+        def fake_post(payload):
+            captured.append(dict(payload))
+            return {
+                "type": "response",
+                "request_id": payload["request_id"],
+                "account": payload["account"],
+                "action": payload["action"],
+                "status": "COMPLETED",
+                "ok": True,
+                "symbol": payload.get("symbol"),
+                "timeframe": payload.get("timeframe"),
+                "candles": [{"time": 1, "open": 1, "high": 2, "low": 0.5, "close": 1.5}],
+            }
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "candles", "account": "LITE7486706MT5", "symbol": "ZECUSD", "interval": "1h", "limit": 5})
+
+        self.assertTrue(resp.success)
+        self.assertEqual(captured[0]["timeframe"], "H1")
+        self.assertEqual(captured[0]["count"], 5)
+
     def test_list_resolve_market_price_use_live_canonical_fields(self) -> None:
         from plugins.trade.agents import x_metatrader_agent as mt
 
@@ -669,11 +695,194 @@ class MarketDataAndCancelTests(_MetaTraderEnvMixin, unittest.TestCase):
         self.assertEqual(mp.requested_symbol, "ZECUSD")
         self.assertEqual(mp.market, "ZECUSD")
         self.assertEqual(mp.price, "1656.43")
-        self.assertEqual(mp.mark_price, "1656.43")
+        self.assertIsNone(mp.mark_price)
         self.assertEqual(mp.last_external_price, "1656.43")
+        self.assertEqual(mp.symbol, "ZECUSD")
+        self.assertEqual(mp.native_symbol, "ZECUSD")
+        self.assertEqual(mp.price_increment, "0.01")
+        self.assertEqual(mp.size_increment, "0.01")
+        self.assertEqual(mp.minimum_size, "0.01")
         self.assertEqual((priced.data or {}).get("price_increment"), "0.01")
         self.assertEqual((priced.data or {}).get("size_increment"), "0.01")
         self.assertEqual((priced.data or {}).get("minimum_size"), "0.01")
+
+    def test_get_tickers_preserves_broker_symbols_and_missing_fields(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        mt._TICKERS_CACHE.clear()
+        mt._TICKERS_CACHE_EXPIRES.clear()
+        captured = []
+
+        def fake_post(payload):
+            captured.append(dict(payload))
+            action = payload["action"]
+            if action == "symbols":
+                return {
+                    "type": "response",
+                    "request_id": payload["request_id"],
+                    "account": payload["account"],
+                    "action": action,
+                    "status": "COMPLETED",
+                    "ok": True,
+                    "symbols": [
+                        {"symbol": "ZECUSD", "tick_size": 0.01, "volume_step": 0.01, "volume_min": 0.01},
+                        {"symbol": "EURUSD", "tick_size": 0.00001, "volume_step": 0.01, "volume_min": 0.01},
+                    ],
+                }
+            if payload["symbol"] == "ZECUSD":
+                return {
+                    "type": "response",
+                    "request_id": payload["request_id"],
+                    "account": payload["account"],
+                    "action": action,
+                    "status": "COMPLETED",
+                    "ok": True,
+                    "symbol": "ZECUSD",
+                    "bid": 1656.40,
+                    "ask": 1656.46,
+                    "last": 1656.43,
+                    "tick_size": 0.01,
+                    "volume_min": 0.01,
+                    "volume_step": 0.01,
+                }
+            return {
+                "type": "response",
+                "request_id": payload["request_id"],
+                "account": payload["account"],
+                "action": action,
+                "status": "COMPLETED",
+                "ok": True,
+                "symbol": "EURUSD",
+                "bid": 1.13883,
+                "ask": 1.13946,
+                "last": 0,
+                "tick_size": 0.00001,
+                "volume_min": 0.01,
+                "volume_step": 0.01,
+            }
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "get_tickers", "account": "LITE7486706MT5", "force": True})
+
+        self.assertTrue(resp.success)
+        self.assertIsNotNone(resp.tickers_batch)
+        rows = resp.tickers_batch.tickers
+        self.assertEqual(sorted(rows), ["EURUSD", "ZECUSD"])
+        zec = rows["ZECUSD"]
+        self.assertEqual(zec.symbol, "ZECUSD")
+        self.assertEqual(zec.native_symbol, "ZECUSD")
+        self.assertEqual(zec.display_symbol, "ZECUSD")
+        self.assertEqual(zec.display_name, "ZECUSD")
+        self.assertEqual(zec.price, "1656.43")
+        self.assertEqual(zec.last_external_price, "1656.43")
+        self.assertIsNone(zec.mark_price)
+        self.assertIsNone(zec.oracle_price)
+        self.assertIsNone(zec.funding_rate)
+        self.assertIsNone(zec.open_interest)
+        self.assertIsNone(zec.turnover_24h)
+        self.assertIsNone(zec.volume_24h_quote)
+        self.assertIsNone(zec.volume_24h_base)
+        self.assertEqual(zec.price_increment, "0.01")
+        self.assertEqual(zec.size_increment, "0.01")
+        self.assertEqual(zec.minimum_size, "0.01")
+        eur = rows["EURUSD"]
+        self.assertEqual(eur.price, "1.13883")
+        self.assertIsNone(eur.last_external_price)
+        self.assertIsNone(eur.mark_price)
+        self.assertIsNone(eur.market_type)
+        self.assertEqual(resp.tickers_batch.source, "metatrader_bridge_fanout")
+        self.assertEqual(resp.tickers_batch.refresh_status, "ok")
+        self.assertEqual([c["action"] for c in captured].count("symbols"), 1)
+        self.assertEqual([c["action"] for c in captured].count("ticker"), 2)
+
+    def test_get_tickers_preserves_static_row_when_ticker_unavailable(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        mt._TICKERS_CACHE.clear()
+        mt._TICKERS_CACHE_EXPIRES.clear()
+
+        def fake_post(payload):
+            if payload["action"] == "symbols":
+                return {
+                    "type": "response",
+                    "request_id": payload["request_id"],
+                    "account": payload["account"],
+                    "action": "symbols",
+                    "status": "COMPLETED",
+                    "ok": True,
+                    "symbols": [{"symbol": "XAUUSD", "tick_size": 0.01, "volume_step": 0.01, "volume_min": 0.01}],
+                }
+            return {
+                "type": "response",
+                "request_id": payload["request_id"],
+                "account": payload["account"],
+                "action": "ticker",
+                "status": "FAILED",
+                "ok": False,
+                "error": "NO_TICK",
+                "message": "No current tick available",
+            }
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            resp = mt.execute({"operation": "get_tickers", "account": "LITE7486706MT5", "force": True})
+
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.tickers_batch.refresh_status, "partial")
+        self.assertEqual(resp.tickers_batch.failed_symbols, ("XAUUSD",))
+        row = resp.tickers_batch.tickers["XAUUSD"]
+        self.assertEqual(row.symbol, "XAUUSD")
+        self.assertEqual(row.native_symbol, "XAUUSD")
+        self.assertIsNone(row.price)
+        self.assertIsNone(row.mark_price)
+        self.assertIsNone(row.turnover_24h)
+        self.assertEqual(row.price_increment, "0.01")
+
+    def test_get_tickers_cache_marks_served_from_cache(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        mt._TICKERS_CACHE.clear()
+        mt._TICKERS_CACHE_EXPIRES.clear()
+        calls = []
+
+        def fake_post(payload):
+            calls.append(dict(payload))
+            if payload["action"] == "symbols":
+                return {
+                    "type": "response",
+                    "request_id": payload["request_id"],
+                    "account": payload["account"],
+                    "action": "symbols",
+                    "status": "COMPLETED",
+                    "ok": True,
+                    "symbols": ["BTCUSD"],
+                }
+            return {
+                "type": "response",
+                "request_id": payload["request_id"],
+                "account": payload["account"],
+                "action": "ticker",
+                "status": "COMPLETED",
+                "ok": True,
+                "symbol": "BTCUSD",
+                "bid": 84726.0,
+                "ask": 84726.01,
+                "last": 0,
+            }
+
+        with mock.patch.object(mt, "_bridge_post", side_effect=fake_post):
+            first = mt.execute({"operation": "get_tickers", "account": "LITE7486706MT5", "force": True})
+            second = mt.execute({"operation": "get_tickers", "account": "LITE7486706MT5"})
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertFalse(first.tickers_batch.served_from_cache)
+        self.assertTrue(second.tickers_batch.served_from_cache)
+        self.assertEqual(len(calls), 2)  # one symbols + one ticker refresh only
+
+    def test_capabilities_include_get_tickers(self) -> None:
+        from plugins.trade.agents import x_metatrader_agent as mt
+
+        self.assertIn("get_tickers", mt.capabilities())
 
     def test_cancel_order_mapping_and_timeout_ambiguity(self) -> None:
         from plugins.trade.agents import x_metatrader_agent as mt

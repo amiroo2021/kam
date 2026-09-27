@@ -15,9 +15,12 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -34,6 +37,7 @@ from ..canonical import (
     CanonicalPosition,
     CanonicalPositionActionResult,
     CanonicalResponse,
+    CanonicalTickersBatch,
     make_failure,
     make_success,
     normalize_balance,
@@ -58,6 +62,12 @@ _MUTATING_OPS = frozenset(
 _READ_OPS = frozenset({"ping", "balance", "positions_orders"})
 _TIMEOUT_SECONDS = 30
 METATRADER_MAGIC_NUMBER = 26092601
+_TICKERS_TTL_SECONDS = 15
+_TICKERS_MAX_WORKERS = 8
+_TICKERS_LOCK = threading.Lock()
+_TICKERS_CACHE: Dict[str, CanonicalTickersBatch] = {}
+_TICKERS_CACHE_EXPIRES: Dict[str, float] = {}
+_TICKERS_INFLIGHT: Dict[str, threading.Event] = {}
 
 
 class MetaTraderConfigError(Exception):
@@ -155,6 +165,7 @@ def capabilities() -> List[str]:
         "list_instruments",
         "resolve_instrument",
         "market_price",
+        "get_tickers",
     ]
 
 
@@ -673,6 +684,28 @@ def _execute_new_order(request: Mapping[str, Any]) -> CanonicalResponse:
     )
 
 
+def _metatrader_timeframe(value: Any) -> str:
+    text = str(value or "M1").strip()
+    key = text.lower().replace(" ", "")
+    mapping = {
+        "1m": "M1",
+        "m1": "M1",
+        "5m": "M5",
+        "m5": "M5",
+        "15m": "M15",
+        "m15": "M15",
+        "30m": "M30",
+        "m30": "M30",
+        "1h": "H1",
+        "h1": "H1",
+        "4h": "H4",
+        "h4": "H4",
+        "1d": "D1",
+        "d1": "D1",
+    }
+    return mapping.get(key, text.upper())
+
+
 def _execute_bridge_read_action(request: Mapping[str, Any], action: str) -> CanonicalResponse:
     account = str(request.get("account") or "").strip()
     alias_upper, account_login = _alias_to_account(account)
@@ -689,8 +722,8 @@ def _execute_bridge_read_action(request: Mapping[str, Any], action: str) -> Cano
             return _failure(action, alias_upper, "MISSING_SYMBOL", "Symbol is required.")
         payload["symbol"] = symbol
     if action == "candles":
-        timeframe = str(request.get("timeframe") or "M1").strip().upper()
-        count_raw = request.get("count", 10)
+        timeframe = _metatrader_timeframe(request.get("timeframe", request.get("interval", "M1")))
+        count_raw = request.get("count", request.get("limit", 10))
         try:
             count = int(count_raw)
         except (TypeError, ValueError):
@@ -1065,6 +1098,208 @@ def _ticker_last_price(ticker: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _optional_decimal_text(value: Any) -> Optional[str]:
+    parsed = _decimal_field(value)
+    if parsed is None:
+        return None
+    return _decimal_text(parsed)
+
+
+def _positive_decimal_text(value: Any) -> Optional[str]:
+    parsed = _decimal_field(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return _decimal_text(parsed)
+
+
+def _first_present(mapping: Mapping[str, Any], *keys: str) -> Optional[Any]:
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None and mapping.get(key) != "":
+            return mapping.get(key)
+    return None
+
+
+def _ticker_price(ticker: Mapping[str, Any]) -> Optional[str]:
+    # MetaTrader supplies ordinary bid/ask/last quotes, not exchange mark or
+    # oracle prices. Prefer a real last price when non-zero, otherwise expose
+    # the current bid (or ask if bid is unavailable) as the display price.
+    for key in ("last", "bid", "ask"):
+        value = _positive_decimal_text(ticker.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _ticker_mark_price(ticker: Mapping[str, Any]) -> Optional[str]:
+    # Only preserve an explicit mark field. Do not fabricate mark from bid/ask.
+    return _positive_decimal_text(ticker.get("mark"))
+
+
+def _ticker_last_external_price(ticker: Mapping[str, Any]) -> Optional[str]:
+    # Only preserve an explicit last field. Do not fabricate last from bid/ask.
+    return _positive_decimal_text(ticker.get("last"))
+
+
+def _timestamp_text(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _market_price_from_symbol_ticker(symbol_row: Mapping[str, Any], ticker: Mapping[str, Any]) -> CanonicalMarketPrice:
+    symbol = str(ticker.get("symbol") or symbol_row.get("symbol") or "").strip()
+    native = str(ticker.get("native_symbol") or ticker.get("symbol") or symbol_row.get("native_symbol") or symbol).strip()
+    display_symbol = str(_first_present(ticker, "display_symbol", "displayName") or _first_present(symbol_row, "display_symbol", "displayName") or symbol).strip()
+    display_name = str(_first_present(ticker, "display_name", "description", "name") or _first_present(symbol_row, "display_name", "description", "name") or symbol).strip()
+    meta = dict(_ticker_increments(symbol_row))
+    meta.update(_ticker_increments(ticker))
+    return CanonicalMarketPrice(
+        requested_symbol=symbol,
+        market=native or symbol,
+        symbol=symbol,
+        native_symbol=native or None,
+        display_symbol=display_symbol or None,
+        display_name=display_name or None,
+        base=_first_present(ticker, "base") or _first_present(symbol_row, "base"),
+        quote=_first_present(ticker, "quote") or _first_present(symbol_row, "quote"),
+        market_type=_first_present(ticker, "market_type") or _first_present(symbol_row, "market_type"),
+        price_increment=meta.get("price_increment"),
+        size_increment=meta.get("size_increment"),
+        minimum_size=meta.get("minimum_size"),
+        minimum_notional=_optional_decimal_text(_first_present(ticker, "minimum_notional", "min_notional") or _first_present(symbol_row, "minimum_notional", "min_notional")),
+        price=_ticker_price(ticker),
+        mark_price=_ticker_mark_price(ticker),
+        oracle_price=_positive_decimal_text(_first_present(ticker, "oracle_price", "oracle")),
+        last_external_price=_ticker_last_external_price(ticker),
+        last_updated_time=_timestamp_text(_first_present(ticker, "last_updated_time", "timestamp", "time", "time_msc")),
+        volume_24h_base=_optional_decimal_text(_first_present(ticker, "volume_24h_base", "base_volume_24h")),
+        volume_24h_quote=_optional_decimal_text(_first_present(ticker, "volume_24h_quote", "quote_volume_24h")),
+        turnover_24h=_optional_decimal_text(_first_present(ticker, "turnover_24h", "turnover24h")),
+        change_24h_pct=_optional_decimal_text(_first_present(ticker, "change_24h_pct", "change24h_pct")),
+        funding_rate=_optional_decimal_text(_first_present(ticker, "funding_rate", "funding")),
+        open_interest=_optional_decimal_text(_first_present(ticker, "open_interest", "openInterest")),
+    )
+
+
+def _fetch_ticker_for_batch(alias: str, account_login: int, symbol_row: Mapping[str, Any]) -> tuple[str, Optional[CanonicalMarketPrice], Optional[str]]:
+    symbol = str(symbol_row.get("symbol") or "").strip()
+    if not symbol:
+        return symbol, None, "missing_symbol"
+    payload = {
+        "request_id": _request_id(),
+        "account": account_login,
+        "action": "ticker",
+        "symbol": symbol,
+    }
+    try:
+        response = _bridge_post(payload)
+    except Exception as exc:  # noqa: BLE001
+        return symbol, None, sanitize_error_message(str(exc))
+    mismatch = _validate_correlated("ticker", alias, payload, response)
+    if mismatch is not None:
+        code = mismatch.error.code if mismatch.error is not None else "REQUEST_ID_MISMATCH"
+        return symbol, None, code
+    if not _is_ok_response(response):
+        error = _error_from_response("ticker", alias, response)
+        code = error.error.code if error.error is not None else "EA_FAILED"
+        return symbol, None, code
+    return symbol, _market_price_from_symbol_ticker(symbol_row, response), None
+
+
+def _refresh_tickers_batch(alias: str, account_login: int) -> CanonicalResponse:
+    payload = {"request_id": _request_id(), "account": account_login, "action": "symbols"}
+    try:
+        response = _bridge_post(payload)
+    except MetaTraderConfigError as exc:
+        return _failure("get_tickers", alias, exc.code, exc.message)
+    except Exception as exc:  # noqa: BLE001
+        return _failure("get_tickers", alias, "BRIDGE_UNAVAILABLE", sanitize_error_message(str(exc)))
+    mismatch = _validate_correlated("symbols", alias, payload, response)
+    if mismatch is not None:
+        return mismatch
+    if not _is_ok_response(response):
+        return _error_from_response("get_tickers", alias, response)
+    symbols = _symbol_records(response.get("symbols") or response)
+    tickers: Dict[str, CanonicalMarketPrice] = {}
+    failed: List[str] = []
+    workers = max(1, min(_TICKERS_MAX_WORKERS, len(symbols) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fetch_ticker_for_batch, alias, account_login, row) for row in symbols]
+        for fut in as_completed(futures):
+            symbol, market_price, error = fut.result()
+            if market_price is not None:
+                tickers[market_price.symbol or symbol] = market_price
+                continue
+            if symbol:
+                # Preserve the broker's symbol universe even when an
+                # individual current-tick request has no quote. Dynamic
+                # fields remain None; failed_symbols marks the row unavailable.
+                static_row = next((row for row in symbols if str(row.get("symbol") or "").strip() == symbol), {"symbol": symbol})
+                static_price = _market_price_from_symbol_ticker(static_row, {})
+                tickers[static_price.symbol or symbol] = static_price
+                failed.append(symbol)
+    if tickers and failed:
+        status = "partial"
+    elif tickers:
+        status = "ok"
+    else:
+        status = "no_data"
+    batch = CanonicalTickersBatch(
+        tickers=dict(sorted(tickers.items())),
+        failed_symbols=tuple(sorted(failed)),
+        fetched_at=str(int(time.time())),
+        ttl_seconds=_TICKERS_TTL_SECONDS,
+        refresh_status=status,
+        source="metatrader_bridge_fanout",
+        served_from_cache=False,
+    )
+    with _TICKERS_LOCK:
+        _TICKERS_CACHE[alias] = batch
+        _TICKERS_CACHE_EXPIRES[alias] = time.monotonic() + _TICKERS_TTL_SECONDS
+    return make_success(operation="get_tickers", exchange=name, account=alias, tickers_batch=batch)
+
+
+def _execute_get_tickers(request: Mapping[str, Any]) -> CanonicalResponse:
+    account = str(request.get("account") or "").strip()
+    alias_upper, account_login = _alias_to_account(account)
+    if account_login is None:
+        return _failure("get_tickers", account, "ACCOUNT_NOT_CONFIGURED", "MetaTrader account alias is not configured.")
+    force = _bool_value(request.get("force"))
+    while True:
+        with _TICKERS_LOCK:
+            cached = _TICKERS_CACHE.get(alias_upper)
+            expires = _TICKERS_CACHE_EXPIRES.get(alias_upper, 0)
+            if cached is not None and not force and time.monotonic() < expires:
+                batch = CanonicalTickersBatch(
+                    tickers=cached.tickers,
+                    failed_symbols=cached.failed_symbols,
+                    fetched_at=cached.fetched_at,
+                    ttl_seconds=cached.ttl_seconds,
+                    stale_symbols=cached.stale_symbols,
+                    refresh_status=cached.refresh_status,
+                    source=cached.source,
+                    served_from_cache=True,
+                )
+                return make_success(operation="get_tickers", exchange=name, account=alias_upper, tickers_batch=batch)
+            event = _TICKERS_INFLIGHT.get(alias_upper)
+            if event is None:
+                event = threading.Event()
+                _TICKERS_INFLIGHT[alias_upper] = event
+                owner = True
+            else:
+                owner = False
+        if owner:
+            try:
+                return _refresh_tickers_batch(alias_upper, account_login)
+            finally:
+                with _TICKERS_LOCK:
+                    done = _TICKERS_INFLIGHT.pop(alias_upper, None)
+                    if done is not None:
+                        done.set()
+        event.wait(timeout=60)
+        force = False
+
+
 def _execute_list_instruments(request: Mapping[str, Any]) -> CanonicalResponse:
     response = _execute_bridge_read_action(request, "symbols")
     if not response.success:
@@ -1124,13 +1359,20 @@ def _execute_market_price(request: Mapping[str, Any]) -> CanonicalResponse:
     ticker = dict(ticker_resp.data or {})
     native = str(ticker.get("symbol") or requested).strip() or requested
     meta = _ticker_increments(ticker)
-    price = _ticker_last_price(ticker)
+    price = _ticker_price(ticker)
     market_price = CanonicalMarketPrice(
         requested_symbol=requested or native,
         market=native,
-        mark_price=price,
+        symbol=native,
+        native_symbol=native,
+        display_symbol=native,
+        display_name=native,
         price=price,
-        last_external_price=price,
+        mark_price=_ticker_mark_price(ticker),
+        last_external_price=_ticker_last_external_price(ticker),
+        price_increment=meta.get("price_increment"),
+        size_increment=meta.get("size_increment"),
+        minimum_size=meta.get("minimum_size"),
     )
     data = dict(ticker)
     data.setdefault("symbol", native)
@@ -1167,6 +1409,8 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _execute_resolve_instrument(request)
     if operation == "market_price":
         return _execute_market_price(request)
+    if operation == "get_tickers":
+        return _execute_get_tickers(request)
     if operation == "cancel_order":
         return _execute_cancel_order(request)
     if operation == "ladder":
