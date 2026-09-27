@@ -181,5 +181,49 @@ class WebTrade2CandlesContractTests(unittest.TestCase):
         self.assertEqual(ts, [_ts_seconds(0), _ts_seconds(1), _ts_seconds(2)])
 
 
+
+
+class CandlesUpstreamErrorGuardTests(unittest.TestCase):
+    """Regression for the pre-LIVE audit finding: a fetcher that returns
+    an upstream error envelope (e.g. Apex ``{"code": 2, "msg": "..."}``)
+    must surface as ``CANDLES_UPSTREAM_ERROR`` rather than a silent
+    ``success=true, count=0``.
+    """
+
+    def test_fetch_for_exchange_raises_when_upstream_returns_error_envelope(self) -> None:
+        # Simulate the Apex-style envelope: a dict with explicit code & msg.
+        from plugins.trade import candles as candles_mod
+        with mock.patch.dict(candles_mod.FETCHERS, {"apex": lambda *a, **kw: {"code": 2, "msg": "internal server error"}}):
+            with self.assertRaises(RuntimeError) as cm:
+                candles_mod.fetch_for_exchange("apex", "BTC-USDT", "1h", limit=5)
+            msg = str(cm.exception)
+            self.assertTrue(msg.startswith("CANDLES_UPSTREAM_ERROR"), msg)
+
+    def test_handle_candles_operation_surfaces_upstream_error(self) -> None:
+        from plugins.trade import candles as candles_mod
+        with mock.patch.dict(candles_mod.FETCHERS, {"apex": lambda *a, **kw: {"code": 2, "msg": "internal server error"}}):
+            out = candles_mod.handle_candles_operation(
+                "apex", "fibo",
+                {"symbol": "BTC-USDT", "interval": "1h", "limit": 5, "market_type": "futures"},
+            )
+        d = out.to_dict()
+        self.assertFalse(d.get("success"))
+        self.assertEqual(d["error"]["code"], "CANDLES_UPSTREAM_ERROR")
+
+    def test_handle_candles_operation_preserves_legitimate_empty_dataset(self) -> None:
+        # Empty list (NOT an error envelope) MUST remain success=true, count=0.
+        # This is the legitimate "no candles in window" case.
+        from plugins.trade import candles as candles_mod
+        with mock.patch.dict(candles_mod.FETCHERS, {"apex": lambda *a, **kw: []}):
+            out = candles_mod.handle_candles_operation(
+                "apex", "fibo",
+                {"symbol": "BTC-USDT", "interval": "1h", "limit": 5, "market_type": "futures"},
+            )
+        d = out.to_dict()
+        self.assertTrue(d.get("success"))
+        self.assertEqual(d["data"]["count"], 0)
+        self.assertEqual(d["data"]["candles"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

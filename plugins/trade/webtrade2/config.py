@@ -10,7 +10,7 @@ import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 def _hermes_home() -> Path:
@@ -58,6 +58,11 @@ class WebTrade2Config:
     # Step 7: LIVE ladder activation is opt-in. Defaults to False; the
     # server refuses LIVE ladder dispatches unless WEBTRADE2_LADDER_ENABLED=1.
     ladder_enabled: bool = False
+    # Step 8: account-level LIVE allowlist. Empty default -> NO account is
+    # LIVE-eligible. Format accepted by __post_init__: a comma-separated
+    # string of "exchange:account" tokens, or an iterable of (ex, acc)
+    # tuples. Never wildcards; never implicitly expands.
+    live_accounts: Any = None
 
     def __post_init__(self) -> None:
         self.password = self.password or str(_env("WEBTRADE2_PASSWORD") or _env("TRADE_WEB_PASSWORD") or _env("WEB_PASSWORD") or "")
@@ -75,6 +80,13 @@ class WebTrade2Config:
         self.write_enabled = _env_bool("WEBTRADE2_WRITE_ENABLED", self.write_enabled)
         self.dry_run = _env_bool("WEBTRADE2_DRY_RUN", self.dry_run)
         self.ladder_enabled = _env_bool("WEBTRADE2_LADDER_ENABLED", self.ladder_enabled)
+        # If the env var is unset AND the caller didn't pass an explicit
+        # live_accounts, leave the allowlist empty.
+        env_raw = _env("WEBTRADE2_LIVE_ACCOUNTS", None)
+        if env_raw is not None:
+            self.live_accounts = env_raw
+        elif self.live_accounts is None:
+            self.live_accounts = ""
 
     @classmethod
     def from_values(
@@ -88,6 +100,7 @@ class WebTrade2Config:
         dry_run: bool = True,
         preview_ttl_seconds: int = 300,
         ladder_enabled: bool = False,
+        live_accounts: Any = None,
     ) -> "WebTrade2Config":
         return cls(
             password=password,
@@ -98,6 +111,7 @@ class WebTrade2Config:
             dry_run=dry_run,
             preview_ttl_seconds=preview_ttl_seconds,
             ladder_enabled=ladder_enabled,
+            live_accounts=live_accounts,
         )
 
     @classmethod

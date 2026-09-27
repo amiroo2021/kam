@@ -116,6 +116,65 @@ def _safe_error(resp: Any) -> Dict[str, str]:
     return {"code": code, "message": msg}
 
 
+# --- LIVE account allowlist -------------------------------------------------
+#
+# Generic helper for "is this (exchange, account) LIVE-eligible?".
+#
+# Accepted inputs (deterministic, testable, no silent wildcard):
+#   None / empty string / empty iterable  -> empty frozenset
+#   iterable of (exchange, account) tuples
+#       -> frozenset({(exchange.lower(), account.strip()), ...})
+#   str of the form "ex1:acc1,ex2:acc2"  -> same
+#   str with a single token like "acc1"   -> ValueError (must be qualified)
+#
+# IMPORTANT: empty allowlist means NO account is LIVE-eligible. The helper
+# never expands an entry into a wildcard; the canonical form is always
+# (exchange, account) and lookups require both fields to match.
+
+def _normalize_live_accounts(value: Any) -> "frozenset[tuple[str, str]]":
+    raw: List[str] = []
+    if value is None or value == "":
+        return frozenset()
+    if isinstance(value, str):
+        for token in value.split(","):
+            token = token.strip()
+            if token:
+                raw.append(token)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                ex, acc = item
+                if ex and acc:
+                    raw.append(f"{ex}:{acc}")
+            elif isinstance(item, str) and item:
+                raw.append(item)
+            else:
+                raise ValueError(
+                    f"Invalid live_accounts entry: {item!r}; expected (exchange, account) tuple or 'exchange:account' string."
+                )
+    else:
+        raise ValueError(
+            f"Invalid live_accounts type: {type(value).__name__}; expected string, list, or None."
+        )
+
+    out: set[tuple[str, str]] = set()
+    for token in raw:
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise ValueError(
+                f"Invalid live_accounts token: {token!r}; must be qualified as 'exchange:account'."
+            )
+        ex, _, acc = token.partition(":")
+        ex = ex.strip().lower()
+        acc = acc.strip()
+        if not ex or not acc:
+            raise ValueError(f"Invalid live_accounts token: {token!r}; empty exchange or account.")
+        out.add((ex, acc))
+    return frozenset(out)
+
+
 # --- capability gate ------------------------------------------------------
 
 _WRITE_OPS = {
@@ -141,6 +200,7 @@ class WebTrade2Phase2Service:
         dry_run: bool = True,
         preview_ttl_seconds: int = 300,
         ladder_enabled: bool = False,
+        live_accounts: Any = None,
     ) -> None:
         self.desk = desk or get_tradedesk()
         self.write_enabled = bool(write_enabled)
@@ -149,6 +209,12 @@ class WebTrade2Phase2Service:
         # the server refuses LIVE ladder dispatches unless explicitly opted
         # in via env (WEBTRADE2_LADDER_ENABLED=1).
         self.ladder_enabled = bool(ladder_enabled)
+        # Step 8 (Pre-LIVE hardening): account-level LIVE allowlist.
+        # Empty set means NO account is eligible for LIVE mutations; LIVE
+        # is gated exclusively through this frozenset. The allowlist is
+        # NOT a preview blocker — previews still run regardless of LIVE
+        # eligibility so DRY_RUN tests can validate behavior.
+        self.live_accounts: "frozenset[tuple[str, str]]" = _normalize_live_accounts(live_accounts)
         self.previews = PreviewPlanStore(session_secret, ttl_seconds=int(preview_ttl_seconds))
 
     # ---- status helpers -------------------------------------------------
@@ -160,12 +226,18 @@ class WebTrade2Phase2Service:
             "dry_run": self.dry_run,
             "ladder_enabled": self.ladder_enabled,
             "preview_ttl_seconds": self.previews.ttl_seconds,
+            # True iff (exchange, account) is in the LIVE allowlist.
+            # This is a per-account boolean so the frontend can render a
+            # per-account LIVE-eligible hint WITHOUT exposing the rest of
+            # the allowlist or any secret material.
+            "live_allowlist_active": bool(self.live_accounts),
         }
 
-    def phase2_capabilities(self, exchange: str) -> Dict[str, Any]:
+    def phase2_capabilities(self, exchange: str, account: str = "") -> Dict[str, Any]:
         caps = set(self.desk.capabilities(exchange))
         return {
             "exchange": exchange,
+            "account": account,
             "capabilities": sorted(caps),
             "order_type_limit": "new_order" in caps,
             "order_type_market": False,  # agents do not advertise market orders via TradeDesk today
@@ -176,7 +248,29 @@ class WebTrade2Phase2Service:
             "set_sl": "set_sl" in caps,
             "close_position": "close_position" in caps,
             "reduce_only": "reduce_only" in caps,
+            # True iff this (exchange, account) is in the LIVE allowlist
+            # AND the server is configured for LIVE writes.
+            "live_allowed_for_account": bool(self.live_accounts) and (
+                self.is_live_account_allowed(exchange, account)
+                if account else bool(self.live_accounts)
+            ),
+            "dry_run": self.dry_run,
         }
+
+    # ---- LIVE allowlist helpers -----------------------------------------
+
+    def is_live_account_allowed(self, exchange: str, account: str) -> bool:
+        """Generic helper. Returns True iff (exchange, account) is in the
+        LIVE allowlist. Empty allowlist -> always False. Comparison is
+        case-insensitive on exchange, exact on account after stripping.
+        """
+        if not self.live_accounts:
+            return False
+        ex = str(exchange or "").strip().lower()
+        acc = str(account or "").strip()
+        if not ex or not acc:
+            return False
+        return (ex, acc) in self.live_accounts
 
     # ---- gate ------------------------------------------------------------
 
@@ -188,6 +282,38 @@ class WebTrade2Phase2Service:
                 "error": {"code": "PHASE2_DISABLED", "message": "WebTrade2 writes are disabled (WEBTRADE2_WRITE_ENABLED=0)."},
             }
         return None
+
+    def _gate_live_account(self, exchange: str, account: str) -> Optional[Dict[str, Any]]:
+        """Generic LIVE eligibility gate.
+
+        Return a structured rejection when (exchange, account) is NOT in
+        the LIVE allowlist. Called AFTER ``_gate`` / capability checks and
+        BEFORE any TradeDesk.execute on the LIVE path. Under DRY_RUN=1,
+        callers should not invoke this gate — DRY_RUN never reaches the
+        LIVE branch.
+        """
+        if self.is_live_account_allowed(exchange, account):
+            return None
+        return {
+            "success": False,
+            "status": "REJECTED",
+            "operation": "live_account_not_allowed",
+            "exchange": exchange,
+            "account": account,
+            "mode": "LIVE",
+            "exchange_order_ids": [],
+            "accepted": 0,
+            "requested": 0,
+            "partial": False,
+            "message": (
+                f"LIVE mutations are not allowed for {exchange}/{account}. "
+                "Add this (exchange, account) to WEBTRADE2_LIVE_ACCOUNTS to enable."
+            ),
+            "error": {
+                "code": "LIVE_ACCOUNT_NOT_ALLOWED",
+                "message": f"LIVE mutations are not allowed for {exchange}/{account}.",
+            },
+        }
 
     def _require_capability(self, exchange: str, operation: str) -> Optional[Dict[str, Any]]:
         if operation not in _WRITE_OPS:
@@ -646,6 +772,24 @@ class WebTrade2Phase2Service:
         # Live branch: dispatch through TradeDesk using the plan's
         # final normalized values (never the browser's raw inputs).
         if kind == "order":
+            # LIVE-path gate (Step 8): block desk.execute when account
+            # not in LIVE allowlist. MUST run before TradeDesk.execute.
+            live_gate = self._gate_live_account(exchange, account)
+            if live_gate:
+                self._audit(
+                    operation="new_order",
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=side,
+                    preview_id=preview_id,
+                    mode="LIVE",
+                    status="REJECTED",
+                    accepted=0,
+                    requested=1,
+                    error_code="LIVE_ACCOUNT_NOT_ALLOWED",
+                )
+                return live_gate
             req = {
                 "operation": "new_order",
                 "exchange": exchange,
@@ -770,6 +914,24 @@ class WebTrade2Phase2Service:
                     error_code="LADDER_NOT_ENABLED",
                 )
                 return out
+            # LIVE-path gate (Step 8): account eligibility must hold even
+            # when ladders are nominally enabled. Run BEFORE desk.execute.
+            live_gate = self._gate_live_account(exchange, account)
+            if live_gate:
+                self._audit(
+                    operation="ladder",
+                    exchange=exchange,
+                    account=account,
+                    symbol=symbol,
+                    side=side,
+                    preview_id=preview_id,
+                    mode="LIVE",
+                    status="REJECTED",
+                    accepted=0,
+                    requested=int(plan.get("order_count") or 0),
+                    error_code="LIVE_ACCOUNT_NOT_ALLOWED",
+                )
+                return live_gate
             exec_body = plan.get("exec") or {}
             req = {
                 "operation": "ladder",
@@ -933,6 +1095,23 @@ class WebTrade2Phase2Service:
             req["side"] = normalized_side
         if extra:
             req.update(extra)
+        # LIVE-path gate (Step 8): block desk.execute when the account is
+        # not in the LIVE allowlist. This MUST run before TradeDesk.execute.
+        live_gate = self._gate_live_account(exchange, account)
+        if live_gate:
+            self._audit(
+                operation=operation,
+                exchange=exchange,
+                account=account,
+                symbol=symbol,
+                side=normalized_side,
+                mode="LIVE",
+                status="REJECTED",
+                accepted=0,
+                requested=1,
+                error_code="LIVE_ACCOUNT_NOT_ALLOWED",
+            )
+            return live_gate
         t0 = time.perf_counter()
         resp = self.desk.execute(req)
         desk_ms = round((time.perf_counter() - t0) * 1000.0, 1)

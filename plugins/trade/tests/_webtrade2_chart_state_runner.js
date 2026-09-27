@@ -558,7 +558,30 @@ async function handleFetch(url, opts) {
     phase: 2, write_enabled: true, dry_run: true, ladder_enabled: false, preview_ttl_seconds: 300,
   });
   if (path === "/api/exchanges") return okResp({
-    exchanges: [{ exchange: "apex", accounts: ["BITGET"] }],
+    exchanges: [{ exchange: "apex", accounts: ["BITGET"],
+                  capabilities: {
+                    market_types: ["futures"],
+                    features: {
+                      market_price: true,
+                      candles: true,
+                      volume_24h: true,
+                      limit_orders: true,
+                      market_orders: false,
+                      ladder: true,
+                      uniform_ladder: true,
+                      half_gaussian_ladder: true,
+                      reduce_only: false,
+                      tp_sl: true,
+                      close_position: true,
+                      leverage: false,
+                      fills: false,
+                      balance: true,
+                      positions: true,
+                      open_orders: true,
+                      cancel_order_group: true,
+                    },
+                  },
+                }],
   });
   if (path === "/api/markets") {
     const syms = ["BTCUSDT", "ETHUSDT", "NVDAUSDT", "QQQUSDT", "XRPUSDT", "AAPLUSDT"];

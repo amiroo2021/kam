@@ -131,9 +131,30 @@
   }
 
   function setTradeTab(tab) {
-    state.tradeTab = tab;
+    // Capability-driven UI (Step 3 pre-LIVE): when the selected exchange
+    // does not advertise ladder or order capability, the corresponding
+    // tab is hidden so the user cannot submit an op the agent rejects.
+    // Capability is read at click-time so a later exchange change takes
+    // effect on the next render.
+    const caps = (capabilityFor(state.exchange) || {}).features || {};
+    const ladderSupported = !!caps.ladder;
+    const orderSupported = !!caps.order_type_limit;
+    if (tab === 'ladder' && !ladderSupported) tab = 'order';
+    if (tab === 'order' && !orderSupported && ladderSupported) tab = 'ladder';
+    // Hide the trade-tab buttons themselves when the corresponding op
+    // is unsupported.
     document.querySelectorAll('[data-trade-tab]').forEach(btn => {
-      const active = btn.dataset.tradeTab === tab;
+      const target = btn.dataset.tradeTab;
+      if (target === 'ladder' && !ladderSupported) {
+        btn.hidden = true;
+        return;
+      }
+      if (target === 'order' && !orderSupported) {
+        btn.hidden = true;
+        return;
+      }
+      btn.hidden = false;
+      const active = target === tab;
       btn.classList.toggle('active', active);
       btn.setAttribute('aria-selected', String(active));
     });
@@ -141,6 +162,7 @@
     const ladder = $('#ladderPanel');
     if (order) order.hidden = tab !== 'order';
     if (ladder) ladder.hidden = tab !== 'ladder';
+    state.tradeTab = tab;
   }
   function setMobileSection(section) {
     state.mobile = section;
@@ -717,7 +739,24 @@
         }
         return fmt(sym);
       };
-      box.innerHTML = sortedRows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Actions</th></tr></thead><tbody>${sortedRows.map((p) => { const origIdx = rows.indexOf(p); const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); const instSym = p.symbol || p.instrument || p.market || ''; return `<tr class="clickable-row" data-pos-row="${origIdx}" data-pos-key="${escapeAttr(positionKey(p))}" data-symbol="${escapeAttr(instSym)}"><td class="cell-instrument">${fmtInst(p)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="row-actions"><button class="row-action" data-pos-action="tp" data-pos-index="${origIdx}">TP</button><button class="row-action" data-pos-action="sl" data-pos-index="${origIdx}">SL</button><button class="row-action destructive" data-pos-action="close" data-pos-index="${origIdx}">CLOSE</button></td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
+      // Capability-driven UI (Step 3 pre-LIVE): only render TP/SL/Close
+      // action buttons when the selected exchange advertises that op in
+      // its capabilities. Capability table is loaded once per render so
+      // switching exchange/account re-evaluates the buttons on the next
+      // account_state refresh. The exchange/account is read from state
+      // rather than the row so a single selector applies to every row.
+      const caps = (capabilityFor(state.exchange) || {}).features || {};
+      // The capabilities schema exposes TP/SL as a single combined flag
+      // (`tp_sl`) — separate `set_tp` / `set_sl` granular flags are not
+      // part of the current contract. Mirror that to the per-row buttons
+      // so a venue that supports only TP cannot render a standalone SL.
+      const supportsTpSl = !!caps.tp_sl;
+      const capsSetTp = supportsTpSl;
+      const capsSetSl = supportsTpSl;
+      const capsClose = !!caps.close_position;
+      const anyRowAction = capsSetTp || capsSetSl || capsClose;
+      const actionsPlaceholder = '<span class="muted">—</span>';
+      box.innerHTML = sortedRows.length ? `<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Liq</th><th>TP</th><th>SL</th><th>Actions</th></tr></thead><tbody>${sortedRows.map((p) => { const origIdx = rows.indexOf(p); const side = fmt(p.side).toLowerCase(); const sideCls = side === 'buy' || side === 'long' ? 'side-buy' : (side === 'sell' || side === 'short' ? 'side-sell' : ''); const pnl = p.pnl ?? p.unrealized_pnl; const fmtSize = (() => { const n = num(p.size || p.position_size); if (n === null) return '—'; return n.toLocaleString(undefined, { maximumFractionDigits: 6 }); })(); const fmtPx = (v) => formatDynamicPrice(v); const instSym = p.symbol || p.instrument || p.market || ''; const btnTp = capsSetTp ? `<button class="row-action" data-pos-action="tp" data-pos-index="${origIdx}">TP</button>` : ''; const btnSl = capsSetSl ? `<button class="row-action" data-pos-action="sl" data-pos-index="${origIdx}">SL</button>` : ''; const btnClose = capsClose ? `<button class="row-action destructive" data-pos-action="close" data-pos-index="${origIdx}">CLOSE</button>` : ''; const actionsCell = anyRowAction ? `${btnTp}${btnSl}${btnClose}` : actionsPlaceholder; return `<tr class="clickable-row" data-pos-row="${origIdx}" data-pos-key="${escapeAttr(positionKey(p))}" data-symbol="${escapeAttr(instSym)}"><td class="cell-instrument">${fmtInst(p)}</td><td class="${sideCls}">${fmt(p.side)}</td><td>${fmtSize}</td><td>${fmtPx(p.entry_price || p.entry)}</td><td>${fmtPx(p.mark || p.mark_price)}</td><td class="${pnlClass(pnl)}">${formatSignedMoney(pnl)}</td><td>${fmtPx(p.liquidation_price)}</td><td>${fmtPx(p.tp)}</td><td>${fmtPx(p.sl)}</td><td class="row-actions">${actionsCell}</td></tr>`; }).join('')}</tbody></table>` : `<div class="empty">No positions</div>`;
       // Row-level navigation: clicking the instrument cell or row (but
       // NOT the action buttons — see stopPropagation below) selects
       // that position's canonical instrument via the same path that

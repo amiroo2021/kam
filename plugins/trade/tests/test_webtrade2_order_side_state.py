@@ -265,6 +265,43 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
         self.assertIn("sortedRows", positions_block)
         self.assertIn("localeCompare", positions_block)
 
+    def test_capability_driven_ui_hides_unsupported_position_buttons(self) -> None:
+        """Step 3 (pre-LIVE hardening): UI must hide TP / SL / Close when
+        the selected exchange does not advertise that capability.
+
+        Must be capability-driven, NOT exchange-name-driven.
+
+        The capabilities schema exposes TP/SL as a single combined flag
+        ``tp_sl`` (not separate ``set_tp``/``set_sl``), so the row
+        rendering must gate on ``caps.tp_sl`` and ``caps.close_position``.
+        """
+        app_js = Path("/root/kam/plugins/trade/webtrade2/static/app.js").read_text(encoding="utf-8")
+        # 1) Capability-driven gate via capabilityFor().features
+        self.assertIn("caps.tp_sl", app_js)
+        self.assertIn("caps.close_position", app_js)
+        # 2) Each button is conditional on the gate; no exchange name in
+        # the gate condition.
+        self.assertNotIn("state.exchange === \"metatrader\"", app_js)
+        self.assertNotIn("state.exchange === \"lighter\"", app_js)
+        # 3) The gate produces empty buttons (so the row shows "—") when
+        # all three caps are false.
+        self.assertIn('class="muted">—', app_js)
+
+    def test_capability_driven_ui_hides_unsupported_trade_tabs(self) -> None:
+        """Step 3: hide the LADDER tab when ladder capability is false,
+        and the ORDER tab when limit_orders capability is false. Must
+        be capability-driven, NOT exchange-name-driven.
+        """
+        app_js = Path("/root/kam/plugins/trade/webtrade2/static/app.js").read_text(encoding="utf-8")
+        # 1) setTradeTab reads capabilityFor().features
+        # It must check caps.ladder and caps.order_type_limit.
+        self.assertIn("caps.ladder", app_js)
+        self.assertIn("caps.order_type_limit", app_js)
+        # 2) Trade-tab buttons get hidden when capability missing.
+        self.assertIn("btn.hidden = true", app_js)
+        # 3) Negative: no exchange-name-based tab hiding.
+        self.assertNotIn("data-trade-tab === \"ladder\"", app_js)
+
 
 if __name__ == "__main__":
     unittest.main()

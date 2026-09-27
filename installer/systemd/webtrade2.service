@@ -8,18 +8,27 @@ Type=simple
 WorkingDirectory=__HERMES_ROOT__
 Environment=PYTHONPATH=__HERMES_ROOT__
 Environment=HERMES_HOME=__HERMES_HOME__
-# Phase 2 controlled activation.
-#   WRITE_ENABLED=1     — write endpoints are mounted (preview/execute/TP/SL/Close/Cancel).
-#   DRY_RUN=0           — LIVE exchange writes are permitted for orders + position
-#                         management (set_tp / set_sl / close_position) and
-#                         single-order cancel.
-#   LADDER_ENABLED=0    — LIVE ladder writes are PERMANENTLY disabled at this
-#                         stage. The ladder Confirm modal in the UI shows
-#                         'LIVE LADDER TEST NOT YET ENABLED' and the server
-#                         refuses any LIVE ladder execute with
-#                         LADDER_NOT_ENABLED. To enable ladders after explicit
-#                         approval, set LADDER_ENABLED=1 and restart
-#                         webtrade2.service.
+# Phase 2 controlled activation. The deployed webtrade2.service ships
+# with every LIVE flag OFF; flip individually after explicit approval:
+#   WRITE_ENABLED=1     — mounts write endpoints (preview/execute/TP/SL/Close/Cancel).
+#                        Defaults to 0 (read-only).
+#   DRY_RUN=1           — LIVE exchange writes are NOT permitted. When 1,
+#                        the server rejects any execute / set_tp / set_sl /
+#                        close_position / cancel with WRITE_DISABLED or
+#                        DRY_RUN_REJECT. Set DRY_RUN=0 only when LIVE
+#                        activation is explicitly approved AND the
+#                        WEBTRADE2_LIVE_ACCOUNTS allowlist includes the
+#                        target (exchange, account) pair.
+#   LADDER_ENABLED=0    — LIVE ladder writes are PERMANENTLY disabled at
+#                        this stage. The ladder Confirm modal in the UI
+#                        shows 'LIVE LADDER TEST NOT YET ENABLED' and the
+#                        server refuses any LIVE ladder execute with
+#                        LADDER_NOT_ENABLED. Set LADDER_ENABLED=1 only
+#                        after explicit LIVE-ladder approval.
+#   LIVE_ACCOUNTS=      — Optional. Comma-separated exchange:account
+#                        tokens that identify which accounts are LIVE-
+#                        eligible. When unset, NO account is LIVE-eligible
+#                        even if DRY_RUN=0.
 #   PREVIEW_TTL_SECONDS=300 — preview_id validity window.
 Environment=WEBTRADE2_WRITE_ENABLED=1
 Environment=WEBTRADE2_DRY_RUN=1

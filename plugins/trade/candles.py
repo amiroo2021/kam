@@ -1188,10 +1188,29 @@ def fetch_for_exchange(exchange: str, symbol: str, tf: str, limit: int = 300, *,
         raise RuntimeError(f"UNSUPPORTED_CANDLES: {UNSUPPORTED_NATIVE_CANDLES.get(ex, 'No native candle adapter registered.')}")
     if ex == "binance":
         market = "futures" if str(account).lower() in {"futures", "future", "perp", "perps"} else "spot"
-        return fn(symbol, tf, limit=limit, market=market)
-    if ex == "perpl":
-        return fn(symbol, tf, limit=limit, account=account)
-    return fn(symbol, tf, limit=limit)
+        rows = fn(symbol, tf, limit=limit, market=market)
+    elif ex == "perpl":
+        rows = fn(symbol, tf, limit=limit, account=account)
+    else:
+        rows = fn(symbol, tf, limit=limit)
+    # Generic upstream-error guard: if a fetcher returned a non-list
+    # (e.g. an error envelope dict from the upstream), raise so the
+    # handle_candles_operation layer can surface a CANDLES_UPSTREAM_ERROR
+    # instead of a silent success=true / count=0.
+    if not isinstance(rows, list):
+        msg = ""
+        if isinstance(rows, dict):
+            msg = (
+                str(rows.get("msg") or rows.get("error") or rows.get("message") or "")
+                or f"Upstream returned non-list body (keys={sorted(rows.keys())[:5]})"
+            )
+            code = rows.get("code") or rows.get("status")
+            if isinstance(code, (int, float)) and code != 0:
+                msg = f"Upstream error code={int(code)}: {msg}"
+        else:
+            msg = f"Upstream returned non-list body (type={type(rows).__name__})"
+        raise RuntimeError(f"CANDLES_UPSTREAM_ERROR: {msg[:240]}")
+    return rows
 
 
 def candle_error_class(error_message: str) -> str:
