@@ -20,6 +20,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from plugins.trade.canonical import CanonicalInstrument, make_success
+
 from fastapi.testclient import TestClient
 
 
@@ -156,6 +158,41 @@ class FakeDesk:
             )
         return FakeCanonical(success=False, error={"code": "UNSUPPORTED_OP", "message": f"unsupported op {op}"})
 
+
+
+class MetadataDesk(FakeDesk):
+    def __init__(self, *, minimum_size: str = "0.1", size_increment: str = "0.1") -> None:
+        super().__init__()
+        self.minimum_size = minimum_size
+        self.size_increment = size_increment
+
+    def execute(self, request: Dict[str, Any]):
+        self.calls.append(dict(request))
+        if request.get("operation") == "resolve_instrument":
+            sym = str(request.get("symbol") or "BTC")
+            return make_success(
+                operation="resolve_instrument",
+                exchange=str(request.get("exchange") or ""),
+                account=str(request.get("account") or ""),
+                instrument=CanonicalInstrument(
+                    requested_symbol=sym,
+                    symbol=sym,
+                    display_name=sym,
+                    price_increment="0.5",
+                    size_increment=self.size_increment,
+                    minimum_size=self.minimum_size,
+                ),
+            )
+        return super().execute(request)
+
+
+class FailingMutationDesk(MetadataDesk):
+    MUTATIONS = {"new_order", "ladder", "cancel_order", "cancel_orders", "cancel_order_group", "set_tp", "set_sl", "close_position"}
+
+    def execute(self, request: Dict[str, Any]):
+        if request.get("operation") in self.MUTATIONS:
+            raise AssertionError(f"mutation dispatch reached desk in DRY_RUN: {request}")
+        return super().execute(request)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -690,6 +727,303 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         self.assertEqual(out.get("status"), "DRY_RUN")
         writes = [c for c in desk.calls if c.get("operation") == "cancel_order_group"]
         self.assertEqual(writes, [])
+
+
+
+    def test_preview_ladder_rejects_insufficient_volume_without_500(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = MetadataDesk(minimum_size="0.1", size_increment="0.1")
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        app = app_mod.create_app(config=cfg, phase2=p2)
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/trade/preview_ladder",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "distribution": "uniform", "order_count": 3, "total_size": "0.1", "start_price": "110", "end_price": "90"},
+            headers=_hdr(csrf),
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json().get("error", {}).get("code"), "INSUFFICIENT_VOLUME_FOR_ORDER_COUNT")
+
+
+    def test_position_side_propagates_for_tp_sl_close_dry_run(self) -> None:
+        app, desk, _, _ = _build_app()
+        client = TestClient(app)
+        csrf = _login(client)
+        cases = [
+            ("/api/position/set_tp", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "SELL", "price": "110"}, "set_tp"),
+            ("/api/position/set_sl", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "short", "price": "90"}, "set_sl"),
+            ("/api/position/close", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "BUY"}, "close_position"),
+        ]
+        for path, payload, op in cases:
+            r = client.post(path, json=payload, headers=_hdr(csrf))
+            self.assertEqual(r.status_code, 200, r.text)
+            out = r.json()
+            self.assertEqual(out.get("status"), "DRY_RUN")
+            expected_side = "sell" if payload["side"].lower() in {"sell", "short"} else "buy"
+            self.assertEqual(out.get("side"), expected_side)
+            self.assertEqual(out.get("symbol"), "BTC")
+            self.assertEqual([c for c in desk.calls if c.get("operation") == op], [])
+
+    def test_position_side_remains_optional_for_existing_generic_clients(self) -> None:
+        app, desk, _, _ = _build_app()
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/position/set_tp",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "price": "110"},
+            headers=_hdr(csrf),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out.get("status"), "DRY_RUN")
+        self.assertEqual(out.get("side"), "")
+        self.assertEqual([c for c in desk.calls if c.get("operation") == "set_tp"], [])
+
+    def test_preview_order_rejects_size_below_known_minimum(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = MetadataDesk(minimum_size="0.1", size_increment="0.01")
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        app = app_mod.create_app(config=cfg, phase2=p2)
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/trade/preview_order",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "size": "0.09", "price": "100"},
+            headers=_hdr(csrf),
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json().get("error", {}).get("code"), "SIZE_BELOW_MINIMUM")
+        self.assertEqual(r.json().get("minimum_size"), "0.1")
+
+    def test_preview_order_preserves_increment_quantization_behavior(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = MetadataDesk(minimum_size="0.1", size_increment="0.1")
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        app = app_mod.create_app(config=cfg, phase2=p2)
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.post(
+            "/api/trade/preview_order",
+            json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "size": "0.26", "price": "100.2"},
+            headers=_hdr(csrf),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out.get("requested_size"), "0.26")
+        self.assertEqual(out.get("final_size"), "0.3")
+        self.assertEqual(out.get("final_price"), "100")
+
+    def test_hard_dry_run_boundary_blocks_every_mutation_dispatch(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = FailingMutationDesk()
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=True, preview_ttl_seconds=300, ladder_enabled=False)
+        app = app_mod.create_app(config=cfg, phase2=p2)
+        client = TestClient(app)
+        csrf = _login(client)
+
+        order = client.post("/api/trade/preview_order", json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "size": "1", "price": "100"}, headers=_hdr(csrf)).json()
+        self.assertEqual(client.post("/api/trade/execute", json={"preview_id": order["preview_id"]}, headers=_hdr(csrf)).json().get("status"), "DRY_RUN")
+
+        ladder = client.post("/api/trade/preview_ladder", json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "sell", "distribution": "uniform", "order_count": 3, "total_size": "3", "start_price": "90", "end_price": "110"}, headers=_hdr(csrf)).json()
+        self.assertEqual(client.post("/api/trade/execute", json={"preview_id": ladder["preview_id"]}, headers=_hdr(csrf)).json().get("status"), "DRY_RUN")
+
+        for path, payload in [
+            ("/api/position/set_tp", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "price": "110"}),
+            ("/api/position/set_sl", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "sell", "price": "90"}),
+            ("/api/position/close", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy"}),
+            ("/api/orders/cancel_group", {"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "buy", "order_type": "limit", "order_ids": ["a", "b"]}),
+        ]:
+            r = client.post(path, json=payload, headers=_hdr(csrf))
+            self.assertEqual(r.status_code, 200, f"{path}: {r.text}")
+            self.assertEqual(r.json().get("status"), "DRY_RUN")
+
+    def test_ladder_enabled_zero_blocks_live_ladder_before_dispatch(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=False)
+        desk = FailingMutationDesk()
+        p2 = p2_mod.WebTrade2Phase2Service(desk=desk, session_secret="x" * 32, write_enabled=True, dry_run=False, preview_ttl_seconds=300, ladder_enabled=False)
+        app = app_mod.create_app(config=cfg, phase2=p2)
+        client = TestClient(app)
+        csrf = _login(client)
+        body = client.post("/api/trade/preview_ladder", json={"exchange": "hyperliquid", "account": "fibo", "symbol": "BTC", "side": "sell", "distribution": "uniform", "order_count": 3, "total_size": "3", "start_price": "90", "end_price": "110"}, headers=_hdr(csrf)).json()
+        r = client.post("/api/trade/execute", json={"preview_id": body["preview_id"]}, headers=_hdr(csrf))
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json().get("error", {}).get("code"), "LADDER_NOT_ENABLED")
+
+
+
+class HedgingPositionDesk(FakeDesk):
+    """Simulate MetaTrader positions_orders with two independent BUY/SELL groups."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.account_state_payload = {
+            "success": True,
+            "positions": [
+                {
+                    "symbol": "BTCUSD", "side": "BUY",
+                    "size": "3.42", "entry_price": "67500",
+                    "pnl": "0", "tp": "89000", "sl": "60000",
+                },
+                {
+                    "symbol": "BTCUSD", "side": "SELL",
+                    "size": "4.15", "entry_price": "85500",
+                    "pnl": "0", "tp": "60000", "sl": "89000",
+                },
+            ],
+            "order_groups": [
+                {"symbol": "BTCUSD", "side": "buy", "order_count": 1, "total_size": "0.1",
+                 "vwap": "70000", "min_price": "69900", "max_price": "70100"},
+            ],
+        }
+
+    def execute(self, request):
+        op = request.get("operation")
+        if op == "positions_orders":
+            self.calls.append(dict(request))
+            from plugins.trade.canonical import make_success
+            return make_success(
+                operation="positions_orders",
+                exchange="metatrader",
+                account=str(request.get("account") or ""),
+                data={"positions": self.account_state_payload["positions"],
+                      "order_groups": self.account_state_payload["order_groups"],
+                      "open_order_count": 1},
+            )
+        return super().execute(request)
+
+
+class HedgingHTTPMutationDesk(HedgingPositionDesk):
+    MUTATIONS = {"new_order", "ladder", "cancel_order", "cancel_orders",
+                 "cancel_order_group", "set_tp", "set_sl", "close_position"}
+
+    def execute(self, request):
+        op = request.get("operation")
+        if op in self.MUTATIONS:
+            raise AssertionError(f"mutation dispatch reached desk in DRY_RUN: {request}")
+        return super().execute(request)
+
+
+    def test_account_state_preserves_both_btc_buy_and_sell_groups(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        svc_mod = _import("plugins.trade.webtrade2.service")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = HedgingPositionDesk()
+        svc = svc_mod.WebTrade2Service(desk=desk)
+        app = app_mod.create_app(config=cfg, service=svc)
+        client = TestClient(app)
+        csrf = _login(client)
+        r = client.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf))
+        self.assertEqual(r.status_code, 200, r.text)
+        positions = r.json().get("positions") or []
+        sides = [(p.get("symbol"), p.get("side")) for p in positions]
+        self.assertEqual(sides.count(("BTCUSD", "BUY")), 1)
+        self.assertEqual(sides.count(("BTCUSD", "SELL")), 1)
+        buy = next(p for p in positions if p.get("side") == "BUY")
+        sell = next(p for p in positions if p.get("side") == "SELL")
+        self.assertEqual(buy.get("size"), "3.42")
+        self.assertEqual(buy.get("entry_price"), "67500")
+        self.assertEqual(buy.get("tp"), "89000")
+        self.assertEqual(buy.get("sl"), "60000")
+        self.assertEqual(sell.get("size"), "4.15")
+        self.assertEqual(sell.get("entry_price"), "85500")
+        self.assertEqual(sell.get("tp"), "60000")
+        self.assertEqual(sell.get("sl"), "89000")
+        # Pending orders remain separate.
+        self.assertEqual(len(r.json().get("order_groups") or []), 1)
+
+    def test_hedging_set_tp_sends_symbol_and_side_per_group(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        svc_mod = _import("plugins.trade.webtrade2.service")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = HedgingHTTPMutationDesk()
+        svc = svc_mod.WebTrade2Service(desk=desk)
+        app = app_mod.create_app(config=cfg, service=svc)
+        client = TestClient(app)
+        csrf = _login(client)
+        for side in ("BUY", "SELL"):
+            r = client.post(
+                "/api/position/set_tp",
+                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                      "symbol": "BTCUSD", "side": side, "price": "70000"},
+                headers=_hdr(csrf),
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            out = r.json()
+            self.assertEqual(out.get("status"), "DRY_RUN")
+            self.assertEqual(out.get("symbol"), "BTCUSD")
+            self.assertEqual(out.get("side"), side.lower())
+        # No mutation dispatch reached the desk.
+        writes = [c for c in desk.calls if c.get("operation") in HedgingHTTPMutationDesk.MUTATIONS]
+        self.assertEqual(writes, [])
+
+    def test_hedging_set_sl_sends_symbol_and_side_per_group(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        svc_mod = _import("plugins.trade.webtrade2.service")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = HedgingHTTPMutationDesk()
+        svc = svc_mod.WebTrade2Service(desk=desk)
+        app = app_mod.create_app(config=cfg, service=svc)
+        client = TestClient(app)
+        csrf = _login(client)
+        for side in ("BUY", "SELL"):
+            r = client.post(
+                "/api/position/set_sl",
+                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                      "symbol": "BTCUSD", "side": side, "price": "70000"},
+                headers=_hdr(csrf),
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            out = r.json()
+            self.assertEqual(out.get("status"), "DRY_RUN")
+            self.assertEqual(out.get("symbol"), "BTCUSD")
+            self.assertEqual(out.get("side"), side.lower())
+        writes = [c for c in desk.calls if c.get("operation") in HedgingHTTPMutationDesk.MUTATIONS]
+        self.assertEqual(writes, [])
+
+    def test_hedging_close_sends_symbol_and_side_per_group(self) -> None:
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        app_mod = _import("plugins.trade.webtrade2.app")
+        svc_mod = _import("plugins.trade.webtrade2.service")
+        cfg = cfg_mod.WebTrade2Config.from_values(password="test-password", session_secret="x" * 32, port=9009, write_enabled=True, dry_run=True, preview_ttl_seconds=300)
+        desk = HedgingHTTPMutationDesk()
+        svc = svc_mod.WebTrade2Service(desk=desk)
+        app = app_mod.create_app(config=cfg, service=svc)
+        client = TestClient(app)
+        csrf = _login(client)
+        for side in ("BUY", "SELL"):
+            r = client.post(
+                "/api/position/close",
+                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                      "symbol": "BTCUSD", "side": side},
+                headers=_hdr(csrf),
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            out = r.json()
+            self.assertEqual(out.get("status"), "DRY_RUN")
+            self.assertEqual(out.get("symbol"), "BTCUSD")
+            self.assertEqual(out.get("side"), side.lower())
+        writes = [c for c in desk.calls if c.get("operation") in HedgingHTTPMutationDesk.MUTATIONS]
+        self.assertEqual(writes, [])
+
 
     # ---- 24. market order hidden/rejected when unsupported ----------
 

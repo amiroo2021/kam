@@ -82,6 +82,15 @@ def _fmt_dec(value: Optional[Decimal]) -> Optional[str]:
     return text or "0"
 
 
+def _normalized_optional_side(side: Any) -> str:
+    text = str(side or "").strip().lower()
+    if text in {"buy", "long"}:
+        return "buy"
+    if text in {"sell", "short"}:
+        return "sell"
+    return ""
+
+
 def _safe_error(resp: Any) -> Dict[str, str]:
     """Mirror of WebTradeService._safe_error: scrub secret-bearing strings."""
     err = _to_plain(getattr(resp, "error", None)) or {}
@@ -345,8 +354,18 @@ class WebTrade2Phase2Service:
                         native_symbol = native.strip()
                     if isinstance(inst, dict):
                         meta = inst.get("format_meta") or inst
-                        px_inc = _dec(meta.get("price_increment")) or final_price
-                        sz_inc = _dec(meta.get("size_increment")) or final_size
+                        px_inc = _dec(meta.get("price_increment"))
+                        sz_inc = _dec(meta.get("size_increment"))
+                        min_size = _dec(meta.get("minimum_size") or meta.get("min_size"))
+                        if min_size is not None and req_size is not None and req_size < min_size:
+                            return {
+                                "success": False,
+                                "error": {
+                                    "code": "SIZE_BELOW_MINIMUM",
+                                    "message": f"Size must be at least {_fmt_dec(min_size)}.",
+                                },
+                                "minimum_size": _fmt_dec(min_size),
+                            }
                         if px_inc is not None and final_price is not None and px_inc > 0:
                             final_price = quantize_to_increment(final_price, px_inc)
                         if sz_inc is not None and final_size is not None and sz_inc > 0:
@@ -475,16 +494,20 @@ class WebTrade2Phase2Service:
             px_inc = Decimal("0.01")
             sz_inc = Decimal("0.0001")
 
-        children_raw, submitted_total, vwap = build_ladder_children(
-            side=str(side).strip().lower(),
-            distribution=dist,
-            order_count=n,
-            total_volume=ts,
-            start_price=sp,
-            end_price=ep,
-            price_increment=px_inc,
-            size_increment=sz_inc,
-        )
+        try:
+            children_raw, submitted_total, vwap = build_ladder_children(
+                side=str(side).strip().lower(),
+                distribution=dist,
+                order_count=n,
+                total_volume=ts,
+                start_price=sp,
+                end_price=ep,
+                price_increment=px_inc,
+                size_increment=sz_inc,
+            )
+        except ValueError as exc:
+            code = str(exc) or "INVALID_LADDER"
+            return {"success": False, "error": {"code": code, "message": code.replace("_", " ").title()}}
         # Children from ladder_math are dicts {price, size} already.
         children_serialized: List[Dict[str, str]] = []
         for ch in children_raw:
@@ -855,7 +878,10 @@ class WebTrade2Phase2Service:
         gate = self._gate()
         if gate:
             return {"_http_status": gate[0], **gate[1]}
-        verr = self._validate_inputs(exchange=exchange, account=account, symbol=symbol, side=side or "buy")
+        normalized_side = _normalized_optional_side(side)
+        if side and not normalized_side:
+            return {"success": False, "error": {"code": "INVALID_SIDE", "message": "side must be buy or sell."}}
+        verr = self._validate_inputs(exchange=exchange, account=account, symbol=symbol, side=normalized_side or "buy")
         if verr:
             return verr
         cap_err = self._require_capability(exchange, operation)
@@ -873,7 +899,7 @@ class WebTrade2Phase2Service:
                 "account": account,
                 "market_type": "futures",
                 "symbol": symbol,
-                "side": side,
+                "side": normalized_side,
                 "mode": "DRY_RUN",
                 "exchange_order_ids": [],
                 "message": "DRY_RUN: validated successfully; no exchange write was performed.",
@@ -889,7 +915,7 @@ class WebTrade2Phase2Service:
                 exchange=exchange,
                 account=account,
                 symbol=symbol,
-                side=side,
+                side=normalized_side,
                 mode="DRY_RUN",
                 status=status,
                 accepted=out["accepted"],
@@ -903,8 +929,8 @@ class WebTrade2Phase2Service:
             "account": account,
             "symbol": symbol,
         }
-        if side:
-            req["side"] = side
+        if normalized_side:
+            req["side"] = normalized_side
         if extra:
             req.update(extra)
         t0 = time.perf_counter()
@@ -921,7 +947,7 @@ class WebTrade2Phase2Service:
             "account": account,
             "market_type": "futures",
             "symbol": symbol,
-            "side": side,
+            "side": normalized_side,
             "mode": "LIVE",
             "timing_ms": {"tradedesk_ms": desk_ms},
             "requested": 1,
@@ -936,7 +962,7 @@ class WebTrade2Phase2Service:
                 exchange=exchange,
                 account=account,
                 symbol=symbol,
-                side=side,
+                side=normalized_side,
                 mode="LIVE",
                 status="REJECTED",
                 accepted=0,
@@ -949,7 +975,7 @@ class WebTrade2Phase2Service:
                 exchange=exchange,
                 account=account,
                 symbol=symbol,
-                side=side,
+                side=normalized_side,
                 mode="LIVE",
                 status=status,
                 accepted=1,
@@ -973,27 +999,27 @@ class WebTrade2Phase2Service:
 
     # public wrappers -----------------------------------------------------
 
-    def set_tp(self, exchange: str, account: str, symbol: str, price: str) -> Dict[str, Any]:
+    def set_tp(self, exchange: str, account: str, symbol: str, price: str, side: str = "") -> Dict[str, Any]:
         verr = self._validate_inputs(exchange=exchange, account=account, symbol=symbol, side="buy",
                                      extra_required=(("price", price),))
         if verr:
             return verr
         return self._one_shot(operation="set_tp", exchange=exchange, account=account,
-                              symbol=symbol, side="", extra={"price": str(price).strip()},
+                              symbol=symbol, side=side, extra={"price": str(price).strip()},
                               preview_kind="set_tp")
 
-    def set_sl(self, exchange: str, account: str, symbol: str, price: str) -> Dict[str, Any]:
+    def set_sl(self, exchange: str, account: str, symbol: str, price: str, side: str = "") -> Dict[str, Any]:
         verr = self._validate_inputs(exchange=exchange, account=account, symbol=symbol, side="buy",
                                      extra_required=(("price", price),))
         if verr:
             return verr
         return self._one_shot(operation="set_sl", exchange=exchange, account=account,
-                              symbol=symbol, side="", extra={"price": str(price).strip()},
+                              symbol=symbol, side=side, extra={"price": str(price).strip()},
                               preview_kind="set_sl")
 
-    def close_position(self, exchange: str, account: str, symbol: str) -> Dict[str, Any]:
+    def close_position(self, exchange: str, account: str, symbol: str, side: str = "") -> Dict[str, Any]:
         return self._one_shot(operation="close_position", exchange=exchange, account=account,
-                              symbol=symbol, side="", extra={}, preview_kind="close_position")
+                              symbol=symbol, side=side, extra={}, preview_kind="close_position")
 
     def cancel_order_group(
         self,

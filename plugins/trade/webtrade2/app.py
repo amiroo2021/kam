@@ -132,8 +132,10 @@ def create_app(
         return svc.capability_description(exchange)
 
     @app.get("/api/markets")
-    def api_markets(exchange: str, account: str, market_type: str = "futures", search: str = "", _: str = Depends(require_auth)) -> dict:
-        return svc.markets(exchange, account, market_type, search)
+    def api_markets(exchange: str, account: str, market_type: str = "futures",
+                    search: str = "", sort: str = "volume",
+                    _: str = Depends(require_auth)) -> dict:
+        return svc.markets(exchange, account, market_type, search, sort=sort)
 
     @app.get("/api/account/state")
     def api_account_state(exchange: str, account: str, _: str = Depends(require_auth)) -> dict:
@@ -237,6 +239,7 @@ def create_app(
             exchange=str(body.get("exchange") or ""),
             account=str(body.get("account") or ""),
             symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or ""),
             price=str(body.get("price") or ""),
         )
         return _send(out)
@@ -248,6 +251,7 @@ def create_app(
             exchange=str(body.get("exchange") or ""),
             account=str(body.get("account") or ""),
             symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or ""),
             price=str(body.get("price") or ""),
         )
         return _send(out)
@@ -259,6 +263,7 @@ def create_app(
             exchange=str(body.get("exchange") or ""),
             account=str(body.get("account") or ""),
             symbol=str(body.get("symbol") or ""),
+            side=str(body.get("side") or ""),
         )
         return _send(out)
 

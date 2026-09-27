@@ -198,5 +198,38 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
         self.assertIn('id="ladderSell"', html, "index.html must have #ladderSell button")
 
 
+    def test_position_management_payloads_send_structured_side(self) -> None:
+        """TP/SL/close must preserve structured position.side in the request payload.
+
+        The frontend may normalize canonical long/short or buy/sell values, but
+        it must not infer side from visual classes, colors, or row text.
+        """
+        app_js = Path("/root/kam/plugins/trade/webtrade2/static/app.js").read_text(encoding="utf-8")
+        self.assertIn("function positionSideForRequest(position)", app_js)
+        self.assertIn("position?.side", app_js)
+        self.assertIn("raw === 'buy' || raw === 'long'", app_js)
+        self.assertIn("raw === 'sell' || raw === 'short'", app_js)
+        self.assertIn("symbol: position.symbol, side: positionSideForRequest(position), price: newPrice", app_js)
+        self.assertIn("symbol: position.symbol, side: positionSideForRequest(position) }),", app_js)
+
+
+    def test_positions_tab_uses_side_aware_identity(self) -> None:
+        """The Positions tab must key rows by (symbol + side), never symbol alone.
+
+        MetaTrader is a hedging venue where the same symbol can hold
+        independent BUY and SELL groups. A symbol-only DOM key would
+        let the second group overwrite the first.
+        """
+        app_js = Path("/root/kam/plugins/trade/webtrade2/static/app.js").read_text(encoding="utf-8")
+        self.assertIn("data-pos-key=", app_js)
+        self.assertIn("positionKey(p)", app_js)
+        self.assertIn("${p.symbol || p.instrument || p.market || ''}|${positionSideForRequest(p)}", app_js)
+        # Row identity MUST use positionSideForRequest (canonical), never derive from P/L sign.
+        self.assertNotIn("p.side === 'long' ? 'buy' : 'sell'", app_js)
+        # Position row click must select the instrument (symbol-only is OK for market picker).
+        # But the position-management payload (TP/SL/close) must use structured side.
+        self.assertIn("side: positionSideForRequest(position)", app_js)
+
+
 if __name__ == "__main__":
     unittest.main()
