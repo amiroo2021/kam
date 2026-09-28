@@ -1716,15 +1716,20 @@ class TradeWizard:
         lines = ["New Order"]
         order = response.order if response.success and getattr(response, "order", None) is not None else None
         if order is not None:
+            status = str(getattr(order, "status", "") or "").strip().lower()
+            is_preview = status in {"dry_run", "preview", "built"}
             lines.extend([
                 "",
-                "✅ Order Submitted",
+                "🧪 Order Preview Built" if is_preview else "✅ Order Submitted",
                 f"Exchange: {state.exchange}",
                 f"Account: {state.account}",
                 "",
                 f"{side_label} {symbol}",
-                f"Verified on exchange: {'Yes' if order.verified else 'No'}",
             ])
+            if is_preview:
+                lines.append("Live submission: No")
+                lines.append("Signed/submitted: No")
+            lines.append(f"Verified on exchange: {'Yes' if order.verified else 'No'}")
         else:
             error = response.error
             lines.extend(_render_error_lines(error, "Order submission failed."))
@@ -2614,13 +2619,31 @@ class TradeWizard:
             "",
             "What would you like to do?",
         ]
+        # Gate mutation buttons by agent capabilities. Empty caps (test stubs /
+        # unknown desks) keep the legacy full button set so existing wizard
+        # tests stay green; real agents that omit set_tp/set_sl/close_position
+        # must not show those actions.
+        caps = self._agent_capabilities(state.exchange)
+        show_all = not caps
+        show_tp = show_all or "set_tp" in caps
+        show_sl = show_all or "set_sl" in caps
+        show_close = show_all or "close_position" in caps
+        buttons: List[List[Dict[str, str]]] = []
+        action_row: List[Dict[str, str]] = []
+        if show_tp:
+            action_row.append(_button_row("Set TP", "set_tp"))
+        if show_sl:
+            action_row.append(_button_row("Set SL", "set_sl"))
+        if action_row:
+            buttons.append(action_row)
+        if show_close:
+            buttons.append([_button_row("Close Position", "close_position")])
+        if not show_tp and not show_sl and not show_close:
+            lines[-1] = "No position actions available on this exchange."
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
         return Screen(
             text="\n".join(lines),
-            buttons=[
-                [_button_row("Set TP", "set_tp"), _button_row("Set SL", "set_sl")],
-                [_button_row("Close Position", "close_position")],
-                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
-            ],
+            buttons=buttons,
             state="position_detail",
         )
 

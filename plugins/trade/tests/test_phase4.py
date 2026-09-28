@@ -351,6 +351,54 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertIn("Set SL", detail_labels)
         self.assertIn("Close Position", detail_labels)
 
+    def test_position_detail_hides_unsupported_actions_when_caps_known(self):
+        """When the desk advertises capabilities without set_tp/set_sl/close,
+        the detail screen must not show those buttons (Bulk path).
+        """
+        class CapsDesk(SequenceDesk):
+            def list_exchanges(self):
+                return ["bulk"]
+
+            def list_accounts(self, exchange: str):
+                return ["amiroo"] if exchange == "bulk" else []
+
+            def capabilities(self, exchange: str):
+                if exchange != "bulk":
+                    return []
+                return [
+                    "balance",
+                    "positions_orders",
+                    "positions_management",
+                    "new_order",
+                    "ladder",
+                    "cancel_order_group",
+                ]
+
+        response = make_success(
+            operation="positions_management",
+            exchange="bulk",
+            account="amiroo",
+            positions=[
+                CanonicalPosition(symbol="HYPE", side="short", size="10", entry_price="100", pnl="1", tp=None, sl=None),
+            ],
+        )
+        desk = CapsDesk([response])
+        wizard = TradeWizard(tradedesk=desk)  # type: ignore[arg-type]
+        key = ("chat",)
+        wizard.open(key)
+        wizard.handle_callback(key, "exchange:bulk")
+        wizard.handle_callback(key, "account:amiroo")
+        list_screen = wizard.handle_callback(key, "action:positions_management")
+        self.assertIn("Positions Management", list_screen.text)
+        self.assertIn("HYPE", list_screen.text)
+        detail = wizard.handle_callback(key, "position:HYPE:short")
+        labels = [btn["text"] for row in detail.buttons for btn in row]
+        self.assertNotIn("Set TP", labels)
+        self.assertNotIn("Set SL", labels)
+        self.assertNotIn("Close Position", labels)
+        self.assertIn("No position actions available on this exchange.", detail.text)
+        self.assertIn("◀️ Back", labels)
+
     def test_positions_management_tp_entry_confirmation_writes_and_verifies(self):
         read = self._positions_response([
             CanonicalPosition(symbol="HYPE", side="short", size="319.84", entry_price="71.075", pnl="+3573.91", tp=None, sl=None),
