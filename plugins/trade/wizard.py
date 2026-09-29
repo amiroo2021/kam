@@ -2175,6 +2175,29 @@ class TradeWizard:
                 lines.append(f"Succeeded: {succeeded}")
             if failed is not None:
                 lines.append(f"Failed: {failed}")
+            ladder_obj = getattr(response, "ladder", None)
+            if ladder_obj is not None and getattr(ladder_obj, "status", None):
+                lines.append(f"Status: {ladder_obj.status}")
+            plan = data.get("batch_plan") if isinstance(data, dict) else None
+            if isinstance(plan, list) and plan:
+                sizes = [str(item.get("size")) for item in plan if isinstance(item, dict) and item.get("size") is not None]
+                if sizes:
+                    lines.append(f"Batch plan: {'+'.join(sizes)} (size {data.get('batch_size', 50)})")
+            batches = data.get("batches") if isinstance(data, dict) else None
+            if isinstance(batches, list) and batches and isinstance(plan, list) and plan:
+                ok_n = sum(1 for item in batches if isinstance(item, dict) and item.get("ok"))
+                lines.append(f"Batches completed: {ok_n}/{len(plan)}")
+            if (isinstance(data, dict) and data.get("rate_limited")) or (
+                ladder_obj is not None and getattr(ladder_obj, "rate_limited", None)
+            ):
+                lines.append("Note: Bulk rate-limited later batches; resting children were kept.")
+            reason = None
+            if ladder_obj is not None:
+                reason = getattr(ladder_obj, "exchange_reason", None)
+            if not reason and isinstance(data, dict):
+                reason = data.get("verification_error")
+            if reason:
+                lines.append(f"Detail: {reason}")
             failures = data.get("failures") if isinstance(data, dict) else None
             if isinstance(failures, list) and failures:
                 shown = failures[:5]

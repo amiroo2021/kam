@@ -238,6 +238,7 @@ class TestBulkAgent(unittest.TestCase):
             (110, [50, 50, 10]),
             (50, [50]),
             (51, [50, 1]),
+            (200, [50, 50, 50, 50]),
         ]
         for order_count, expected_sizes in cases:
             after = {
@@ -281,24 +282,67 @@ class TestBulkAgent(unittest.TestCase):
         market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 1, "lotSize": 0.1}
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
              mock.patch.object(bulk, "_find_market", return_value=market), \
-             mock.patch.object(bulk, "_submit_order", side_effect=RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")), \
-             mock.patch.object(bulk.time, "sleep", return_value=None):
+             mock.patch.object(bulk, "_submit_order", side_effect=RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")) as submit, \
+             mock.patch.object(bulk.time, "sleep", return_value=None) as slept:
             resp = bulk.execute({"operation": "ladder", "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "buy", "distribution": "uniform", "order_count": "2", "total_volume": "1", "start_price": "100", "end_price": "101"})
         self.assertFalse(resp.success)
         self.assertEqual(resp.error.code, "BULK_RATE_LIMITED")
         self.assertTrue(resp.ladder.rate_limited)
+        # initial attempt + LADDER_BATCH_MAX_RETRIES
+        self.assertEqual(submit.call_count, bulk.LADDER_BATCH_MAX_RETRIES + 1)
+        self.assertGreaterEqual(slept.call_count, bulk.LADDER_BATCH_MAX_RETRIES)
 
-    def test_ladder_stops_after_partial_rate_limit(self) -> None:
+    def test_ladder_retries_rate_limit_then_continues(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
         market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 1, "lotSize": 0.001}
-        after = {"openOrders": [{"symbol": "BTC-USD", "orderId": f"o{i}", "size": 1, "price": 100 + i} for i in range(50)]}
+        after = {"openOrders": [{"symbol": "BTC-USD", "orderId": f"o{i}", "size": 1, "price": 100 + i} for i in range(70)]}
+        # batch0 ok; batch1 first try 429 then ok
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
              mock.patch.object(bulk, "_find_market", return_value=market), \
              mock.patch.object(
                  bulk,
                  "_submit_order",
-                 side_effect=[{"status": "ok"}, RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")],
+                 side_effect=[
+                     {"status": "ok"},
+                     RuntimeError("HTTP 429: Too Many Requests (Retry-After: 3)"),
+                     {"status": "ok"},
+                 ],
              ) as submit, \
+             mock.patch.object(bulk, "_live_account", return_value=after), \
+             mock.patch.object(bulk.time, "sleep", return_value=None) as slept:
+            resp = bulk.execute({
+                "operation": "ladder",
+                "exchange": "bulk",
+                "account": "main",
+                "symbol": "BTC",
+                "side": "buy",
+                "distribution": "uniform",
+                "order_count": "70",
+                "total_volume": "70",
+                "start_price": "100",
+                "end_price": "169",
+            })
+        self.assertTrue(resp.success)
+        self.assertEqual(submit.call_count, 3)
+        self.assertEqual([len(c.args[1]) for c in submit.call_args_list], [50, 20, 20])
+        self.assertEqual(resp.ladder.accepted_child_count, 70)
+        self.assertEqual(resp.ladder.status, "success")
+        self.assertFalse(resp.ladder.rate_limited or False)
+        # one inter-batch pause + one retry pause (Retry-After 3)
+        self.assertGreaterEqual(slept.call_count, 2)
+
+    def test_ladder_stops_after_partial_rate_limit(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 1, "lotSize": 0.001}
+        after = {"openOrders": [{"symbol": "BTC-USD", "orderId": f"o{i}", "size": 1, "price": 100 + i} for i in range(50)]}
+        # batch0 ok; batch1 always 429 through all retries
+        side_effects = [{"status": "ok"}] + [
+            RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")
+            for _ in range(bulk.LADDER_BATCH_MAX_RETRIES + 1)
+        ]
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_submit_order", side_effect=side_effects) as submit, \
              mock.patch.object(bulk, "_live_account", return_value=after), \
              mock.patch.object(bulk.time, "sleep", return_value=None):
             resp = bulk.execute({
@@ -314,12 +358,15 @@ class TestBulkAgent(unittest.TestCase):
                 "end_price": "169",
             })
         self.assertTrue(resp.success)
-        self.assertEqual(submit.call_count, 2)
-        self.assertEqual([len(c.args[1]) for c in submit.call_args_list], [50, 20])
+        self.assertEqual(submit.call_count, 1 + bulk.LADDER_BATCH_MAX_RETRIES + 1)
+        self.assertEqual(len(submit.call_args_list[0].args[1]), 50)
+        for call in submit.call_args_list[1:]:
+            self.assertEqual(len(call.args[1]), 20)
         self.assertEqual(resp.ladder.accepted_child_count, 50)
         self.assertEqual(resp.ladder.status, "partial")
         self.assertTrue(resp.ladder.rate_limited)
         self.assertEqual(resp.data["failed"], 20)
+        self.assertTrue(resp.data["rate_limited"])
 
     def test_ladder_verification_rate_limit_returns_submitted(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
@@ -385,12 +432,13 @@ class TestBulkAgent(unittest.TestCase):
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
              mock.patch.object(bulk, "_find_market", return_value=market), \
              mock.patch.object(bulk, "_live_account", return_value=before), \
-             mock.patch.object(bulk, "_submit_order", side_effect=RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")), \
+             mock.patch.object(bulk, "_submit_order", side_effect=RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")) as submit, \
              mock.patch.object(bulk.time, "sleep", return_value=None):
             resp = bulk.execute({"operation": "cancel_order_group", "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "buy"})
         self.assertFalse(resp.success)
         self.assertEqual(resp.error.code, "BULK_RATE_LIMITED")
         self.assertTrue(resp.cancel_group.rate_limited)
+        self.assertEqual(submit.call_count, bulk.CANCEL_BATCH_MAX_RETRIES + 1)
 
     def test_cancel_group_partial_after_second_batch_rate_limit(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
@@ -407,19 +455,21 @@ class TestBulkAgent(unittest.TestCase):
                 for i in range(50, 72)
             ]
         }
+        side_effects = [{"status": "ok"}] + [
+            RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")
+            for _ in range(bulk.CANCEL_BATCH_MAX_RETRIES + 1)
+        ]
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
              mock.patch.object(bulk, "_find_market", return_value=market), \
              mock.patch.object(bulk, "_live_account", side_effect=[before, after]), \
-             mock.patch.object(
-                 bulk,
-                 "_submit_order",
-                 side_effect=[{"status": "ok"}, RuntimeError("HTTP 429: HTTP Error 429: Too Many Requests")],
-             ) as submit, \
+             mock.patch.object(bulk, "_submit_order", side_effect=side_effects) as submit, \
              mock.patch.object(bulk.time, "sleep", return_value=None):
             resp = bulk.execute({"operation": "cancel_order_group", "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "buy"})
         self.assertTrue(resp.success)
-        self.assertEqual(submit.call_count, 2)
-        self.assertEqual([len(c.args[1]) for c in submit.call_args_list], [50, 22])
+        self.assertEqual(submit.call_count, 1 + bulk.CANCEL_BATCH_MAX_RETRIES + 1)
+        self.assertEqual(len(submit.call_args_list[0].args[1]), 50)
+        for call in submit.call_args_list[1:]:
+            self.assertEqual(len(call.args[1]), 22)
         self.assertEqual(resp.cancel_group.cancelled_order_count, 50)
         self.assertEqual(resp.cancel_group.remaining_target_count, 22)
         self.assertEqual(resp.cancel_group.status, "partial")

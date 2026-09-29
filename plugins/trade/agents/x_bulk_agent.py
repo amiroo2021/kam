@@ -53,13 +53,19 @@ API_TIMEOUT_SECONDS = 20
 DEFAULT_UNIT = "USDC"
 # Ladder children are submitted as multiple signed POST /order transactions.
 # Each transaction carries up to LADDER_BATCH_SIZE limit actions.
-# Example: 70 orders -> batches of 50 + 20; 110 -> 50 + 50 + 10.
+# Example: 70 orders -> batches of 50 + 20; 110 -> 50 + 50 + 10; 200 -> 50×4.
 LADDER_BATCH_SIZE = 50
-LADDER_BATCH_PAUSE_SECONDS = 2.0
+LADDER_BATCH_PAUSE_SECONDS = 5.0
+# On HTTP 429, retry the *same* batch with exponential backoff before giving up.
+# Bounded retries only — do not probe the live rate limit by inventing extra traffic.
+LADDER_BATCH_MAX_RETRIES = 3
+LADDER_BATCH_RETRY_BASE_SECONDS = 5.0
 # Cancel group uses the same chunk size: side-filtered `cx` actions, not symbol-wide
 # `cxa` (cxa would also cancel the opposite side on that symbol).
 CANCEL_BATCH_SIZE = 50
-CANCEL_BATCH_PAUSE_SECONDS = 2.0
+CANCEL_BATCH_PAUSE_SECONDS = 5.0
+CANCEL_BATCH_MAX_RETRIES = 3
+CANCEL_BATCH_RETRY_BASE_SECONDS = 5.0
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _BASE58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
@@ -213,6 +219,24 @@ def _redact(text: Any, credentials: Optional[Mapping[str, str]] = None) -> str:
     return sanitize_error_message(rendered)
 
 
+def _raise_http_error(exc: urllib.error.HTTPError) -> None:
+    raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+    message = raw or str(exc)
+    retry_after_raw = None
+    try:
+        retry_after_raw = exc.headers.get("Retry-After") if exc.headers else None
+    except Exception:  # noqa: BLE001
+        retry_after_raw = None
+    text = f"HTTP {exc.code}: {message}"
+    if retry_after_raw:
+        text = f"{text} (Retry-After: {retry_after_raw})"
+    err = RuntimeError(text)
+    setattr(err, "http_status", int(exc.code))
+    if retry_after_raw is not None:
+        setattr(err, "retry_after", retry_after_raw)
+    raise err from exc
+
+
 def _post_json(base_url: str, path: str, payload: Mapping[str, Any], headers: Optional[Mapping[str, str]] = None) -> Any:
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     body = json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
@@ -232,12 +256,10 @@ def _post_json(base_url: str, path: str, payload: Mapping[str, Any], headers: Op
             raw = resp.read().decode("utf-8", errors="replace")
         return json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        message = raw or str(exc)
-        raise RuntimeError(f"HTTP {exc.code}: {message}") from exc
+        _raise_http_error(exc)
     except urllib.error.URLError as exc:
         raise RuntimeError(str(exc.reason or exc)) from exc
-
+    raise RuntimeError("Bulk HTTP POST failed without a response")
 
 
 def _get_json(base_url: str, path: str, query: Optional[Mapping[str, Any]] = None) -> Any:
@@ -254,10 +276,10 @@ def _get_json(base_url: str, path: str, query: Optional[Mapping[str, Any]] = Non
             raw = resp.read().decode("utf-8", errors="replace")
         return json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        raise RuntimeError(f"HTTP {exc.code}: {raw or exc}") from exc
+        _raise_http_error(exc)
     except urllib.error.URLError as exc:
         raise RuntimeError(str(exc.reason or exc)) from exc
+    raise RuntimeError("Bulk HTTP GET failed without a response")
 
 
 def _account_query(credentials: Mapping[str, str], query_type: str = "fullAccount") -> Any:
@@ -289,8 +311,69 @@ def _plain_decimal(value: Any) -> str:
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
+    status = getattr(exc, "http_status", None)
+    if status == 429:
+        return True
     text = str(exc).lower()
     return "http 429" in text or "too many requests" in text or "rate limit" in text or "rate_limited" in text
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """Parse Retry-After from a Bulk HTTP error when the exchange provides one."""
+    raw = getattr(exc, "retry_after", None)
+    if raw is None:
+        match = re.search(r"retry-after\s*[:=]?\s*(\d+(?:\.\d+)?)", str(exc), flags=re.IGNORECASE)
+        raw = match.group(1) if match else None
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    # Cap a single wait so a bad header cannot stall the wizard for minutes.
+    return min(value, 60.0)
+
+
+def _submit_order_with_retries(
+    credentials: Mapping[str, str],
+    actions: list[Mapping[str, Any]],
+    *,
+    max_retries: int,
+    base_sleep: float,
+    label: str,
+    batch_index: int,
+) -> Dict[str, Any]:
+    """Submit one multi-action POST /order, retrying only on HTTP 429.
+
+    Retries are bounded and only re-send the same batch payload after a pause.
+    This is recovery, not rate-limit probing.
+    """
+    attempts = max(0, int(max_retries)) + 1
+    last_exc: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return _submit_order(credentials, actions)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if not _is_rate_limit_error(exc) or attempt + 1 >= attempts:
+                raise
+            delay = _retry_after_seconds(exc)
+            if delay is None:
+                delay = float(base_sleep) * (2 ** attempt)
+            delay = max(0.5, min(float(delay), 60.0))
+            logger.warning(
+                "Bulk %s batch %s rate-limited (attempt %s/%s); sleeping %.1fs then retrying same batch",
+                label,
+                batch_index,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _display_symbol(symbol: Any) -> str:
@@ -948,7 +1031,14 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
             "accepted": 0,
         }
         try:
-            payload = _submit_order(credentials, batch_actions)
+            payload = _submit_order_with_retries(
+                credentials,
+                batch_actions,
+                max_retries=LADDER_BATCH_MAX_RETRIES,
+                base_sleep=LADDER_BATCH_RETRY_BASE_SECONDS,
+                label="ladder",
+                batch_index=batch_index,
+            )
             last_payload = payload
             ok = _payload_ok(payload)
             batch_meta["ok"] = ok
@@ -969,8 +1059,19 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
                 rate_limited = True
                 batch_meta["rate_limited"] = True
                 if first_error is None:
-                    first_error = "Bulk rate-limited a ladder batch transaction; wait briefly and try again."
+                    first_error = (
+                        f"Bulk rate-limited ladder batch {batch_index + 1}/{len(action_batches)} "
+                        f"after {LADDER_BATCH_MAX_RETRIES} retries; "
+                        f"{accepted_actions}/{len(children)} children already resting."
+                    )
                 batches.append(batch_meta)
+                logger.warning(
+                    "Bulk ladder stopped after rate-limit on batch %s/%s (accepted=%s/%s)",
+                    batch_index + 1,
+                    len(action_batches),
+                    accepted_actions,
+                    len(children),
+                )
                 break
             if first_error is None:
                 first_error = batch_meta["error"]
@@ -1064,6 +1165,9 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
         "batch_count": len(batches),
         "batch_plan": result.batch_plan,
         "batches": batches,
+        "rate_limited": bool(rate_limited),
+        "batch_pause_seconds": LADDER_BATCH_PAUSE_SECONDS,
+        "batch_max_retries": LADDER_BATCH_MAX_RETRIES,
     }
     if verification_error:
         data["verification_error"] = verification_error
@@ -1138,7 +1242,14 @@ def _cancel_order_group(credentials: Mapping[str, str], account: str, request: M
             "accepted": 0,
         }
         try:
-            payload = _submit_order(credentials, batch_actions)
+            payload = _submit_order_with_retries(
+                credentials,
+                batch_actions,
+                max_retries=CANCEL_BATCH_MAX_RETRIES,
+                base_sleep=CANCEL_BATCH_RETRY_BASE_SECONDS,
+                label="cancel",
+                batch_index=batch_index,
+            )
             last_payload = payload
             ok = _payload_ok(payload) or "cancelled" in json.dumps(payload, sort_keys=True).lower()
             batch_meta["ok"] = ok
@@ -1158,8 +1269,19 @@ def _cancel_order_group(credentials: Mapping[str, str], account: str, request: M
                 rate_limited = True
                 batch_meta["rate_limited"] = True
                 if first_error is None:
-                    first_error = "Bulk rate-limited a cancel batch transaction; wait briefly and try again."
+                    first_error = (
+                        f"Bulk rate-limited cancel batch {batch_index + 1}/{len(action_batches)} "
+                        f"after {CANCEL_BATCH_MAX_RETRIES} retries; "
+                        f"{len(accepted_ids)}/{len(target_ids)} cancels already accepted."
+                    )
                 batches.append(batch_meta)
+                logger.warning(
+                    "Bulk cancel stopped after rate-limit on batch %s/%s (accepted=%s/%s)",
+                    batch_index + 1,
+                    len(action_batches),
+                    len(accepted_ids),
+                    len(target_ids),
+                )
                 break
             if first_error is None:
                 first_error = batch_meta["error"]
