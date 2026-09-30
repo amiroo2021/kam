@@ -191,7 +191,7 @@ class FakeMexcSpotDesk:
         tick_size: str = "",
         min_qty: str = "",
         max_qty: str = "",
-        min_notional: str = "",
+        min_notional: str = "1",
     ) -> Dict[str, Any]:
         size = step_size
         if not size:
@@ -729,6 +729,13 @@ class TradeSpotMexcQtyNormalizationTests(unittest.TestCase):
                 row["quotePrecision"] = 2
                 row["min_qty"] = ""
                 row["min_notional"] = ""
+        # The qty-norm tests focus on size_step/price_tick normalization;
+        # clear min_notional on every instrument so the existing single-order
+        # scenarios (e.g. 0.9 SUI @ 0.9 USDC) keep the same client-side gate
+        # they had before. Min-notional enforcement for single orders is
+        # covered separately by the MEXC agent's NOT_ENOUGH_NOTIONAL path.
+        for row in self.desk.instruments:
+            row["min_notional"] = ""
 
     def _preview(self, asset: str, pair_label: str, side: str, qty: str, price: str):
         self.wizard.open(self.key)

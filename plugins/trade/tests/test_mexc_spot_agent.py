@@ -395,7 +395,10 @@ class MexcSpotQtyIncrementTests(unittest.TestCase):
         self.assertEqual(inst["price_tick"], "0.0001")
         self.assertEqual(inst.get("min_qty") or "", "")
         self.assertEqual(inst.get("max_qty") or "", "")
-        self.assertEqual(inst.get("min_notional") or "", "")
+        # MEXC spot always stamps its 1 USDC/USDT min-notional policy on
+        # the resolved instrument so the exchange-neutral ladder planner
+        # can enforce it without baking the default into spot_ladder.py.
+        self.assertEqual(inst.get("min_notional") or "", "1")
         self.assertEqual(spot._quantize_down(Decimal("0.9"), Decimal(inst["size_step"])), Decimal("0.9"))
 
     def test_hypeusdc_resolve_exposes_normalized_steps(self) -> None:

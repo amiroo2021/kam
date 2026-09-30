@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 
 name = "mexc"
 
+# MEXC spot enforces a per-child minimum notional of 1 USDT/USDC (cost.min
+# in CCXT markets for every spot pair tested; minNotional is not always
+# published in exchangeInfo filters). Stamp this on the resolved
+# instrument so the exchange-neutral ladder planner can enforce it
+# per-child without baking an exchange default into spot_ladder.py.
+MEXC_SPOT_MIN_NOTIONAL = "1"
+
 DEFAULT_SPOT_BASE = "https://api.mexc.com"
 API_TIMEOUT_SECONDS = 20
 _USER_AGENT = (
@@ -451,6 +458,14 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
     order_types = [str(x) for x in row.get("orderTypes") or []]
     is_allowed = bool(row.get("isSpotTradingAllowed"))
     status = str(row.get("status") or "")
+    # MEXC spot enforces a per-child minimum of 1 USDT/USDC; exchangeInfo
+    # does NOT publish MIN_NOTIONAL consistently, so the agent stamps the
+    # exchange's policy on the resolved instrument for the planner to
+    # consume. Callers can override via the dict before passing into
+    # spot_ladder.compute_ladder_with_min_notional.
+    resolved_min_notional = _decimal_step(min_notional)
+    if resolved_min_notional <= 0:
+        resolved_min_notional = _decimal_step(MEXC_SPOT_MIN_NOTIONAL)
     return {
         "symbol": symbol,
         "base": base,
@@ -465,7 +480,7 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
         "price_tick": _format_step(price_tick),
         "min_qty": _format_step(_decimal_step(min_qty)),
         "max_qty": _format_step(_decimal_step(max_qty)),
-        "min_notional": _format_step(_decimal_step(min_notional)),
+        "min_notional": _format_step(resolved_min_notional),
         "tick_size": tick_size,
         "step_size": lot_step,
         "api_eligible": status.upper() in {"1", "ENABLED", "TRADING"} and is_allowed,

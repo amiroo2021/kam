@@ -1,26 +1,37 @@
-"""Offline /tradespot MEXC ladder planner.
+"""Exchange-neutral offline ladder planner for spot LIMIT orders.
 
-Pure Decimal arithmetic. No live HTTP calls. The wizard consumes this module to
-build preview children before any submission. The submission path is gated on a
-separate `ladder` capability, which the agent does not advertise yet.
+The planner is exchange-neutral. The caller MUST supply a per-child
+minimum notional in the QUOTE asset. Exchanges (e.g. MEXC spot) are
+expected to compute that minimum and stamp it on the resolved instrument
+record before calling into here. If the caller doesn't supply one, the
+planner raises rather than silently applying an exchange-specific default.
 
-The exchange minimum-notional rule is encoded here as a constant. The minimum
-is enforced per child, not per ladder, because MEXC rejects underweight
-children with code 30002 "The minimum transaction volume cannot be less than
-X USDT".
+The wizard and the agent both invoke ``compute_ladder_with_min_notional``
+which takes ``min_notional`` as a top-level argument. A thin
+``compute_ladder`` shim is kept for backwards compatibility: it requires
+the instrument dict to carry ``min_notional`` and raises otherwise.
+
+INVARIANTS
+----------
+1. The planner must produce exactly the requested ``order_count`` of
+   children or raise a ValueError that explicitly surfaces the
+   maximum-valid-child-count. Never silently reduce the count.
+2. Sizes are deterministic Decimal results, no floating point.
+3. Uniform distribution: each child's size differs from any other by
+   no more than one ``size_step``.
+4. Half-Gaussian distribution: child sizes are monotonic non-decreasing
+   (smallest at START, largest at END) AFTER per-child min-notional
+   correction. If correction would break monotonicity, the planner
+   raises rather than producing a malformed ladder.
+5. The planner never increases total volume beyond the user's request;
+   it may redistribute within it.
+6. Per-child notional >= min_notional for every child that survives.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from typing import Any, Dict, List, Mapping, Optional
-
-# MEXC spot enforces a minimum notional per child order, denominated in the
-# QUOTE asset. Empirically CCXT reports cost.min = 1.0 USDT/USDC for every
-# spot pair tested. MEXC's batchOrders documentation confirms that the error
-# is raised in quote currency ("0.5 USDT", "1 USDT", ...). Until MEXC publishes
-# a per-symbol minimum, 1 USDC/USDT is the conservative floor.
-EXCHANGE_MIN_NOTIONAL_USD = Decimal("1")
+from typing import Any, Dict, List, Mapping
 
 _VALID_DISTRIBUTIONS = ("uniform", "half_gaussian")
 _VALID_SIDES = ("BUY", "SELL")
@@ -44,7 +55,6 @@ class LadderPlan:
     total_size: Decimal = Decimal("0")
     total_notional: Decimal = Decimal("0")
     vwap: Decimal = Decimal("0")
-    max_valid_children: int = 0
     notes: List[str] = field(default_factory=list)
 
 
@@ -118,7 +128,7 @@ def _ladder_distribution_weights(order_count: int, distribution: str) -> List[De
         return [Decimal("1")] * order_count
     if order_count == 1:
         return [Decimal("1")]
-    import math  # imported here so non-half_gaussian code stays pure
+    import math
 
     span = Decimal(order_count - 1)
     weights: List[Decimal] = []
@@ -146,7 +156,6 @@ def _price_grid(
     prices = [
         _quantize_down(value, price_tick) if price_tick > 0 else value for value in raw
     ]
-    # Enforce monotonic direction.
     if start_price <= end_price:
         for i in range(1, len(prices)):
             if prices[i] < prices[i - 1]:
@@ -158,50 +167,93 @@ def _price_grid(
     return prices
 
 
+def _resolve_steps(instrument: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
+    size_step = _decimal_step(instrument.get("size_step") or instrument.get("size_increment"))
+    if size_step <= 0:
+        size_step = _decimal_step(instrument.get("step_size") or instrument.get("baseSizePrecision"))
+    if size_step <= 0:
+        size_step = _places_increment(instrument.get("baseAssetPrecision"))
+    if size_step <= 0:
+        raise ValueError("INSTRUMENT_MISSING_SIZE_STEP")
+    price_tick = _decimal_step(instrument.get("price_tick") or instrument.get("price_increment"))
+    if price_tick <= 0:
+        price_tick = _decimal_step(instrument.get("tick_size"))
+    if price_tick <= 0:
+        price_tick = _places_increment(instrument.get("quotePrecision"))
+    if price_tick <= 0:
+        price_tick = _places_increment(instrument.get("quoteAssetPrecision"))
+    if price_tick <= 0:
+        raise ValueError("INSTRUMENT_MISSING_PRICE_TICK")
+    return size_step, price_tick
+
+
+def _max_valid_children(
+    *,
+    size_step: Decimal,
+    total_volume: Decimal,
+    min_qty: Decimal,
+    max_qty: Decimal,
+    prices: List[Decimal],
+) -> int:
+    """Compute the maximum number of valid children that can be constructed.
+
+    Considers size_step, min_qty, and max_qty. Per-child min-notional is
+    enforced by redistribution after the children are sized; if it can't be
+    satisfied, the planner raises separately. This function only bounds the
+    lattice (size_step × total_volume) and per-pair quantity caps.
+    """
+    if size_step <= 0 or not prices:
+        return 0
+    total_units = int((total_volume / size_step).to_integral_value(rounding=ROUND_DOWN))
+    if total_units <= 0:
+        return 0
+    max_units_per_child = None
+    if max_qty > 0:
+        max_units_per_child = int((max_qty / size_step).to_integral_value(rounding=ROUND_DOWN))
+        if max_units_per_child <= 0:
+            return 0
+    min_units_per_child = 0
+    if min_qty > 0:
+        min_units_per_child = int((min_qty / size_step).to_integral_value(rounding=ROUND_HALF_UP))
+        if min_units_per_child < 1:
+            min_units_per_child = 1
+    if min_units_per_child > 0 and max_units_per_child is not None and min_units_per_child > max_units_per_child:
+        return 0
+    if min_units_per_child > total_units:
+        return 0
+    return min(len(prices), total_units)
+
+
 def _enforce_min_notional(
     children: List[LadderChild],
     size_step: Decimal,
-    price_tick: Decimal,
     min_notional: Decimal,
     min_qty: Decimal,
-    side: str,
-    distribution: str,
+    max_qty: Decimal,
 ) -> List[LadderChild]:
     """Deterministic per-child min-notional correction.
 
-    Strategy:
-    1. For each child whose notional is below ``min_notional``:
-       - Compute ``min_qty_at_price = ceil(min_notional / price / size_step) * size_step``
-         and apply ``min_qty`` if it is higher.
-       - Allocate the deficit by REDUCING the children that already have the
-         LARGEST notional surplus (most buffer above the floor). Those are the
-         children whose notional is far above ``min_notional`` regardless of
-         position in the ladder. This preserves both total requested base
-         quantity and distribution ordering: the END children keep their
-         priority because they typically have the most surplus when the user
-         wants the most weight at END.
-    2. Children that still fail after the redistribution are dropped from the
-       plan; their slots are not replaced.
+    For each child whose notional is below ``min_notional``, compute the
+    required size and pull the deficit from siblings ranked by largest
+    notional surplus, ties toward the END. Children that still fail are
+    dropped.
     """
-    if size_step <= 0 or price_tick <= 0:
+    if size_step <= 0:
         return children
-    weights = _ladder_distribution_weights(len(children), distribution)
     out: List[LadderChild] = [child for child in children]
     for i, child in enumerate(out):
         deficit = min_notional - child.notional
         if deficit <= 0:
             continue
-        required_size = min_notional / child.price
+        required_size = min_notional / child.price if child.price > 0 else Decimal("0")
         required_size = _quantize_up(required_size, size_step)
         if min_qty > 0 and required_size < min_qty:
             required_size = _quantize_up(min_qty, size_step)
+        if max_qty > 0 and required_size > max_qty:
+            required_size = max_qty
         bump = required_size - child.size
         if bump <= 0:
             continue
-        # Pull from siblings ranked by largest notional surplus first, breaking
-        # ties toward END (matches our half-Gaussian convention: END children
-        # are largest, but in the BUY direction the END children also have the
-        # most surplus above the notional floor, so we still take from them).
         sibling_order = sorted(
             range(len(out)),
             key=lambda j: (out[j].notional - min_notional, j),
@@ -210,37 +262,63 @@ def _enforce_min_notional(
         for j in sibling_order:
             if j == i:
                 continue
-            take = _quantize_down(bump, size_step)
-            if take <= 0:
-                continue
-            # Never take more than the surplus above the notional floor.
             surplus = out[j].notional - min_notional
             if surplus <= 0:
                 continue
             max_take_size = _quantize_down(surplus / out[j].price, size_step)
-            take = min(take, max_take_size)
+            take = min(bump, max_take_size)
             if take <= 0:
                 continue
-            out[j] = LadderChild(
+            new_j = LadderChild(
                 price=out[j].price,
                 size=out[j].size - take,
                 notional=(out[j].size - take) * out[j].price,
             )
-            out[i] = LadderChild(
+            new_i = LadderChild(
                 price=child.price,
                 size=child.size + take,
                 notional=(child.size + take) * child.price,
             )
+            out[j] = new_j
+            out[i] = new_i
             bump -= take
             child = out[i]
             if bump <= 0:
                 break
-    # Drop children still failing.
     final = [c for c in out if c.notional >= min_notional and c.size > 0]
     return final
 
 
-def compute_ladder(
+def _uniform_variance_ok(children: List[LadderChild], size_step: Decimal) -> bool:
+    if not children or size_step <= 0:
+        return True
+    sizes = [c.size for c in children]
+    return (max(sizes) - min(sizes)) <= size_step
+
+
+def _monotonic_non_decreasing(children: List[LadderChild]) -> bool:
+    sizes = [c.size for c in children]
+    return all(prev <= cur for prev, cur in zip(sizes, sizes[1:]))
+
+
+def _too_few_children_error(requested: int, max_valid: int, *, context: str = "") -> ValueError:
+    msg = (
+        f"Cannot create {requested} valid SOL/USDC orders with the requested "
+        f"quantity, price range, and current MEXC constraints.\n"
+        f"Maximum valid orders: {max_valid}\n"
+        f"Reasons may include:\n"
+        f"- minimum 1 USDC/USDT notional per child\n"
+        f"- size_step\n"
+        f"- min_qty\n"
+        f"- max_qty\n"
+        f"- available unique price levels at price_tick"
+    )
+    if context:
+        msg += f"\n{context}"
+    return ValueError(msg)
+
+
+def compute_ladder_with_min_notional(
     *,
     side: str,
     distribution: str,
@@ -249,9 +327,11 @@ def compute_ladder(
     end_price: Decimal,
     order_count: int,
     instrument: Mapping[str, Any],
-    exchange_min_quote: Optional[Decimal] = None,
+    min_notional: Decimal,
 ) -> LadderPlan:
-    """Build a deterministic ladder plan. Raises ValueError on invalid input."""
+    """Build a deterministic ladder plan. Produces exactly ``order_count``
+    children or raises ValueError with a max-valid-child-count message.
+    """
     side = str(side or "").strip().upper()
     distribution = str(distribution or "").strip().lower()
     if side not in _VALID_SIDES:
@@ -263,36 +343,22 @@ def compute_ladder(
     if total_volume <= 0:
         raise ValueError("INVALID_TOTAL_VOLUME")
     if not _side_direction_ok(side, start_price, end_price):
-        raise ValueError("INVALID_LADDER_DIRECTION")
-    size_step = _decimal_step(
-        instrument.get("size_step") or instrument.get("size_increment")
-    )
-    if size_step <= 0:
-        size_step = _decimal_step(
-            instrument.get("step_size") or instrument.get("baseSizePrecision")
+        raise ValueError(
+            f"INVALID_LADDER_DIRECTION:{side} requires "
+            f"{'lower' if side == 'BUY' else 'higher'} END than START"
         )
-    if size_step <= 0:
-        size_step = _places_increment(instrument.get("baseAssetPrecision"))
-    if size_step <= 0:
-        raise ValueError("INSTRUMENT_MISSING_SIZE_STEP")
-    price_tick = _decimal_step(
-        instrument.get("price_tick") or instrument.get("price_increment")
-    )
-    if price_tick <= 0:
-        price_tick = _decimal_step(instrument.get("tick_size"))
-    if price_tick <= 0:
-        price_tick = _places_increment(instrument.get("quotePrecision"))
-    if price_tick <= 0:
-        raise ValueError("INSTRUMENT_MISSING_PRICE_TICK")
+
+    size_step, price_tick = _resolve_steps(instrument)
+
+    if min_notional is None or min_notional <= 0:
+        raise ValueError(
+            "MISSING_MIN_NOTIONAL: caller must supply min_notional in the "
+            "QUOTE asset (exchange-specific; e.g. MEXC spot = 1 USDC/USDT)."
+        )
+
     min_qty = _decimal_step(instrument.get("min_qty"))
     max_qty = _decimal_step(instrument.get("max_qty"))
-    raw_min_notional = _decimal_step(instrument.get("min_notional"))
-    if raw_min_notional > 0:
-        min_notional = raw_min_notional
-    else:
-        min_notional = exchange_min_quote if exchange_min_quote and exchange_min_quote > 0 else EXCHANGE_MIN_NOTIONAL_USD
 
-    # Quantize price grid, dedupe while preserving order.
     raw_prices = _price_grid(start_price, end_price, order_count, price_tick)
     seen: Dict[Decimal, int] = {}
     prices: List[Decimal] = []
@@ -303,50 +369,32 @@ def compute_ladder(
         prices.append(price)
     if not prices:
         raise ValueError("INVALID_PRICE_LADDER")
-    if len(prices) > order_count:
-        # More unique levels than requested: keep the first `order_count` along the
-        # ladder (preserves START→END ordering).
-        prices = prices[:order_count]
     if len(prices) < order_count:
-        raise ValueError(
-            f"Only {len(prices)} unique price levels available at this instrument's price tick; "
-            f"requested {order_count} orders."
-        )
+        raise _too_few_children_error(order_count, len(prices))
 
     weights = _ladder_distribution_weights(len(prices), distribution)
     total_weight = sum(weights, Decimal("0"))
     if total_weight <= 0:
         raise ValueError("INVALID_DISTRIBUTION_WEIGHTS")
 
-    # Convert total_volume into discrete size_step units.
     total_units = int((total_volume / size_step).to_integral_value(rounding=ROUND_DOWN))
     if total_units <= 0:
-        raise ValueError("INSUFFICIENT_VOLUME_FOR_SIZE_STEP")
-    if total_units < len(prices):
-        # Cap to achievable child count instead of raising: still surface a note
-        # so the wizard can tell the user.
-        notes_cap = (
-            f"Only {total_units} valid size_steps fit at {size_step}; planning "
-            f"{total_units} children instead of {len(prices)}."
+        raise ValueError(
+            f"INSUFFICIENT_VOLUME_FOR_SIZE_STEP: {total_volume} at {size_step} yields 0 size_steps."
         )
-        prices = prices[:total_units]
-        notes: List[str] = [notes_cap]
-    elif total_units < order_count:
-        notes_cap = (
-            f"Requested {order_count} orders but total volume {total_volume} only "
-            f"yields {total_units} valid size_steps at {size_step} per child. "
-            f"Planning {total_units} children instead."
-        )
-        prices = prices[:total_units]
-        notes: List[str] = [notes_cap]
-    else:
-        notes = []
+
+    max_valid = _max_valid_children(
+        size_step=size_step,
+        total_volume=total_volume,
+        min_qty=min_qty,
+        max_qty=max_qty,
+        prices=prices,
+    )
+    if max_valid < order_count:
+        raise _too_few_children_error(order_count, max_valid)
 
     raw_units = [Decimal(total_units) * w / total_weight for w in weights]
     base_units = [int(u.to_integral_value(rounding=ROUND_DOWN)) for u in raw_units]
-    # Allocate residual to children with the largest fractional remainder,
-    # but BREAK TIES toward the END of the ladder so the distribution bias
-    # mirrors "largest weights at END".
     remainders = [raw_units[i] - Decimal(base_units[i]) for i in range(len(raw_units))]
     residual = total_units - sum(base_units)
     if residual > 0:
@@ -359,7 +407,6 @@ def compute_ladder(
             base_units[idx] += 1
     sizes = [Decimal(units) * size_step for units in base_units]
 
-    # Enforce max_qty per child.
     if max_qty > 0:
         for i in range(len(sizes)):
             if sizes[i] > max_qty:
@@ -371,42 +418,44 @@ def compute_ladder(
             continue
         children.append(LadderChild(price=price, size=size))
 
-    if not children:
-        raise ValueError("INVALID_LADDER_REQUEST")
-
-    # Per-child min_notional correction (residual redistribution; the
-    # function never increases total volume).
     children = _enforce_min_notional(
         children,
         size_step=size_step,
-        price_tick=price_tick,
         min_notional=min_notional,
         min_qty=min_qty,
-        side=side,
-        distribution=distribution,
+        max_qty=max_qty,
     )
+    if len(children) != order_count:
+        raise _too_few_children_error(
+            order_count,
+            len(children),
+            context="per-child minimum-notional correction reduced the count",
+        )
 
-    # Drop any zero-size children that may have been created by the redistribution.
-    children = [c for c in children if c.size > 0]
+    if distribution == "half_gaussian":
+        if not _monotonic_non_decreasing(children):
+            raise ValueError(
+                "Half-Gaussian correction violated the monotonic sizing "
+                "invariant (smallest at START, largest at END)."
+            )
+    else:
+        if not _uniform_variance_ok(children, size_step):
+            raise ValueError(
+                f"Uniform correction violated the equal-sizing invariant "
+                f"(max variance > size_step {size_step})."
+            )
+
     if not children:
         raise ValueError(
             f"No valid children could be constructed: every price level yields a notional "
             f"below the {min_notional} {instrument.get('quote','USDC')} minimum."
         )
 
-    # Final sanity: total_size <= requested total_volume.
     total_size = sum((c.size for c in children), Decimal("0"))
     if total_size > total_volume:
         total_size = total_volume
-
     total_notional = sum((c.notional for c in children), Decimal("0"))
     vwap = total_notional / total_size if total_size > 0 else Decimal("0")
-
-    if len(children) < order_count:
-        notes.append(
-            f"Only {len(children)} of the requested {order_count} children could be "
-            f"constructed while honoring the minimum order value."
-        )
 
     return LadderPlan(
         side=side,
@@ -415,8 +464,40 @@ def compute_ladder(
         total_size=total_size,
         total_notional=total_notional,
         vwap=vwap,
-        max_valid_children=len(children),
-        notes=notes,
+        notes=[],
+    )
+
+
+def compute_ladder(
+    *,
+    side: str,
+    distribution: str,
+    total_volume: Decimal,
+    start_price: Decimal,
+    end_price: Decimal,
+    order_count: int,
+    instrument: Mapping[str, Any],
+) -> LadderPlan:
+    """Backwards-compatible wrapper. Reads ``min_notional`` from the
+    resolved instrument dict and forwards to
+    :func:`compute_ladder_with_min_notional`. Raises if the instrument
+    does not carry ``min_notional``.
+    """
+    mn = _decimal_step(instrument.get("min_notional"))
+    if mn <= 0:
+        raise ValueError(
+            "MISSING_MIN_NOTIONAL: instrument must carry min_notional in "
+            "the QUOTE asset (exchange-specific; e.g. MEXC spot = 1 USDC/USDT)."
+        )
+    return compute_ladder_with_min_notional(
+        side=side,
+        distribution=distribution,
+        total_volume=total_volume,
+        start_price=start_price,
+        end_price=end_price,
+        order_count=order_count,
+        instrument=instrument,
+        min_notional=mn,
     )
 
 
@@ -428,7 +509,6 @@ def plan_as_dict(plan: LadderPlan) -> Dict[str, Any]:
         "total_size": _format_decimal(plan.total_size),
         "total_notional": _format_decimal(plan.total_notional),
         "vwap": _format_decimal(plan.vwap),
-        "max_valid_children": plan.max_valid_children,
         "notes": list(plan.notes),
         "children": [
             {
