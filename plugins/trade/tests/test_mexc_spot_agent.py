@@ -657,6 +657,56 @@ class MexcSpotLadderTests(unittest.TestCase):
     def test_capability_advertised(self) -> None:
         self.assertIn("ladder", spot.capabilities())
 
+    def test_ladder_result_uses_live_canonical_contract(self) -> None:
+        """Regression: live CanonicalLadderResult has no expected_children kwarg."""
+        import dataclasses
+        from typing import Optional
+
+        @dataclasses.dataclass(frozen=True)
+        class LiveCanonicalLadderResult:
+            symbol: str
+            side: str
+            distribution: str
+            requested_order_count: int
+            submitted_order_count: int
+            requested_volume: str
+            submitted_volume: str
+            batch_count: int
+            verified: bool
+            partial: bool = False
+            status: str = "success"
+            accepted_child_count: Optional[int] = None
+            omitted_order_count: Optional[int] = None
+            omitted_below_minimum: Optional[int] = None
+            child_order_ids: Optional[list[str | int]] = None
+            batches: Optional[list[Dict[str, Any]]] = None
+            rate_limited: Optional[bool] = None
+            exchange_reason: Optional[str] = None
+
+        def fake_signed(_c, method, p_path, params=None):
+            if method.upper() == "POST" and p_path == "/api/v3/batchOrders":
+                batch = json.loads(params.get("batchOrders", "[]"))
+                return [
+                    {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": b["price"], "origQty": b["quantity"], "status": "NEW"}
+                    for i, b in enumerate(batch)
+                ]
+            if method.upper() == "GET" and p_path == "/api/v3/openOrders":
+                return []
+            return []
+
+        with mock.patch.object(spot, "CanonicalLadderResult", LiveCanonicalLadderResult):
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                    resp = spot.execute(self._request(10, distribution="uniform"))
+        self.assertTrue(resp.success, msg=resp)
+        self.assertIsNone(resp.error)
+        self.assertEqual(resp.ladder.accepted_child_count, 10)
+        self.assertEqual(resp.data["rejected"], 0)
+        self.assertEqual(resp.data["unknown"], 0)
+        self.assertEqual(resp.data["not_attempted"], 0)
+        self.assertEqual(resp.data["planned_vwap"], resp.data["accepted_vwap"])
+        self.assertEqual(len(resp.ladder.batches[0]["child_results"]), 10)
+
     # ----- batch-count parity -----
     def test_batch_count_table(self) -> None:
         # 1 / 10 / 20 / 21 / 40 / 41 / 50 / 100 / 200 / 500

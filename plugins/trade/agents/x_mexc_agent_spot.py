@@ -866,6 +866,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     accepted_qty = Decimal("0")
     accepted_notional = Decimal("0")
     accepted_order_ids: List[str] = []
+    accepted_count = 0
     rejected_count = 0
     unknown_count = 0
     not_attempted_count = 0
@@ -901,6 +902,15 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             # Ambiguous timeout: request may have been transmitted. Mark
             # this batch's children UNKNOWN and STOP. Do not retry.
             record["status"] = "UNKNOWN"
+            record["child_results"] = [
+                {
+                    "client_order_id": str(c.get("client_order_id") or ""),
+                    "status": "UNKNOWN",
+                    "quantity": str(c.get("quantity") or ""),
+                    "price": str(c.get("price") or ""),
+                }
+                for c in batch
+            ]
             unknown_count += len(batch)
             stopped_early = True
             batch_records.append(record)
@@ -909,6 +919,16 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             record["status"] = "REJECTED"
             record["error_code"] = "TRANSPORT_ERROR"
             record["exchange_reason"] = sanitize_error_message(str(exc))
+            record["child_results"] = [
+                {
+                    "client_order_id": str(c.get("client_order_id") or ""),
+                    "status": "REJECTED",
+                    "quantity": str(c.get("quantity") or ""),
+                    "price": str(c.get("price") or ""),
+                    "message": record["exchange_reason"],
+                }
+                for c in batch
+            ]
             rejected_count += len(batch)
             stopped_early = True
             exchange_reason = record["exchange_reason"]
@@ -917,12 +937,28 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
 
         results = payload if isinstance(payload, list) else []
         record["exchange_order_ids"] = []
+        record["child_results"] = []
         record["accepted_vwap"] = None
         accepted_qty_batch = Decimal("0")
         accepted_notional_batch = Decimal("0")
         for child_in, child_result in zip(batch, results):
             status = _ladder_child_status(child_result)
+            child_record: Dict[str, Any] = {
+                "client_order_id": str(child_in.get("client_order_id") or ""),
+                "status": status,
+                "quantity": str(child_in.get("quantity") or ""),
+                "price": str(child_in.get("price") or ""),
+            }
+            if isinstance(child_result, Mapping):
+                if child_result.get("orderId") is not None:
+                    child_record["exchange_order_id"] = str(child_result.get("orderId"))
+                if child_result.get("code") is not None:
+                    child_record["error_code"] = child_result.get("code")
+                if child_result.get("msg") is not None:
+                    child_record["message"] = str(child_result.get("msg"))
+            record["child_results"].append(child_record)
             if status == "ACCEPTED":
+                accepted_count += 1
                 try:
                     q = Decimal(str(child_in.get("quantity") or "0"))
                     p = Decimal(str(child_in.get("price") or "0"))
@@ -931,13 +967,23 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                     p = Decimal("0")
                 accepted_qty_batch += q
                 accepted_notional_batch += q * p
-                order_id = child_result.get("orderId")
+                order_id = child_result.get("orderId") if isinstance(child_result, Mapping) else None
                 if order_id is not None:
                     record["exchange_order_ids"].append(str(order_id))
                     accepted_order_ids.append(str(order_id))
             elif status == "REJECTED":
                 rejected_count += 1
             else:
+                unknown_count += 1
+        if len(results) < len(batch):
+            for child_in in batch[len(results):]:
+                record["child_results"].append({
+                    "client_order_id": str(child_in.get("client_order_id") or ""),
+                    "status": "UNKNOWN",
+                    "quantity": str(child_in.get("quantity") or ""),
+                    "price": str(child_in.get("price") or ""),
+                    "message": "MEXC returned no per-child result.",
+                })
                 unknown_count += 1
         record["status"] = "ACCEPTED" if (rejected_count + unknown_count == 0) else "PARTIAL"
         record["accepted_vwap"] = (
@@ -998,27 +1044,34 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         side=side,
         distribution=str(request.get("distribution") or "ladder"),
         requested_order_count=requested_order_count,
-        submitted_order_count=accepted_order_ids.__len__(),
+        submitted_order_count=accepted_count,
         requested_volume=_format_decimal(requested_volume),
         submitted_volume=_format_decimal(accepted_qty),
         batch_count=len(batches),
-        verified=bool(success and accepted_order_ids),
+        verified=bool(success and accepted_count == requested_order_count),
         partial=partial,
         status="success" if success else ("partial" if partial else "unknown"),
-        accepted_child_count=accepted_order_ids.__len__(),
+        accepted_child_count=accepted_count,
         omitted_order_count=rejected_count + unknown_count + not_attempted_count,
         child_order_ids=list(accepted_order_ids),
         batches=batch_records,
         exchange_reason=exchange_reason,
-        expected_children=[{"client_order_id": c.get("client_order_id")} for c in children_in],
     )
     # Stash the accepted/accepted-vwap/planned-vwap in data for the wizard.
     data = {
+        "planned_child_count": requested_order_count,
+        "accepted": accepted_count,
         "accepted_vwap": _format_decimal(accepted_vwap) if accepted_vwap is not None else None,
         "planned_vwap": _format_decimal(planned_vwap) if planned_vwap is not None else None,
         "rejected": rejected_count,
         "unknown": unknown_count,
         "not_attempted": not_attempted_count,
+        "child_results": [
+            dict(child)
+            for batch in batch_records
+            for child in (batch.get("child_results") or [])
+            if isinstance(child, Mapping)
+        ],
     }
     return make_success(
         operation="ladder",
