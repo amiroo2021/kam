@@ -180,6 +180,35 @@ class TestTradeshopAdapterUpgrade(unittest.TestCase):
         self.assertEqual(text.count("await _tradespot_cmd(self, msg)"), 1)
         self.assertNotIn("await handle_tradespot_command(self, msg)", text)
 
+        self.assertEqual(
+            text.count(
+                "from plugins.trade.tradespot_wizard import handle_tradespot_callback as _tradespot_cb"
+            ),
+            1,
+        )
+        self.assertEqual(text.count("await _tradespot_cb(self, query, data)"), 1)
+        self.assertNotIn("await handle_tradespot_callback(self, query, data)", text)
+
+        self.assertEqual(
+            text.count(
+                "from plugins.trade.tradespot_wizard import handle_tradespot_text as _tradespot_tx"
+            ),
+            1,
+        )
+        self.assertEqual(text.count("if await _tradespot_tx(self, msg):"), 1)
+        self.assertNotIn("if await handle_tradespot_text(self, msg):", text)
+
+        for marker in (
+            "BEGIN KAM TRADE PLUGIN (tradespot slash command dispatch)",
+            "BEGIN KAM TRADE PLUGIN (tradespot callback dispatch)",
+            "BEGIN KAM TRADE PLUGIN (tradespot text interception)",
+        ):
+            begin = text.find("# " + marker) if False else text.find(marker)
+            end = text.find("END KAM TRADE PLUGIN", begin)
+            block = text[begin:end]
+            stray_block = [ln for ln in block.splitlines() if ln.strip() == "\\"]
+            self.assertEqual(stray_block, [], marker)
+
     def test_tradespot_command_never_reads_cmd_body_before_assignment(self) -> None:
         _apply_public(self.hermes_root)
         text = self.fixture.read_text(errors="replace")
@@ -211,6 +240,25 @@ class TestTradeAdapterSpecsUniqueness(unittest.TestCase):
             if "tradespot" in s.seam:
                 token = s.native_sentinel.split()[-1]
                 self.assertEqual(s.block.count(token), 1, s.seam)
+
+
+
+    def test_callback_and_text_aliases_match(self) -> None:
+        specs = {s.seam: s for s in trade_adapter_specs()}
+        cb = specs["tradespot callback dispatch"].block
+        self.assertIn("handle_tradespot_callback as _tradespot_cb", cb)
+        self.assertIn("await _tradespot_cb(self, query, data)", cb)
+        self.assertNotIn("await handle_tradespot_callback(", cb)
+        tx = specs["tradespot text interception"].block
+        self.assertIn("handle_tradespot_text as _tradespot_tx", tx)
+        self.assertIn("await _tradespot_tx(self, msg)", tx)
+        self.assertNotIn("await handle_tradespot_text(", tx)
+        for s in specs.values():
+            if "tradespot" in s.seam:
+                self.assertFalse(
+                    any(ln.strip() == "\\" for ln in s.block.splitlines()),
+                    s.seam,
+                )
 
 
 class TestSyntheticCommandDispatch(unittest.TestCase):
@@ -330,6 +378,209 @@ class TestSyntheticCommandDispatch(unittest.TestCase):
         self.assertEqual(calls["backtest"], 1)
         self.assertEqual(calls["tradespot"], 0)
 
+
+
+def _handle_callback_query_node(source: str) -> ast.AsyncFunctionDef:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, ast.AsyncFunctionDef) and item.name == "_handle_callback_query":
+                    return item
+    raise AssertionError("_handle_callback_query not found")
+
+
+def _handle_text_node(source: str) -> ast.AST:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, ast.AsyncFunctionDef) and item.name in ("_handle_text", "_handle_text_message"):
+                    return item
+    raise AssertionError("_handle_text not found")
+
+
+class TestSyntheticCallbackDispatch(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="tradespot_cb_")
+        self.hermes_root = _build_hermes_tree(Path(self.tmp.name))
+        self.fixture = (
+            self.hermes_root / "plugins" / "platforms" / "telegram" / "adapter.py"
+        )
+        self.fixture.write_bytes(PRE_PATCH_ADAPTER.read_bytes())
+        result = _apply_public(self.hermes_root)
+        self.assertTrue(result.get("ok"), result)
+        self.adapter_text = self.fixture.read_text(errors="replace")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _run_callback(self, data: str):
+        sys.path.insert(0, "/usr/local/lib/hermes-agent")
+        method = _handle_callback_query_node(self.adapter_text)
+        src = ast.get_source_segment(self.adapter_text, method)
+        self.assertIsNotNone(src)
+        calls = {"tradespot": 0, "trade": 0, "backtest": 0}
+        async def fake_ts(adapter, query, data):
+            calls["tradespot"] += 1
+            return None
+        async def fake_tr(adapter, query, data):
+            calls["trade"] += 1
+        async def fake_bt(adapter, query, data):
+            calls["backtest"] += 1
+        import plugins.trade.backtest_wizard as bw
+        import plugins.trade.tradespot_wizard as tw
+        import plugins.trade.wizard as w
+        orig = (tw.handle_tradespot_callback, w.handle_trade_callback, bw.handle_backtest_callback)
+        tw.handle_tradespot_callback = fake_ts  # type: ignore[assignment]
+        w.handle_trade_callback = fake_tr  # type: ignore[assignment]
+        bw.handle_backtest_callback = fake_bt  # type: ignore[assignment]
+        ns = {"Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object), "logger": logging.getLogger("synth")}
+        exec("from typing import Any, Dict\n" + src, ns)  # noqa: S102
+        handle = ns["_handle_callback_query"]
+        class FakeAdapter:
+            name = "telegram"
+            def _callback_ctx(self, query):
+                return {}
+        FakeAdapter._handle_callback_query = handle  # type: ignore[method-assign]
+        adapter = FakeAdapter()
+        query = SimpleNamespace(data=data, message=SimpleNamespace(chat_id=1))
+        async def _answer():
+            return None
+        query.answer = _answer
+        update = SimpleNamespace(callback_query=query)
+        try:
+            asyncio.run(adapter._handle_callback_query(update, None))
+        finally:
+            tw.handle_tradespot_callback, w.handle_trade_callback, bw.handle_backtest_callback = orig
+        return calls
+
+    def test_tradespot_exchange_mexc_callback(self) -> None:
+        calls = self._run_callback("tradespot:exchange:mexc")
+        self.assertEqual(calls["tradespot"], 1)
+        self.assertEqual(calls["trade"], 0)
+
+    def test_trade_callback_regression(self) -> None:
+        calls = self._run_callback("trade:exchange:foo")
+        self.assertEqual(calls["trade"], 1)
+        self.assertEqual(calls["tradespot"], 0)
+
+    def test_text_alias_invokes_tradespot_tx(self) -> None:
+        sys.path.insert(0, "/usr/local/lib/hermes-agent")
+        text = self.adapter_text
+        self.assertIn("await _tradespot_tx(self, msg)", text)
+        self.assertIn("handle_tradespot_text as _tradespot_tx", text)
+        calls = {"tradespot": 0, "trade": 0}
+        async def fake_tx(adapter, msg):
+            calls["tradespot"] += 1
+            return True
+        async def fake_tr(adapter, msg):
+            calls["trade"] += 1
+            return False
+        import plugins.trade.tradespot_wizard as tw
+        import plugins.trade.wizard as w
+        orig = (tw.handle_tradespot_text, w.handle_trade_text)
+        tw.handle_tradespot_text = fake_tx  # type: ignore[assignment]
+        w.handle_trade_text = fake_tr  # type: ignore[assignment]
+        async def run():
+            from plugins.trade.tradespot_wizard import handle_tradespot_text as _tradespot_tx
+            from plugins.trade.wizard import handle_trade_text
+            class A:
+                name = "telegram"
+            msg = SimpleNamespace(text="BTC")
+            if await _tradespot_tx(A(), msg):
+                return "tradespot"
+            if await handle_trade_text(A(), msg):
+                return "trade"
+            return "none"
+        try:
+            result = asyncio.run(run())
+        finally:
+            tw.handle_tradespot_text, w.handle_trade_text = orig
+        self.assertEqual(result, "tradespot")
+        self.assertEqual(calls["tradespot"], 1)
+        self.assertEqual(calls["trade"], 0)
+
+
+
+class TestRealWizardCallbackAndText(unittest.TestCase):
+    def test_mexc_callback_renders_amiroo(self) -> None:
+        import types
+        fake = types.ModuleType("plugins.platforms.telegram.adapter")
+        class InlineKeyboardButton:
+            def __init__(self, text, callback_data=None):
+                self.text = text
+                self.callback_data = callback_data
+        class InlineKeyboardMarkup:
+            def __init__(self, inline_keyboard=None):
+                self.inline_keyboard = inline_keyboard or []
+        fake.InlineKeyboardButton = InlineKeyboardButton
+        fake.InlineKeyboardMarkup = InlineKeyboardMarkup
+        sys.modules.setdefault("plugins.platforms", types.ModuleType("plugins.platforms"))
+        sys.modules.setdefault("plugins.platforms.telegram", types.ModuleType("plugins.platforms.telegram"))
+        sys.modules["plugins.platforms.telegram.adapter"] = fake
+        sys.path.insert(0, "/root/kam")
+        from plugins.trade.tradespot_wizard import handle_tradespot_callback, _WIZARD
+        chat_key = ("1",)
+        _WIZARD.reset(chat_key)
+        _WIZARD.open(chat_key)
+        edited = {}
+        async def edit_message_text(text=None, reply_markup=None):
+            edited["text"] = text
+            edited["markup"] = reply_markup
+        async def answer():
+            return None
+        query = SimpleNamespace(
+            data="tradespot:exchange:mexc",
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), chat_id=1),
+            edit_message_text=edit_message_text,
+            answer=answer,
+        )
+        asyncio.run(handle_tradespot_callback(SimpleNamespace(name="telegram"), query, query.data))
+        blob = (edited.get("text") or "") + " " + str(edited.get("markup"))
+        self.assertIn("amiroo", blob.lower())
+
+    def test_other_then_btc_text_path(self) -> None:
+        sys.path.insert(0, "/root/kam")
+        from plugins.trade.canonical import make_success, CanonicalMarketPrice
+        from plugins.trade.tradespot_wizard import TradeSpotWizard
+
+        class Desk:
+            def list_exchanges(self):
+                return ["mexc"]
+            def list_accounts(self, exchange):
+                return ["amiroo"]
+            def capabilities(self, exchange, account=None):
+                return ["balance", "list_instruments", "resolve_instrument", "market_price", "new_order"]
+            def execute(self, request):
+                op = str(request.get("operation") or "")
+                if op == "list_instruments":
+                    rows = [
+                        {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT"},
+                        {"symbol": "BTCUSDC", "baseAsset": "BTC", "quoteAsset": "USDC"},
+                    ]
+                    return make_success(op, "mexc", "amiroo", data={"instruments": rows, "count": 2})
+                if op == "market_price":
+                    return make_success(
+                        op, "mexc", "amiroo",
+                        market_price=CanonicalMarketPrice(
+                            requested_symbol="BTCUSDT", market="BTCUSDT", mark_price="1", price="1"
+                        ),
+                        data={"symbol": "BTCUSDT", "price": "1"},
+                    )
+                return make_success(op, "mexc", "amiroo", data={})
+
+        wiz = TradeSpotWizard(spotdesk=Desk())  # type: ignore[arg-type]
+        key = ("synth", 99)
+        wiz.open(key)
+        wiz.handle_callback(key, "exchange:mexc")
+        wiz.handle_callback(key, "account:amiroo")
+        wiz.handle_callback(key, "action:new_order")
+        screen = wiz.handle_callback(key, "asset:other")
+        self.assertEqual(screen.state, "new_order_other")
+        screen = wiz.handle_text(key, "BTC")
+        blob = screen.text.upper() + " " + str(screen.buttons).upper()
+        self.assertIn("BTC", blob)
 
 if __name__ == "__main__":
     unittest.main()

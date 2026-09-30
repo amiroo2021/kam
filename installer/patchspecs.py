@@ -183,32 +183,32 @@ except Exception as exc:  # noqa: BLE001
     )
 '''
 
-_TRADESPOT_CALLBACK_BLOCK = '''\\
+_TRADESPOT_CALLBACK_BLOCK = """
 if data.startswith("tradespot:"):
     try:
-        from plugins.trade.tradespot_wizard import handle_tradespot_callback
+        from plugins.trade.tradespot_wizard import handle_tradespot_callback as _tradespot_cb
 
         await _tradespot_cb(self, query, data)
         return
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(
             "[%s] tradespot callback dispatch failed: %s",
             self.name, exc, exc_info=True,
         )
-'''
+"""
 
-_TRADESPOT_TEXT_BLOCK = '''\\
+_TRADESPOT_TEXT_BLOCK = """
 try:
-    from plugins.trade.tradespot_wizard import handle_tradespot_text
+    from plugins.trade.tradespot_wizard import handle_tradespot_text as _tradespot_tx
 
     if await _tradespot_tx(self, msg):
         return
-except Exception as exc:  # noqa: BLE001
+except Exception as exc:
     logger.error(
         "[%s] /tradespot text dispatch failed: %s",
         self.name, exc, exc_info=True,
     )
-'''
+"""
 
 _TRADESPOT_COMMAND_BLOCK = """
     if cmd_body == "tradespot":
