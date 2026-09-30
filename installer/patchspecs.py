@@ -188,7 +188,7 @@ if data.startswith("tradespot:"):
     try:
         from plugins.trade.tradespot_wizard import handle_tradespot_callback
 
-        await handle_tradespot_callback(self, query, data)
+        await _tradespot_cb(self, query, data)
         return
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -201,7 +201,7 @@ _TRADESPOT_TEXT_BLOCK = '''\\
 try:
     from plugins.trade.tradespot_wizard import handle_tradespot_text
 
-    if await handle_tradespot_text(self, msg):
+    if await _tradespot_tx(self, msg):
         return
 except Exception as exc:  # noqa: BLE001
     logger.error(
@@ -215,7 +215,7 @@ if cmd_body == "tradespot":
     try:
         from plugins.trade.tradespot_wizard import handle_tradespot_command
 
-        handled = await handle_tradespot_command(self, msg)
+        handled = await _tradespot_cmd(self, msg)
         if handled:
             return
     except Exception as exc:  # noqa: BLE001
@@ -250,7 +250,7 @@ if first_token:
         try:
             from plugins.trade.tradespot_wizard import handle_tradespot_command
 
-            handled = await handle_tradespot_command(self, msg)
+            handled = await _tradespot_cmd(self, msg)
             if handled:
                 return
         except Exception as exc:  # noqa: BLE001
