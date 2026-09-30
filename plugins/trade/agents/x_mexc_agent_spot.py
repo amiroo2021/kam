@@ -415,6 +415,7 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
     raw_filters = row.get("filters")
     filters: List[Any] = raw_filters if isinstance(raw_filters, list) else []
     min_qty = ""
+    max_qty = ""
     step_size = ""
     tick_size = ""
     min_notional = ""
@@ -422,13 +423,14 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
         if not isinstance(f, Mapping):
             continue
         ftype = str(f.get("filterType") or "")
-        if ftype in {"LOT_SIZE", "MARKET_LOT_SIZE"} and not step_size:
+        if ftype == "LOT_SIZE":
             step_size = str(f.get("stepSize") or "")
             min_qty = str(f.get("minQty") or "")
+            max_qty = str(f.get("maxQty") or "")
         elif ftype == "PRICE_FILTER":
             tick_size = str(f.get("tickSize") or "")
         elif ftype in {"MIN_NOTIONAL", "NOTIONAL"}:
-            min_notional = str(f.get("minNotional") or f.get("minNotionalForMarket") or "")
+            min_notional = str(f.get("minNotional") or f.get("notional") or "")
     order_types = [str(x) for x in row.get("orderTypes") or []]
     is_allowed = bool(row.get("isSpotTradingAllowed"))
     status = str(row.get("status") or "")
@@ -448,6 +450,7 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
         "tick_size": tick_size,
         "step_size": step_size,
         "min_qty": min_qty,
+        "max_qty": max_qty,
         "min_notional": min_notional,
         "api_eligible": status.upper() in {"1", "ENABLED", "TRADING"} and is_allowed,
     }
@@ -695,24 +698,28 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
     )
 
 
-def _increment_from_precision(value: Any) -> Decimal:
+def _decimal_step(value: Any) -> Decimal:
     text = str(value or "").strip()
     if not text:
         return Decimal("0")
     try:
-        if "." in text or text.startswith("0"):
-            inc = Decimal(text)
-            return inc if inc > 0 else Decimal("0")
-        places = int(text)
-        if places < 0:
-            return Decimal("0")
-        return Decimal("1").scaleb(-places)
+        inc = Decimal(text)
     except Exception:  # noqa: BLE001
-        try:
-            inc = Decimal(text)
-            return inc if inc > 0 else Decimal("0")
-        except Exception:  # noqa: BLE001
-            return Decimal("0")
+        return Decimal("0")
+    return inc if inc > 0 else Decimal("0")
+
+
+def _places_increment(value: Any) -> Decimal:
+    text = str(value or "").strip()
+    if not text:
+        return Decimal("0")
+    try:
+        places = int(text)
+    except Exception:  # noqa: BLE001
+        return Decimal("0")
+    if places < 0:
+        return Decimal("0")
+    return Decimal("1").scaleb(-places)
 
 
 def _quantize_down(value: Decimal, increment: Decimal) -> Decimal:
@@ -723,19 +730,21 @@ def _quantize_down(value: Decimal, increment: Decimal) -> Decimal:
 
 
 def _size_increment(info: Mapping[str, Any]) -> Decimal:
-    for key in ("step_size", "baseSizePrecision"):
-        inc = _increment_from_precision(info.get(key))
-        if inc > 0:
-            return inc
-    return _increment_from_precision(info.get("baseAssetPrecision"))
+    inc = _decimal_step(info.get("step_size"))
+    if inc > 0:
+        return inc
+    inc = _decimal_step(info.get("baseSizePrecision"))
+    if inc > 0:
+        return inc
+    return _places_increment(info.get("baseAssetPrecision"))
 
 
 def _price_increment(info: Mapping[str, Any]) -> Decimal:
-    inc = _increment_from_precision(info.get("tick_size"))
+    inc = _decimal_step(info.get("tick_size"))
     if inc > 0:
         return inc
     for key in ("quotePrecision", "quoteAssetPrecision"):
-        inc = _increment_from_precision(info.get(key))
+        inc = _places_increment(info.get(key))
         if inc > 0:
             return inc
     return Decimal("0")

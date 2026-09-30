@@ -153,8 +153,9 @@ class FakeMexcSpotDesk:
             self._inst("SOLBTC", "SOL", "BTC", quote_precision=8),
             self._inst("ETHUSDT", "ETH", "USDT", quote_precision=2),
             self._inst("HYPEUSDT", "HYPE", "USDT", quote_precision=4),
+            self._inst("HYPEUSDC", "HYPE", "USDC", quote_precision=2, base_size_precision="0", base_asset_precision=2),
             self._inst("SUIUSDT", "SUI", "USDT", quote_precision=4),
-            self._inst("SUIUSDC", "SUI", "USDC", quote_precision=4),
+            self._inst("SUIUSDC", "SUI", "USDC", quote_precision=4, base_size_precision="0", base_asset_precision=2),
             self._inst("BTCUSDT", "BTC", "USDT", quote_precision=2),
             self._inst("BTCUSDC", "BTC", "USDC", quote_precision=2),
             self._inst("SOLDELIST", "SOL", "DELIST", status="0"),
@@ -167,6 +168,7 @@ class FakeMexcSpotDesk:
             "SOLBTC": "0.00123",
             "ETHUSDT": "4000.12",
             "HYPEUSDT": "47.1234",
+            "HYPEUSDC": "50.00",
             "SUIUSDT": "1.2345",
             "SUIUSDC": "1.2300",
             "BTCUSDT": "114000.12",
@@ -183,6 +185,13 @@ class FakeMexcSpotDesk:
         status: str = "1",
         api_enabled: bool = True,
         spot_allowed: bool = True,
+        base_size_precision: str = "0.01",
+        base_asset_precision: int = 2,
+        step_size: str = "",
+        tick_size: str = "",
+        min_qty: str = "",
+        max_qty: str = "",
+        min_notional: str = "",
     ) -> Dict[str, Any]:
         return {
             "symbol": symbol,
@@ -193,8 +202,14 @@ class FakeMexcSpotDesk:
             "isSpotTradingAllowed": spot_allowed,
             "orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"],
             "quotePrecision": quote_precision,
-            "baseSizePrecision": "0.01",
-            "tick_size": "0." + ("0" * (quote_precision - 1)) + "1" if quote_precision else "0.01",
+            "quoteAssetPrecision": quote_precision,
+            "baseAssetPrecision": base_asset_precision,
+            "baseSizePrecision": base_size_precision,
+            "step_size": step_size,
+            "tick_size": tick_size or ("0." + ("0" * (quote_precision - 1)) + "1" if quote_precision else "0.01"),
+            "min_qty": min_qty,
+            "max_qty": max_qty,
+            "min_notional": min_notional,
             "api_enabled_for_key": api_enabled,
             "api_eligible": api_enabled and spot_allowed and status == "1",
         }
@@ -684,6 +699,121 @@ class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
         self.assertTrue(all(not cb.startswith("trade:") for cb in _callbacks(screen)))
         self.assertIsNone(trade_exchange_name_from_filename("x_mexc_agent_spot.py"))
         self.assertEqual(trade_exchange_name_from_filename("x_mexc_agent.py"), "mexc")
+
+
+class TradeSpotMexcQtyNormalizationTests(unittest.TestCase):
+    """Regression against live MEXC exchangeInfo shapes (no LOT_SIZE)."""
+
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.key = ("chat-qty-norm",)
+        self.desk.balances["HYPE"] = "100"
+        # Live SOLUSDC uses a decimal baseSizePrecision, not a place count.
+        for row in self.desk.instruments:
+            if row["symbol"] == "SOLUSDC":
+                row["baseSizePrecision"] = "0.000001"
+                row["baseAssetPrecision"] = 2
+                row["step_size"] = ""
+                row["tick_size"] = ""
+                row["quotePrecision"] = 2
+                row["min_qty"] = ""
+                row["min_notional"] = ""
+
+    def _preview(self, asset: str, pair_label: str, side: str, qty: str, price: str):
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        self.wizard.handle_callback(self.key, "account:amiroo")
+        self.wizard.handle_callback(self.key, "action:new_order")
+        pairs = self.wizard.handle_callback(self.key, f"asset:{asset}")
+        cb = _callbacks(pairs)[_labels(pairs).index(next(label for label in _labels(pairs) if pair_label in label))]
+        self.wizard.handle_callback(self.key, cb)
+        self.wizard.handle_callback(self.key, f"side:{side}")
+        self.wizard.handle_text(self.key, qty)
+        return self.wizard.handle_text(self.key, price)
+
+    def test_fractional_sui_quantity_does_not_become_zero(self) -> None:
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "0.9")
+        assert preview is not None
+        self.assertIn("Quantity: 0.9 SUI", preview.text)
+        self.assertNotIn("Quantity: 0 SUI", preview.text)
+        self.assertIn("Limit price: 0.9 USDC", preview.text)
+        self.assertIn("Required: 0.81 USDC", preview.text)
+        self.assertFalse("Invalid quantity or price" in preview.text)
+        self.assertTrue(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_fractional_hype_quantity_does_not_become_zero(self) -> None:
+        preview = self._preview("HYPE", "HYPE/USDC", "buy", "0.1", "50")
+        assert preview is not None
+        self.assertIn("Quantity: 0.1 HYPE", preview.text)
+        self.assertNotIn("Quantity: 0 HYPE", preview.text)
+        self.assertIn("Limit price: 50 USDC", preview.text)
+        self.assertIn("Required: 5.00 USDC", preview.text)
+        self.assertTrue(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_fractional_sol_quantity_remains_correct(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        assert preview is not None
+        self.assertIn("Quantity: 0.1 SOL", preview.text)
+        self.assertIn("Limit price: 101 USDC", preview.text)
+        self.assertTrue(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_sui_step_boundaries_use_base_asset_precision(self) -> None:
+        # Live SUIUSDC: baseSizePrecision "0" (unset), baseAssetPrecision 2 → 0.01
+        exact = self._preview("SUI", "SUI/USDC", "buy", "0.01", "1.2")
+        assert exact is not None
+        self.assertIn("Quantity: 0.01 SUI", exact.text)
+        above = self._preview("SUI", "SUI/USDC", "buy", "0.019", "1.2")
+        assert above is not None
+        self.assertIn("Quantity: 0.01 SUI", above.text)
+        multi = self._preview("SUI", "SUI/USDC", "buy", "0.25", "1.2")
+        assert multi is not None
+        self.assertIn("Quantity: 0.25 SUI", multi.text)
+        round_down = self._preview("SUI", "SUI/USDC", "buy", "0.259", "1.2")
+        assert round_down is not None
+        self.assertIn("Quantity: 0.25 SUI", round_down.text)
+
+    def test_sol_step_boundaries_use_base_size_precision_string(self) -> None:
+        exact = self._preview("SOL", "SOL/USDC", "buy", "0.000001", "101")
+        assert exact is not None
+        self.assertIn("Quantity: 0.000001 SOL", exact.text)
+        round_down = self._preview("SOL", "SOL/USDC", "buy", "0.0000019", "101")
+        assert round_down is not None
+        self.assertIn("Quantity: 0.000001 SOL", round_down.text)
+
+    def test_sui_price_precision_is_not_confused_with_quantity(self) -> None:
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "0.9")
+        assert preview is not None
+        self.assertIn("Quantity: 0.9 SUI", preview.text)
+        self.assertIn("Limit price: 0.9 USDC", preview.text)
+
+    def test_below_one_step_shows_minimum_quantity(self) -> None:
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.009", "1.2")
+        assert preview is not None
+        self.assertIn("Minimum quantity: 0.01 SUI", preview.text)
+        self.assertNotIn("Invalid quantity or price", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_min_notional_shows_actual_reason(self) -> None:
+        for row in self.desk.instruments:
+            if row["symbol"] == "SUIUSDC":
+                row["min_notional"] = "5"
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "0.9")
+        assert preview is not None
+        self.assertIn("Quantity: 0.9 SUI", preview.text)
+        self.assertIn("Minimum order value: 5 USDC", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_lot_size_min_qty_shows_actual_reason(self) -> None:
+        for row in self.desk.instruments:
+            if row["symbol"] == "SUIUSDC":
+                row["step_size"] = "1"
+                row["min_qty"] = "1"
+                row["baseSizePrecision"] = "1"
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "1.2")
+        assert preview is not None
+        self.assertIn("Minimum quantity: 1 SUI", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
 
 
 def _spot_open(

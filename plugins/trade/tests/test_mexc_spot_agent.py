@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from decimal import Decimal
 from typing import Any, Dict, List, Mapping
 from unittest import mock
 
@@ -347,6 +348,62 @@ class MexcSpotParsingTests(unittest.TestCase):
         self.assertFalse(resp.success)
         self.assertEqual(resp.error.code, "EXCHANGE_REJECTED")
         self.assertIn("insufficient USDC", resp.error.message)
+
+
+class MexcSpotQtyIncrementTests(unittest.TestCase):
+    def _live_row(self, symbol: str, **fields: Any) -> Dict[str, Any]:
+        row = {
+            "symbol": symbol,
+            "status": "1",
+            "baseAsset": symbol.replace("USDC", ""),
+            "quoteAsset": "USDC",
+            "isSpotTradingAllowed": True,
+            "orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"],
+            "filters": [{"filterType": "PERCENT_PRICE_BY_SIDE", "bidMultiplierUp": "0.1", "askMultiplierDown": "0.1"}],
+        }
+        row.update(fields)
+        return row
+
+    def test_suiusdc_zero_base_size_precision_falls_back_to_places(self) -> None:
+        info = spot._instrument_from_market(self._live_row(
+            "SUIUSDC",
+            baseAssetPrecision=2,
+            quotePrecision=4,
+            quoteAssetPrecision=4,
+            baseSizePrecision="0",
+        ))
+        self.assertEqual(info["step_size"], "")
+        self.assertEqual(spot._size_increment(info), Decimal("0.01"))
+        self.assertEqual(spot._price_increment(info), Decimal("0.0001"))
+        self.assertEqual(spot._quantize_down(Decimal("0.9"), spot._size_increment(info)), Decimal("0.9"))
+
+    def test_hypeusdc_zero_base_size_precision_keeps_fractional_qty(self) -> None:
+        info = spot._instrument_from_market(self._live_row(
+            "HYPEUSDC",
+            baseAssetPrecision=2,
+            quotePrecision=2,
+            quoteAssetPrecision=2,
+            baseSizePrecision="0",
+        ))
+        self.assertEqual(spot._size_increment(info), Decimal("0.01"))
+        self.assertEqual(spot._quantize_down(Decimal("0.1"), spot._size_increment(info)), Decimal("0.1"))
+
+    def test_solusdc_uses_base_size_precision_step_string(self) -> None:
+        info = spot._instrument_from_market(self._live_row(
+            "SOLUSDC",
+            baseAssetPrecision=2,
+            quotePrecision=2,
+            quoteAssetPrecision=2,
+            baseSizePrecision="0.000001",
+        ))
+        self.assertEqual(spot._size_increment(info), Decimal("0.000001"))
+        self.assertEqual(spot._quantize_down(Decimal("0.1"), spot._size_increment(info)), Decimal("0.1"))
+        self.assertEqual(spot._quantize_down(Decimal("0.0000019"), spot._size_increment(info)), Decimal("0.000001"))
+
+    def test_integer_base_size_precision_is_a_step_not_places(self) -> None:
+        info = {"step_size": "", "baseSizePrecision": "1", "baseAssetPrecision": 2}
+        self.assertEqual(spot._size_increment(info), Decimal("1"))
+        self.assertEqual(spot._quantize_down(Decimal("0.9"), Decimal("1")), Decimal("0"))
 
 
 class MexcSpotCancelOrdersTests(unittest.TestCase):

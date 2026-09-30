@@ -780,24 +780,27 @@ class TradeSpotWizard:
         text = format(value.normalize(), "f")
         return text.rstrip("0").rstrip(".") if "." in text else text
 
-    def _increment_from(self, value: Any) -> Decimal:
+    def _decimal_step(self, value: Any) -> Decimal:
         text = str(value or "").strip()
         if not text:
             return Decimal("0")
         try:
-            if "." in text or (text.startswith("0") and text != "0"):
-                inc = Decimal(text)
-                return inc if inc > 0 else Decimal("0")
-            places = int(text)
-            if places < 0:
-                return Decimal("0")
-            return Decimal("1").scaleb(-places)
+            inc = Decimal(text)
         except (InvalidOperation, ValueError):
-            try:
-                inc = Decimal(text)
-                return inc if inc > 0 else Decimal("0")
-            except (InvalidOperation, ValueError):
-                return Decimal("0")
+            return Decimal("0")
+        return inc if inc > 0 else Decimal("0")
+
+    def _places_increment(self, value: Any) -> Decimal:
+        text = str(value or "").strip()
+        if not text:
+            return Decimal("0")
+        try:
+            places = int(text)
+        except (TypeError, ValueError):
+            return Decimal("0")
+        if places < 0:
+            return Decimal("0")
+        return Decimal("1").scaleb(-places)
 
     def _quantize_down(self, value: Decimal, increment: Decimal) -> Decimal:
         if increment <= 0:
@@ -806,21 +809,49 @@ class TradeSpotWizard:
         return steps * increment
 
     def _size_increment(self, item: Mapping[str, Any]) -> Decimal:
-        for key in ("step_size", "baseSizePrecision"):
-            inc = self._increment_from(item.get(key))
-            if inc > 0:
-                return inc
-        return self._increment_from(item.get("baseAssetPrecision"))
+        inc = self._decimal_step(item.get("step_size"))
+        if inc > 0:
+            return inc
+        inc = self._decimal_step(item.get("baseSizePrecision"))
+        if inc > 0:
+            return inc
+        return self._places_increment(item.get("baseAssetPrecision"))
 
     def _price_increment(self, item: Mapping[str, Any]) -> Decimal:
-        inc = self._increment_from(item.get("tick_size"))
+        inc = self._decimal_step(item.get("tick_size"))
         if inc > 0:
             return inc
         for key in ("quotePrecision", "quoteAssetPrecision"):
-            inc = self._increment_from(item.get(key))
+            inc = self._places_increment(item.get(key))
             if inc > 0:
                 return inc
         return Decimal("0")
+
+    def _constraint_error(
+        self,
+        item: Mapping[str, Any],
+        qty: Decimal,
+        price: Decimal,
+        side: str,
+        base: str,
+        quote: str,
+    ) -> Optional[str]:
+        min_qty = self._decimal_step(item.get("min_qty"))
+        if min_qty <= 0:
+            min_qty = self._size_increment(item)
+        max_qty = self._decimal_step(item.get("max_qty"))
+        min_notional = self._decimal_step(item.get("min_notional"))
+        if qty <= 0 or (min_qty > 0 and qty < min_qty):
+            if min_qty > 0:
+                return f"Minimum quantity: {self._format_decimal(min_qty)} {base}"
+            return "Invalid quantity or price."
+        if max_qty > 0 and qty > max_qty:
+            return f"Maximum quantity: {self._format_decimal(max_qty)} {base}"
+        if price <= 0:
+            return "Invalid quantity or price."
+        if side == "BUY" and min_notional > 0 and (qty * price) < min_notional:
+            return f"Minimum order value: {self._format_decimal(min_notional)} {quote}"
+        return None
 
     def _re_resolve_instrument(self, state: SpotWizardState) -> Optional[Dict[str, Any]]:
         item = dict(state.selected_instrument or {})
@@ -902,6 +933,7 @@ class TradeSpotWizard:
         available = self._holding_for(state, required_asset)
         after = available - required
         tradable_error = self._instrument_tradable(item)
+        constraint_error = self._constraint_error(item, qty, price, side, base, quote)
         lines = [
             f"🟦 MEXC Spot — {pair}",
             "LIMIT order preview",
@@ -928,8 +960,8 @@ class TradeSpotWizard:
                 ]
             )
         buttons: List[List[Dict[str, str]]]
-        if qty <= 0 or price <= 0:
-            lines.extend(["", "Invalid quantity or price."])
+        if constraint_error:
+            lines.extend(["", constraint_error])
             state.confirm_token = None
             buttons = [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]]
         elif tradable_error:
