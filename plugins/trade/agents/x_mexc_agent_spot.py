@@ -745,18 +745,6 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
     )
 
 
-def _ladder_not_enabled(account: str) -> CanonicalResponse:
-    # Retained for back-compat with any code path that still references it;
-    # live ladder is now wired in `_ladder`. Should never be reached.
-    return make_failure(
-        operation="ladder",
-        exchange=name,
-        account=str(account or ""),
-        code="NOT_IMPLEMENTED",
-        message="Live ladder submission is not enabled yet.",
-    )
-
-
 def _ladder_validate_child(child: Mapping[str, Any]) -> Optional[str]:
     if not isinstance(child, Mapping):
         return "CHILD_NOT_MAPPING"

@@ -295,9 +295,27 @@ def _monotonic_non_decreasing(children: List[LadderChild]) -> bool:
     return all(prev <= cur for prev, cur in zip(sizes, sizes[1:]))
 
 
-def _too_few_children_error(requested: int, max_valid: int, *, context: str = "") -> ValueError:
+def _instrument_pair(instrument: Mapping[str, Any]) -> str:
+    display = str(instrument.get("display_name") or "").strip()
+    if display:
+        return display
+    base = str(instrument.get("base") or instrument.get("baseAsset") or "").strip().upper()
+    quote = str(instrument.get("quote") or instrument.get("quoteAsset") or "").strip().upper()
+    if base and quote:
+        return f"{base}/{quote}"
+    return str(instrument.get("symbol") or "spot pair" or "spot pair").strip().upper()
+
+
+def _too_few_children_error(
+    requested: int,
+    max_valid: int,
+    *,
+    instrument: Mapping[str, Any] | None = None,
+    context: str = "",
+) -> ValueError:
+    pair = _instrument_pair(instrument or {})
     msg = (
-        f"Cannot create {requested} valid SOL/USDC orders with the requested "
+        f"Cannot create {requested} valid {pair} orders with the requested "
         f"quantity, price range, and current MEXC constraints.\n"
         f"Maximum valid orders: {max_valid}\n"
         f"Reasons may include:\n"
@@ -359,7 +377,7 @@ def compute_ladder_with_min_notional(
     if not prices:
         raise ValueError("INVALID_PRICE_LADDER")
     if len(prices) < order_count:
-        raise _too_few_children_error(order_count, len(prices))
+        raise _too_few_children_error(order_count, len(prices), instrument=instrument)
 
     weights = _ladder_distribution_weights(len(prices), distribution)
     total_weight = sum(weights, Decimal("0"))
@@ -380,7 +398,7 @@ def compute_ladder_with_min_notional(
         prices=prices,
     )
     if max_valid < order_count:
-        raise _too_few_children_error(order_count, max_valid)
+        raise _too_few_children_error(order_count, max_valid, instrument=instrument)
 
     raw_units = [Decimal(total_units) * w / total_weight for w in weights]
     base_units = [int(u.to_integral_value(rounding=ROUND_DOWN)) for u in raw_units]
@@ -418,6 +436,7 @@ def compute_ladder_with_min_notional(
         raise _too_few_children_error(
             order_count,
             len(children),
+            instrument=instrument,
             context="per-child minimum-notional correction reduced the count",
         )
 

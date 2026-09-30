@@ -365,11 +365,9 @@ class TradeSpotWizard:
                 return self._handle_ladder_confirm_callback(chat_key, suffix)
             return self._render_ladder_preview(chat_key)
         if state.state == "ladder_result":
-            return Screen(
-                "Live ladder submission is not enabled yet.",
-                [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
-                "ladder_result",
-            )
+            if suffix == "back":
+                return self._render_action(chat_key)
+            return self._render_action(chat_key)
         if state.state in {"balance", "orders", "unsupported"}:
             return self._handle_result_screen(chat_key, suffix)
         return self.open(chat_key)
@@ -654,10 +652,14 @@ class TradeSpotWizard:
             start = _to_amount(state.ladder_start_price)
             end = _to_amount(state.ladder_end_price)
             count = int(state.ladder_order_count or 0)
-        except (InvalidOperation, ValueError, TypeError):
-            return None
-        if total <= 0 or start <= 0 or end <= 0 or count <= 0:
-            return None
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            return {"_error": f"Invalid ladder inputs: {exc}"}
+        if total <= 0:
+            return {"_error": "Total quantity must be greater than zero."}
+        if start <= 0 or end <= 0:
+            return {"_error": "START and END prices must be greater than zero."}
+        if count <= 0:
+            return {"_error": "Order count must be greater than zero."}
         try:
             plan = compute_ladder(
                 side=state.ladder_side or "BUY",
@@ -668,14 +670,78 @@ class TradeSpotWizard:
                 order_count=count,
                 instrument=item,
             )
-        except ValueError:
-            return None
+        except ValueError as exc:
+            return {"_error": str(exc)}
         return plan_as_dict(plan)
+
+    def _ladder_request_values(self, state: SpotWizardState) -> tuple[Decimal, int] | None:
+        try:
+            total = _to_amount(state.ladder_total_qty)
+            count = int(state.ladder_order_count or 0)
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        return total, count
+
+    def _ladder_plan_error(self, state: SpotWizardState, plan: Optional[Dict[str, Any]]) -> Optional[str]:
+        requested = self._ladder_request_values(state)
+        if requested is None:
+            return "Invalid ladder inputs. Re-open the ladder preview and try again."
+        requested_total, requested_count = requested
+        if requested_count <= 0:
+            return "Order count must be greater than zero."
+        if requested_total <= 0:
+            return "Total quantity must be greater than zero."
+        if not isinstance(plan, dict):
+            return "Planner did not return a ladder plan."
+        if plan.get("_error"):
+            return str(plan.get("_error"))
+        children = plan.get("children") or []
+        if not children:
+            return "Planner returned no children."
+        if len(children) != requested_count:
+            return f"Planner returned {len(children)} children for requested {requested_count} orders."
+        for index, child in enumerate(children, start=1):
+            try:
+                qty = _to_amount(child.get("size"))
+                price = _to_amount(child.get("price"))
+            except (InvalidOperation, ValueError, TypeError):
+                return f"Child {index} has invalid quantity or price."
+            if qty <= 0 or price <= 0:
+                return f"Child {index} has non-positive quantity or price."
+        return None
+
+    def _render_ladder_plan_error(self, chat_key: Tuple[Any, ...], message: str) -> Screen:
+        state = self._state_for(chat_key)
+        state.ladder_confirm_token = None
+        state.ladder_execution_id = None
+        state.state = "ladder_preview"
+        pair = self._selected_pair_name(state)
+        body = (
+            f"🟦 {pair} — LIMIT Ladder Preview\n\n"
+            f"Unable to build ladder.\n\n{message}\n\n"
+            "No orders were submitted. Adjust total quantity, order count, or price range and try again."
+        )
+        return Screen(body, [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]], "ladder_preview")
+
+    def _render_ladder_submit_error(self, chat_key: Tuple[Any, ...], message: str) -> Screen:
+        state = self._state_for(chat_key)
+        state.ladder_confirm_token = None
+        state.state = "ladder_result"
+        body = (
+            "🟦 Unable to submit ladder\n\n"
+            f"{message}\n\n"
+            "No orders were submitted. Re-open the ladder preview before trying again."
+        )
+        return Screen(body, [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]], "ladder_result")
 
     def _render_ladder_preview(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
         item = state.selected_instrument or {}
-        plan = self._compute_ladder_plan(state) or {}
+        plan = self._compute_ladder_plan(state)
+        plan_error = self._ladder_plan_error(state, plan)
+        if plan_error:
+            return self._render_ladder_plan_error(chat_key, plan_error)
+        plan = plan or {}
         base = ((item.get("base") or item.get("baseAsset") or "BASE")).upper()
         quote = ((item.get("quote") or item.get("quoteAsset") or "QUOTE")).upper()
         side = (state.ladder_side or "").upper()
@@ -811,7 +877,11 @@ class TradeSpotWizard:
             if not symbol:
                 continue
             totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(row)
-        plan = self._compute_ladder_plan(state) or {}
+        plan = self._compute_ladder_plan(state)
+        plan_error = self._ladder_plan_error(state, plan)
+        if plan_error:
+            return self._render_ladder_submit_error(chat_key, plan_error)
+        plan = plan or {}
         if side == "BUY":
             required = _to_amount(plan.get("total_notional"))
             have = totals.get(quote, Decimal("0"))

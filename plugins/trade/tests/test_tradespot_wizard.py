@@ -1463,6 +1463,111 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self.assertEqual(len(self._post_calls), 0)
 
 
+    def _walk_sui_uniform_preview(self, qty: str = "10", n_orders: int = 10):
+        w = self.wizard
+        w.open(self.key)
+        w.handle_callback(self.key, "exchange:mexc")
+        w.handle_callback(self.key, "account:amiroo")
+        w.handle_callback(self.key, "action:ladder")
+        pair_picker = w.handle_callback(self.key, "asset:SUI")
+        labels = _labels(pair_picker)
+        idx = next(i for i, label in enumerate(labels) if "SUI/USDC" in label)
+        w.handle_callback(self.key, _callbacks(pair_picker)[idx] or "")
+        w.handle_callback(self.key, "side:buy")
+        w.handle_text(self.key, qty)
+        w.handle_text(self.key, "1")
+        w.handle_text(self.key, "0.5")
+        w.handle_text(self.key, str(n_orders))
+        return w.handle_callback(self.key, "distribution:uniform")
+
+    def test_sui_infeasible_ladder_does_not_render_zero_preview_or_confirm(self) -> None:
+        preview = self._walk_sui_uniform_preview(qty="10", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        self.assertEqual(state.ladder_total_qty, "10")
+        self.assertEqual(state.ladder_order_count, 10)
+        self.assertIn("Unable to build ladder", preview.text)
+        self.assertNotIn("Orders: 0", preview.text)
+        self.assertNotIn("Total Quantity: 0 SUI", preview.text)
+        self.assertNotIn("Children:\n  (none)", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+
+    def test_confirm_stops_locally_when_preview_plan_missing_children(self) -> None:
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        state = self.wizard._state_for(self.key)
+        state.ladder_order_count = 0
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Unable to submit ladder", result.text)
+        self.assertEqual(len(self._post_calls), 0)
+        ladder_requests = [r for r in self.desk.requests if r.get("operation") == "ladder"]
+        self.assertEqual(ladder_requests, [])
+
+    def test_confirm_stops_locally_when_children_count_mismatches_requested(self) -> None:
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        state = self.wizard._state_for(self.key)
+        state.ladder_order_count = 11
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Unable to submit ladder", result.text)
+        self.assertEqual(len(self._post_calls), 0)
+        ladder_requests = [r for r in self.desk.requests if r.get("operation") == "ladder"]
+        self.assertEqual(ladder_requests, [])
+
+    def test_preview_blocks_zero_order_count_state(self) -> None:
+        self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        state.ladder_order_count = 0
+        preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Order count must be greater than zero", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_preview_blocks_zero_quantity_state(self) -> None:
+        self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        state.ladder_total_qty = "0"
+        preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Total quantity must be greater than zero", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_preview_blocks_empty_children_from_planner(self) -> None:
+        self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        with self._mock.patch.object(self.wizard, "_compute_ladder_plan", return_value={"children": [], "total_size": "0"}):
+            preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Planner returned no children", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_preview_blocks_children_count_mismatch(self) -> None:
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        valid_plan = self.wizard._compute_ladder_plan(self.wizard._state_for(self.key))
+        assert isinstance(valid_plan, dict)
+        bad_plan = dict(valid_plan)
+        bad_plan["children"] = list(valid_plan.get("children") or [])[:-1]
+        with self._mock.patch.object(self.wizard, "_compute_ladder_plan", return_value=bad_plan):
+            result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Unable to submit ladder", result.text)
+        self.assertIn("Planner returned 9 children for requested 10 orders", result.text)
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_preview_blocks_missing_min_notional(self) -> None:
+        for row in self.desk.instruments:
+            if row["symbol"] == "SUIUSDC":
+                row["min_notional"] = ""
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        self.assertIn("MISSING_MIN_NOTIONAL", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_preview_blocks_quantity_insufficient_for_one_dollar_children(self) -> None:
+        preview = self._walk_sui_uniform_preview(qty="10", n_orders=10)
+        self.assertIn("Maximum valid orders", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+
 class TradeSpotCommandRegistrationTests(unittest.TestCase):
     def test_tradespot_command_is_registered_with_trade_capability(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kam_home_") as home:

@@ -481,6 +481,8 @@ class SpotLadderSuiExplicitTests(unittest.TestCase):
                 instrument=self._sui(),
             )
         self.assertIn("Maximum valid orders:", str(ctx.exception))
+        self.assertIn("SUI/USDC", str(ctx.exception))
+        self.assertNotIn("SOL/USDC", str(ctx.exception))
 
 
 class SpotLadderInvariantsTests(unittest.TestCase):
