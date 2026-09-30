@@ -466,6 +466,25 @@ class MexcSpotQtyIncrementTests(unittest.TestCase):
         self.assertEqual(resp.error.code, "INSTRUMENT_CONSTRAINTS_UNAVAILABLE")
 
 
+class MexcSpotLadderStubTests(unittest.TestCase):
+    def setUp(self) -> None:
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    def test_ladder_capability_is_not_advertised(self) -> None:
+        self.assertNotIn("ladder", spot.capabilities())
+
+    def test_ladder_write_is_not_implemented(self) -> None:
+        resp = spot.execute({
+            "operation": "ladder",
+            "exchange": "mexc",
+            "account": "amiroo",
+        })
+        self.assertFalse(resp.success)
+        self.assertIsNotNone(resp.error)
+        self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+        self.assertIn("not enabled", (resp.error.message or "").lower())
+
+
 class MexcSpotCancelOrdersTests(unittest.TestCase):
     def setUp(self) -> None:
         self.saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("MEXC_") or k == "HERMES_HOME"}

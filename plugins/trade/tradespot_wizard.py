@@ -247,10 +247,24 @@ class SpotWizardState:
     cancel_side: Optional[str] = None
     cancel_symbol: Optional[str] = None
     cancel_pair: Optional[str] = None
+    # Ladder state
+    ladder_side: Optional[str] = None
+    ladder_total_qty: Optional[str] = None
+    ladder_start_price: Optional[str] = None
+    ladder_end_price: Optional[str] = None
+    ladder_order_count: Optional[int] = None
+    ladder_distribution: Optional[str] = None
+    ladder_plan: Optional[Dict[str, Any]] = None
+    ladder_confirm_token: Optional[str] = None
 
 
 class TradeSpotWizard:
     """Small SPOT-specific Telegram state machine."""
+
+    # Test-only escape hatch: when True, the wizard renders the Ladder action
+    # button even if the agent does not advertise the `ladder` capability.
+    # Production keeps the agent cap off, so the button is hidden by default.
+    _ladder_preview_only: bool = False
 
     def __init__(self, spotdesk: Optional[SpotDesk] = None) -> None:
         self._desk = spotdesk or get_spotdesk()
@@ -279,6 +293,8 @@ class TradeSpotWizard:
             return self._handle_quantity_text(chat_key, value)
         if state.state == "new_order_price":
             return self._handle_limit_price_text(chat_key, value)
+        if state.state.startswith("ladder_"):
+            return self._handle_ladder_text(chat_key, value)
         return None
 
     def handle_callback(self, chat_key: Tuple[Any, ...], callback_suffix: str) -> Screen:
@@ -315,6 +331,43 @@ class TradeSpotWizard:
             return self._handle_cancel_confirm_callback(chat_key, suffix)
         if state.state == "cancel_result":
             return self._handle_cancel_result_callback(chat_key, suffix)
+        # Ladder states
+        if state.state == "ladder_asset":
+            screen = self._handle_ladder_asset(chat_key, suffix)
+            if screen.state == "new_order_pairs":
+                state.state = "ladder_pairs"
+            return screen
+        if state.state == "ladder_pairs":
+            screen = self._handle_ladder_pair_selection(chat_key, suffix)
+            if screen.state == "new_order_side":
+                state.state = "ladder_side"
+                return self._render_ladder_side(chat_key)
+            return screen
+        if state.state == "ladder_side":
+            return self._handle_ladder_side_selection(chat_key, suffix)
+        if state.state == "ladder_total_qty":
+            return self._render_ladder_total_qty(chat_key)
+        if state.state == "ladder_start_price":
+            return self._render_ladder_start_price(chat_key)
+        if state.state == "ladder_end_price":
+            return self._render_ladder_end_price(chat_key)
+        if state.state == "ladder_order_count":
+            return self._render_ladder_order_count(chat_key)
+        if state.state == "ladder_distribution":
+            if suffix in {"distribution:uniform", "distribution:half_gaussian"}:
+                state.ladder_distribution = suffix[len("distribution:") :].strip()
+                return self._render_ladder_preview(chat_key)
+            return self._render_ladder_distribution(chat_key)
+        if state.state == "ladder_preview":
+            if suffix.startswith("ladder_confirm:"):
+                return self._handle_ladder_confirm_callback(chat_key, suffix)
+            return self._render_ladder_preview(chat_key)
+        if state.state == "ladder_result":
+            return Screen(
+                "Live ladder submission is not enabled yet.",
+                [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                "ladder_result",
+            )
         if state.state in {"balance", "orders", "unsupported"}:
             return self._handle_result_screen(chat_key, suffix)
         return self.open(chat_key)
@@ -409,6 +462,14 @@ class TradeSpotWizard:
         rows: List[tuple[str, str]] = []
         seen_callbacks: set[str] = set()
         for cap, label, callback in _SPOT_ACTIONS:
+            if cap == "ladder":
+                # Phase 1 source-only: ladder button only renders when the
+                # agent explicitly advertises the `ladder` capability OR the
+                # wizard is in test-only preview mode.
+                if "ladder" in caps or self._ladder_preview_only:
+                    rows.append((label, f"action:{callback}"))
+                    seen_callbacks.add(callback)
+                continue
             if cap == "new_order" and self._supports_new_order_picker(exchange):
                 rows.append((label, f"action:{callback}"))
                 seen_callbacks.add(callback)
@@ -462,6 +523,10 @@ class TradeSpotWizard:
             return self._render_new_order_assets(chat_key)
         if action == "cancel_orders" and "cancel_orders" in caps:
             return self._render_cancel_orders(chat_key)
+        if action == "ladder" and (
+            "ladder" in caps or self._ladder_preview_only
+        ):
+            return self._render_ladder_assets(chat_key)
         if action in _MUTATING_ACTIONS and action in caps:
             return self._render_mutating_not_enabled(chat_key, action)
         return self._render_action(chat_key)
@@ -480,6 +545,302 @@ class TradeSpotWizard:
         state.cancel_side = None
         state.cancel_symbol = None
         state.cancel_pair = None
+        # Clear ladder fields so a fresh wizard session does not inherit them.
+        state.ladder_side = None
+        state.ladder_total_qty = None
+        state.ladder_start_price = None
+        state.ladder_end_price = None
+        state.ladder_order_count = None
+        state.ladder_distribution = None
+        state.ladder_plan = None
+        state.ladder_confirm_token = None
+
+    # ------------------------------------------------------------------
+    # Ladder preview flow (Phase 1, source-only)
+    # ------------------------------------------------------------------
+
+    def _render_ladder_assets(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_asset"
+        self._clear_order_state(state)
+        exchange = state.exchange or ""
+        title = f"🟦 {exchange.upper()} Spot — Ladder" if exchange else "🟦 Spot — Ladder"
+        rows = [[_button_row(asset, f"asset:{asset}")] for asset in _QUICK_PICK_BASE_ASSETS]
+        rows.append([_button_row("Other", "asset:other")])
+        rows.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)])
+        return Screen(f"{title}\n\nSelect Asset:", rows, "ladder_asset")
+
+    def _render_ladder_side(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_side"
+        pair = self._selected_pair_name(state)
+        rows = [
+            [_button_row("🔵 BUY", "side:buy")],
+            [_button_row("🔴 SELL", "side:sell")],
+            [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)],
+        ]
+        return Screen(f"🟦 {pair} — Ladder\n\nSelect Side:", rows, "ladder_side")
+
+    def _render_ladder_total_qty(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_total_qty"
+        pair = self._selected_pair_name(state)
+        base = ((state.selected_instrument or {}).get("base")
+                or (state.selected_instrument or {}).get("baseAsset")
+                or "BASE").upper()
+        return Screen(
+            f"🟦 {pair} — Ladder\n\nEnter total quantity in {base}:",
+            [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+            "ladder_total_qty",
+        )
+
+    def _render_ladder_start_price(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_start_price"
+        pair = self._selected_pair_name(state)
+        quote = ((state.selected_instrument or {}).get("quote")
+                 or (state.selected_instrument or {}).get("quoteAsset")
+                 or "QUOTE").upper()
+        return Screen(
+            f"🟦 {pair} — Ladder\n\nEnter START price in {quote}:",
+            [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+            "ladder_start_price",
+        )
+
+    def _render_ladder_end_price(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_end_price"
+        pair = self._selected_pair_name(state)
+        quote = ((state.selected_instrument or {}).get("quote")
+                 or (state.selected_instrument or {}).get("quoteAsset")
+                 or "QUOTE").upper()
+        side = (state.ladder_side or "").upper()
+        direction = "lower than START (BUY)" if side == "BUY" else "higher than START (SELL)"
+        return Screen(
+            f"🟦 {pair} — Ladder\n\nEnter END price in {quote}:\nMust be {direction}.",
+            [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+            "ladder_end_price",
+        )
+
+    def _render_ladder_order_count(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_order_count"
+        pair = self._selected_pair_name(state)
+        return Screen(
+            f"🟦 {pair} — Ladder\n\nEnter number of orders (1-500):",
+            [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+            "ladder_order_count",
+        )
+
+    def _render_ladder_distribution(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "ladder_distribution"
+        pair = self._selected_pair_name(state)
+        rows = [
+            [_button_row("Uniform", "distribution:uniform")],
+            [_button_row("Half-Gaussian", "distribution:half_gaussian")],
+            [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)],
+        ]
+        return Screen(f"🟦 {pair} — Ladder\n\nSelect distribution:", rows, "ladder_distribution")
+
+    def _compute_ladder_plan(self, state: SpotWizardState) -> Optional[Dict[str, Any]]:
+        from plugins.trade.spot_ladder import compute_ladder, plan_as_dict
+
+        item = state.selected_instrument or {}
+        try:
+            total = _to_amount(state.ladder_total_qty)
+            start = _to_amount(state.ladder_start_price)
+            end = _to_amount(state.ladder_end_price)
+            count = int(state.ladder_order_count or 0)
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        if total <= 0 or start <= 0 or end <= 0 or count <= 0:
+            return None
+        try:
+            plan = compute_ladder(
+                side=state.ladder_side or "BUY",
+                distribution=state.ladder_distribution or "uniform",
+                total_volume=total,
+                start_price=start,
+                end_price=end,
+                order_count=count,
+                instrument=item,
+            )
+        except ValueError:
+            return None
+        return plan_as_dict(plan)
+
+    def _render_ladder_preview(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        item = state.selected_instrument or {}
+        plan = self._compute_ladder_plan(state) or {}
+        base = ((item.get("base") or item.get("baseAsset") or "BASE")).upper()
+        quote = ((item.get("quote") or item.get("quoteAsset") or "QUOTE")).upper()
+        side = (state.ladder_side or "").upper()
+        distribution_label = (
+            "Half-Gaussian" if plan.get("distribution") == "half_gaussian" else "Uniform"
+        )
+        if side == "BUY":
+            required_asset = quote
+            available = self._holding_for(state, required_asset)
+            required = _to_amount(plan.get("total_notional"))
+            after = available - required
+        else:
+            required_asset = base
+            available = self._holding_for(state, required_asset)
+            required = _to_amount(plan.get("total_size"))
+            after = available - required
+
+        children = plan.get("children") or []
+        total_children = len(children)
+        show_first = min(3, total_children)
+        show_last = min(3, max(0, total_children - show_first))
+        child_rows: List[str] = []
+        for c in children[:show_first]:
+            child_rows.append(
+                f"  {c['price']} {quote} × {c['size']} {base} = {c['notional']} {quote}"
+            )
+        if total_children > show_first + show_last:
+            child_rows.append("  …")
+        if show_last > 0:
+            for c in children[-show_last:]:
+                child_rows.append(
+                    f"  {c['price']} {quote} × {c['size']} {base} = {c['notional']} {quote}"
+                )
+
+        notes = plan.get("notes") or []
+        notes_block = ("\n\n" + "\n".join(notes)) if notes else ""
+
+        insufficient = after < 0
+        body = (
+            f"🟦 {base}/{quote} — LIMIT Ladder Preview\n"
+            f"\nSide: {side}\n"
+            f"Distribution: {distribution_label}\n"
+            f"Orders: {plan.get('max_valid_children', total_children)}\n"
+            f"Total Quantity: {plan.get('total_size','0')} {base}\n"
+            f"Price Range: {state.ladder_end_price or ''} → {state.ladder_start_price or ''} {quote}\n"
+            f"VWAP: {plan.get('vwap','0')} {quote}\n"
+            f"\nRequired: {plan.get('total_notional','0')} {quote}\n"
+            f"Available: {available.normalize():f} {quote}\n"
+            f"After ladder: {after.normalize():f} {quote}"
+            f"{notes_block}\n\nChildren:\n"
+            + ("\n".join(child_rows) if child_rows else "  (none)")
+        )
+
+        if insufficient:
+            body += (
+                f"\n\nInsufficient {required_asset}: need {required.normalize():f}, "
+                f"have {available.normalize():f}. No orders were submitted."
+            )
+            rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+            state.state = "ladder_result"
+            return Screen(body, rows, "ladder_result")
+
+        if not state.ladder_confirm_token:
+            import secrets
+            state.ladder_confirm_token = f"lad:{secrets.token_hex(8)}"
+        rows: List[List[Dict[str, str]]] = [
+            [_button_row("✅ Confirm Ladder", f"ladder_confirm:{state.ladder_confirm_token}")],
+            [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)],
+        ]
+        state.state = "ladder_preview"
+        return Screen(body, rows, "ladder_preview")
+
+    def _handle_ladder_confirm_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        token = suffix[len("ladder_confirm:") :].strip() if suffix.startswith("ladder_confirm:") else ""
+        if not token or token != (state.ladder_confirm_token or ""):
+            return self._render_ladder_preview(chat_key)
+        # Phase 1 source-only: no live submission. The agent advertises no
+        # `ladder` capability and the handler returns the explicit "not enabled"
+        # message. Future phases flip the agent cap and replace this block.
+        rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+        state.ladder_confirm_token = None
+        state.state = "ladder_result"
+        return Screen(
+            "Live ladder submission is not enabled yet.",
+            rows,
+            "ladder_result",
+        )
+
+    def _handle_ladder_text(self, chat_key: Tuple[Any, ...], text: str) -> Optional[Screen]:
+        state = self._state_for(chat_key)
+        if state.state == "ladder_total_qty":
+            value = (text or "").strip()
+            try:
+                qty = _to_amount(value)
+                if qty <= 0:
+                    raise InvalidOperation
+            except InvalidOperation:
+                return Screen(
+                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nInvalid total quantity.\nEnter a positive decimal in {((state.selected_instrument or {}).get('base') or 'BASE')}:",
+                    [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                    "ladder_total_qty",
+                )
+            state.ladder_total_qty = format(qty.normalize(), "f")
+            return self._render_ladder_start_price(chat_key)
+        if state.state == "ladder_start_price":
+            try:
+                value = _to_amount(text)
+                if value <= 0:
+                    raise InvalidOperation
+            except InvalidOperation:
+                return Screen(
+                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nInvalid START price.\nEnter a positive price in {((state.selected_instrument or {}).get('quote') or 'QUOTE')}:",
+                    [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                    "ladder_start_price",
+                )
+            state.ladder_start_price = format(value.normalize(), "f")
+            return self._render_ladder_end_price(chat_key)
+        if state.state == "ladder_end_price":
+            side = (state.ladder_side or "BUY").upper()
+            try:
+                value = _to_amount(text)
+                start_v = _to_amount(state.ladder_start_price)
+                if value <= 0:
+                    raise InvalidOperation
+                if side == "BUY" and value >= start_v:
+                    raise InvalidOperation
+                if side == "SELL" and value <= start_v:
+                    raise InvalidOperation
+            except InvalidOperation:
+                direction = "lower than START" if side == "BUY" else "higher than START"
+                return Screen(
+                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nEND price must be {direction}.\nTry again:",
+                    [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                    "ladder_end_price",
+                )
+            state.ladder_end_price = format(value.normalize(), "f")
+            return self._render_ladder_order_count(chat_key)
+        if state.state == "ladder_order_count":
+            try:
+                count = int((text or "").strip())
+                if count <= 0 or count > 500:
+                    raise ValueError
+            except ValueError:
+                return Screen(
+                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nEnter an integer between 1 and 500:",
+                    [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                    "ladder_order_count",
+                )
+            state.ladder_order_count = count
+            return self._render_ladder_distribution(chat_key)
+        return None
+
+    def _handle_ladder_asset(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        # Reuse the new_order asset handlers so ladder pairs flow identically.
+        return self._handle_new_order_asset(chat_key, suffix)
+
+    def _handle_ladder_pair_selection(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        return self._handle_pair_selection(chat_key, suffix)
+
+    def _handle_ladder_side_selection(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        # The new_order side handler sets `state.order_side` and renders the qty
+        # prompt; for ladder we want the ladder total-qty prompt next.
+        self._handle_side_selection(chat_key, suffix)
+        state = self._state_for(chat_key)
+        state.ladder_side = state.order_side
+        return self._render_ladder_total_qty(chat_key)
 
     def _render_new_order_assets(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)

@@ -155,6 +155,10 @@ def list_accounts() -> List[str]:
 
 
 def capabilities() -> List[str]:
+    # NOTE: `ladder` is intentionally NOT advertised. Phase 1 is source-only —
+    # the wizard supports the ladder flow when `_ladder_preview_only` is True,
+    # the agent always rejects `ladder` writes with `NOT_IMPLEMENTED`. Future
+    # phases will flip this on and add the real submit path.
     return [
         "balance",
         "orders",
@@ -718,6 +722,22 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
     )
 
 
+def _ladder_not_enabled(account: str) -> CanonicalResponse:
+    return make_failure(
+        operation="ladder",
+        exchange=name,
+        account=str(account or ""),
+        code="NOT_IMPLEMENTED",
+        # Phase 1 source-only: planned batch submission architecture uses
+        # `POST /api/v3/batchOrders` (max 20 orders per call, rate-limit
+        # bucket shared with /api/v3/order at 12 req/s) and fallbacks to
+        # per-order `POST /api/v3/order` for >20-child ladders, with
+        # idempotent `newClientOrderId` values, bounded batches, and explicit
+        # accepted/failed tracking. The actual submit path is not wired yet.
+        message="Live ladder submission is not enabled yet.",
+    )
+
+
 def _decimal_step(value: Any) -> Decimal:
     text = str(value or "").strip()
     if not text:
@@ -1137,7 +1157,9 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _new_order(account, request)
     if op == "cancel_orders":
         return _cancel_orders(account, request)
-    if op in {"ladder", "cancel_order_group", "cancel_order"}:
+    if op == "ladder":
+        return _ladder_not_enabled(account)
+    if op in {"cancel_order_group", "cancel_order"}:
         return _unsupported(op, account)
     return make_failure(
         operation=op,

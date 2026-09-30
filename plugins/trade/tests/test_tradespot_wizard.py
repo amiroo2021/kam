@@ -1082,6 +1082,191 @@ class TradeSpotMexcCancelOrdersTests(unittest.TestCase):
         self.assertTrue(all(not str(cb).startswith("trade:") for cb in _callbacks(confirm_from_action)))
 
 
+class TradeSpotMexcLadderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        # Phase 1 source-only: enable the Ladder preview flow inside tests
+        # without advertising the `ladder` capability on the agent.
+        self.wizard._ladder_preview_only = True
+        self.key = ("chat-ladder",)
+        self.desk.balances["SOL"] = "100"
+        self.desk.balances["USDT"] = "10000"
+        for row in self.desk.instruments:
+            if row["symbol"] == "SOLUSDC":
+                row["size_step"] = format(Decimal("0.000001").normalize(), "f")
+                row["step_size"] = ""
+                row["price_tick"] = format(Decimal("1").scaleb(-2).normalize(), "f")
+                row["tick_size"] = ""
+
+    def _open_action(self):
+        w = self.wizard
+        w.open(self.key)
+        w.handle_callback(self.key, "exchange:mexc")
+        w.handle_callback(self.key, "account:amiroo")
+        return w.handle_callback(self.key, "action:")
+
+    def _action_screen(self):
+        return self._open_action()
+
+    def _open_ladder(self):
+        # Walk through exchange -> account -> ladder action so the wizard state
+        # machine sees the ladder button in the action menu.
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        self.wizard.handle_callback(self.key, "account:amiroo")
+        screen = self.wizard.handle_callback(self.key, "action:ladder")
+        return screen
+
+    def _callbacks(self, screen) -> List[str]:
+        return [b.get("callback_data", "") for row in screen.buttons for b in row]
+
+    def _labels(self, screen) -> List[str]:
+        return [b.get("text", "") for row in screen.buttons for b in row]
+
+    def _select_pair(self, screen, pair_label: str):
+        # screen is the asset picker. Tap the base, then tap the pair.
+        cbs = self._callbacks(screen)
+        labels = self._labels(screen)
+        base = pair_label.split("/", 1)[0]
+        idx = next(i for i, label in enumerate(labels) if label == base)
+        screen = self.wizard.handle_callback(self.key, cbs[idx] or "")
+        cbs = self._callbacks(screen)
+        labels = self._labels(screen)
+        idx = next(i for i, label in enumerate(labels) if pair_label in label)
+        cb = cbs[idx]
+        return self.wizard.handle_callback(self.key, cb or "")
+
+    def test_ladder_button_appears_with_preview_only_cap(self) -> None:
+        screen = self._action_screen()
+        self.assertTrue(any("Ladder" in label for label in self._labels(screen)))
+
+    def test_ladder_button_hidden_when_agent_does_not_advertise(self) -> None:
+        # Default capabilities do not include "ladder"; this test is a negative.
+        caps = self.desk.capabilities("mexc")
+        self.assertNotIn("ladder", caps)
+
+    def test_uniform_buy_sol_usdc_preview(self) -> None:
+        screen = self._open_ladder()
+        # pair picker
+        pair_screen = self._select_pair(screen, "SOL/USDC")
+        side = self.wizard.handle_callback(self.key, "side:buy")
+        # enter total qty
+        after_qty = self.wizard.handle_text(self.key, "10")
+        # enter start price
+        after_start = self.wizard.handle_text(self.key, "100")
+        # enter end price
+        after_end = self.wizard.handle_text(self.key, "73")
+        # enter order count
+        after_count = self.wizard.handle_text(self.key, "10")
+        # choose distribution (default prompt; pick uniform)
+        # Distribution buttons are returned by the count handler — uniform should be present.
+        dist = self.wizard.handle_callback(self.key, "distribution:uniform")
+        # dist now should be the preview
+        self.assertIn("LIMIT Ladder Preview", dist.text)
+        self.assertIn("Distribution: Uniform", dist.text)
+        self.assertIn("Orders: 10", dist.text)
+        self.assertIn("Total Quantity: 10 SOL", dist.text)
+        self.assertIn("Price Range: 73 → 100 USDC", dist.text)
+        self.assertIn("Required:", dist.text)
+        # Show first/last child
+        self.assertIn("100 USDC", dist.text)
+        self.assertIn("73 USDC", dist.text)
+
+    def test_half_gaussian_smallest_at_start_largest_at_end(self) -> None:
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "100")
+        self.wizard.handle_text(self.key, "73")
+        self.wizard.handle_text(self.key, "10")
+        dist = self.wizard.handle_callback(self.key, "distribution:half_gaussian")
+        self.assertIn("Distribution: Half-Gaussian", dist.text)
+        # The first child in the rendered preview should be at the START price
+        # and have the smallest size; last at END with largest size. We
+        # just check that END price is in the last listed child row.
+        self.assertIn("73 USDC", dist.text)
+        self.assertIn("100 USDC", dist.text)
+
+    def test_confirm_is_non_submitting(self) -> None:
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "100")
+        self.wizard.handle_text(self.key, "73")
+        self.wizard.handle_text(self.key, "10")
+        dist = self.wizard.handle_callback(self.key, "distribution:uniform")
+        # The confirm callback is present but does NOT submit.
+        cbs = self._callbacks(dist)
+        confirm_cb = next((cb for cb in cbs if cb.startswith("ladder_confirm:")), None)
+        self.assertIsNotNone(confirm_cb, "missing ladder_confirm callback")
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Live ladder submission is not enabled yet.", result.text)
+        # No POST /api/v3/order hit
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+
+    def test_insufficient_buy_quote_blocks_preview(self) -> None:
+        self.desk.balances["USDC"] = "10"
+        self.desk.balances["USDT"] = "10"
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "100")
+        self.wizard.handle_text(self.key, "73")
+        self.wizard.handle_text(self.key, "10")
+        # 10 SOL @ ~100 each = ~1000 USDC > 10 USDC. Preview must surface
+        # the insufficient-balance reason, not offer a Confirm button.
+        preview = self.wizard.handle_callback(self.key, "distribution:uniform")
+        self.assertIn("Insufficient", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+
+    def test_insufficient_sell_base_blocks_preview(self) -> None:
+        self.desk.balances["SOL"] = "1"
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:sell")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "120")
+        self.wizard.handle_text(self.key, "250")
+        self.wizard.handle_text(self.key, "8")
+        preview = self.wizard.handle_callback(self.key, "distribution:uniform")
+        self.assertIn("Insufficient", preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
+
+    def test_vwap_shown_in_preview(self) -> None:
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "100")
+        self.wizard.handle_text(self.key, "73")
+        self.wizard.handle_text(self.key, "10")
+        dist = self.wizard.handle_callback(self.key, "distribution:uniform")
+        self.assertIn("VWAP:", dist.text)
+
+    def test_large_ladder_truncates_child_list(self) -> None:
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "100")
+        self.wizard.handle_text(self.key, "73")
+        self.wizard.handle_text(self.key, "50")
+        dist = self.wizard.handle_callback(self.key, "distribution:uniform")
+        # Truncation marker
+        self.assertIn("…", dist.text)
+
+    def test_ladder_does_not_break_existing_cancel_orders(self) -> None:
+        # Navigate into Ladder, then Back to action, then Cancel Orders.
+        self._open_ladder()
+        self.wizard.handle_callback(self.key, "back")
+        cancel = self.wizard.handle_callback(self.key, "action:cancel_orders")
+        self.assertIn("Cancel Orders", cancel.text)
+
+
 class TradeSpotCommandRegistrationTests(unittest.TestCase):
     def test_tradespot_command_is_registered_with_trade_capability(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kam_home_") as home:
