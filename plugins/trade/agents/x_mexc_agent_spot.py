@@ -5,8 +5,8 @@ Uses the existing MEXC credential convention from ``x_mexc_agent.py``:
 API-key/secret aliases). This agent is strictly separate from the futures
 ``x_mexc_agent.py`` used by /trade.
 
-Read operations plus a single LIMIT ``new_order``. Ladder and cancel remain
-disabled.
+Read operations plus LIMIT ``new_order`` and grouped ``cancel_orders``.
+Ladder, MARKET, and exchange-wide cancel-all remain disabled.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..canonical import (
     CanonicalBalance,
+    CanonicalCancelGroupResult,
     CanonicalInstrument,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
@@ -162,6 +163,7 @@ def capabilities() -> List[str]:
         "resolve_instrument",
         "market_price",
         "new_order",
+        "cancel_orders",
     ]
 
 
@@ -923,6 +925,159 @@ def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         )
 
 
+def _open_order_rows(credentials: Mapping[str, str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], bool]:
+    try:
+        payload = _signed_request(credentials, "GET", "/api/v3/openOrders")
+        err = _response_error(payload, "openOrders failed") if isinstance(payload, dict) else None
+        if err:
+            return None, err, False
+        rows = payload if isinstance(payload, list) else payload.get("orders", []) if isinstance(payload, dict) else []
+        parsed = [_parse_order(row) for row in rows if isinstance(row, Mapping)]
+        return parsed, None, False
+    except urllib.error.URLError as exc:
+        if _is_timeout_error(exc):
+            return None, "MEXC openOrders timed out.", True
+        return None, _redact(sanitize_error_message(str(exc)), credentials), False
+    except Exception as exc:  # noqa: BLE001
+        if _is_timeout_error(exc):
+            return None, "MEXC openOrders timed out.", True
+        return None, _redact(sanitize_error_message(str(exc)), credentials), False
+
+
+def _cancel_orders(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return _missing_account("cancel_orders", account)
+    raw_ids = request.get("order_ids") if request.get("order_ids") is not None else request.get("orderIds")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_ORDER_IDS",
+            message="cancel_orders requires an explicit list of MEXC order IDs.",
+        )
+    side = str(request.get("side") or "").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper().replace("/", "")
+    if side not in {"BUY", "SELL"}:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_SIDE",
+            message="Side must be BUY or SELL.",
+        )
+    if not symbol:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_SYMBOL",
+            message="cancel_orders requires a symbol.",
+        )
+    order_ids = [str(oid).strip() for oid in raw_ids if str(oid).strip()]
+    if not order_ids:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_ORDER_IDS",
+            message="cancel_orders requires an explicit list of MEXC order IDs.",
+        )
+    timed_out = False
+    for oid in order_ids:
+        try:
+            _signed_request(
+                credentials,
+                "DELETE",
+                "/api/v3/order",
+                {"symbol": symbol, "orderId": oid},
+            )
+        except urllib.error.URLError as exc:
+            if _is_timeout_error(exc):
+                timed_out = True
+                continue
+            return make_failure(
+                operation="cancel_orders",
+                exchange=name,
+                account=credentials["account"],
+                code="MEXC_SPOT_ERROR",
+                message=_redact(sanitize_error_message(str(exc)), credentials),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _is_timeout_error(exc):
+                timed_out = True
+                continue
+            return make_failure(
+                operation="cancel_orders",
+                exchange=name,
+                account=credentials["account"],
+                code="MEXC_SPOT_ERROR",
+                message=_redact(sanitize_error_message(str(exc)), credentials),
+            )
+    parsed, list_error, list_timeout = _open_order_rows(credentials)
+    if parsed is None:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="CANCEL_STATUS_UNKNOWN",
+            message=(list_error or "MEXC open-order status is unknown after cancel.") + " Not retried.",
+        )
+    matching = [
+        row
+        for row in parsed
+        if str(row.get("symbol") or "").upper().replace("/", "") == symbol
+        and str(row.get("side") or "").upper() == side
+        and str(row.get("status") or "").upper() not in {"FILLED", "CANCELED", "CANCELLED"}
+    ]
+    remaining_ids = {str(row.get("order_id") or "") for row in matching}
+    requested_set = set(order_ids)
+    still_open_requested = requested_set & remaining_ids
+    cancelled = len(requested_set) - len(still_open_requested)
+    remaining = len(matching)
+    verified = len(still_open_requested) == 0
+    data = {
+        "source": "mexc_spot_cancel",
+        "symbol": symbol,
+        "side": side,
+        "order_ids": order_ids,
+        "requested": len(order_ids),
+        "cancelled": cancelled,
+        "remaining": remaining,
+        "verified": verified,
+    }
+    cancel_group = CanonicalCancelGroupResult(
+        symbol=symbol,
+        side=side,
+        targeted_order_count=len(order_ids),
+        cancelled_order_count=cancelled,
+        confirmed_absent_count=cancelled,
+        remaining_target_count=len(still_open_requested),
+        verified=verified,
+        partial=cancelled > 0 and not verified,
+        status="unknown" if timed_out or list_timeout else ("success" if verified else "partial"),
+        requested_cancel_count=len(order_ids),
+        verified_cancel_count=cancelled,
+    )
+    if timed_out or list_timeout:
+        return make_failure(
+            operation="cancel_orders",
+            exchange=name,
+            account=credentials["account"],
+            code="CANCEL_STATUS_UNKNOWN",
+            message="MEXC cancel request timed out after transmission. Order status is unknown; not retried.",
+            cancel_group=cancel_group,
+        )
+    return make_success(
+        operation="cancel_orders",
+        exchange=name,
+        account=credentials["account"],
+        cancel_group=cancel_group,
+        data=data,
+    )
+
+
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     op = str(request.get("operation") or "").strip()
     account = str(request.get("account") or "").strip()
@@ -938,7 +1093,9 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _market_price(account, request)
     if op == "new_order":
         return _new_order(account, request)
-    if op in {"ladder", "cancel_orders", "cancel_order_group", "cancel_order"}:
+    if op == "cancel_orders":
+        return _cancel_orders(account, request)
+    if op in {"ladder", "cancel_order_group", "cancel_order"}:
         return _unsupported(op, account)
     return make_failure(
         operation=op,

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from decimal import Decimal
 from typing import Any, Dict, List
 
 _HERE = Path(__file__).resolve().parent
@@ -142,6 +143,9 @@ class FakeMexcSpotDesk:
         self.reject_new_order = False
         self.reject_message = "exchange rejected order"
         self.timeout_new_order = False
+        self.open_orders: List[Dict[str, Any]] = []
+        self.fail_cancel_ids: set[str] = set()
+        self.timeout_cancel = False
         self.balances: Dict[str, str] = {"USDT": "10000", "USDC": "10000", "SOL": "100", "SUI": "100"}
         self.instruments: List[Dict[str, Any]] = [
             self._inst("SOLUSDT", "SOL", "USDT", quote_precision=2),
@@ -204,7 +208,16 @@ class FakeMexcSpotDesk:
     def capabilities(self, exchange: str) -> List[str]:
         if exchange != "mexc":
             return []
-        return ["balance", "orders", "open_orders", "list_instruments", "resolve_instrument", "market_price", "new_order"]
+        return [
+            "balance",
+            "orders",
+            "open_orders",
+            "list_instruments",
+            "resolve_instrument",
+            "market_price",
+            "new_order",
+            "cancel_orders",
+        ]
 
     def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
         self.requests.append(dict(request))
@@ -234,6 +247,52 @@ class FakeMexcSpotDesk:
         if op == "balance":
             assets = [{"asset": k, "total": v} for k, v in self.balances.items()]
             return make_success(op, "mexc", "amiroo", data={"assets": assets})
+        if op in {"orders", "open_orders"}:
+            return make_success(
+                op,
+                "mexc",
+                "amiroo",
+                open_order_count=len(self.open_orders),
+                data={"orders": [dict(row) for row in self.open_orders]},
+            )
+        if op == "cancel_orders":
+            if self.timeout_cancel:
+                return make_failure(op, "mexc", "amiroo", code="CANCEL_STATUS_UNKNOWN", message="timed out after transmission")
+            ids = [str(x) for x in (request.get("order_ids") or [])]
+            symbol = str(request.get("symbol") or "").upper().replace("/", "")
+            side = str(request.get("side") or "").upper()
+            remaining: List[Dict[str, Any]] = []
+            cancelled = 0
+            for row in self.open_orders:
+                oid = str(row.get("order_id") or "")
+                row_symbol = str(row.get("symbol") or "").upper().replace("/", "")
+                row_side = str(row.get("side") or "").upper()
+                if oid in ids and oid not in self.fail_cancel_ids and row_symbol == symbol and row_side == side:
+                    cancelled += 1
+                    continue
+                remaining.append(row)
+            self.open_orders = remaining
+            remaining_match = [
+                row
+                for row in self.open_orders
+                if str(row.get("symbol") or "").upper().replace("/", "") == symbol
+                and str(row.get("side") or "").upper() == side
+            ]
+            verified = cancelled == len(ids) and not remaining_match
+            return make_success(
+                op,
+                "mexc",
+                "amiroo",
+                data={
+                    "requested": len(ids),
+                    "cancelled": cancelled,
+                    "remaining": len(remaining_match),
+                    "verified": verified,
+                    "order_ids": ids,
+                    "symbol": symbol,
+                    "side": side,
+                },
+            )
         if op == "new_order":
             if self.timeout_new_order:
                 return make_failure(op, "mexc", "amiroo", code="ORDER_STATUS_UNKNOWN", message="timed out after transmission")
@@ -474,7 +533,7 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         self.assertEqual(cancelled.state, "action")
         self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
         self.assertNotIn("🪜 Ladder", _labels(cancelled))
-        self.assertNotIn("❌ Cancel Orders", _labels(cancelled))
+        self.assertIn("❌ Cancel Orders", _labels(cancelled))
 
 
 class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
@@ -618,13 +677,259 @@ class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
         labels = _labels(screen)
         self.assertIn("➕ New Order", labels)
         self.assertNotIn("🪜 Ladder", labels)
-        self.assertNotIn("❌ Cancel Orders", labels)
+        self.assertIn("❌ Cancel Orders", labels)
 
     def test_trade_namespace_still_separate(self) -> None:
         screen = self.wizard.open(self.key)
         self.assertTrue(all(not cb.startswith("trade:") for cb in _callbacks(screen)))
         self.assertIsNone(trade_exchange_name_from_filename("x_mexc_agent_spot.py"))
         self.assertEqual(trade_exchange_name_from_filename("x_mexc_agent.py"), "mexc")
+
+
+def _spot_open(
+    order_id: str,
+    symbol: str,
+    pair: str,
+    side: str,
+    price: str,
+    orig: str,
+    executed: str = "0",
+    status: str = "NEW",
+) -> Dict[str, Any]:
+    remaining = Decimal(orig) - Decimal(executed)
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "pair": pair,
+        "side": side,
+        "type": "LIMIT",
+        "price": price,
+        "orig_qty": orig,
+        "executed_qty": executed,
+        "remaining_qty": format(remaining.normalize(), "f").rstrip("0").rstrip(".") if "." in format(remaining, "f") else str(remaining),
+        "status": status,
+    }
+
+
+class TradeSpotMexcCancelOrdersTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.key = ("chat-cancel",)
+
+    def _account(self):
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        return self.wizard.handle_callback(self.key, "account:amiroo")
+
+    def _open_cancel(self):
+        self._account()
+        return self.wizard.handle_callback(self.key, "action:cancel_orders")
+
+    def test_three_buy_sol_usdc_grouped(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "100", "4"),
+            _spot_open("3", "SOLUSDC", "SOL/USDC", "BUY", "80", "4"),
+        ]
+        screen = self._open_cancel()
+        self.assertIn("❌ Cancel Orders", screen.text)
+        self.assertIn("🔵 SOL/USDC", screen.text)
+        self.assertIn("3 Orders", screen.text)
+        self.assertIn("Total Volume: 11 SOL", screen.text)
+        self.assertIn("Price Range: 73 → 100 USDC", screen.text)
+        expected_vwap = (Decimal("3") * Decimal("73") + Decimal("4") * Decimal("100") + Decimal("4") * Decimal("80")) / Decimal("11")
+        self.assertIn(f"VWAP: {format(expected_vwap.normalize(), 'f').rstrip('0').rstrip('.')} USDC", screen.text)
+        self.assertIn("🔵 SOL/USDC · 3", _labels(screen))
+
+    def test_buy_and_sell_sol_usdc_are_separate_groups(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "SELL", "120", "5"),
+            _spot_open("3", "SOLUSDC", "SOL/USDC", "SELL", "250", "10"),
+        ]
+        screen = self._open_cancel()
+        labels = _labels(screen)
+        self.assertIn("🔵 SOL/USDC · 1", labels)
+        self.assertIn("🔴 SOL/USDC · 2", labels)
+        self.assertIn("🔵 SOL/USDC", screen.text)
+        self.assertIn("🔴 SOL/USDC", screen.text)
+
+    def test_sol_usdc_and_sol_usdt_are_separate_groups(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1"),
+            _spot_open("2", "SOLUSDT", "SOL/USDT", "BUY", "74", "1"),
+        ]
+        screen = self._open_cancel()
+        labels = _labels(screen)
+        self.assertIn("🔵 SOL/USDC · 1", labels)
+        self.assertIn("🔵 SOL/USDT · 1", labels)
+
+    def test_partially_filled_uses_remaining_quantity(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "80", "10", executed="6"),
+        ]
+        screen = self._open_cancel()
+        self.assertIn("Total Volume: 4 SOL", screen.text)
+        self.assertNotIn("Total Volume: 10 SOL", screen.text)
+
+    def test_total_volume_min_max_and_vwap(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "70", "2"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "90", "2"),
+        ]
+        screen = self._open_cancel()
+        self.assertIn("Total Volume: 4 SOL", screen.text)
+        self.assertIn("Price Range: 70 → 90 USDC", screen.text)
+        self.assertIn("VWAP: 80 USDC", screen.text)
+
+    def test_single_order_uses_price_not_range(self) -> None:
+        self.desk.open_orders = [_spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "101", "1")]
+        screen = self._open_cancel()
+        self.assertIn("Orders: 1", screen.text)
+        self.assertIn("Price: 101 USDC", screen.text)
+        self.assertNotIn("→", screen.text)
+
+    def test_zero_open_orders(self) -> None:
+        self.desk.open_orders = []
+        screen = self._open_cancel()
+        self.assertIn("No open LIMIT orders", screen.text)
+        self.assertFalse(any("SOL/USDC" in label for label in _labels(screen)))
+        self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
+
+    def test_group_selection_performs_no_cancellation(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "100", "4"),
+            _spot_open("3", "SOLUSDC", "SOL/USDC", "BUY", "80", "4"),
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        self.assertIn("This will cancel ALL currently open BUY SOL/USDC limit orders", confirm.text)
+        self.assertIn("❌ Cancel 3 Orders", _labels(confirm))
+        self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
+        self.assertEqual(len(self.desk.open_orders), 3)
+
+    def test_confirmation_screen_refreshes_live_orders(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "100", "4"),
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        self.desk.open_orders.append(_spot_open("3", "SOLUSDC", "SOL/USDC", "BUY", "80", "4"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        self.assertIn("Orders: 3", confirm.text)
+        self.assertIn("Total Volume: 11 SOL", confirm.text)
+        reads = [r for r in self.desk.requests if r.get("operation") in {"orders", "open_orders"}]
+        self.assertGreaterEqual(len(reads), 2)
+
+    def test_final_confirm_cancels_only_matching_side_and_instrument(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "100", "4"),
+            _spot_open("9", "SOLUSDC", "SOL/USDC", "SELL", "120", "5"),
+            _spot_open("8", "SOLUSDT", "SOL/USDT", "BUY", "74", "1"),
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if "BUY:SOLUSDC" in str(cb) or str(cb).endswith("BUY:SOLUSDC"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        result = self.wizard.handle_callback(self.key, cx)
+        self.assertIn("✅ Orders Cancelled", result.text)
+        self.assertIn("Requested: 2", result.text)
+        self.assertIn("Cancelled: 2", result.text)
+        self.assertIn("Remaining: 0", result.text)
+        cancels = [r for r in self.desk.requests if r.get("operation") == "cancel_orders"]
+        self.assertEqual(len(cancels), 1)
+        self.assertEqual(set(cancels[0]["order_ids"]), {"1", "2"})
+        self.assertEqual(cancels[0]["side"], "BUY")
+        self.assertEqual(cancels[0]["symbol"].replace("/", ""), "SOLUSDC")
+        remaining_ids = {row["order_id"] for row in self.desk.open_orders}
+        self.assertEqual(remaining_ids, {"9", "8"})
+
+    def test_opposite_side_untouched(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1"),
+            _spot_open("9", "SOLUSDC", "SOL/USDC", "SELL", "120", "1"),
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if "BUY:SOLUSDC" in str(cb))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        self.wizard.handle_callback(self.key, cx)
+        self.assertEqual({row["order_id"] for row in self.desk.open_orders}, {"9"})
+
+    def test_other_instrument_untouched(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1"),
+            _spot_open("8", "SUIUSDC", "SUI/USDC", "BUY", "1.02", "2"),
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if "BUY:SOLUSDC" in str(cb))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        self.wizard.handle_callback(self.key, cx)
+        self.assertEqual({row["order_id"] for row in self.desk.open_orders}, {"8"})
+
+    def test_double_confirm_cancels_once(self) -> None:
+        self.desk.open_orders = [_spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1")]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        self.wizard.handle_callback(self.key, cx)
+        self.wizard.handle_callback(self.key, cx)
+        self.assertEqual(len([r for r in self.desk.requests if r.get("operation") == "cancel_orders"]), 1)
+
+    def test_partial_failure_reports_incomplete(self) -> None:
+        self.desk.open_orders = [
+            _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1"),
+            _spot_open("2", "SOLUSDC", "SOL/USDC", "BUY", "80", "1"),
+        ]
+        self.desk.fail_cancel_ids = {"2"}
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        result = self.wizard.handle_callback(self.key, cx)
+        self.assertIn("Cancellation incomplete", result.text)
+        self.assertIn("Requested: 2", result.text)
+        self.assertIn("Cancelled: 1", result.text)
+        self.assertIn("Remaining: 1", result.text)
+        self.assertNotIn("✅ Orders Cancelled", result.text)
+
+    def test_timeout_does_not_blindly_retry(self) -> None:
+        self.desk.open_orders = [_spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1")]
+        self.desk.timeout_cancel = True
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        cx = next(cb for cb in _callbacks(confirm) if str(cb).startswith("cx:"))
+        result = self.wizard.handle_callback(self.key, cx)
+        self.assertTrue("unknown" in result.text.lower() or "UNKNOWN" in result.text)
+        self.assertIn("Not retried", result.text)
+        self.wizard.handle_callback(self.key, cx)
+        self.assertEqual(len([r for r in self.desk.requests if r.get("operation") == "cancel_orders"]), 1)
+
+    def test_back_performs_no_cancellation(self) -> None:
+        self.desk.open_orders = [_spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1")]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        back = self.wizard.handle_callback(self.key, "back")
+        self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
+        self.assertEqual(len(self.desk.open_orders), 1)
+        self.assertEqual(back.state, "cancel_orders")
+
+    def test_trade_namespace_unaffected(self) -> None:
+        self.desk.open_orders = [_spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "1")]
+        screen = self._open_cancel()
+        self.assertTrue(all(not str(cb).startswith("trade:") for cb in _callbacks(screen)))
+        confirm_from_action = self._account()
+        self.assertIn("❌ Cancel Orders", _labels(confirm_from_action))
+        self.assertTrue(all(not str(cb).startswith("trade:") for cb in _callbacks(confirm_from_action)))
 
 
 class TradeSpotCommandRegistrationTests(unittest.TestCase):

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 BUTTON_CLOSE = ("❌ Close", "close")
 BUTTON_BACK = ("⬅️ Back", "back")
+BUTTON_BACK_RETURN = ("↩️ Back", "back")
 BUTTON_REFRESH = ("🔄 Refresh", "refresh")
 BUTTON_CHANGE_ACCOUNT = ("🔄 Change Account", "change_account")
 BUTTON_CHANGE_EXCHANGE = ("🔄 Change Exchange", "change_exchange")
@@ -46,6 +47,9 @@ _QUICK_PICK_BASE_ASSETS = ("SOL", "ETH", "HYPE", "SUI")
 _PAIR_PAGE_SIZE = 8
 _MEXC_QUOTE_ASSETS = ("USDT", "USDC")
 _QUOTE_CENTS = Decimal("0.01")
+_OPEN_LIMIT_STATUSES = {"", "NEW", "PARTIALLY_FILLED", "LIVE", "PENDING"}
+_LIMIT_ORDER_TYPES = {"", "LIMIT", "LIMIT_MAKER"}
+_CLOSED_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
 
 
 def _balance_assets(response: CanonicalResponse) -> List[Any]:
@@ -135,6 +139,89 @@ def _mexc_inventory_lines(assets: List[Any]) -> List[str]:
     return lines
 
 
+def _format_spot_number(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if not text or text == "-":
+        text = "0"
+    return _thousands(text)
+
+
+def _display_pair_from_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().replace("/", "")
+    for quote in ("USDT", "USDC", "FDUSD", "BTC", "ETH", "MX", "USD"):
+        if sym.endswith(quote) and len(sym) > len(quote):
+            return f"{sym[:-len(quote)]}/{quote}"
+    return str(symbol or "").upper()
+
+
+def _order_remaining(row: Mapping[str, Any]) -> Decimal:
+    remaining = row.get("remaining_qty")
+    if remaining is not None and str(remaining).strip() != "":
+        return _to_amount(remaining)
+    orig = row.get("orig_qty", row.get("origQty"))
+    executed = row.get("executed_qty", row.get("executedQty"))
+    return _to_amount(orig) - _to_amount(executed)
+
+
+def _group_open_limit_orders(rows: List[Any]) -> List[Dict[str, Any]]:
+    buckets: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        status = str(item.get("status") or "").upper()
+        if status in _CLOSED_STATUSES or (status and status not in _OPEN_LIMIT_STATUSES):
+            continue
+        order_type = str(item.get("type") or item.get("order_type") or "").upper()
+        if order_type and order_type not in _LIMIT_ORDER_TYPES:
+            continue
+        side = str(item.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        remaining = _order_remaining(item)
+        if remaining <= 0:
+            continue
+        pair = str(item.get("pair") or "").strip().upper()
+        compact = str(item.get("symbol") or "").strip().upper().replace("/", "")
+        if not pair:
+            pair = _display_pair_from_symbol(compact or str(item.get("symbol") or ""))
+        if not compact:
+            compact = pair.replace("/", "")
+        if not pair or not compact:
+            continue
+        buckets.setdefault((side, pair), []).append(item)
+    groups: List[Dict[str, Any]] = []
+    for side, pair in sorted(buckets, key=lambda key: (key[1], 0 if key[0] == "BUY" else 1)):
+        items = buckets[(side, pair)]
+        qty = sum((_order_remaining(row) for row in items), Decimal("0"))
+        prices = [_to_amount(row.get("price")) for row in items]
+        live_prices = [p for p in prices if p > 0]
+        notional = sum((_order_remaining(row) * _to_amount(row.get("price")) for row in items), Decimal("0"))
+        vwap = (notional / qty) if qty > 0 else Decimal("0")
+        compact = str(items[0].get("symbol") or pair).upper().replace("/", "")
+        quote = pair.split("/")[-1] if "/" in pair else ""
+        base = pair.split("/")[0] if "/" in pair else pair
+        groups.append(
+            {
+                "side": side,
+                "pair": pair,
+                "symbol": compact,
+                "base": base,
+                "quote": quote,
+                "order_count": len(items),
+                "total_qty": qty,
+                "min_price": min(live_prices) if live_prices else Decimal("0"),
+                "max_price": max(live_prices) if live_prices else Decimal("0"),
+                "vwap": vwap,
+                "order_ids": [str(row.get("order_id") or row.get("orderId") or "") for row in items if str(row.get("order_id") or row.get("orderId") or "")],
+            }
+        )
+    return groups
+
+
 @dataclass(frozen=True)
 class Screen:
     text: str
@@ -157,6 +244,9 @@ class SpotWizardState:
     confirm_token: Optional[str] = None
     confirm_consumed: bool = False
     last_submit_screen: Optional["Screen"] = None
+    cancel_side: Optional[str] = None
+    cancel_symbol: Optional[str] = None
+    cancel_pair: Optional[str] = None
 
 
 class TradeSpotWizard:
@@ -219,6 +309,12 @@ class TradeSpotWizard:
             return self._handle_preview_callback(chat_key, suffix)
         if state.state == "order_result":
             return self._handle_order_result_callback(chat_key, suffix)
+        if state.state == "cancel_orders":
+            return self._handle_cancel_list_callback(chat_key, suffix)
+        if state.state == "cancel_confirm":
+            return self._handle_cancel_confirm_callback(chat_key, suffix)
+        if state.state == "cancel_result":
+            return self._handle_cancel_result_callback(chat_key, suffix)
         if state.state in {"balance", "orders", "unsupported"}:
             return self._handle_result_screen(chat_key, suffix)
         return self.open(chat_key)
@@ -364,6 +460,8 @@ class TradeSpotWizard:
             return self._render_orders(chat_key)
         if action == "new_order" and self._supports_new_order_picker(exchange):
             return self._render_new_order_assets(chat_key)
+        if action == "cancel_orders" and "cancel_orders" in caps:
+            return self._render_cancel_orders(chat_key)
         if action in _MUTATING_ACTIONS and action in caps:
             return self._render_mutating_not_enabled(chat_key, action)
         return self._render_action(chat_key)
@@ -379,6 +477,9 @@ class TradeSpotWizard:
         state.confirm_token = None
         state.confirm_consumed = False
         state.last_submit_screen = None
+        state.cancel_side = None
+        state.cancel_symbol = None
+        state.cancel_pair = None
 
     def _render_new_order_assets(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
@@ -1064,6 +1165,262 @@ class TradeSpotWizard:
         else:
             lines.extend(_render_error_lines(response.error, "Orders unavailable."))
         return Screen("\n".join(lines).rstrip(), self._result_buttons(), "orders")
+
+    def _fetch_open_order_rows(self, state: SpotWizardState) -> List[Any]:
+        exchange = state.exchange or ""
+        account = state.account or ""
+        caps = set(self._desk.capabilities(exchange) or [])
+        operation = "open_orders" if "open_orders" in caps else "orders"
+        response = self._desk.execute({"operation": operation, "exchange": exchange, "account": account})
+        if not response.success:
+            return []
+        data = getattr(response, "data", None)
+        rows = data.get("orders") if isinstance(data, dict) else None
+        return list(rows) if isinstance(rows, list) else []
+
+    def _side_dot(self, side: str) -> str:
+        return "🔵" if str(side).upper() == "BUY" else "🔴"
+
+    def _group_body_lines(self, group: Mapping[str, Any], *, confirm: bool) -> List[str]:
+        side = str(group.get("side") or "")
+        pair = str(group.get("pair") or "")
+        count = int(group.get("order_count") or 0)
+        base = str(group.get("base") or "")
+        quote = str(group.get("quote") or "")
+        qty = group.get("total_qty") if isinstance(group.get("total_qty"), Decimal) else _to_amount(group.get("total_qty"))
+        min_price = group.get("min_price") if isinstance(group.get("min_price"), Decimal) else _to_amount(group.get("min_price"))
+        max_price = group.get("max_price") if isinstance(group.get("max_price"), Decimal) else _to_amount(group.get("max_price"))
+        vwap = group.get("vwap") if isinstance(group.get("vwap"), Decimal) else _to_amount(group.get("vwap"))
+        title = f"{self._side_dot(side)} {side} {pair}" if confirm else f"{self._side_dot(side)} {pair}"
+        count_line = f"Orders: {count}" if confirm or count == 1 else f"{count} Orders"
+        lines = [title, count_line, f"Total Volume: {_format_spot_number(qty)} {base}"]
+        if count == 1:
+            lines.append(f"Price: {_format_spot_number(min_price or max_price)} {quote}")
+        else:
+            lines.append(f"Price Range: {_format_spot_number(min_price)} → {_format_spot_number(max_price)} {quote}")
+        lines.append(f"VWAP: {_format_spot_number(vwap)} {quote}")
+        return lines
+
+    def _find_group(self, groups: List[Dict[str, Any]], side: str, symbol: str) -> Optional[Dict[str, Any]]:
+        side_u = str(side or "").upper()
+        compact = str(symbol or "").upper().replace("/", "")
+        for group in groups:
+            if str(group.get("side") or "").upper() == side_u and str(group.get("symbol") or "").upper().replace("/", "") == compact:
+                return group
+        return None
+
+    def _render_cancel_orders(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "cancel_orders"
+        state.confirm_token = None
+        state.confirm_consumed = False
+        exchange = state.exchange or ""
+        account = state.account or ""
+        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        lines = [
+            "🟦 Spot Trading",
+            "❌ Cancel Orders",
+            "",
+            f"Exchange: {exchange}",
+            f"Account: {account}",
+            "",
+        ]
+        buttons: List[List[Dict[str, str]]] = []
+        if not groups:
+            lines.append("No open LIMIT orders.")
+        else:
+            blocks = []
+            for group in groups:
+                blocks.append("\n".join(self._group_body_lines(group, confirm=False)))
+                label = f"{self._side_dot(group['side'])} {group['pair']} · {group['order_count']}"
+                buttons.append([_button_row(label, f"cg:{group['side']}:{group['symbol']}")])
+            lines.append("\n\n".join(blocks))
+        buttons.append([_button_row(*BUTTON_BACK_RETURN)])
+        return Screen("\n".join(lines).rstrip(), buttons, "cancel_orders")
+
+    def _handle_cancel_list_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        if suffix == "back":
+            return self._render_action(chat_key)
+        if suffix.startswith("cg:"):
+            parts = suffix.split(":")
+            if len(parts) >= 3:
+                return self._render_cancel_confirm(chat_key, parts[1], parts[2])
+        return self._render_cancel_orders(chat_key)
+
+    def _render_cancel_confirm(self, chat_key: Tuple[Any, ...], side: str, symbol: str) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "cancel_confirm"
+        side_u = str(side or "").upper()
+        compact = str(symbol or "").upper().replace("/", "")
+        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        group = self._find_group(groups, side_u, compact)
+        if group is None:
+            state.confirm_token = None
+            return Screen(
+                "🟦 MEXC Spot — Cancel Orders\n\nNo matching open LIMIT orders remain.",
+                [[_button_row(*BUTTON_BACK_RETURN)]],
+                "cancel_confirm",
+            )
+        state.cancel_side = side_u
+        state.cancel_symbol = str(group["symbol"])
+        state.cancel_pair = str(group["pair"])
+        token = secrets.token_hex(8)
+        state.confirm_token = token
+        state.confirm_consumed = False
+        count = int(group["order_count"])
+        lines = [
+            "🟦 MEXC Spot — Cancel Orders",
+            "",
+            *self._group_body_lines(group, confirm=True),
+            "",
+            f"This will cancel ALL currently open {side_u} {group['pair']} limit orders.",
+        ]
+        buttons = [
+            [_button_row(f"❌ Cancel {count} Orders", f"cx:{token}")],
+            [_button_row(*BUTTON_BACK_RETURN)],
+        ]
+        return Screen("\n".join(lines), buttons, "cancel_confirm")
+
+    def _handle_cancel_confirm_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        if suffix == "back":
+            return self._render_cancel_orders(chat_key)
+        if suffix.startswith("cx:"):
+            return self._submit_cancel_orders(chat_key, suffix[len("cx:") :])
+        state = self._state_for(chat_key)
+        return self._render_cancel_confirm(chat_key, state.cancel_side or "", state.cancel_symbol or "")
+
+    def _submit_cancel_orders(self, chat_key: Tuple[Any, ...], token: str) -> Screen:
+        state = self._state_for(chat_key)
+        if not token or token != (state.confirm_token or ""):
+            return self._render_cancel_confirm(chat_key, state.cancel_side or "", state.cancel_symbol or "")
+        if state.confirm_consumed:
+            if state.last_submit_screen is not None:
+                return state.last_submit_screen
+            return Screen(
+                "🟦 MEXC Spot — Cancel Orders\n\nThis confirmation was already used. No additional cancellation was sent.",
+                [[_button_row(*BUTTON_BACK_RETURN)]],
+                "cancel_result",
+            )
+        state.confirm_consumed = True
+        side = str(state.cancel_side or "").upper()
+        symbol = str(state.cancel_symbol or "").upper().replace("/", "")
+        pair = str(state.cancel_pair or _display_pair_from_symbol(symbol))
+        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        group = self._find_group(groups, side, symbol)
+        order_ids = list(group.get("order_ids") or []) if group else []
+        if not order_ids:
+            screen = self._cancel_result_screen(state, pair, side, requested=0, cancelled=0, remaining=0, unknown=False)
+            state.last_submit_screen = screen
+            state.state = "cancel_result"
+            return screen
+        response = self._desk.execute(
+            {
+                "operation": "cancel_orders",
+                "exchange": state.exchange or "",
+                "account": state.account or "",
+                "symbol": symbol,
+                "side": side,
+                "order_ids": order_ids,
+            }
+        )
+        err = getattr(response, "error", None)
+        code = getattr(err, "code", "") if err is not None else ""
+        if code == "CANCEL_STATUS_UNKNOWN" or (not response.success and code == "CANCEL_STATUS_UNKNOWN"):
+            screen = self._cancel_unknown_screen(state, pair, side, len(order_ids))
+            state.last_submit_screen = screen
+            state.state = "cancel_result"
+            return screen
+        refreshed = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        remaining_group = self._find_group(refreshed, side, symbol)
+        remaining = int(remaining_group["order_count"]) if remaining_group else 0
+        still = set(remaining_group.get("order_ids") or []) if remaining_group else set()
+        cancelled = len(set(order_ids) - still)
+        data = getattr(response, "data", None) if response.success else None
+        if isinstance(data, dict):
+            if data.get("cancelled") is not None:
+                cancelled = int(data.get("cancelled") or cancelled)
+            if data.get("remaining") is not None:
+                remaining = int(data.get("remaining") or remaining)
+        screen = self._cancel_result_screen(
+            state,
+            pair,
+            side,
+            requested=len(order_ids),
+            cancelled=cancelled,
+            remaining=remaining,
+            unknown=False,
+        )
+        state.last_submit_screen = screen
+        state.state = "cancel_result"
+        return screen
+
+    def _cancel_unknown_screen(self, state: SpotWizardState, pair: str, side: str, requested: int) -> Screen:
+        dot = self._side_dot(side)
+        text = "\n".join(
+            [
+                "🟦 Spot Trading",
+                "⚠️ Cancellation status unknown",
+                "",
+                f"Exchange: {state.exchange or ''}",
+                f"Account: {state.account or ''}",
+                "",
+                f"{dot} {pair}",
+                "",
+                f"Requested: {requested}",
+                "Not retried.",
+            ]
+        )
+        return Screen(text, self._cancel_result_buttons(), "cancel_result")
+
+    def _cancel_result_screen(
+        self,
+        state: SpotWizardState,
+        pair: str,
+        side: str,
+        *,
+        requested: int,
+        cancelled: int,
+        remaining: int,
+        unknown: bool,
+    ) -> Screen:
+        complete = remaining == 0 and cancelled == requested and requested > 0
+        title = "✅ Orders Cancelled" if complete else "⚠️ Cancellation incomplete"
+        dot = self._side_dot(side)
+        text = "\n".join(
+            [
+                "🟦 Spot Trading",
+                title,
+                "",
+                f"Exchange: {state.exchange or ''}",
+                f"Account: {state.account or ''}",
+                "",
+                f"{dot} {pair}",
+                "",
+                f"Requested: {requested}",
+                f"Cancelled: {cancelled}",
+                f"Remaining: {remaining}",
+            ]
+        )
+        return Screen(text, self._cancel_result_buttons(), "cancel_result")
+
+    def _cancel_result_buttons(self) -> List[List[Dict[str, str]]]:
+        return [
+            [_button_row("Cancel Orders", "cancel_orders")],
+            [_button_row("Orders", "orders")],
+            [_button_row("Main Menu", "main")],
+        ]
+
+    def _handle_cancel_result_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix in {"back", "main"}:
+            return self._render_action(chat_key)
+        if suffix in {"cancel_orders", "action:cancel_orders"}:
+            return self._render_cancel_orders(chat_key)
+        if suffix == "orders":
+            return self._render_orders(chat_key)
+        if state.last_submit_screen is not None:
+            return state.last_submit_screen
+        return self._render_action(chat_key)
 
     def _render_mutating_not_enabled(self, chat_key: Tuple[Any, ...], action: str) -> Screen:
         state = self._state_for(chat_key)

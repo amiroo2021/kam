@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
@@ -54,8 +54,8 @@ class MexcSpotEnvTests(unittest.TestCase):
         self.assertIn("open_orders", caps)
         self.assertIn("list_instruments", caps)
         self.assertIn("new_order", caps)
+        self.assertIn("cancel_orders", caps)
         self.assertNotIn("ladder", caps)
-        self.assertNotIn("cancel_orders", caps)
 
     def test_signed_request_uses_mexc_spot_signature_without_exposing_secret(self) -> None:
         captured: Dict[str, Any] = {}
@@ -227,9 +227,9 @@ class MexcSpotParsingTests(unittest.TestCase):
         assert data is not None
         self.assertEqual(data["instrument"]["symbol"], "SOLUSDT")
 
-    def test_ladder_and_cancel_remain_unimplemented(self) -> None:
+    def test_ladder_and_cancel_all_remain_unimplemented(self) -> None:
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
-            for op in ("ladder", "cancel_orders", "cancel_order_group"):
+            for op in ("ladder", "cancel_order_group"):
                 resp = spot.execute({"operation": op, "exchange": "mexc", "account": "amiroo"})
                 self.assertFalse(resp.success)
                 self.assertIsNotNone(resp.error)
@@ -349,6 +349,103 @@ class MexcSpotParsingTests(unittest.TestCase):
         self.assertIn("insufficient USDC", resp.error.message)
 
 
+class MexcSpotCancelOrdersTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("MEXC_") or k == "HERMES_HOME"}
+        for k in list(os.environ):
+            if k.startswith("MEXC_"):
+                os.environ.pop(k, None)
+        os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
+        os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    def tearDown(self) -> None:
+        for k in list(os.environ):
+            if k.startswith("MEXC_"):
+                os.environ.pop(k, None)
+        os.environ.pop("HERMES_HOME", None)
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_cancel_orders_deletes_only_listed_ids(self) -> None:
+        calls: List[Dict[str, Any]] = []
+        open_rows = [
+            {"symbol": "SOLUSDC", "side": "BUY", "type": "LIMIT", "price": "73", "origQty": "1", "executedQty": "0", "status": "NEW", "orderId": "1"},
+            {"symbol": "SOLUSDC", "side": "SELL", "type": "LIMIT", "price": "120", "origQty": "1", "executedQty": "0", "status": "NEW", "orderId": "9"},
+            {"symbol": "SOLUSDT", "side": "BUY", "type": "LIMIT", "price": "74", "origQty": "1", "executedQty": "0", "status": "NEW", "orderId": "8"},
+        ]
+
+        def fake_signed(_credentials, method, path, params=None):
+            calls.append({"method": method, "path": path, "params": dict(params or {})})
+            if method.upper() == "DELETE":
+                return {"symbol": "SOLUSDC", "orderId": params.get("orderId")}
+            if path == "/api/v3/openOrders":
+                remaining_ids = {c["params"]["orderId"] for c in calls if c["method"].upper() == "DELETE"}
+                return [row for row in open_rows if str(row["orderId"]) not in remaining_ids]
+            raise AssertionError(f"unexpected {method} {path}")
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute({
+                    "operation": "cancel_orders",
+                    "exchange": "mexc",
+                    "account": "amiroo",
+                    "symbol": "SOLUSDC",
+                    "side": "BUY",
+                    "order_ids": ["1"],
+                })
+        self.assertTrue(resp.success)
+        deletes = [c for c in calls if c["method"].upper() == "DELETE"]
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(deletes[0]["path"], "/api/v3/order")
+        self.assertEqual(deletes[0]["params"]["symbol"], "SOLUSDC")
+        self.assertEqual(str(deletes[0]["params"]["orderId"]), "1")
+        self.assertFalse(any(c["params"].get("orderId") in {"9", "8"} for c in deletes))
+        self.assertEqual(resp.data["cancelled"], 1)
+        self.assertEqual(resp.data["remaining"], 0)
+
+    def test_cancel_orders_without_ids_does_not_hit_exchange(self) -> None:
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("no HTTP")):
+                resp = spot.execute({
+                    "operation": "cancel_orders",
+                    "account": "amiroo",
+                    "symbol": "SOLUSDC",
+                    "side": "BUY",
+                })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "MISSING_ORDER_IDS")
+
+    def test_cancel_timeout_does_not_retry_delete(self) -> None:
+        import urllib.error
+
+        calls = {"delete": 0, "get": 0}
+
+        def fake_signed(_credentials, method, path, params=None):
+            if method.upper() == "DELETE":
+                calls["delete"] += 1
+                raise urllib.error.URLError("timed out")
+            calls["get"] += 1
+            return [{"symbol": "SOLUSDC", "side": "BUY", "type": "LIMIT", "price": "73", "origQty": "1", "executedQty": "0", "status": "NEW", "orderId": "1"}]
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute({
+                    "operation": "cancel_orders",
+                    "account": "amiroo",
+                    "symbol": "SOLUSDC",
+                    "side": "BUY",
+                    "order_ids": ["1"],
+                })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "CANCEL_STATUS_UNKNOWN")
+        self.assertEqual(calls["delete"], 1)
+        self.assertEqual(calls["get"], 1)
+
+
 class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
     def test_spotdesk_discovers_mexc_spot_agent(self) -> None:
         desk = SpotDesk()
@@ -370,8 +467,8 @@ class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
         self.assertTrue(str(getattr(agent, "__file__", "")).endswith("x_mexc_agent_spot.py"))
         assert agent is not None
         self.assertIn("new_order", agent.capabilities())
+        self.assertIn("cancel_orders", agent.capabilities())
         self.assertNotIn("ladder", agent.capabilities())
-        self.assertNotIn("cancel_orders", agent.capabilities())
 
 
 if __name__ == "__main__":
