@@ -183,8 +183,50 @@ except Exception as exc:  # noqa: BLE001
     )
 '''
 
+_TRADESPOT_CALLBACK_BLOCK = '''\\
+if data.startswith("tradespot:"):
+    try:
+        from plugins.trade.tradespot_wizard import handle_tradespot_callback
+
+        await handle_tradespot_callback(self, query, data)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] tradespot callback dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+'''
+
+_TRADESPOT_TEXT_BLOCK = '''\\
+try:
+    from plugins.trade.tradespot_wizard import handle_tradespot_text
+
+    if await handle_tradespot_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /tradespot text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
+'''
+
+_TRADESPOT_COMMAND_BLOCK = '''\\
+if cmd_body == "tradespot":
+    try:
+        from plugins.trade.tradespot_wizard import handle_tradespot_command
+
+        handled = await handle_tradespot_command(self, msg)
+        if handled:
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] /tradespot command dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+'''
+
 # --- Seam C: /trade slash command -----------------------------------------
-_COMMAND_BLOCK = '''\
+_COMMAND_BLOCK = '''\\
 # Match exactly: ``/trade``, ``/trade@botname``, or
 # ``/trade<space>...`` -- but NOT ``/trader`` or ``/trades``.
 raw_text = (msg.text or "").strip()
@@ -824,6 +866,134 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
             block=_COMMAND_BLOCK,
             insertion_indent="        ",
             native_sentinel="from plugins.trade.wizard import handle_trade_command",
+            method_name="_handle_command",
+            method_name_candidates=[
+                "_handle_command",
+                "handle_command",
+                "_on_command",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(msg)",
+                "await self._ensure_forum_commands(update.message)",
+                "_ensure_forum_commands",
+                "is_command=True",
+            ],
+        ),
+        # tradespot seams (added for /tradespot Phase-1/Phase-2)
+        PatchSpec(
+            seam="tradespot callback dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cb_before,
+            anchor_after=cb_after,
+            block=_TRADESPOT_CALLBACK_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_callback",
+            method_name="_handle_callback_query",
+            method_name_candidates=[
+                "_handle_callback_query",
+                "handle_callback_query",
+                "_on_callback_query",
+            ],
+            method_after_substrings=[
+                "data = query.data",
+                "query.data",
+                "callback_query",
+            ],
+        ),
+        PatchSpec(
+            seam="tradespot text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=text_before,
+            anchor_after=text_after,
+            block=_TRADESPOT_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_text",
+            method_name="_handle_text",
+            method_name_candidates=[
+                "_handle_text",
+                "_handle_text_message",
+                "_on_text",
+                "handle_text",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(update.message)",
+                "await self._ensure_forum_commands(msg)",
+                "_ensure_forum_commands",
+                "MessageType.TEXT",
+            ],
+        ),
+        PatchSpec(
+            seam="tradespot slash command dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cmd_before,
+            anchor_after=cmd_after,
+            block=_TRADESPOT_COMMAND_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_command",
+            method_name="_handle_command",
+            method_name_candidates=[
+                "_handle_command",
+                "handle_command",
+                "_on_command",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(msg)",
+                "await self._ensure_forum_commands(update.message)",
+                "_ensure_forum_commands",
+                "is_command=True",
+            ],
+        ),
+        # tradespot seams (added for /tradespot Phase-1/Phase-2)
+        PatchSpec(
+            seam="tradespot callback dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cb_before,
+            anchor_after=cb_after,
+            block=_TRADESPOT_CALLBACK_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_callback",
+            method_name="_handle_callback_query",
+            method_name_candidates=[
+                "_handle_callback_query",
+                "handle_callback_query",
+                "_on_callback_query",
+            ],
+            method_after_substrings=[
+                "data = query.data",
+                "query.data",
+                "callback_query",
+            ],
+        ),
+        PatchSpec(
+            seam="tradespot text interception",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=text_before,
+            anchor_after=text_after,
+            block=_TRADESPOT_TEXT_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_text",
+            method_name="_handle_text",
+            method_name_candidates=[
+                "_handle_text",
+                "_handle_text_message",
+                "_on_text",
+                "handle_text",
+            ],
+            method_after_substrings=[
+                "await self._ensure_forum_commands(update.message)",
+                "await self._ensure_forum_commands(msg)",
+                "_ensure_forum_commands",
+                "MessageType.TEXT",
+            ],
+        ),
+        PatchSpec(
+            seam="tradespot slash command dispatch",
+            relative_path=TELEGRAM_ADAPTER,
+            anchor_before=cmd_before,
+            anchor_after=cmd_after,
+            block=_TRADESPOT_COMMAND_BLOCK,
+            insertion_indent="        ",
+            native_sentinel="from plugins.trade.tradespot_wizard import handle_tradespot_command",
             method_name="_handle_command",
             method_name_candidates=[
                 "_handle_command",
