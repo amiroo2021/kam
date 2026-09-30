@@ -304,13 +304,14 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = old
 
-        # Verify the plugin registered the Telegram-menu command.
-        self.assertEqual(len(ctx.calls), 1)
+        # Verify the plugin registered the Telegram-menu commands exposed by the trade capability.
         names = {call["name"] for call in ctx.calls}
-        self.assertEqual(names, {"trade"})
+        self.assertEqual(names, {"trade", "tradespot", "backtest"})
         trade_call = next(call for call in ctx.calls if call["name"] == "trade")
         self.assertEqual(trade_call["description"], "Open the trading wizard")
         self.assertIs(trade_call["handler"], _handle_trade_slash)
+        spot_call = next(call for call in ctx.calls if call["name"] == "tradespot")
+        self.assertEqual(spot_call["description"], "Open the spot trading wizard")
 
     def test_no_gateway_platforms_keyword_in_register_call(self) -> None:
         """The plugin's register() must not emit gateway_platforms=.
@@ -436,9 +437,11 @@ class TradeRegistrationIsIdempotentTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = old
 
-        self.assertEqual(set(ctx.entries.keys()), {"trade"})
+        self.assertEqual(set(ctx.entries.keys()), {"trade", "tradespot", "backtest"})
         self.assertEqual(ctx.entries["trade"]["description"],
                          "Open the trading wizard")
+        self.assertEqual(ctx.entries["tradespot"]["description"],
+                         "Open the spot trading wizard")
 
     def test_register_handles_missing_register_command_gracefully(self) -> None:
         """If the plugin context lacks register_command (older Hermes),

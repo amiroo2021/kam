@@ -50,6 +50,20 @@ def _handle_trade_slash(raw_args: str) -> str:
     )
 
 
+def _handle_tradespot_slash(raw_args: str) -> str:
+    """Handler invoked by non-Telegram surfaces for /tradespot."""
+    suffix = (raw_args or "").strip()
+    if suffix:
+        return (
+            "`/tradespot` is a Telegram-only spot-trading wizard. "
+            "Open Hermes on Telegram and type /tradespot to use it."
+        )
+    return (
+        "`/tradespot` is a Telegram-only spot-trading wizard. "
+        "Open Hermes on Telegram and type /tradespot to start."
+    )
+
+
 def _handle_fibo_slash(raw_args: str) -> str:
     """Handler invoked by the gateway when ``/fibo`` is dispatched via the
     plugin-command registry.
@@ -177,6 +191,12 @@ def register(ctx: Any) -> None:
         )
         _try_register_command(
             ctx,
+            "tradespot",
+            handler=_handle_tradespot_slash,
+            description="Open the spot trading wizard",
+        )
+        _try_register_command(
+            ctx,
             "backtest",
             handler=_handle_backtest_slash,
             description="Open the backtest wizard",
@@ -212,6 +232,7 @@ def registered_commands() -> List[str]:
     out: List[str] = []
     if caps.get("trade"):
         out.append("trade")
+        out.append("tradespot")
         out.append("backtest")
     if caps.get("fibo"):
         out.append("fibo")

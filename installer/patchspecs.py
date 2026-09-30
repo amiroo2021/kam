@@ -47,6 +47,22 @@ if data.startswith("trade:"):
         except Exception:
             pass
         return
+if data.startswith("tradespot:"):
+    try:
+        from plugins.trade.tradespot_wizard import handle_tradespot_callback
+
+        await handle_tradespot_callback(self, query, data)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[%s] /tradespot callback dispatch failed: %s",
+            self.name, exc, exc_info=True,
+        )
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
 if data.startswith("backtest:"):
     try:
         from plugins.trade.backtest_wizard import handle_backtest_callback
@@ -116,6 +132,16 @@ except Exception as exc:  # noqa: BLE001
         "[%s] /trade text dispatch failed: %s",
         self.name, exc, exc_info=True,
     )
+try:
+    from plugins.trade.tradespot_wizard import handle_tradespot_text
+
+    if await handle_tradespot_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /tradespot text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
 '''
 
 _BACKTEST_TEXT_BLOCK = '''\
@@ -175,6 +201,19 @@ if first_token:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "[%s] /trade command dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+            # Fall through to normal dispatch rather than swallow.
+    if cmd_body == "tradespot":
+        try:
+            from plugins.trade.tradespot_wizard import handle_tradespot_command
+
+            handled = await handle_tradespot_command(self, msg)
+            if handled:
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[%s] /tradespot command dispatch failed: %s",
                 self.name, exc, exc_info=True,
             )
             # Fall through to normal dispatch rather than swallow.

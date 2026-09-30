@@ -625,9 +625,12 @@ class TestHermesIntegration(unittest.TestCase):
 
         names = {call["name"] for call in ctx.calls}
         self.assertIn("trade", names)
+        self.assertIn("tradespot", names)
         trade_cmd = next(call for call in ctx.calls if call["name"] == "trade")
         self.assertEqual(trade_cmd["description"], "Open the trading wizard")
         self.assertIs(trade_cmd["handler"], _handle_trade_slash)
+        spot_cmd = next(call for call in ctx.calls if call["name"] == "tradespot")
+        self.assertEqual(spot_cmd["description"], "Open the spot trading wizard")
 
     def test_12b_trade_dispatch_in_handle_command(self):
         """The adapter's _handle_command path contains direct /trade

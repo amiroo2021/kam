@@ -268,6 +268,10 @@ TRADE_ADAPTER_SENTINELS = {
     "callback": "from plugins.trade.wizard import handle_trade_callback",
     "text": "from plugins.trade.wizard import handle_trade_text",
     "namespace": 'data.startswith("trade:")',
+    "spot_command": "from plugins.trade.tradespot_wizard import handle_tradespot_command",
+    "spot_callback": "from plugins.trade.tradespot_wizard import handle_tradespot_callback",
+    "spot_text": "from plugins.trade.tradespot_wizard import handle_tradespot_text",
+    "spot_namespace": 'data.startswith("tradespot:")',
 }
 BACKTEST_ADAPTER_SENTINELS = {
     "command": "from plugins.trade.backtest_wizard import handle_backtest_command",
