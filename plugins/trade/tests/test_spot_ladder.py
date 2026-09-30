@@ -327,30 +327,6 @@ class SpotLadderValidationTests(unittest.TestCase):
                 instrument=_inst("SOLUSDC", "SOL", "USDC"),
             )
 
-    def test_invalid_direction_buy_end_greater_or_equal_start_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            compute_ladder(
-                side="BUY",
-                distribution="uniform",
-                total_volume=Decimal("10"),
-                start_price=Decimal("73"),
-                end_price=Decimal("100"),
-                order_count=10,
-                instrument=_inst("SOLUSDC", "SOL", "USDC"),
-            )
-
-    def test_invalid_direction_sell_end_less_or_equal_start_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            compute_ladder(
-                side="SELL",
-                distribution="uniform",
-                total_volume=Decimal("10"),
-                start_price=Decimal("250"),
-                end_price=Decimal("120"),
-                order_count=10,
-                instrument=_inst("SOLUSDC", "SOL", "USDC"),
-            )
-
     def test_invalid_distribution_raises(self) -> None:
         with self.assertRaises(ValueError):
             compute_ladder(
@@ -606,64 +582,96 @@ class SpotLadderInvariantsTests(unittest.TestCase):
 
 
 class SpotLadderPriceDirectionTests(unittest.TestCase):
-    """Verify price direction is preserved after tick rounding."""
+    """All 8 (side × direction × distribution) combinations.
 
-    def _direction(self, prices):
-        return ("increasing" if prices[-1] > prices[0] else "decreasing") if len(prices) >= 2 else "n/a"
+    Direction is determined by the user-entered START/END; no side-based
+    inference. Half-Gaussian sizes are positional: smallest at START,
+    largest at END, regardless of price direction.
+    """
 
-    def test_buy_100_to_73_preserved(self) -> None:
+    def _check(self, *, side: str, start: str, end: str, distribution: str) -> LadderPlan:
         plan = compute_ladder(
-            side="BUY",
-            distribution="uniform",
-            total_volume=Decimal("10"),
-            start_price=Decimal("100"),
-            end_price=Decimal("73"),
+            side=side,
+            distribution=distribution,
+            total_volume=Decimal("20"),
+            start_price=Decimal(start),
+            end_price=Decimal(end),
             order_count=10,
             instrument=_inst("SOLUSDC", "SOL", "USDC", size_step="0.000001", price_tick="0.01"),
         )
+        self.assertEqual(len(plan.children), 10, "must produce exactly requested N")
+        sizes = [c.size for c in plan.children]
         prices = [c.price for c in plan.children]
-        self.assertEqual(prices[0], Decimal("100"))
-        self.assertEqual(prices[-1], Decimal("73"))
-        self.assertEqual(self._direction(prices), "decreasing")
-
-    def test_buy_73_to_100_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            compute_ladder(
-                side="BUY",
-                distribution="uniform",
-                total_volume=Decimal("10"),
-                start_price=Decimal("73"),
-                end_price=Decimal("100"),
-                order_count=10,
-                instrument=_inst("SOLUSDC", "SOL", "USDC", size_step="0.000001", price_tick="0.01"),
+        # Price direction: monotonic from START → END as entered.
+        self.assertEqual(prices[0], Decimal(start))
+        self.assertEqual(prices[-1], Decimal(end))
+        if Decimal(start) <= Decimal(end):
+            self.assertTrue(
+                all(prices[i] <= prices[i + 1] for i in range(len(prices) - 1)),
+                f"prices must monotonically increase from {start} to {end}: {prices}",
             )
-
-    def test_sell_100_to_120_preserved(self) -> None:
-        plan = compute_ladder(
-            side="SELL",
-            distribution="uniform",
-            total_volume=Decimal("10"),
-            start_price=Decimal("100"),
-            end_price=Decimal("120"),
-            order_count=10,
-            instrument=_inst("SOLUSDC", "SOL", "USDC", size_step="0.000001", price_tick="0.01"),
-        )
-        prices = [c.price for c in plan.children]
-        self.assertEqual(prices[0], Decimal("100"))
-        self.assertEqual(prices[-1], Decimal("120"))
-        self.assertEqual(self._direction(prices), "increasing")
-
-    def test_sell_120_to_100_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            compute_ladder(
-                side="SELL",
-                distribution="uniform",
-                total_volume=Decimal("10"),
-                start_price=Decimal("120"),
-                end_price=Decimal("100"),
-                order_count=10,
-                instrument=_inst("SOLUSDC", "SOL", "USDC", size_step="0.000001", price_tick="0.01"),
+        else:
+            self.assertTrue(
+                all(prices[i] >= prices[i + 1] for i in range(len(prices) - 1)),
+                f"prices must monotonically decrease from {start} to {end}: {prices}",
             )
+        # Per-child min notional floor (1 USDC).
+        for c in plan.children:
+            self.assertGreaterEqual(c.notional, Decimal("1"))
+            # Aligned to size_step.
+            self.assertEqual(c.size % Decimal("0.000001"), Decimal("0"))
+            # Aligned to price_tick.
+            self.assertEqual(c.price % Decimal("0.01"), Decimal("0"))
+        # Total qty cap.
+        self.assertLessEqual(sum(sizes), Decimal("20"))
+        if distribution == "half_gaussian":
+            # qty[i] <= qty[i+1] (positional smallest-at-START, largest-at-END).
+            self.assertTrue(
+                all(sizes[i] <= sizes[i + 1] for i in range(len(sizes) - 1)),
+                f"half-Gaussian qty must be monotonic non-decreasing: {sizes}",
+            )
+        # VWAP recomputed from final children.
+        vwap = sum(c.size * c.price for c in plan.children) / sum(sizes)
+        self.assertEqual(plan.vwap, vwap)
+        return plan
+
+    # ----- BUY -----
+    def test_buy_100_to_73_uniform(self) -> None:
+        self._check(side="BUY", start="100", end="73", distribution="uniform")
+
+    def test_buy_73_to_100_uniform(self) -> None:
+        self._check(side="BUY", start="73", end="100", distribution="uniform")
+
+    def test_buy_100_to_73_half_gaussian(self) -> None:
+        # START=100 (highest price) smallest qty, END=73 (lowest) largest qty.
+        plan = self._check(side="BUY", start="100", end="73", distribution="half_gaussian")
+        sizes = [c.size for c in plan.children]
+        self.assertLess(sizes[0], sizes[-1], "half-Gaussian: smallest at START, largest at END")
+
+    def test_buy_73_to_100_half_gaussian(self) -> None:
+        # START=73 (lowest price) smallest qty, END=100 (highest) largest qty.
+        plan = self._check(side="BUY", start="73", end="100", distribution="half_gaussian")
+        sizes = [c.size for c in plan.children]
+        self.assertLess(sizes[0], sizes[-1], "half-Gaussian: smallest at START, largest at END")
+
+    # ----- SELL -----
+    def test_sell_100_to_120_uniform(self) -> None:
+        self._check(side="SELL", start="100", end="120", distribution="uniform")
+
+    def test_sell_120_to_100_uniform(self) -> None:
+        self._check(side="SELL", start="120", end="100", distribution="uniform")
+
+    def test_sell_100_to_120_half_gaussian(self) -> None:
+        # START=100 (lowest price) smallest qty, END=120 (highest) largest qty.
+        plan = self._check(side="SELL", start="100", end="120", distribution="half_gaussian")
+        sizes = [c.size for c in plan.children]
+        self.assertLess(sizes[0], sizes[-1], "half-Gaussian: smallest at START, largest at END")
+
+    def test_sell_120_to_100_half_gaussian(self) -> None:
+        # START=120 (highest price) smallest qty, END=100 (lowest) largest qty.
+        plan = self._check(side="SELL", start="120", end="100", distribution="half_gaussian")
+        sizes = [c.size for c in plan.children]
+        self.assertLess(sizes[0], sizes[-1], "half-Gaussian: smallest at START, largest at END")
 
 
 class SpotLadderLargeCountsTests(unittest.TestCase):

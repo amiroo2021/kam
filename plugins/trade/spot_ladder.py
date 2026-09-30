@@ -105,12 +105,6 @@ def _quantize_up(value: Decimal, increment: Decimal) -> Decimal:
     return steps * increment
 
 
-def _side_direction_ok(side: str, start_price: Decimal, end_price: Decimal) -> bool:
-    if side == "BUY":
-        return end_price < start_price
-    return end_price > start_price
-
-
 def _ladder_distribution_weights(order_count: int, distribution: str) -> List[Decimal]:
     """Smallest child at START, largest at END.
 
@@ -342,11 +336,6 @@ def compute_ladder_with_min_notional(
         raise ValueError("INVALID_ORDER_COUNT")
     if total_volume <= 0:
         raise ValueError("INVALID_TOTAL_VOLUME")
-    if not _side_direction_ok(side, start_price, end_price):
-        raise ValueError(
-            f"INVALID_LADDER_DIRECTION:{side} requires "
-            f"{'lower' if side == 'BUY' else 'higher'} END than START"
-        )
 
     size_step, price_tick = _resolve_steps(instrument)
 
