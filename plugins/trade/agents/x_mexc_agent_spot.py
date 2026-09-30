@@ -416,7 +416,7 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
     filters: List[Any] = raw_filters if isinstance(raw_filters, list) else []
     min_qty = ""
     max_qty = ""
-    step_size = ""
+    lot_step = ""
     tick_size = ""
     min_notional = ""
     for f in filters:
@@ -424,34 +424,46 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
             continue
         ftype = str(f.get("filterType") or "")
         if ftype == "LOT_SIZE":
-            step_size = str(f.get("stepSize") or "")
+            lot_step = str(f.get("stepSize") or "")
             min_qty = str(f.get("minQty") or "")
             max_qty = str(f.get("maxQty") or "")
         elif ftype == "PRICE_FILTER":
             tick_size = str(f.get("tickSize") or "")
         elif ftype in {"MIN_NOTIONAL", "NOTIONAL"}:
             min_notional = str(f.get("minNotional") or f.get("notional") or "")
+    size_step = _decimal_step(lot_step)
+    if size_step <= 0:
+        size_step = _decimal_step(row.get("baseSizePrecision"))
+    if size_step <= 0:
+        size_step = _places_increment(row.get("baseAssetPrecision"))
+    price_tick = _decimal_step(tick_size)
+    if price_tick <= 0:
+        for key in ("quotePrecision", "quoteAssetPrecision"):
+            price_tick = _places_increment(row.get(key))
+            if price_tick > 0:
+                break
+    base = str(row.get("baseAsset") or "")
+    quote = str(row.get("quoteAsset") or "")
     order_types = [str(x) for x in row.get("orderTypes") or []]
     is_allowed = bool(row.get("isSpotTradingAllowed"))
     status = str(row.get("status") or "")
     return {
         "symbol": symbol,
-        "baseAsset": str(row.get("baseAsset") or ""),
-        "quoteAsset": str(row.get("quoteAsset") or ""),
-        "display_name": f"{row.get('baseAsset')}/{row.get('quoteAsset')}",
+        "base": base,
+        "quote": quote,
+        "baseAsset": base,
+        "quoteAsset": quote,
+        "display_name": f"{base}/{quote}" if base and quote else symbol,
         "status": status,
         "isSpotTradingAllowed": is_allowed,
         "orderTypes": order_types,
-        "baseAssetPrecision": row.get("baseAssetPrecision"),
-        "quoteAssetPrecision": row.get("quoteAssetPrecision"),
-        "quotePrecision": row.get("quotePrecision"),
-        "baseSizePrecision": row.get("baseSizePrecision"),
-        "quoteAmountPrecision": row.get("quoteAmountPrecision"),
+        "size_step": _format_step(size_step),
+        "price_tick": _format_step(price_tick),
+        "min_qty": _format_step(_decimal_step(min_qty)),
+        "max_qty": _format_step(_decimal_step(max_qty)),
+        "min_notional": _format_step(_decimal_step(min_notional)),
         "tick_size": tick_size,
-        "step_size": step_size,
-        "min_qty": min_qty,
-        "max_qty": max_qty,
-        "min_notional": min_notional,
+        "step_size": lot_step,
         "api_eligible": status.upper() in {"1", "ENABLED", "TRADING"} and is_allowed,
     }
 
@@ -586,8 +598,8 @@ def _list_instruments(account: str, request: Mapping[str, Any]) -> CanonicalResp
                 requested_symbol=str(item["symbol"]),
                 symbol=str(item["symbol"]),
                 display_name=str(item.get("display_name") or item["symbol"]),
-                price_increment=str(item.get("tick_size") or ""),
-                size_increment=str(item.get("step_size") or ""),
+                price_increment=str(item.get("price_tick") or ""),
+                size_increment=str(item.get("size_step") or ""),
                 minimum_size=str(item.get("min_qty") or ""),
             ).to_dict()
             for item in out
@@ -634,12 +646,20 @@ def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalRe
             message="MEXC spot symbol not found.",
         )
     info = _instrument_from_market(row)
+    if not info.get("size_step") or not info.get("price_tick"):
+        return make_failure(
+            operation="resolve_instrument",
+            exchange=name,
+            account=str(account or ""),
+            code="INSTRUMENT_CONSTRAINTS_UNAVAILABLE",
+            message="MEXC spot instrument is missing size or price constraints.",
+        )
     inst = CanonicalInstrument(
         requested_symbol=requested,
         symbol=str(info["symbol"]),
         display_name=str(info.get("display_name") or info["symbol"]),
-        price_increment=str(info.get("tick_size") or ""),
-        size_increment=str(info.get("step_size") or ""),
+        price_increment=str(info.get("price_tick") or ""),
+        size_increment=str(info.get("size_step") or ""),
         minimum_size=str(info.get("min_qty") or ""),
     )
     return make_success(
@@ -722,6 +742,13 @@ def _places_increment(value: Any) -> Decimal:
     return Decimal("1").scaleb(-places)
 
 
+def _format_step(value: Decimal) -> str:
+    if value <= 0:
+        return ""
+    text = format(value.normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def _quantize_down(value: Decimal, increment: Decimal) -> Decimal:
     if increment <= 0:
         return value
@@ -730,6 +757,9 @@ def _quantize_down(value: Decimal, increment: Decimal) -> Decimal:
 
 
 def _size_increment(info: Mapping[str, Any]) -> Decimal:
+    inc = _decimal_step(info.get("size_step"))
+    if inc > 0:
+        return inc
     inc = _decimal_step(info.get("step_size"))
     if inc > 0:
         return inc
@@ -740,6 +770,9 @@ def _size_increment(info: Mapping[str, Any]) -> Decimal:
 
 
 def _price_increment(info: Mapping[str, Any]) -> Decimal:
+    inc = _decimal_step(info.get("price_tick"))
+    if inc > 0:
+        return inc
     inc = _decimal_step(info.get("tick_size"))
     if inc > 0:
         return inc

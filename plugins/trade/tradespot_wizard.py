@@ -790,18 +790,6 @@ class TradeSpotWizard:
             return Decimal("0")
         return inc if inc > 0 else Decimal("0")
 
-    def _places_increment(self, value: Any) -> Decimal:
-        text = str(value or "").strip()
-        if not text:
-            return Decimal("0")
-        try:
-            places = int(text)
-        except (TypeError, ValueError):
-            return Decimal("0")
-        if places < 0:
-            return Decimal("0")
-        return Decimal("1").scaleb(-places)
-
     def _quantize_down(self, value: Decimal, increment: Decimal) -> Decimal:
         if increment <= 0:
             return value
@@ -809,20 +797,15 @@ class TradeSpotWizard:
         return steps * increment
 
     def _size_increment(self, item: Mapping[str, Any]) -> Decimal:
-        inc = self._decimal_step(item.get("step_size"))
-        if inc > 0:
-            return inc
-        inc = self._decimal_step(item.get("baseSizePrecision"))
-        if inc > 0:
-            return inc
-        return self._places_increment(item.get("baseAssetPrecision"))
+        for key in ("size_step", "size_increment"):
+            inc = self._decimal_step(item.get(key))
+            if inc > 0:
+                return inc
+        return Decimal("0")
 
     def _price_increment(self, item: Mapping[str, Any]) -> Decimal:
-        inc = self._decimal_step(item.get("tick_size"))
-        if inc > 0:
-            return inc
-        for key in ("quotePrecision", "quoteAssetPrecision"):
-            inc = self._places_increment(item.get(key))
+        for key in ("price_tick", "price_increment"):
+            inc = self._decimal_step(item.get(key))
             if inc > 0:
                 return inc
         return Decimal("0")
@@ -836,9 +819,9 @@ class TradeSpotWizard:
         base: str,
         quote: str,
     ) -> Optional[str]:
-        min_qty = self._decimal_step(item.get("min_qty"))
-        if min_qty <= 0:
-            min_qty = self._size_increment(item)
+        if self._size_increment(item) <= 0 or self._price_increment(item) <= 0:
+            return "Instrument trading constraints are unavailable."
+        min_qty = self._decimal_step(item.get("min_qty") or item.get("minimum_size"))
         max_qty = self._decimal_step(item.get("max_qty"))
         min_notional = self._decimal_step(item.get("min_notional"))
         if qty <= 0 or (min_qty > 0 and qty < min_qty):
@@ -913,18 +896,21 @@ class TradeSpotWizard:
         state.confirm_consumed = False
         state.last_submit_screen = None
         item = self._re_resolve_instrument(state) or {}
+        item = dict(item)
+        size_step = self._size_increment(item)
+        price_step = self._price_increment(item)
         pair = self._selected_pair_name(state)
         side = str(state.order_side or "").upper()
-        base = str(item.get("baseAsset") or "BASE").upper()
-        quote = str(item.get("quoteAsset") or "QUOTE").upper()
+        base = str(item.get("base") or item.get("baseAsset") or "BASE").upper()
+        quote = str(item.get("quote") or item.get("quoteAsset") or "QUOTE").upper()
         try:
             qty = Decimal(str(state.order_quantity or "0"))
             price = Decimal(str(state.order_limit_price or "0"))
         except (InvalidOperation, ValueError):
             qty = Decimal("0")
             price = Decimal("0")
-        qty = self._quantize_down(qty, self._size_increment(item))
-        price = self._quantize_down(price, self._price_increment(item))
+        qty = self._quantize_down(qty, size_step)
+        price = self._quantize_down(price, price_step)
         state.order_quantity = self._format_decimal(qty)
         state.order_limit_price = self._format_decimal(price)
         quote_like = quote in _MEXC_QUOTE_ASSETS
@@ -1008,6 +994,9 @@ class TradeSpotWizard:
             )
         state.confirm_consumed = True
         item = self._re_resolve_instrument(state) or {}
+        item = dict(item)
+        size_step = self._size_increment(item)
+        price_step = self._price_increment(item)
         tradable_error = self._instrument_tradable(item)
         if tradable_error:
             screen = Screen(
@@ -1019,16 +1008,25 @@ class TradeSpotWizard:
             state.state = "order_result"
             return screen
         side = str(state.order_side or "").upper()
-        base = str(item.get("baseAsset") or "").upper()
-        quote = str(item.get("quoteAsset") or "").upper()
+        base = str(item.get("base") or item.get("baseAsset") or "").upper()
+        quote = str(item.get("quote") or item.get("quoteAsset") or "").upper()
         try:
             qty = Decimal(str(state.order_quantity or "0"))
             price = Decimal(str(state.order_limit_price or "0"))
         except (InvalidOperation, ValueError):
             qty = Decimal("0")
             price = Decimal("0")
-        qty = self._quantize_down(qty, self._size_increment(item))
-        price = self._quantize_down(price, self._price_increment(item))
+        qty = self._quantize_down(qty, size_step)
+        price = self._quantize_down(price, price_step)
+        if size_step <= 0 or price_step <= 0:
+            screen = Screen(
+                "🟦 MEXC Spot\n\nInstrument trading constraints are unavailable.\nNo order was placed.",
+                [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "order_result",
+            )
+            state.last_submit_screen = screen
+            state.state = "order_result"
+            return screen
         if qty <= 0 or price <= 0:
             screen = Screen(
                 "🟦 MEXC Spot\n\nInvalid quantity or price.\nNo order was placed.",

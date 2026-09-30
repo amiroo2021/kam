@@ -193,20 +193,28 @@ class FakeMexcSpotDesk:
         max_qty: str = "",
         min_notional: str = "",
     ) -> Dict[str, Any]:
+        size = step_size
+        if not size:
+            try:
+                raw = Decimal(str(base_size_precision))
+                size = format(raw.normalize(), "f") if raw > 0 else ""
+            except Exception:  # noqa: BLE001
+                size = ""
+        if not size and base_asset_precision >= 0:
+            size = format(Decimal("1").scaleb(-int(base_asset_precision)).normalize(), "f")
+        tick = tick_size or format(Decimal("1").scaleb(-int(quote_precision)).normalize(), "f")
         return {
             "symbol": symbol,
+            "base": base,
+            "quote": quote,
             "baseAsset": base,
             "quoteAsset": quote,
             "display_name": f"{base}/{quote}",
             "status": status,
             "isSpotTradingAllowed": spot_allowed,
             "orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"],
-            "quotePrecision": quote_precision,
-            "quoteAssetPrecision": quote_precision,
-            "baseAssetPrecision": base_asset_precision,
-            "baseSizePrecision": base_size_precision,
-            "step_size": step_size,
-            "tick_size": tick_size or ("0." + ("0" * (quote_precision - 1)) + "1" if quote_precision else "0.01"),
+            "size_step": size,
+            "price_tick": tick,
             "min_qty": min_qty,
             "max_qty": max_qty,
             "min_notional": min_notional,
@@ -714,7 +722,9 @@ class TradeSpotMexcQtyNormalizationTests(unittest.TestCase):
             if row["symbol"] == "SOLUSDC":
                 row["baseSizePrecision"] = "0.000001"
                 row["baseAssetPrecision"] = 2
+                row["size_step"] = format(Decimal("0.000001").normalize(), "f")
                 row["step_size"] = ""
+                row["price_tick"] = format(Decimal("1").scaleb(-2).normalize(), "f")
                 row["tick_size"] = ""
                 row["quotePrecision"] = 2
                 row["min_qty"] = ""
@@ -787,11 +797,22 @@ class TradeSpotMexcQtyNormalizationTests(unittest.TestCase):
         self.assertIn("Quantity: 0.9 SUI", preview.text)
         self.assertIn("Limit price: 0.9 USDC", preview.text)
 
-    def test_below_one_step_shows_minimum_quantity(self) -> None:
+    def test_below_one_step_without_min_qty_is_invalid(self) -> None:
         preview = self._preview("SUI", "SUI/USDC", "buy", "0.009", "1.2")
         assert preview is not None
-        self.assertIn("Minimum quantity: 0.01 SUI", preview.text)
-        self.assertNotIn("Invalid quantity or price", preview.text)
+        self.assertIn("Invalid quantity or price.", preview.text)
+        self.assertNotIn("Minimum quantity:", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+
+    def test_missing_size_step_does_not_guess_lot_one(self) -> None:
+        for row in self.desk.instruments:
+            if row["symbol"] == "SUIUSDC":
+                row["size_step"] = ""
+                row["price_tick"] = "0.0001"
+        preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "0.9")
+        assert preview is not None
+        self.assertIn("Instrument trading constraints are unavailable.", preview.text)
+        self.assertNotIn("Quantity: 0 SUI", preview.text)
         self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
 
     def test_min_notional_shows_actual_reason(self) -> None:
@@ -807,9 +828,8 @@ class TradeSpotMexcQtyNormalizationTests(unittest.TestCase):
     def test_lot_size_min_qty_shows_actual_reason(self) -> None:
         for row in self.desk.instruments:
             if row["symbol"] == "SUIUSDC":
-                row["step_size"] = "1"
+                row["size_step"] = "1"
                 row["min_qty"] = "1"
-                row["baseSizePrecision"] = "1"
         preview = self._preview("SUI", "SUI/USDC", "buy", "0.9", "1.2")
         assert preview is not None
         self.assertIn("Minimum quantity: 1 SUI", preview.text)

@@ -351,6 +351,9 @@ class MexcSpotParsingTests(unittest.TestCase):
 
 
 class MexcSpotQtyIncrementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
     def _live_row(self, symbol: str, **fields: Any) -> Dict[str, Any]:
         row = {
             "symbol": symbol,
@@ -364,46 +367,103 @@ class MexcSpotQtyIncrementTests(unittest.TestCase):
         row.update(fields)
         return row
 
-    def test_suiusdc_zero_base_size_precision_falls_back_to_places(self) -> None:
-        info = spot._instrument_from_market(self._live_row(
+    def _resolve(self, row: Dict[str, Any]) -> Any:
+        with mock.patch.object(spot, "_public_request", return_value={"symbols": [row]}):
+            return spot.execute({
+                "operation": "resolve_instrument",
+                "exchange": "mexc",
+                "account": "amiroo",
+                "symbol": row["symbol"],
+            })
+
+    def _instrument(self, resp: Any) -> Dict[str, Any]:
+        self.assertTrue(resp.success, getattr(resp, "error", None))
+        assert resp.data is not None
+        return resp.data["instrument"]
+
+    def test_suiusdc_resolve_exposes_normalized_steps(self) -> None:
+        inst = self._instrument(self._resolve(self._live_row(
             "SUIUSDC",
             baseAssetPrecision=2,
             quotePrecision=4,
             quoteAssetPrecision=4,
             baseSizePrecision="0",
-        ))
-        self.assertEqual(info["step_size"], "")
-        self.assertEqual(spot._size_increment(info), Decimal("0.01"))
-        self.assertEqual(spot._price_increment(info), Decimal("0.0001"))
-        self.assertEqual(spot._quantize_down(Decimal("0.9"), spot._size_increment(info)), Decimal("0.9"))
+        )))
+        self.assertEqual(inst["base"], "SUI")
+        self.assertEqual(inst["quote"], "USDC")
+        self.assertEqual(inst["size_step"], "0.01")
+        self.assertEqual(inst["price_tick"], "0.0001")
+        self.assertEqual(inst.get("min_qty") or "", "")
+        self.assertEqual(inst.get("max_qty") or "", "")
+        self.assertEqual(inst.get("min_notional") or "", "")
+        self.assertEqual(spot._quantize_down(Decimal("0.9"), Decimal(inst["size_step"])), Decimal("0.9"))
 
-    def test_hypeusdc_zero_base_size_precision_keeps_fractional_qty(self) -> None:
-        info = spot._instrument_from_market(self._live_row(
+    def test_hypeusdc_resolve_exposes_normalized_steps(self) -> None:
+        inst = self._instrument(self._resolve(self._live_row(
             "HYPEUSDC",
             baseAssetPrecision=2,
             quotePrecision=2,
             quoteAssetPrecision=2,
             baseSizePrecision="0",
-        ))
-        self.assertEqual(spot._size_increment(info), Decimal("0.01"))
-        self.assertEqual(spot._quantize_down(Decimal("0.1"), spot._size_increment(info)), Decimal("0.1"))
+        )))
+        self.assertEqual(inst["size_step"], "0.01")
+        self.assertEqual(inst["price_tick"], "0.01")
+        self.assertEqual(spot._quantize_down(Decimal("0.1"), Decimal(inst["size_step"])), Decimal("0.1"))
 
-    def test_solusdc_uses_base_size_precision_step_string(self) -> None:
-        info = spot._instrument_from_market(self._live_row(
+    def test_solusdc_resolve_uses_base_size_precision_step_string(self) -> None:
+        inst = self._instrument(self._resolve(self._live_row(
             "SOLUSDC",
             baseAssetPrecision=2,
             quotePrecision=2,
             quoteAssetPrecision=2,
             baseSizePrecision="0.000001",
-        ))
-        self.assertEqual(spot._size_increment(info), Decimal("0.000001"))
-        self.assertEqual(spot._quantize_down(Decimal("0.1"), spot._size_increment(info)), Decimal("0.1"))
-        self.assertEqual(spot._quantize_down(Decimal("0.0000019"), spot._size_increment(info)), Decimal("0.000001"))
+        )))
+        self.assertEqual(inst["size_step"], "0.000001")
+        self.assertEqual(inst["price_tick"], "0.01")
+        self.assertEqual(spot._quantize_down(Decimal("0.1"), Decimal(inst["size_step"])), Decimal("0.1"))
+        self.assertEqual(spot._quantize_down(Decimal("0.0000019"), Decimal(inst["size_step"])), Decimal("0.000001"))
+
+    def test_lot_size_and_price_filter_win(self) -> None:
+        inst = self._instrument(self._resolve(self._live_row(
+            "SOLUSDC",
+            baseAssetPrecision=2,
+            quotePrecision=2,
+            quoteAssetPrecision=2,
+            baseSizePrecision="0.000001",
+            filters=[
+                {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.05"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "5"},
+            ],
+        )))
+        self.assertEqual(inst["size_step"], "0.001")
+        self.assertEqual(inst["price_tick"], "0.05")
+        self.assertEqual(inst["min_qty"], "0.001")
+        self.assertEqual(inst["max_qty"], "1000")
+        self.assertEqual(inst["min_notional"], "5")
 
     def test_integer_base_size_precision_is_a_step_not_places(self) -> None:
-        info = {"step_size": "", "baseSizePrecision": "1", "baseAssetPrecision": 2}
-        self.assertEqual(spot._size_increment(info), Decimal("1"))
-        self.assertEqual(spot._quantize_down(Decimal("0.9"), Decimal("1")), Decimal("0"))
+        inst = self._instrument(self._resolve(self._live_row(
+            "FOOUSDC",
+            baseAssetPrecision=2,
+            quotePrecision=2,
+            baseSizePrecision="1",
+        )))
+        self.assertEqual(inst["size_step"], "1")
+        self.assertEqual(spot._quantize_down(Decimal("0.9"), Decimal(inst["size_step"])), Decimal("0"))
+
+    def test_resolve_fails_when_size_or_price_step_cannot_be_derived(self) -> None:
+        resp = self._resolve(self._live_row(
+            "BADUSDC",
+            baseAssetPrecision="",
+            quotePrecision="",
+            quoteAssetPrecision="",
+            baseSizePrecision="0",
+            filters=[{"filterType": "PERCENT_PRICE_BY_SIDE"}],
+        ))
+        self.assertFalse(resp.success)
+        self.assertIsNotNone(resp.error)
+        self.assertEqual(resp.error.code, "INSTRUMENT_CONSTRAINTS_UNAVAILABLE")
 
 
 class MexcSpotCancelOrdersTests(unittest.TestCase):
