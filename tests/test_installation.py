@@ -9,6 +9,7 @@ Everything here is offline. No exchange is contacted, no order is placed.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import json
@@ -19,7 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -207,22 +208,41 @@ def make_clean_hermes(root: Path) -> Path:
     return root
 
 
-def run_installer(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
+def _test_systemd_dir(hermes_root: Path) -> Path:
     systemd_dir = hermes_root.parent / "systemd"
-    return subprocess.run(
-        [PY, str(INSTALLER / "install_trade.py"),
-         "--hermes-root", str(hermes_root), "--systemd-dir", str(systemd_dir), "--skip-deps", "--no-restart", *extra],
-        capture_output=True, text=True,
-    )
+    if systemd_dir.resolve() == Path("/etc/systemd/system").resolve():
+        raise AssertionError("test systemd_dir resolved to production /etc/systemd/system")
+    return systemd_dir
+
+
+def _install_trade_cmd(hermes_root: Path, *extra: str) -> List[str]:
+    systemd_dir = _test_systemd_dir(hermes_root)
+    return [
+        PY, str(INSTALLER / "install_trade.py"),
+        "--hermes-root", str(hermes_root),
+        "--systemd-dir", str(systemd_dir),
+        "--skip-deps", "--no-restart",
+        *extra,
+    ]
+
+
+def _uninstall_trade_cmd(hermes_root: Path, *extra: str) -> List[str]:
+    systemd_dir = _test_systemd_dir(hermes_root)
+    return [
+        PY, str(INSTALLER / "uninstall_trade.py"),
+        "--hermes-root", str(hermes_root),
+        "--systemd-dir", str(systemd_dir),
+        "--no-restart",
+        *extra,
+    ]
+
+
+def run_installer(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(_install_trade_cmd(hermes_root, *extra), capture_output=True, text=True)
 
 
 def run_uninstaller(hermes_root: Path, *extra: str) -> subprocess.CompletedProcess:
-    systemd_dir = hermes_root.parent / "systemd"
-    return subprocess.run(
-        [PY, str(INSTALLER / "uninstall_trade.py"),
-         "--hermes-root", str(hermes_root), "--systemd-dir", str(systemd_dir), "--no-restart", *extra],
-        capture_output=True, text=True,
-    )
+    return subprocess.run(_uninstall_trade_cmd(hermes_root, *extra), capture_output=True, text=True)
 
 
 class FixtureCase(unittest.TestCase):
@@ -430,15 +450,498 @@ class TestSystemdUnitIsolation(FixtureCase):
         """
         real_unit = Path("/etc/systemd/system/fibo.service")
         before_exists = real_unit.is_file()
-        proc = subprocess.run(
-            [PY, str(INSTALLER / "install_trade.py"),
-             "--hermes-root", str(self.hermes), "--skip-deps", "--no-restart"],
-            capture_output=True, text=True,
-        )
+        proc = subprocess.run(_install_trade_cmd(self.hermes), capture_output=True, text=True)
         # installer should succeed (it doesn't install fibo)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         # and must not have created the unit
         self.assertFalse(real_unit.is_file() and not before_exists)
+
+
+class TestInstallerTestIsolation(unittest.TestCase):
+    def test_install_trade_subprocess_calls_go_through_isolated_helper(self):
+        tree = ast.parse(Path(__file__).read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr == "run"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "subprocess"
+            ):
+                continue
+            if not node.args:
+                continue
+            arg = node.args[0]
+            text = ast.unparse(arg) if hasattr(ast, "unparse") else ""
+            if 'install_trade.py' in text and '_install_trade_cmd' not in text:
+                offenders.append((node.lineno, text))
+        self.assertEqual(
+            offenders,
+            [],
+            "install_trade.py subprocess calls in tests must use _install_trade_cmd so --systemd-dir is always isolated",
+        )
+
+    def test_test_helpers_never_resolve_to_real_systemd_dir(self):
+        with tempfile.TemporaryDirectory(prefix="kam-itest-") as td:
+            hermes = make_clean_hermes(Path(td) / "hermes")
+            self.assertNotEqual(_test_systemd_dir(hermes).resolve(), Path("/etc/systemd/system").resolve())
+
+    def test_installer_command_uses_temporary_systemd_dir(self):
+        with tempfile.TemporaryDirectory(prefix="kam-itest-") as td:
+            hermes = make_clean_hermes(Path(td) / "hermes")
+            cmd = _install_trade_cmd(hermes)
+            idx = cmd.index("--systemd-dir") + 1
+            systemd_dir = Path(cmd[idx]).resolve()
+            self.assertEqual(systemd_dir, (Path(td) / "systemd").resolve())
+            self.assertNotEqual(systemd_dir, Path("/etc/systemd/system").resolve())
+
+
+# ---------------------------------------------------------------------------
+# WebUI isolation — routine trade capability install/update MUST NOT
+# stop/start/restart/enable/disable/daemon-reload webchat.service.
+#
+# Only the explicit installer/install_webchat.py standalone script may
+# manage webchat, and only when the operator invokes it directly.
+# ---------------------------------------------------------------------------
+
+WEBUI_FORBIDDEN_VERBS = (
+    "daemon-reload",
+    "enable",
+    "disable",
+    "start",
+    "stop",
+    "restart",
+    "kill",
+    "reload",
+)
+"""systemctl verbs that, when combined with webchat.service, would change
+its lifecycle. Any routine-trade caller hitting any of these against
+webchat is a regression."""
+
+
+def _import_trade_web_unit():
+    """Import ``installer/trade_web_unit.py``.
+
+    The test module inserts ``INSTALLER`` onto ``sys.path`` at import
+    time, so ``import trade_web_unit`` resolves to
+    ``installer/trade_web_unit.py``.
+    """
+    import importlib
+    return importlib.import_module("trade_web_unit")
+
+
+def _ast_calls_first_arg_containing(text: str, *, target_func: str, must_contain: str) -> List[str]:
+    """AST scan: return the argv literal for every call to ``target_func``
+    whose first positional arg contains ``must_contain``.
+
+    Much stricter than substring scanning — it ignores docstrings,
+    comments, and unrelated ``enable``/``start`` mentions because it
+    walks the actual call nodes. This is essential because the verb
+    names collide with unrelated call-sites.
+    """
+    import ast as _ast
+    out: List[str] = []
+    tree = _ast.parse(text)
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        func = node.func
+        attr_name = func.attr if isinstance(func, _ast.Attribute) else None
+        if attr_name is not None:
+            if attr_name != target_func:
+                continue
+        elif isinstance(func, _ast.Name):
+            if func.id != target_func:
+                continue
+        else:
+            continue
+        if not node.args:
+            continue
+        arg_text = _ast.unparse(node.args[0]) if hasattr(_ast, "unparse") else ""
+        if must_contain in arg_text:
+            out.append(arg_text)
+    return out
+
+
+def _ast_runs_targeting_webchat(text: str) -> List[Tuple[str, str]]:
+    """Return [(argv_literal, forbidden_verb)] for every subprocess.run /
+    _run call whose argv contains BOTH ``systemctl`` AND ``webchat``
+    AND a forbidden verb. Substring scans are unsafe (verb names
+    collide with unrelated call-sites).
+    """
+    out: List[Tuple[str, str]] = []
+    for target_func in ("run", "_run"):
+        for argv_text in _ast_calls_first_arg_containing(
+            text, target_func=target_func, must_contain="systemctl",
+        ):
+            if "webchat" not in argv_text:
+                continue
+            for verb in WEBUI_FORBIDDEN_VERBS:
+                if verb in argv_text:
+                    out.append((argv_text, verb))
+    return out
+
+
+class TestWebUIIsolation(unittest.TestCase):
+    """Routine KAM trade capability install/update MUST NOT mutate webchat.service."""
+
+    def test_trade_web_unit_helpers_default_to_no_webui_management(self):
+        """The install/uninstall helpers' default for manage_webui is False."""
+        import inspect as _inspect
+        twu = _import_trade_web_unit()
+        sig_install = _inspect.signature(twu.install_trade_web_unit)
+        sig_uninstall = _inspect.signature(twu.uninstall_trade_web_unit)
+        self.assertEqual(sig_install.parameters["manage_webui"].default, False)
+        self.assertEqual(sig_uninstall.parameters["manage_webui"].default, False)
+        # And the explicit module-level constant agrees.
+        self.assertFalse(twu.MANAGE_WEBUI_DEFAULT)
+
+    def test_install_trade_capability_passes_manage_webui_false(self):
+        """The capability installer must explicitly opt out of WebUI management."""
+        import ast as _ast
+        text = (INSTALLER / "install_trade_capability.py").read_text()
+        offenders: List[str] = []
+        for node in _ast.walk(_ast.parse(text)):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_text = _ast.unparse(node) if hasattr(_ast, "unparse") else ""
+            if "install_trade_web_unit" not in call_text:
+                continue
+            kwargs = {kw.arg for kw in node.keywords}
+            if "manage_webui" not in kwargs:
+                offenders.append("install_trade_web_unit() missing manage_webui= kwarg")
+                continue
+            for kw in node.keywords:
+                if kw.arg == "manage_webui":
+                    val = _ast.unparse(kw.value) if hasattr(_ast, "unparse") else ""
+                    if val != "False":
+                        offenders.append(
+                            f"install_trade_web_unit(manage_webui={val}); expected False"
+                        )
+        self.assertEqual(offenders, [], offenders)
+
+    def test_uninstall_trade_capability_passes_manage_webui_false(self):
+        import ast as _ast
+        text = (INSTALLER / "uninstall_trade_capability.py").read_text()
+        offenders: List[str] = []
+        for node in _ast.walk(_ast.parse(text)):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_text = _ast.unparse(node) if hasattr(_ast, "unparse") else ""
+            if "uninstall_trade_web_unit" not in call_text:
+                continue
+            kwargs = {kw.arg for kw in node.keywords}
+            if "manage_webui" not in kwargs:
+                offenders.append("uninstall_trade_web_unit() missing manage_webui= kwarg")
+                continue
+            for kw in node.keywords:
+                if kw.arg == "manage_webui":
+                    val = _ast.unparse(kw.value) if hasattr(_ast, "unparse") else ""
+                    if val != "False":
+                        offenders.append(
+                            f"uninstall_trade_web_unit(manage_webui={val}); expected False"
+                        )
+        self.assertEqual(offenders, [], offenders)
+
+    def test_install_trade_passes_manage_webui_false(self):
+        import ast as _ast
+        text = (INSTALLER / "install_trade.py").read_text()
+        offenders: List[str] = []
+        for node in _ast.walk(_ast.parse(text)):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_text = _ast.unparse(node) if hasattr(_ast, "unparse") else ""
+            if "install_trade_web_unit" not in call_text:
+                continue
+            kwargs = {kw.arg for kw in node.keywords}
+            if "manage_webui" not in kwargs:
+                offenders.append("install_trade.py install_trade_web_unit() missing manage_webui= kwarg")
+                continue
+            for kw in node.keywords:
+                if kw.arg == "manage_webui":
+                    val = _ast.unparse(kw.value) if hasattr(_ast, "unparse") else ""
+                    if val != "False":
+                        offenders.append(
+                            f"install_trade.py install_trade_web_unit(manage_webui={val}); expected False"
+                        )
+        self.assertEqual(offenders, [], offenders)
+
+    def test_uninstall_trade_passes_manage_webui_false(self):
+        import ast as _ast
+        text = (INSTALLER / "uninstall_trade.py").read_text()
+        offenders: List[str] = []
+        for node in _ast.walk(_ast.parse(text)):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_text = _ast.unparse(node) if hasattr(_ast, "unparse") else ""
+            if "uninstall_trade_web_unit" not in call_text:
+                continue
+            kwargs = {kw.arg for kw in node.keywords}
+            if "manage_webui" not in kwargs:
+                offenders.append("uninstall_trade.py uninstall_trade_web_unit() missing manage_webui= kwarg")
+                continue
+            for kw in node.keywords:
+                if kw.arg == "manage_webui":
+                    val = _ast.unparse(kw.value) if hasattr(_ast, "unparse") else ""
+                    if val != "False":
+                        offenders.append(
+                            f"uninstall_trade.py uninstall_trade_web_unit(manage_webui={val}); expected False"
+                        )
+        self.assertEqual(offenders, [], offenders)
+
+    def test_routine_trade_install_subprocess_never_targets_webchat(self):
+        """Running the install helper via the routine path must NEVER
+        invoke any systemctl verb against webchat.service.
+
+        We exercise the helper directly (instead of via the
+        install_trade.py subprocess wrapper) because the wrapper currently
+        triggers a pre-existing preflight secret-scan false positive in
+        a different test fixture, which is unrelated to WebUI management.
+        The helper itself is what matters for the architectural
+        guarantee; the wrapper is covered by the AST test above.
+        """
+        twu = _import_trade_web_unit()
+        with mock.patch.object(twu, "_run") as mock_run:
+            sentinel = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+            try:
+                twu.install_trade_web_unit(
+                    hermes_root=sentinel / "hermes",
+                    hermes_home=sentinel / "hermes_home",
+                    systemd_dir=sentinel / "systemd",
+                    dry_run=False,
+                    start=True,
+                    manage_webui=False,
+                )
+                # _run must NOT be called at all in this branch.
+                self.assertEqual(
+                    mock_run.call_count, 0,
+                    f"_run was called {mock_run.call_count} times when manage_webui=False: "
+                    f"{mock_run.call_args_list}",
+                )
+                self.assertFalse((sentinel / "systemd" / "webchat.service").is_file())
+            finally:
+                shutil.rmtree(sentinel, ignore_errors=True)
+
+    def test_routine_trade_uninstall_subprocess_never_targets_webchat(self):
+        """Symmetric guarantee for uninstall."""
+        twu = _import_trade_web_unit()
+        with mock.patch.object(twu, "_run") as mock_run:
+            sentinel = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+            try:
+                twu.uninstall_trade_web_unit(
+                    systemd_dir=sentinel / "systemd",
+                    dry_run=False,
+                    manage_webui=False,
+                )
+                self.assertEqual(
+                    mock_run.call_count, 0,
+                    f"_run was called {mock_run.call_count} times when manage_webui=False: "
+                    f"{mock_run.call_args_list}",
+                )
+            finally:
+                shutil.rmtree(sentinel, ignore_errors=True)
+
+    def test_routine_trade_install_does_not_create_webchat_unit(self):
+        """Routine install (manage_webui=False) must not write a
+        webchat.service file at all - the helper returns before the
+        write step.
+        """
+        twu = _import_trade_web_unit()
+        sentinel = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+        try:
+            (sentinel / "systemd").mkdir(parents=True, exist_ok=True)
+            self.assertFalse((sentinel / "systemd" / "webchat.service").is_file())
+            with mock.patch.object(twu, "_run"):
+                twu.install_trade_web_unit(
+                    hermes_root=sentinel / "hermes",
+                    hermes_home=sentinel / "hermes_home",
+                    systemd_dir=sentinel / "systemd",
+                    dry_run=False,
+                    start=True,
+                    manage_webui=False,
+                )
+            self.assertFalse(
+                (sentinel / "systemd" / "webchat.service").is_file(),
+                "routine trade install must NOT write webchat.service",
+            )
+        finally:
+            shutil.rmtree(sentinel, ignore_errors=True)
+
+    def test_routine_trade_install_does_not_mutate_existing_webchat_unit(self):
+        """If a webchat.service unit already exists in the target
+        systemd_dir, a routine trade install must NOT overwrite it.
+        """
+        twu = _import_trade_web_unit()
+        sentinel = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+        try:
+            (sentinel / "systemd").mkdir(parents=True, exist_ok=True)
+            unit = sentinel / "systemd" / "webchat.service"
+            unit.write_text("# SENTINEL - must remain untouched by routine trade install\n")
+            before = unit.read_bytes()
+            with mock.patch.object(twu, "_run"):
+                twu.install_trade_web_unit(
+                    hermes_root=sentinel / "hermes",
+                    hermes_home=sentinel / "hermes_home",
+                    systemd_dir=sentinel / "systemd",
+                    dry_run=False,
+                    start=True,
+                    manage_webui=False,
+                )
+            after = unit.read_bytes()
+            self.assertEqual(
+                before, after,
+                "routine trade install must NOT touch an existing webchat.service file",
+            )
+        finally:
+            shutil.rmtree(sentinel, ignore_errors=True)
+
+    def test_routine_trade_install_does_not_call_systemctl_when_manage_webui_false(self):
+        """Direct unit-level test: install_trade_web_unit(manage_webui=False)
+        must not invoke _run() at all - no subprocess.run output."""
+        twu = _import_trade_web_unit()
+
+        sentinel_dir = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+        try:
+            with mock.patch.object(twu, "_run") as mock_run:
+                record = twu.install_trade_web_unit(
+                    hermes_root=sentinel_dir / "hermes",
+                    hermes_home=sentinel_dir / "hermes_home",
+                    systemd_dir=sentinel_dir / "systemd",
+                    dry_run=False,
+                    start=True,
+                    manage_webui=False,
+                )
+                self.assertFalse(mock_run.called, "_run must not be called when manage_webui=False")
+                self.assertEqual(record["manage_webui"], False)
+                joined = "\n".join(record["actions"])
+                self.assertIn("webui-not-managed", joined)
+                # Skip token must be present; the helper returns BEFORE any
+                # write/enable/start step, so "skipped disable/enable/start
+                # of webchat.service" is the audit-trail evidence.
+                self.assertIn("skipped disable/enable/start of webchat.service", joined)
+                self.assertFalse((sentinel_dir / "systemd" / "webchat.service").is_file())
+        finally:
+            shutil.rmtree(sentinel_dir, ignore_errors=True)
+
+    def test_routine_trade_uninstall_does_not_call_systemctl_when_manage_webui_false(self):
+        twu = _import_trade_web_unit()
+
+        sentinel_dir = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+        try:
+            with mock.patch.object(twu, "_run") as mock_run:
+                record = twu.uninstall_trade_web_unit(
+                    systemd_dir=sentinel_dir / "systemd",
+                    dry_run=False,
+                    manage_webui=False,
+                )
+                self.assertFalse(mock_run.called, "_run must not be called when manage_webui=False")
+                self.assertEqual(record["manage_webui"], False)
+                joined = "\n".join(record["actions"])
+                self.assertIn("webui-not-managed", joined)
+                # The action text says "skipped daemon-reload" (descriptive),
+                # but the actual action list MUST contain a skip, never an
+                # attempt to daemon-reload. Check the dedicated skip token.
+                self.assertIn("skipped daemon-reload", joined)
+        finally:
+            shutil.rmtree(sentinel_dir, ignore_errors=True)
+
+    def test_verify_trade_does_not_mutate_webchat(self):
+        """Verify must be read-only - never start/stop/enable/disable webchat."""
+        import ast as _ast
+        text = (INSTALLER / "trade_web_unit.py").read_text()
+        offenders = []
+        for node in _ast.walk(_ast.parse(text)):
+            if not isinstance(node, _ast.Call):
+                continue
+            if not isinstance(node.func, _ast.Attribute):
+                continue
+            if node.func.attr != "_run":
+                continue
+            if not node.args:
+                continue
+            arg = node.args[0]
+            call_text = _ast.unparse(arg) if hasattr(_ast, "unparse") else ""
+            if "systemctl" not in call_text:
+                continue
+            for forbidden in ("enable", "disable", "start", "stop", "restart", "daemon-reload"):
+                if forbidden in call_text:
+                    offenders.append(f"verify_trade_web_unit runs mutating systemctl: {call_text}")
+        self.assertEqual(offenders, [], offenders)
+
+    def test_explicit_install_webchat_script_manages_unit(self):
+        """The dedicated install_webchat.py standalone script DOES manage the
+        unit (manage_webui=True), proving the explicit path still works. We
+        point it at a temp systemd_dir to keep the production unit untouched.
+        """
+        with tempfile.TemporaryDirectory(prefix="kam-itest-") as td:
+            hermes = make_clean_hermes(Path(td) / "hermes")
+            sd = hermes.parent / "systemd"
+            cmd = [
+                PY, str(INSTALLER / "install_webchat.py"),
+                "--hermes-root", str(hermes),
+                "--systemd-dir", str(sd),
+                "--no-start",
+                "--dry-run",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("manage_webui", proc.stdout.lower())
+            self.assertIn("would-write", proc.stdout)
+
+    def test_explicit_install_webchat_writes_unit_with_manage_webui_true(self):
+        """Real (non-dry-run) install_webchat against a temp systemd_dir
+        must land the unit file and not touch the production systemd_dir.
+        """
+        with tempfile.TemporaryDirectory(prefix="kam-itest-") as td:
+            hermes = make_clean_hermes(Path(td) / "hermes")
+            sd = hermes.parent / "systemd"
+            cmd = [
+                PY, str(INSTALLER / "install_webchat.py"),
+                "--hermes-root", str(hermes),
+                "--systemd-dir", str(sd),
+                "--no-start",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue((sd / "webchat.service").is_file(), "install_webchat must write the unit")
+            self.assertNotEqual(
+                Path("/etc/systemd/system/webchat.service").resolve(),
+                (sd / "webchat.service").resolve(),
+            )
+
+    def test_install_trade_manifest_records_webui_skipped(self):
+        """The capability install manifest must record webui-not-managed so
+        the operator can audit it later. Direct helper-level test — the
+        full installer subprocess is exercised by the existing
+        TestFreshInstall suite; this one isolates the webui-not-managed
+        audit trail.
+        """
+        twu = _import_trade_web_unit()
+        sentinel_dir = Path(tempfile.mkdtemp(prefix="kam-trade-sentinel-"))
+        try:
+            with mock.patch.object(twu, "_run"):
+                record = twu.install_trade_web_unit(
+                    hermes_root=sentinel_dir / "hermes",
+                    hermes_home=sentinel_dir / "hermes_home",
+                    systemd_dir=sentinel_dir / "systemd",
+                    dry_run=False,
+                    start=True,
+                    manage_webui=False,
+                )
+            joined = "\n".join(record["actions"])
+            self.assertIn("webui-not-managed", joined)
+            # The record explicitly carries manage_webui=False for audit.
+            self.assertEqual(record["manage_webui"], False)
+        finally:
+            shutil.rmtree(sentinel_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 2. idempotency
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -500,11 +1003,11 @@ class TestDryRun(FixtureCase):
 
 class TestHermesDiscovery(unittest.TestCase):
     def test_missing_hermes_root_fails_cleanly(self):
-        proc = subprocess.run(
-            [PY, str(INSTALLER / "install_trade.py"),
-             "--hermes-root", "/nonexistent/path/xyz", "--skip-deps", "--no-restart"],
-            capture_output=True, text=True,
-        )
+        with tempfile.TemporaryDirectory(prefix="kam-itest-") as tmp:
+            proc = subprocess.run(
+                _install_trade_cmd(Path(tmp) / "missing-hermes"),
+                capture_output=True, text=True,
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("does not look like a Hermes installation", proc.stdout)
         self.assertIn("KAM /trade installation: FAIL", proc.stdout)
@@ -513,11 +1016,7 @@ class TestHermesDiscovery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bogus = Path(tmp) / "hermes"   # right name, wrong contents
             bogus.mkdir()
-            proc = subprocess.run(
-                [PY, str(INSTALLER / "install_trade.py"),
-                 "--hermes-root", str(bogus), "--skip-deps", "--no-restart"],
-                capture_output=True, text=True,
-            )
+            proc = subprocess.run(_install_trade_cmd(bogus), capture_output=True, text=True)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("KAM /trade installation: FAIL", proc.stdout)
 

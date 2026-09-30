@@ -104,8 +104,23 @@ def install_trade_web_unit(
     systemd_dir: Path,
     dry_run: bool = False,
     start: bool = True,
+    manage_webui: bool = False,
 ) -> Dict[str, Any]:
-    """Render unit, retire legacy Hermes WebUI unit, enable webchat."""
+    """Render unit, retire legacy Hermes WebUI unit, enable webchat.
+
+    WebUI management is OFF by default. Routine trade capability
+    install/update MUST NOT stop, start, restart, enable, disable, or
+    daemon-reload webchat.service as a side effect. The capability
+    installer passes ``manage_webui=False`` and the standalone
+    ``installer/install_webchat.py`` passes ``manage_webui=True`` for
+    the explicit fresh-WebUI-install path.
+
+    When ``manage_webui=False`` this function still renders the unit
+    file (useful for documentation and offline inspection), but it
+    does NOT call any systemctl mutation. The record reports
+    ``action="skipped" reason="webui-not-managed"`` so audit trails
+    show why the unit file landed without a daemon-reload.
+    """
     webui_root = Path(os.environ.get("WEBCHAT_WEBUI_ROOT", str(DEFAULT_WEBUI_ROOT))).expanduser()
     webchat_port = _webchat_port()
     record: Dict[str, Any] = {
@@ -116,6 +131,7 @@ def install_trade_web_unit(
         "hermes_home": str(hermes_home),
         "ok": True,
         "dry_run": dry_run,
+        "manage_webui": bool(manage_webui),
         "actions": [],
     }
     if not UNIT_TEMPLATE.is_file():
@@ -139,15 +155,26 @@ def install_trade_web_unit(
     dst = Path(systemd_dir) / UNIT_NAME
     legacy = Path(systemd_dir) / LEGACY_UNIT_NAME
 
+    if not str(systemd_dir).strip():
+        record["actions"].append("skipped: empty systemd_dir")
+        return record
+
+    if not manage_webui:
+        # Routine trade capability install/update path. Render the
+        # unit body so operators can inspect it offline, but do NOT
+        # touch /etc/systemd/system, do NOT call systemctl daemon-reload,
+        # enable, disable, start, stop, or restart against webchat.
+        record["actions"].append(f"webui-not-managed: skipped write to {dst}")
+        record["actions"].append("webui-not-managed: skipped disable/enable/start of webchat.service")
+        record["rendered_unit"] = body
+        return record
+
+    # ----- explicit WebUI management path (install_webchat.py only) -----
     if dry_run:
         record["actions"].append(f"would-write {dst}")
         if legacy.is_file():
             record["actions"].append(f"would-remove {legacy}")
         record["actions"].append("would daemon-reload / enable --now webchat (if start)")
-        return record
-
-    if not str(systemd_dir).strip():
-        record["actions"].append("skipped: empty systemd_dir")
         return record
 
     systemd_dir = Path(systemd_dir)
@@ -207,16 +234,30 @@ def uninstall_trade_web_unit(
     *,
     systemd_dir: Path,
     dry_run: bool = False,
+    manage_webui: bool = False,
 ) -> Dict[str, Any]:
+    """Remove the webchat unit. WebUI management is OFF by default.
+
+    The routine trade uninstall path is ``manage_webui=False`` and is
+    a no-op (records ``webui-not-managed: skipped ...``). The
+    explicit WebUI uninstall uses ``manage_webui=True``.
+    """
     record: Dict[str, Any] = {
         "ok": True,
         "dry_run": dry_run,
+        "manage_webui": bool(manage_webui),
         "actions": [],
         "systemd_dir": str(systemd_dir),
     }
     if not str(systemd_dir).strip():
         record["actions"].append("skipped: empty systemd_dir")
         return record
+
+    if not manage_webui:
+        record["actions"].append("webui-not-managed: skipped disable --now / remove of webchat.service")
+        record["actions"].append("webui-not-managed: skipped daemon-reload")
+        return record
+
     systemd_dir = Path(systemd_dir)
     for name in (UNIT_NAME, LEGACY_UNIT_NAME):
         path = systemd_dir / name
@@ -333,4 +374,14 @@ __all__ = [
     "password_status",
     "render_unit",
     "ensure_webui_checkout",
+    "MANAGE_WEBUI_DEFAULT",
 ]
+
+
+MANAGE_WEBUI_DEFAULT = False
+"""Default for ``manage_webui`` keyword on install/uninstall helpers.
+
+Routine trade capability install/update MUST NOT mutate webchat.service
+(see ``install_trade_web_unit`` docstring). Set to True only in the
+dedicated ``installer/install_webchat.py`` standalone script.
+"""

@@ -248,6 +248,7 @@ def main(argv: List[str]) -> int:
         tw = uninstall_trade_web_unit(
             systemd_dir=Path(args.systemd_dir),
             dry_run=args.dry_run,
+            manage_webui=False,  # KAM /trade uninstall does NOT touch webchat
         )
         for action in tw.get("actions") or []:
             ok(str(action))

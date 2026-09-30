@@ -122,6 +122,7 @@ def run(
             systemd_dir=Path(systemd_dir_str),
             dry_run=dry_run,
             start=True,
+            manage_webui=False,  # KAM trade capability does NOT manage webchat
         )
         record["trade_web_unit"] = unit_record
         if not unit_record.get("ok", False):

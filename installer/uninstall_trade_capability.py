@@ -80,8 +80,13 @@ def run(
             shutil.rmtree(own_dir, ignore_errors=True)
 
     # Always retire webtrade + legacy webtrade units; never touch .env.
+    # WebUI management is OFF by default — routine trade uninstall must
+    # NOT disable/stop/daemon-reload webchat.service. Operators remove
+    # the WebUI explicitly via installer/uninstall_webchat.py.
     sd = systemd_dir if systemd_dir is not None else Path("/etc/systemd/system")
-    record["trade_web_unit"] = uninstall_trade_web_unit(systemd_dir=sd, dry_run=dry_run)
+    record["trade_web_unit"] = uninstall_trade_web_unit(
+        systemd_dir=sd, dry_run=dry_run, manage_webui=False,
+    )
     return record
 
 

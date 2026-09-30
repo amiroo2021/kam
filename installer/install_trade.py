@@ -1266,6 +1266,7 @@ def main(argv: List[str]) -> int:
             systemd_dir=Path(args.systemd_dir),
             dry_run=args.dry_run,
             start=True,
+            manage_webui=False,  # KAM /trade does NOT manage webchat
         )
         for action in trade_web_record.get("actions") or []:
             ok(str(action))
