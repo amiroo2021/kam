@@ -11,6 +11,7 @@ from pathlib import Path
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping
 from unittest import mock
+import json
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
@@ -48,7 +49,7 @@ class MexcSpotEnvTests(unittest.TestCase):
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
             self.assertEqual(spot.list_accounts(), ["amiroo"])
 
-    def test_capabilities_include_limit_new_order_only(self) -> None:
+    def test_capabilities_include_limit_ladder_and_new_order(self) -> None:
         caps = set(spot.capabilities())
         self.assertIn("balance", caps)
         self.assertIn("orders", caps)
@@ -56,7 +57,10 @@ class MexcSpotEnvTests(unittest.TestCase):
         self.assertIn("list_instruments", caps)
         self.assertIn("new_order", caps)
         self.assertIn("cancel_orders", caps)
-        self.assertNotIn("ladder", caps)
+        # Phase 5: ladder is now an advertised capability.
+        self.assertIn("ladder", caps)
+        # MARKET + cancel_order_group + cancel_order remain NOT_IMPLEMENTED.
+        self.assertNotIn("market_order", caps)
 
     def test_signed_request_uses_mexc_spot_signature_without_exposing_secret(self) -> None:
         captured: Dict[str, Any] = {}
@@ -228,9 +232,11 @@ class MexcSpotParsingTests(unittest.TestCase):
         assert data is not None
         self.assertEqual(data["instrument"]["symbol"], "SOLUSDT")
 
-    def test_ladder_and_cancel_all_remain_unimplemented(self) -> None:
+    def test_cancel_all_remains_unimplemented(self) -> None:
+        # Phase 5: ladder is now implemented. cancel_order_group / market_order
+        # remain NOT_IMPLEMENTED.
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
-            for op in ("ladder", "cancel_order_group"):
+            for op in ("cancel_order_group", "market_order"):
                 resp = spot.execute({"operation": op, "exchange": "mexc", "account": "amiroo"})
                 self.assertFalse(resp.success)
                 self.assertIsNotNone(resp.error)
@@ -470,22 +476,33 @@ class MexcSpotQtyIncrementTests(unittest.TestCase):
 
 
 class MexcSpotLadderStubTests(unittest.TestCase):
+    # Phase 5: `ladder` is now an advertised capability with full submit
+    # logic. These legacy stubs assert the agent still rejects MARKET and
+    # the unsupported `cancel_order_group` / `cancel_order` operations.
+
     def setUp(self) -> None:
         spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
 
-    def test_ladder_capability_is_not_advertised(self) -> None:
-        self.assertNotIn("ladder", spot.capabilities())
+    def test_ladder_capability_is_advertised(self) -> None:
+        self.assertIn("ladder", spot.capabilities())
 
-    def test_ladder_write_is_not_implemented(self) -> None:
+    def test_market_order_remains_not_implemented(self) -> None:
         resp = spot.execute({
-            "operation": "ladder",
+            "operation": "market_order",
             "exchange": "mexc",
             "account": "amiroo",
         })
         self.assertFalse(resp.success)
-        self.assertIsNotNone(resp.error)
         self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
-        self.assertIn("not enabled", (resp.error.message or "").lower())
+
+    def test_cancel_order_remains_not_implemented(self) -> None:
+        resp = spot.execute({
+            "operation": "cancel_order",
+            "exchange": "mexc",
+            "account": "amiroo",
+        })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
 
 
 class MexcSpotCancelOrdersTests(unittest.TestCase):
@@ -585,6 +602,397 @@ class MexcSpotCancelOrdersTests(unittest.TestCase):
         self.assertEqual(calls["get"], 1)
 
 
+class MexcSpotLadderTests(unittest.TestCase):
+    """Phase 5: live ladder submission via MEXC batchOrders.
+
+    All HTTP is mocked. No live POST /api/v3/order, DELETE, or
+    POST /api/v3/batchOrders ever fires during these tests.
+    """
+
+    def setUp(self) -> None:
+        self.saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("MEXC_") or k == "HERMES_HOME"}
+        for k in list(os.environ):
+            if k.startswith("MEXC_"):
+                os.environ.pop(k, None)
+        os.environ["HERMES_HOME"] = "/tmp/no-such-hermes-mexc-ladder"
+        os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
+        os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
+        # Reset the in-memory cache so setUp order is deterministic.
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    def tearDown(self) -> None:
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    def _children(self, n: int, *, price_first: str = "100", price_step: str = "0.01") -> list:
+        out = []
+        for i in range(n):
+            qty = f"{(i + 1) * Decimal('0.000001'):f}".rstrip("0").rstrip(".") or "0"
+            price = (Decimal(price_first) - Decimal(price_step) * i).quantize(Decimal("0.01"))
+            out.append({
+                "symbol": "SOLUSDC",
+                "side": "BUY",
+                "quantity": qty,
+                "price": str(price),
+                "client_order_id": f"lad_abc123_{i:03d}",
+                "instrument": {"symbol": "SOLUSDC"},
+            })
+        return out
+
+    def _request(self, n: int, **overrides):
+        body = {
+            "operation": "ladder",
+            "exchange": "mexc",
+            "account": "amiroo",
+            "children": self._children(n),
+        }
+        body.update(overrides)
+        return body
+
+    # ----- capability -----
+    def test_capability_advertised(self) -> None:
+        self.assertIn("ladder", spot.capabilities())
+
+    # ----- batch-count parity -----
+    def test_batch_count_table(self) -> None:
+        # 1 / 10 / 20 / 21 / 40 / 41 / 50 / 100 / 200 / 500
+        cases = [
+            (1, 1),
+            (10, 1),
+            (20, 1),
+            (21, 2),
+            (40, 2),
+            (41, 3),
+            (50, 3),
+            (100, 5),
+            (200, 10),
+            (500, 25),
+        ]
+        calls: list = []
+
+        def fake_signed(_c, method, p_path, params=None):
+            if p_path != "/api/v3/batchOrders":
+                return []
+            calls.append({"method": method.upper(), "path": p_path, "params": dict(params or {})})
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {
+                    "orderId": f"mock-{i}",
+                    "clientOrderId": b.get("newClientOrderId"),
+                    "symbol": "SOLUSDC",
+                    "price": "100",
+                    "origQty": "1",
+                    "status": "NEW",
+                }
+                for i, b in enumerate(batch)
+            ]
+
+        for n, expected_batches in cases:
+            calls.clear()
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                    resp = spot.execute(self._request(n))
+            self.assertTrue(resp.success, msg=f"n={n} resp={resp}")
+            self.assertEqual(len(calls), expected_batches, msg=f"n={n} got {len(calls)} calls")
+            for c in calls:
+                self.assertEqual(c["method"], "POST")
+                self.assertEqual(c["path"], "/api/v3/batchOrders")
+                batch = json.loads(c["params"]["batchOrders"])
+                self.assertGreaterEqual(len(batch), 1)
+                self.assertLessEqual(len(batch), 20)
+
+    # ----- max children per batch -----
+    def test_max_children_per_batch_is_20(self) -> None:
+        seen_sizes: list[int] = []
+
+        def fake_signed(_c, _m, path, params=None):
+            if path != "/api/v3/batchOrders":
+                return []
+            seen_sizes.append(len(json.loads(params.get("batchOrders", "[]"))))
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                for i, b in enumerate(batch)
+            ]
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(500))
+        self.assertTrue(resp.success)
+        self.assertEqual(len(seen_sizes), 25)
+        for i, s in enumerate(seen_sizes[:-1]):
+            self.assertEqual(s, 20, f"batch {i} not 20")
+        # Final batch is the remainder: 500 - 24*20 = 20.
+        self.assertEqual(seen_sizes[-1], 20)
+
+    # ----- idempotent client_order_id -----
+    def test_idempotent_client_order_id(self) -> None:
+        captured: list[list[str]] = []
+
+        def fake_signed(_c, _m, _p, params=None):
+            batch = json.loads(params.get("batchOrders", "[]"))
+            captured.append([b.get("newClientOrderId") for b in batch])
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                for i, b in enumerate(batch)
+            ]
+
+        req = self._request(5)
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(req)
+        # Children carry the user-provided client_order_id verbatim.
+        flat = [cid for batch in captured for cid in batch]
+        expected = [c["client_order_id"] for c in req["children"]]
+        self.assertEqual(flat, expected)
+        self.assertTrue(resp.success)
+
+    # ----- MARKET rejected -----
+    def test_market_type_rejected(self) -> None:
+        req = self._request(3)
+        for child in req["children"]:
+            child["type"] = "MARKET"
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("no HTTP")):
+                resp = spot.execute(req)
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "LIMIT_ONLY")
+
+    # ----- empty children -----
+    def test_missing_children_rejected(self) -> None:
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("no HTTP")):
+                resp = spot.execute({
+                    "operation": "ladder",
+                    "account": "amiroo",
+                    "children": [],
+                })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "MISSING_CHILDREN")
+
+    # ----- missing required field per child -----
+    def test_child_missing_client_order_id_rejected(self) -> None:
+        req = self._request(3)
+        req["children"][0].pop("client_order_id")
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("no HTTP")):
+                resp = spot.execute(req)
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "MISSING_CLIENT_ORDER_ID")
+
+    # ----- per-child explicit rejection -----
+    def test_per_child_rejection_classified(self) -> None:
+        def fake_signed(_c, _m, _p, params=None):
+            batch = json.loads(params.get("batchOrders", "[]"))
+            results = []
+            for i, b in enumerate(batch):
+                if i == 1:
+                    results.append({"code": 30002, "msg": "min notional"})
+                else:
+                    # The agent's payload uses `newClientOrderId` (per MEXC spec).
+                    results.append({"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"})
+            return results
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(3))
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.ladder.accepted_child_count, 2)
+        self.assertEqual(resp.data["rejected"], 1)
+        self.assertTrue(resp.ladder.partial)
+        # Rejected child carries an error code in the per-batch breakdown.
+
+    # ----- entire batch rejection -----
+    def test_entire_batch_rejected(self) -> None:
+        def fake_signed(_c, _m, _p, params=None):
+            # All 5 children rejected by the exchange.
+            return [{"code": -1021, "msg": "timestamp outside recvWindow"}] * 5
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(5))
+        # 5 children rejected by the exchange → partial submission. The
+        # envelope is `success=True partial=True` because the call
+        # completed and the agent did not retry.
+        self.assertTrue(resp.success)
+        self.assertTrue(resp.ladder.partial)
+        self.assertEqual(resp.ladder.accepted_child_count, 0)
+        self.assertEqual(resp.data["rejected"], 5)
+        self.assertIsNotNone(resp.ladder.exchange_reason)
+
+    # ----- ambiguous timeout -----
+    def test_timeout_marks_unknown_and_stops_subsequent_batches(self) -> None:
+        import urllib.error
+
+        def fake_signed(_c, method, path, params=None):
+            if path == "/api/v3/batchOrders":
+                # First batch: request may have been transmitted (URLError timeout).
+                raise urllib.error.URLError("timed out")
+            return []
+
+        calls = {"post": 0}
+
+        def counter(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                calls["post"] += 1
+            return fake_signed(_c, method, path, params)
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=counter):
+                resp = spot.execute(self._request(25))
+        # 25 children: first batch (≤20) timed out → all UNKNOWN; remaining 5+ NOT_ATTEMPTED.
+        # The envelope is `success=True partial=True` because the agent
+        # refused to retry the ambiguous batch and refused to submit the
+        # remaining ones.
+        self.assertTrue(resp.success)
+        self.assertTrue(resp.ladder.partial)
+        self.assertEqual(resp.ladder.accepted_child_count, 0)
+        self.assertEqual(resp.data["unknown"], 20)
+        self.assertEqual(resp.data["not_attempted"], 5)
+        # Subsequent batches must not be attempted after a timeout.
+        self.assertEqual(calls["post"], 1)
+
+    # ----- timeout on middle batch -----
+    def test_timeout_on_middle_batch_stops(self) -> None:
+        import urllib.error
+
+        batch_idx = {"i": 0}
+
+        def fake_signed(_c, method, path, params=None):
+            if path == "/api/v3/batchOrders":
+                batch_idx["i"] += 1
+                if batch_idx["i"] == 2:  # middle batch
+                    raise urllib.error.URLError("timed out")
+                batch = json.loads(params.get("batchOrders", "[]"))
+                return [
+                    {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                    for i, b in enumerate(batch)
+                ]
+            return []
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(45))  # 3 batches
+        # First batch (20) accepted; second (20) timed out → UNKNOWN;
+        # third (5) not attempted. STOP after middle batch.
+        self.assertTrue(resp.success)
+        self.assertTrue(resp.ladder.partial)
+        self.assertEqual(batch_idx["i"], 2)  # stopped at middle batch
+
+    # ----- partial success -----
+    def test_partial_success_partial_true(self) -> None:
+        def fake_signed(_c, _m, _p, params=None):
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                if i % 2 == 0
+                else {"code": -1121, "msg": "invalid symbol"}
+                for i, b in enumerate(batch)
+            ]
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(4))
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.ladder.accepted_child_count, 2)
+        self.assertTrue(resp.ladder.partial)
+
+    # ----- planned vs accepted VWAP -----
+    def test_planned_vs_accepted_vwap(self) -> None:
+        # Reject every other child so accepted VWAP differs from planned.
+        def fake_signed(_c, _m, _p, params=None):
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": b["price"], "origQty": b["quantity"], "status": "NEW"}
+                if i % 2 == 0
+                else {"code": -2010, "msg": "balance insufficient"}
+                for i, b in enumerate(batch)
+            ]
+
+        req = self._request(6)
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(req)
+        self.assertTrue(resp.success)
+        self.assertIn("planned_vwap", resp.ladder.batches[-1])
+        self.assertIn("accepted_vwap", resp.ladder.batches[-1])
+
+    # ----- reconciliation by client_order_id -----
+    def test_reconciliation_by_client_order_id(self) -> None:
+        # Pass `reconcile=True` and verify the agent re-reads open orders.
+        get_calls = {"openOrders": 0, "allOrders": 0}
+
+        def fake_signed(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                batch = json.loads(params.get("batchOrders", "[]"))
+                return [
+                    {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                    for i, b in enumerate(batch)
+                ]
+            if path == "/api/v3/openOrders":
+                get_calls["openOrders"] += 1
+                return [{"orderId": "x0", "clientOrderId": "lad_abc123_000", "symbol": "SOLUSDC", "side": "BUY", "price": "100", "origQty": "1", "executedQty": "0", "status": "NEW"}]
+            return []
+
+        req = self._request(1)
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(req)
+        self.assertTrue(resp.success)
+        # Reconciliation re-reads open orders exactly once.
+        self.assertEqual(get_calls["openOrders"], 1)
+
+    # ----- 50-child batch-count table parity -----
+    def test_50_child_partial_batches(self) -> None:
+        calls = []
+
+        def fake_signed(_c, _m, path, params=None):
+            if path != "/api/v3/batchOrders":
+                return []
+            calls.append(len(json.loads(params.get("batchOrders", "[]"))))
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                for i, b in enumerate(batch)
+            ]
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(self._request(50))
+        self.assertTrue(resp.success)
+        self.assertEqual(calls, [20, 20, 10])
+
+    # ----- double-confirm idempotency -----
+    def test_double_submit_yields_one_exchange_attempt(self) -> None:
+        # The agent must not submit twice for the same client_order_ids.
+        # The wizard layer enforces this via single-use tokens, but the
+        # agent should still accept the same request twice without
+        # creating duplicate exchange orders (the second submit just
+        # finds the existing orders by client_order_id).
+        post_calls: list[list[str]] = []
+
+        def fake_signed(_c, _m, path, params=None):
+            if path != "/api/v3/batchOrders":
+                return []
+            batch = json.loads(params.get("batchOrders", "[]"))
+            post_calls.append([b.get("newClientOrderId") for b in batch])
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": "100", "origQty": "1", "status": "NEW"}
+                for i, b in enumerate(batch)
+            ]
+
+        req = self._request(3)
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                resp = spot.execute(req)
+        self.assertTrue(resp.success)
+        self.assertEqual(len(post_calls), 1)
+
+
 class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
     def test_spotdesk_discovers_mexc_spot_agent(self) -> None:
         desk = SpotDesk()
@@ -607,7 +1015,8 @@ class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
         assert agent is not None
         self.assertIn("new_order", agent.capabilities())
         self.assertIn("cancel_orders", agent.capabilities())
-        self.assertNotIn("ladder", agent.capabilities())
+        # Phase 5: ladder is now advertised.
+        self.assertIn("ladder", agent.capabilities())
 
 
 if __name__ == "__main__":

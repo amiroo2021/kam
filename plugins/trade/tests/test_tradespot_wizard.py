@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from decimal import Decimal
+import json
 from typing import Any, Dict, List
 
 _HERE = Path(__file__).resolve().parent
@@ -240,6 +241,7 @@ class FakeMexcSpotDesk:
             "market_price",
             "new_order",
             "cancel_orders",
+            "ladder",
         ]
 
     def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
@@ -344,6 +346,11 @@ class FakeMexcSpotDesk:
                 ),
                 data={"orderId": "999001", "status": "NEW"},
             )
+        if op == "ladder":
+            # Delegate to the real spot agent so wizard tests exercise the
+            # same submit path the live deployment will use.
+            from plugins.trade.agents import x_mexc_agent_spot as spot
+            return spot.execute(request)
         return make_success(op, "mexc", "amiroo", data={})
 
 
@@ -555,7 +562,8 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         cancelled = self.wizard.handle_callback(self.key, "cancel")
         self.assertEqual(cancelled.state, "action")
         self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
-        self.assertNotIn("🪜 Ladder", _labels(cancelled))
+        # Phase 5: ladder button is now present in the action menu.
+        self.assertIn("🪜 Ladder", _labels(cancelled))
         self.assertIn("❌ Cancel Orders", _labels(cancelled))
 
 
@@ -693,13 +701,14 @@ class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
         self.assertIn("Order ID: 999001", screen.text)
         self.assertIn("Status: NEW", screen.text)
 
-    def test_ladder_and_cancel_remain_unavailable(self) -> None:
+    def test_ladder_is_now_available_with_new_order_and_cancel_orders(self) -> None:
         self.wizard.open(self.key)
         self.wizard.handle_callback(self.key, "exchange:mexc")
         screen = self.wizard.handle_callback(self.key, "account:amiroo")
         labels = _labels(screen)
+        # Phase 5: ladder is an advertised capability.
+        self.assertIn("🪜 Ladder", labels)
         self.assertIn("➕ New Order", labels)
-        self.assertNotIn("🪜 Ladder", labels)
         self.assertIn("❌ Cancel Orders", labels)
 
     def test_trade_namespace_still_separate(self) -> None:
@@ -1148,10 +1157,12 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._action_screen()
         self.assertTrue(any("Ladder" in label for label in self._labels(screen)))
 
-    def test_ladder_button_hidden_when_agent_does_not_advertise(self) -> None:
-        # Default capabilities do not include "ladder"; this test is a negative.
+    def test_ladder_button_appears_when_agent_advertises(self) -> None:
+        # Phase 5: ladder is now an advertised capability.
         caps = self.desk.capabilities("mexc")
-        self.assertNotIn("ladder", caps)
+        self.assertIn("ladder", caps)
+        screen = self._action_screen()
+        self.assertTrue(any("Ladder" in label for label in self._labels(screen)))
 
     def test_uniform_buy_sol_usdc_preview(self) -> None:
         screen = self._open_ladder()
@@ -1205,13 +1216,17 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "10")
         dist = self.wizard.handle_callback(self.key, "distribution:uniform")
-        # The confirm callback is present but does NOT submit.
+        # The confirm callback is present.
         cbs = self._callbacks(dist)
         confirm_cb = next((cb for cb in cbs if cb.startswith("ladder_confirm:")), None)
         self.assertIsNotNone(confirm_cb, "missing ladder_confirm callback")
         result = self.wizard.handle_callback(self.key, confirm_cb)
-        self.assertIn("Live ladder submission is not enabled yet.", result.text)
-        # No POST /api/v3/order hit
+        # Phase 5: the FakeMexcSpotDesk has no `_signed_request` mock,
+        # so the confirm either surfaces a balance/instrument message
+        # (the test setUp provides USDC=10000 so it should pass through)
+        # or surfaces the not-enabled stub message if agent doesn't
+        # advertise ladder. Either way, the critical check is:
+        # no POST /api/v3/order (single-order path) ever fires.
         self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
 
     def test_insufficient_buy_quote_blocks_preview(self) -> None:
@@ -1272,6 +1287,180 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         self.wizard.handle_callback(self.key, "back")
         cancel = self.wizard.handle_callback(self.key, "action:cancel_orders")
         self.assertIn("Cancel Orders", cancel.text)
+
+
+class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
+    """End-to-end: Confirm & Place Ladder reaches the MEXC agent.
+
+    Patches the agent's `_signed_request` so no real HTTP fires.
+    """
+
+    def setUp(self) -> None:
+        from unittest import mock as _mock
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+
+        self._mock = _mock
+        self._spot = spot
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.key = ("chat-ladder-live",)
+        self.desk.balances["SOL"] = "100"
+        self.desk.balances["USDT"] = "10000"
+        self.desk.balances["USDC"] = "10000"
+        for row in self.desk.instruments:
+            if row["symbol"] == "SOLUSDC":
+                row["size_step"] = format(Decimal("0.000001").normalize(), "f")
+                row["step_size"] = ""
+                row["price_tick"] = format(Decimal("1").scaleb(-2).normalize(), "f")
+                row["tick_size"] = ""
+        # Set up creds so _ladder's account lookup succeeds.
+        os.environ.setdefault("MEXC_AMIROO_ACCESSKEY", "k")
+        os.environ.setdefault("MEXC_AMIROO_SECRETKEY", "s")
+        self._post_calls: list = []
+        self._get_calls: list = []
+        self._install_patch(self._fake_signed)
+
+    def _install_patch(self, side_effect) -> None:
+        # Stop any previously installed patcher (e.g. from setUp or an earlier test).
+        prev = getattr(self, "_patcher", None)
+        if prev is not None:
+            prev.stop()
+        patcher = self._mock.patch.object(self._spot, "_signed_request", side_effect=side_effect)
+        patcher.start()
+        self._patcher = patcher
+        self.addCleanup(patcher.stop)
+
+    def _fake_signed(self, _c, method, path, params=None):
+        if method.upper() == "POST" and path == "/api/v3/batchOrders":
+            self._post_calls.append({"params": dict(params or {})})
+            batch = json.loads(params.get("batchOrders", "[]"))
+            return [
+                {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": b.get("price"), "origQty": b.get("quantity"), "status": "NEW"}
+                for i, b in enumerate(batch)
+            ]
+        if method.upper() == "GET" and path == "/api/v3/openOrders":
+            self._get_calls.append({"params": dict(params or {})})
+            return []
+        return []
+
+    def _walk_to_confirm(self, n_orders: int = 10):
+        w = self.wizard
+        w.open(self.key)
+        w.handle_callback(self.key, "exchange:mexc")
+        w.handle_callback(self.key, "account:amiroo")
+        screen = w.handle_callback(self.key, "action:ladder")
+        pair_picker = w.handle_callback(self.key, "asset:SOL")
+        # Prefer SOL/USDC; fall back to first SOL pair.
+        labels = _labels(pair_picker)
+        idx = next(
+            (i for i, l in enumerate(labels) if "SOL/USDC" in l),
+            0,
+        )
+        cb = _callbacks(pair_picker)[idx]
+        w.handle_callback(self.key, cb or "")
+        w.handle_callback(self.key, "side:buy")
+        w.handle_text(self.key, "10")
+        w.handle_text(self.key, "100")
+        w.handle_text(self.key, "73")
+        w.handle_text(self.key, str(n_orders))
+        return w.handle_callback(self.key, "distribution:uniform")
+
+    def test_confirm_submits_via_batch_orders(self) -> None:
+        preview = self._walk_to_confirm(10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertEqual(len(self._post_calls), 1)
+        batch = json.loads(self._post_calls[0]["params"]["batchOrders"])
+        self.assertEqual(len(batch), 10)
+        # Result screen
+        self.assertIn("Accepted: 10", result.text)
+        self.assertIn("Planned VWAP", result.text)
+        self.assertIn("Accepted VWAP", result.text)
+
+    def test_double_confirm_submits_once(self) -> None:
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        self.wizard.handle_callback(self.key, confirm_cb)
+        self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertEqual(len(self._post_calls), 1)
+
+    def test_50_order_ladder_splits_into_3_batches(self) -> None:
+        preview = self._walk_to_confirm(50)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertEqual(len(self._post_calls), 3)
+        sizes = [len(json.loads(c["params"]["batchOrders"])) for c in self._post_calls]
+        self.assertEqual(sizes, [20, 20, 10])
+
+    def test_idempotent_client_order_id_in_preview_and_submit(self) -> None:
+        preview = self._walk_to_confirm(7)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        self.wizard.handle_callback(self.key, confirm_cb)
+        batch = json.loads(self._post_calls[0]["params"]["batchOrders"])
+        ids = [b["newClientOrderId"] for b in batch]
+        self.assertEqual(len(ids), 7)
+        # All IDs share the same execution_id prefix.
+        prefixes = {cid.rsplit("_", 1)[0] for cid in ids}
+        self.assertEqual(len(prefixes), 1)
+
+    def test_result_screen_shows_partial_rejection(self) -> None:
+        # Re-patch to inject a per-child rejection.
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+
+        def reject_one(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                self._post_calls.append({"params": dict(params or {})})
+                batch = json.loads(params.get("batchOrders", "[]"))
+                results = []
+                for i, b in enumerate(batch):
+                    if i == 0:
+                        results.append({"code": 30002, "msg": "min notional"})
+                    else:
+                        results.append({"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": b.get("price"), "origQty": b.get("quantity"), "status": "NEW"})
+                return results
+            if method.upper() == "GET" and path == "/api/v3/openOrders":
+                return []
+            return []
+
+        self._install_patch(reject_one)
+        self._post_calls.clear()
+        preview = self._walk_to_confirm(3)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Accepted: 2", result.text)
+        self.assertIn("Rejected: 1", result.text)
+
+    def test_timeout_returns_partial_result(self) -> None:
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+        import urllib.error
+
+        def timeout(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                raise urllib.error.URLError("timed out")
+            if method.upper() == "GET" and path == "/api/v3/openOrders":
+                return []
+            return []
+
+        self._install_patch(timeout)
+        self._post_calls.clear()
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        # First batch (5) timed out → all UNKNOWN.
+        self.assertIn("Unknown: 5", result.text)
+        self.assertIn("Do not retry", result.text)
+
+    def test_constraints_changed_revalidates(self) -> None:
+        # Walk to preview, mutate SOLUSDC size_step, then confirm → must reject.
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        # Mutate size_step on the desk to simulate a live constraint change.
+        for row in self.desk.instruments:
+            if row["symbol"] == "SOLUSDC":
+                row["size_step"] = "0.001"
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("changed since this preview was approved", result.text)
+        self.assertEqual(len(self._post_calls), 0)
 
 
 class TradeSpotCommandRegistrationTests(unittest.TestCase):

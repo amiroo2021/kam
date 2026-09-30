@@ -256,6 +256,8 @@ class SpotWizardState:
     ladder_distribution: Optional[str] = None
     ladder_plan: Optional[Dict[str, Any]] = None
     ladder_confirm_token: Optional[str] = None
+    ladder_execution_id: Optional[str] = None
+    ladder_confirm_consumed: bool = False
 
 
 class TradeSpotWizard:
@@ -739,8 +741,15 @@ class TradeSpotWizard:
         if not state.ladder_confirm_token:
             import secrets
             state.ladder_confirm_token = f"lad:{secrets.token_hex(8)}"
+        if not state.ladder_execution_id:
+            import secrets as _secrets
+            # Deterministic per-preview execution ID; all child
+            # newClientOrderId values are derived from it so the second
+            # Confirm (which is rejected by single-use token below)
+            # would map to the same exchange orders.
+            state.ladder_execution_id = _secrets.token_hex(8)
         rows: List[List[Dict[str, str]]] = [
-            [_button_row("✅ Confirm Ladder", f"ladder_confirm:{state.ladder_confirm_token}")],
+            [_button_row("✅ Confirm & Place Ladder", f"ladder_confirm:{state.ladder_confirm_token}")],
             [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)],
         ]
         state.state = "ladder_preview"
@@ -750,18 +759,166 @@ class TradeSpotWizard:
         state = self._state_for(chat_key)
         token = suffix[len("ladder_confirm:") :].strip() if suffix.startswith("ladder_confirm:") else ""
         if not token or token != (state.ladder_confirm_token or ""):
+            # Invalid token; re-render the preview untouched.
             return self._render_ladder_preview(chat_key)
-        # Phase 1 source-only: no live submission. The agent advertises no
-        # `ladder` capability and the handler returns the explicit "not enabled"
-        # message. Future phases flip the agent cap and replace this block.
-        rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+        if state.ladder_confirm_consumed:
+            # Single-use: a second Confirm tap must NOT submit again.
+            # Show the cached result or a clear "already submitted" line.
+            rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+            state.state = "ladder_result"
+            return Screen(
+                "This ladder has already been submitted. No further orders were placed.",
+                rows,
+                "ladder_result",
+            )
+        # Mark the token consumed BEFORE any network write.
+        state.ladder_confirm_consumed = True
+
+        item = state.selected_instrument or {}
+        # Re-resolve instrument so a stale preview never reaches the wire.
+        fresh = self._re_resolve_instrument(state)
+        if fresh is None or "size_step" not in (fresh or {}):
+            rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+            state.state = "ladder_result"
+            return Screen(
+                "Instrument constraints are unavailable on the live exchange. Re-open the ladder preview before placing.",
+                rows,
+                "ladder_result",
+            )
+        # Compare stable fields; if anything material changed, refuse to submit.
+        if fresh.get("size_step") != item.get("size_step") or fresh.get("price_tick") != item.get("price_tick"):
+            rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+            state.state = "ladder_result"
+            return Screen(
+                "Exchange constraints changed since this preview was approved. "
+                "Re-open the ladder to regenerate the plan.",
+                rows,
+                "ladder_result",
+            )
+        # Re-fetch balance and verify still sufficient.
+        side = (state.ladder_side or "").upper()
+        base = (fresh.get("base") or fresh.get("baseAsset") or "BASE").upper()
+        quote = (fresh.get("quote") or fresh.get("quoteAsset") or "QUOTE").upper()
+        # Reuse the existing balance extraction helper.
+        balance_resp = self._desk.execute(
+            {"operation": "balance", "exchange": state.exchange, "account": state.account}
+        )
+        totals: Dict[str, Decimal] = {}
+        for row in _balance_assets(balance_resp):
+            if not isinstance(row, Mapping):
+                continue
+            symbol = _asset_symbol(row)
+            if not symbol:
+                continue
+            totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(row)
+        plan = self._compute_ladder_plan(state) or {}
+        if side == "BUY":
+            required = _to_amount(plan.get("total_notional"))
+            have = totals.get(quote, Decimal("0"))
+            if have < required:
+                rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+                state.state = "ladder_result"
+                return Screen(
+                    f"Balance insufficient at submit. Need {required.normalize():f} {quote}, have {have.normalize():f} {quote}. No orders were submitted.",
+                    rows,
+                    "ladder_result",
+                )
+        else:
+            required = _to_amount(plan.get("total_size"))
+            have = totals.get(base, Decimal("0"))
+            if have < required:
+                rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+                state.state = "ladder_result"
+                return Screen(
+                    f"Balance insufficient at submit. Need {required.normalize():f} {base}, have {have.normalize():f} {base}. No orders were submitted.",
+                    rows,
+                    "ladder_result",
+                )
+
+        # Build the FINAL precomputed children for the agent.
+        children_payload = []
+        execution_id = state.ladder_execution_id or "lad00000"
+        for idx, child in enumerate(plan.get("children") or []):
+            children_payload.append({
+                "instrument": fresh,
+                "symbol": str(fresh.get("symbol") or ""),
+                "side": side,
+                "quantity": str(child.get("size") or "0"),
+                "price": str(child.get("price") or "0"),
+                "client_order_id": f"ts_{execution_id}_{idx:03d}"[:32],
+            })
+
+        response = self._desk.execute({
+            "operation": "ladder",
+            "exchange": state.exchange,
+            "account": state.account,
+            "children": children_payload,
+            "distribution": plan.get("distribution") or "",
+        })
+        # Burn the token so a second tap cannot submit.
         state.ladder_confirm_token = None
         state.state = "ladder_result"
-        return Screen(
-            "Live ladder submission is not enabled yet.",
-            rows,
-            "ladder_result",
+        return self._render_ladder_result(
+            chat_key,
+            response,
+            plan=plan,
+            base=base,
+            quote=quote,
+            side=side,
+            children=children_payload,
         )
+
+    def _render_ladder_result(
+        self,
+        chat_key: Tuple[Any, ...],
+        response: Any,
+        *,
+        plan: Dict[str, Any],
+        base: str,
+        quote: str,
+        side: str,
+        children: List[Dict[str, Any]],
+    ) -> Screen:
+        """Render the post-submission result. Per the user spec, never
+        label a partial ladder 'failed' — show accepted / rejected /
+        unknown / not_attempted counts explicitly."""
+        rows = [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
+        ladder = getattr(response, "ladder", None) if response is not None else None
+        data = getattr(response, "data", None) or {}
+        if ladder is None:
+            err = getattr(response, "error", None)
+            code = (err.code if err else None) or "UNKNOWN"
+            msg = (err.message if err else "unknown") or "unknown"
+            return Screen(
+                f"🟦 Ladder submission failed\n\n{base}/{quote} {side}\n\nCode: {code}\n{msg}\n\nNo orders were placed.",
+                rows,
+                "ladder_result",
+            )
+        requested = getattr(ladder, "requested_order_count", 0) or 0
+        accepted = getattr(ladder, "submitted_order_count", 0) or 0
+        submitted_volume = getattr(ladder, "submitted_volume", "") or ""
+        accepted_vwap = (data.get("accepted_vwap") if isinstance(data, dict) else None) or ""
+        planned_vwap = (data.get("planned_vwap") if isinstance(data, dict) else None) or ""
+        rejected = (data.get("rejected") if isinstance(data, dict) else 0) or 0
+        unknown = (data.get("unknown") if isinstance(data, dict) else 0) or 0
+        not_attempted = (data.get("not_attempted") if isinstance(data, dict) else 0) or 0
+        warn = ""
+        if unknown or not_attempted:
+            warn = "\n\n⚠️ Submission status is uncertain for some children.\nDo not retry the ladder until open orders are reconciled."
+        body = (
+            f"🟦 Ladder submission result\n\n"
+            f"{base}/{quote} {side}\n"
+            f"Requested: {requested}\n\n"
+            f"Accepted: {accepted}\n"
+            f"Rejected: {rejected}\n"
+            f"Unknown: {unknown}\n"
+            f"Not attempted: {not_attempted}\n\n"
+            f"Accepted volume: {submitted_volume} {base}\n"
+            f"Accepted VWAP: {accepted_vwap} {quote}\n"
+            f"Planned VWAP: {planned_vwap} {quote}"
+            f"{warn}"
+        )
+        return Screen(body, rows, "ladder_result")
 
     def _handle_ladder_text(self, chat_key: Tuple[Any, ...], text: str) -> Optional[Screen]:
         state = self._state_for(chat_key)

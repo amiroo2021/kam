@@ -30,6 +30,7 @@ from ..canonical import (
     CanonicalBalance,
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalLadderResult,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
@@ -50,6 +51,11 @@ name = "mexc"
 # instrument so the exchange-neutral ladder planner can enforce it
 # per-child without baking an exchange default into spot_ladder.py.
 MEXC_SPOT_MIN_NOTIONAL = "1"
+
+# MEXC `POST /api/v3/batchOrders` accepts at most 20 orders per call.
+# Reference: https://www.mexc.com/api-docs/spot-v3/spot-account-trade/batch-orders
+# Place and cancel share the same UID-based rate-limit bucket (12 req/s).
+MEXC_SPOT_BATCH_MAX = 20
 
 DEFAULT_SPOT_BASE = "https://api.mexc.com"
 API_TIMEOUT_SECONDS = 20
@@ -162,10 +168,11 @@ def list_accounts() -> List[str]:
 
 
 def capabilities() -> List[str]:
-    # NOTE: `ladder` is intentionally NOT advertised. Phase 1 is source-only —
-    # the wizard supports the ladder flow when `_ladder_preview_only` is True,
-    # the agent always rejects `ladder` writes with `NOT_IMPLEMENTED`. Future
-    # phases will flip this on and add the real submit path.
+    # Phase 5: live ladder submission via MEXC spot batchOrders endpoint.
+    # The agent receives the FINAL precomputed children from the wizard and
+    # submits them in deterministic <=20-child batches. MARKET orders remain
+    # rejected (`LIMIT_ONLY`); `cancel_order_group` / `cancel_order` /
+    # `market_order` remain NOT_IMPLEMENTED.
     return [
         "balance",
         "orders",
@@ -175,6 +182,7 @@ def capabilities() -> List[str]:
         "market_price",
         "new_order",
         "cancel_orders",
+        "ladder",
     ]
 
 
@@ -738,18 +746,298 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
 
 
 def _ladder_not_enabled(account: str) -> CanonicalResponse:
+    # Retained for back-compat with any code path that still references it;
+    # live ladder is now wired in `_ladder`. Should never be reached.
     return make_failure(
         operation="ladder",
         exchange=name,
         account=str(account or ""),
         code="NOT_IMPLEMENTED",
-        # Phase 1 source-only: planned batch submission architecture uses
-        # `POST /api/v3/batchOrders` (max 20 orders per call, rate-limit
-        # bucket shared with /api/v3/order at 12 req/s) and fallbacks to
-        # per-order `POST /api/v3/order` for >20-child ladders, with
-        # idempotent `newClientOrderId` values, bounded batches, and explicit
-        # accepted/failed tracking. The actual submit path is not wired yet.
         message="Live ladder submission is not enabled yet.",
+    )
+
+
+def _ladder_validate_child(child: Mapping[str, Any]) -> Optional[str]:
+    if not isinstance(child, Mapping):
+        return "CHILD_NOT_MAPPING"
+    required = ("symbol", "side", "quantity", "price", "client_order_id")
+    for key in required:
+        if not str(child.get(key) or "").strip():
+            return f"MISSING_{key.upper()}"
+    side = str(child.get("side") or "").strip().upper()
+    if side not in {"BUY", "SELL"}:
+        return "INVALID_SIDE"
+    order_type = str(child.get("type") or child.get("order_type") or "LIMIT").strip().upper()
+    if order_type != "LIMIT":
+        return "MARKET_NOT_ALLOWED"  # surfaced as LIMIT_ONLY
+    return None
+
+
+def _ladder_plan_batches(children: List[Mapping[str, Any]]) -> List[List[Mapping[str, Any]]]:
+    """Split children into deterministic <=20-child batches, oldest-first."""
+    if not children:
+        return []
+    batches: List[List[Mapping[str, Any]]] = []
+    for i in range(0, len(children), MEXC_SPOT_BATCH_MAX):
+        batches.append(list(children[i : i + MEXC_SPOT_BATCH_MAX]))
+    return batches
+
+
+def _ladder_child_status(child_result: Mapping[str, Any]) -> str:
+    """Classify a single child as ACCEPTED / REJECTED / UNKNOWN.
+
+    MEXC batchOrders returns per-order dicts with either an ``orderId``
+    (success) or a ``code``/``msg`` (rejection). Anything that is not a
+    dict or is missing both is treated as UNKNOWN.
+    """
+    if not isinstance(child_result, Mapping):
+        return "UNKNOWN"
+    if child_result.get("orderId") is not None:
+        return "ACCEPTED"
+    if child_result.get("code") is not None or child_result.get("msg"):
+        return "REJECTED"
+    return "UNKNOWN"
+
+
+def _vwap(children: List[Mapping[str, Any]], qty_key: str, price_key: str) -> Optional[Decimal]:
+    """Decimal VWAP across accepted children. None if no accepted qty."""
+    total_qty = Decimal("0")
+    total_notional = Decimal("0")
+    for c in children:
+        try:
+            q = Decimal(str(c.get(qty_key) or "0"))
+            p = Decimal(str(c.get(price_key) or "0"))
+        except Exception:  # noqa: BLE001
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        total_qty += q
+        total_notional += q * p
+    if total_qty <= 0:
+        return None
+    return total_notional / total_qty
+
+
+def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=str(account or ""),
+            code="MISSING_ACCOUNT",
+            message="No credentials configured for that MEXC spot account.",
+        )
+    children_in = request.get("children")
+    if not isinstance(children_in, list) or not children_in:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="MISSING_CHILDREN",
+            message="Ladder request must contain a non-empty list of FINAL precomputed children.",
+        )
+    if len(children_in) > 500:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=credentials["account"],
+            code="LADDER_TOO_LARGE",
+            message=f"Ladder of {len(children_in)} children exceeds the 500-child safety cap.",
+        )
+    # Validate every child BEFORE any network write.
+    for idx, child in enumerate(children_in):
+        err = _ladder_validate_child(child)
+        if err == "MARKET_NOT_ALLOWED":
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=credentials["account"],
+                code="LIMIT_ONLY",
+                message=f"Child {idx}: MARKET orders are not supported by /tradespot ladder. Use LIMIT only.",
+            )
+        if err:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=credentials["account"],
+                code=err,
+                message=f"Child {idx}: {err.replace('_', ' ').lower()}.",
+            )
+
+    symbol = str(children_in[0].get("symbol") or "").strip().upper().replace("/", "")
+    side = str(children_in[0].get("side") or "").strip().upper()
+    requested_order_count = len(children_in)
+    requested_volume = sum(
+        (Decimal(str(c.get("quantity") or "0")) for c in children_in),
+        Decimal("0"),
+    )
+
+    batches = _ladder_plan_batches(children_in)
+    batch_records: List[Dict[str, Any]] = []
+    accepted_qty = Decimal("0")
+    accepted_notional = Decimal("0")
+    accepted_order_ids: List[str] = []
+    rejected_count = 0
+    unknown_count = 0
+    not_attempted_count = 0
+    stopped_early = False
+    exchange_reason: Optional[str] = None
+
+    for batch_index, batch in enumerate(batches):
+        batch_payload = [
+            {
+                "symbol": str(c.get("symbol") or symbol),
+                "side": str(c.get("side") or side).upper(),
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": str(c.get("quantity") or ""),
+                "price": str(c.get("price") or ""),
+                "newClientOrderId": str(c.get("client_order_id") or "")[:32],
+            }
+            for c in batch
+        ]
+        params = {"batchOrders": json.dumps(batch_payload)}
+        record: Dict[str, Any] = {
+            "batch_index": batch_index,
+            "children_attempted": [str(c.get("client_order_id") or "") for c in batch],
+            "planned_vwap": _vwap(
+                [{"quantity": c.get("quantity"), "price": c.get("price")} for c in batch],
+                "quantity",
+                "price",
+            ),
+        }
+        try:
+            payload = _signed_request(credentials, "POST", "/api/v3/batchOrders", params)
+        except urllib.error.URLError:
+            # Ambiguous timeout: request may have been transmitted. Mark
+            # this batch's children UNKNOWN and STOP. Do not retry.
+            record["status"] = "UNKNOWN"
+            unknown_count += len(batch)
+            stopped_early = True
+            batch_records.append(record)
+            break
+        except Exception as exc:  # noqa: BLE001
+            record["status"] = "REJECTED"
+            record["error_code"] = "TRANSPORT_ERROR"
+            record["exchange_reason"] = sanitize_error_message(str(exc))
+            rejected_count += len(batch)
+            stopped_early = True
+            exchange_reason = record["exchange_reason"]
+            batch_records.append(record)
+            break
+
+        results = payload if isinstance(payload, list) else []
+        record["exchange_order_ids"] = []
+        record["accepted_vwap"] = None
+        accepted_qty_batch = Decimal("0")
+        accepted_notional_batch = Decimal("0")
+        for child_in, child_result in zip(batch, results):
+            status = _ladder_child_status(child_result)
+            if status == "ACCEPTED":
+                try:
+                    q = Decimal(str(child_in.get("quantity") or "0"))
+                    p = Decimal(str(child_in.get("price") or "0"))
+                except Exception:  # noqa: BLE001
+                    q = Decimal("0")
+                    p = Decimal("0")
+                accepted_qty_batch += q
+                accepted_notional_batch += q * p
+                order_id = child_result.get("orderId")
+                if order_id is not None:
+                    record["exchange_order_ids"].append(str(order_id))
+                    accepted_order_ids.append(str(order_id))
+            elif status == "REJECTED":
+                rejected_count += 1
+            else:
+                unknown_count += 1
+        record["status"] = "ACCEPTED" if (rejected_count + unknown_count == 0) else "PARTIAL"
+        record["accepted_vwap"] = (
+            (accepted_notional_batch / accepted_qty_batch) if accepted_qty_batch > 0 else None
+        )
+        batch_records.append(record)
+        accepted_qty += accepted_qty_batch
+        accepted_notional += accepted_notional_batch
+        # If MEXC returned any rejected child reasons, surface the latest one.
+        if not exchange_reason:
+            for child_result in results:
+                if isinstance(child_result, Mapping) and child_result.get("msg"):
+                    exchange_reason = str(child_result.get("msg"))
+                    break
+
+    # Children in batches not attempted (after stopped_early) → NOT_ATTEMPTED.
+    attempted_total = sum(len(r["children_attempted"]) for r in batch_records)
+    not_attempted_count = requested_order_count - attempted_total
+
+    # Reconciliation: re-read open orders to match accepted/unknown children
+    # by newClientOrderId. Read-only GET; no automatic retry or cancel.
+    if accepted_order_ids:
+        try:
+            open_payload = _signed_request(
+                credentials, "GET", "/api/v3/openOrders", {"symbol": symbol}
+            )
+        except Exception:  # noqa: BLE001
+            open_payload = None
+        if isinstance(open_payload, list):
+            # Build a map: clientOrderId -> live row.
+            live_by_cid: Dict[str, Mapping[str, Any]] = {}
+            for row in open_payload:
+                cid = str(row.get("clientOrderId") or "")
+                if cid:
+                    live_by_cid[cid] = row
+            # Annotate batch records with live exchange order IDs / status.
+            for rec in batch_records:
+                matched: List[str] = []
+                for cid in rec.get("children_attempted", []):
+                    row = live_by_cid.get(str(cid))
+                    if row is not None and row.get("orderId") is not None:
+                        matched.append(str(row["orderId"]))
+                if matched:
+                    rec["verified_exchange_order_ids"] = matched
+
+    planned_vwap = _vwap(
+        [{"quantity": c.get("quantity"), "price": c.get("price")} for c in children_in],
+        "quantity",
+        "price",
+    )
+    accepted_vwap = (accepted_notional / accepted_qty) if accepted_qty > 0 else None
+
+    partial = accepted_qty < requested_volume or rejected_count > 0 or unknown_count > 0 or stopped_early
+    success = (not stopped_early) and rejected_count == 0 and unknown_count == 0 and not_attempted_count == 0
+
+    ladder_result = CanonicalLadderResult(
+        symbol=symbol,
+        side=side,
+        distribution=str(request.get("distribution") or "ladder"),
+        requested_order_count=requested_order_count,
+        submitted_order_count=accepted_order_ids.__len__(),
+        requested_volume=_format_decimal(requested_volume),
+        submitted_volume=_format_decimal(accepted_qty),
+        batch_count=len(batches),
+        verified=bool(success and accepted_order_ids),
+        partial=partial,
+        status="success" if success else ("partial" if partial else "unknown"),
+        accepted_child_count=accepted_order_ids.__len__(),
+        omitted_order_count=rejected_count + unknown_count + not_attempted_count,
+        child_order_ids=list(accepted_order_ids),
+        batches=batch_records,
+        exchange_reason=exchange_reason,
+        expected_children=[{"client_order_id": c.get("client_order_id")} for c in children_in],
+    )
+    # Stash the accepted/accepted-vwap/planned-vwap in data for the wizard.
+    data = {
+        "accepted_vwap": _format_decimal(accepted_vwap) if accepted_vwap is not None else None,
+        "planned_vwap": _format_decimal(planned_vwap) if planned_vwap is not None else None,
+        "rejected": rejected_count,
+        "unknown": unknown_count,
+        "not_attempted": not_attempted_count,
+    }
+    return make_success(
+        operation="ladder",
+        exchange=name,
+        account=credentials["account"],
+        ladder=ladder_result,
+        data=data,
     )
 
 
@@ -1173,7 +1461,7 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     if op == "cancel_orders":
         return _cancel_orders(account, request)
     if op == "ladder":
-        return _ladder_not_enabled(account)
+        return _ladder(account, request)
     if op in {"cancel_order_group", "cancel_order"}:
         return _unsupported(op, account)
     return make_failure(
