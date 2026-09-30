@@ -22,6 +22,7 @@ from plugins.trade.canonical import (  # noqa: E402
     CanonicalBalance,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
+    CanonicalOrderResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -138,6 +139,10 @@ class FakeMexcSpotDesk:
     def __init__(self) -> None:
         self.requests: List[Dict[str, Any]] = []
         self.price_failures: set[str] = set()
+        self.reject_new_order = False
+        self.reject_message = "exchange rejected order"
+        self.timeout_new_order = False
+        self.balances: Dict[str, str] = {"USDT": "10000", "USDC": "10000", "SOL": "100", "SUI": "100"}
         self.instruments: List[Dict[str, Any]] = [
             self._inst("SOLUSDT", "SOL", "USDT", quote_precision=2),
             self._inst("SOLUSDC", "SOL", "USDC", quote_precision=2),
@@ -145,6 +150,7 @@ class FakeMexcSpotDesk:
             self._inst("ETHUSDT", "ETH", "USDT", quote_precision=2),
             self._inst("HYPEUSDT", "HYPE", "USDT", quote_precision=4),
             self._inst("SUIUSDT", "SUI", "USDT", quote_precision=4),
+            self._inst("SUIUSDC", "SUI", "USDC", quote_precision=4),
             self._inst("BTCUSDT", "BTC", "USDT", quote_precision=2),
             self._inst("BTCUSDC", "BTC", "USDC", quote_precision=2),
             self._inst("SOLDELIST", "SOL", "DELIST", status="0"),
@@ -158,6 +164,7 @@ class FakeMexcSpotDesk:
             "ETHUSDT": "4000.12",
             "HYPEUSDT": "47.1234",
             "SUIUSDT": "1.2345",
+            "SUIUSDC": "1.2300",
             "BTCUSDT": "114000.12",
             "BTCUSDC": "113990.11",
         }
@@ -183,6 +190,7 @@ class FakeMexcSpotDesk:
             "orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"],
             "quotePrecision": quote_precision,
             "baseSizePrecision": "0.01",
+            "tick_size": "0." + ("0" * (quote_precision - 1)) + "1" if quote_precision else "0.01",
             "api_enabled_for_key": api_enabled,
             "api_eligible": api_enabled and spot_allowed and status == "1",
         }
@@ -196,7 +204,7 @@ class FakeMexcSpotDesk:
     def capabilities(self, exchange: str) -> List[str]:
         if exchange != "mexc":
             return []
-        return ["balance", "orders", "open_orders", "list_instruments", "resolve_instrument", "market_price"]
+        return ["balance", "orders", "open_orders", "list_instruments", "resolve_instrument", "market_price", "new_order"]
 
     def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
         self.requests.append(dict(request))
@@ -216,6 +224,43 @@ class FakeMexcSpotDesk:
                 "amiroo",
                 market_price=CanonicalMarketPrice(requested_symbol=symbol, market=symbol, mark_price=price, price=price),
                 data={"symbol": symbol, "price": price},
+            )
+        if op == "resolve_instrument":
+            symbol = str(request.get("symbol") or "").upper().replace("/", "")
+            for row in self.instruments:
+                if row["symbol"] == symbol:
+                    return make_success(op, "mexc", "amiroo", data={"instrument": dict(row)})
+            return make_failure(op, "mexc", "amiroo", code="INSTRUMENT_NOT_FOUND", message="not found")
+        if op == "balance":
+            assets = [{"asset": k, "total": v} for k, v in self.balances.items()]
+            return make_success(op, "mexc", "amiroo", data={"assets": assets})
+        if op == "new_order":
+            if self.timeout_new_order:
+                return make_failure(op, "mexc", "amiroo", code="ORDER_STATUS_UNKNOWN", message="timed out after transmission")
+            if self.reject_new_order:
+                return make_failure(op, "mexc", "amiroo", code="EXCHANGE_REJECTED", message=self.reject_message)
+            symbol = str(request.get("symbol") or "")
+            side = str(request.get("side") or "")
+            qty = str(request.get("quantity") or "")
+            price = str(request.get("price") or "")
+            return make_success(
+                op,
+                "mexc",
+                "amiroo",
+                order=CanonicalOrderResult(
+                    symbol=symbol,
+                    side=side,
+                    order_type="LIMIT",
+                    requested_volume=qty,
+                    requested_price=price,
+                    submitted_volume=qty,
+                    submitted_price=price,
+                    verified=True,
+                    status="NEW",
+                    exchange_order_id="999001",
+                    client_order_id=str(request.get("client_order_id") or ""),
+                ),
+                data={"orderId": "999001", "status": "NEW"},
             )
         return make_success(op, "mexc", "amiroo", data={})
 
@@ -389,8 +434,9 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         self.wizard.handle_text(self.key, "10")
         preview = self.wizard.handle_text(self.key, "110.10")
         assert preview is not None
-        self.assertIn("Required balance: USDC", preview.text)
-        self.assertIn("Estimated cost: 1101 USDC", preview.text)
+        self.assertIn("Required: 1,101.00 USDC", preview.text)
+        self.assertIn("Available:", preview.text)
+        self.assertIn("Confirm & Place Order", _labels(preview))
 
         self._open_new_order()
         pairs = self.wizard.handle_callback(self.key, "asset:SOL")
@@ -400,8 +446,8 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         self.wizard.handle_text(self.key, "10")
         preview = self.wizard.handle_text(self.key, "110.10")
         assert preview is not None
-        self.assertIn("Required balance: SOL", preview.text)
-        self.assertIn("Estimated proceeds: 1101 USDC", preview.text)
+        self.assertIn("Required: 10 SOL", preview.text)
+        self.assertIn("Available:", preview.text)
 
     def test_back_from_pair_selection_returns_to_asset_picker(self) -> None:
         self._open_new_order()
@@ -411,17 +457,174 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         for label in ["SOL", "ETH", "HYPE", "SUI", "Other"]:
             self.assertIn(label, labels)
 
-    def test_confirm_does_not_submit_live_order(self) -> None:
+    def test_back_and_cancel_never_submit(self) -> None:
         self._open_new_order()
         pairs = self.wizard.handle_callback(self.key, "asset:SOL")
         sol_usdc_cb = _callbacks(pairs)[_labels(pairs).index(next(label for label in _labels(pairs) if "SOL/USDC" in label))]
         self.wizard.handle_callback(self.key, sol_usdc_cb)
         self.wizard.handle_callback(self.key, "side:buy")
         self.wizard.handle_text(self.key, "1")
-        self.wizard.handle_text(self.key, "110")
-        screen = self.wizard.handle_callback(self.key, "confirm_disabled")
-        self.assertIn("No order was placed", screen.text)
+        preview = self.wizard.handle_text(self.key, "110")
+        assert preview is not None
+        self.wizard.handle_callback(self.key, "back")
         self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+        preview = self.wizard.handle_text(self.key, "110")
+        assert preview is not None
+        cancelled = self.wizard.handle_callback(self.key, "cancel")
+        self.assertEqual(cancelled.state, "action")
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+        self.assertNotIn("🪜 Ladder", _labels(cancelled))
+        self.assertNotIn("❌ Cancel Orders", _labels(cancelled))
+
+
+class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.key = ("chat-live",)
+
+    def _preview(self, asset: str, pair_label: str, side: str, qty: str, price: str):
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        self.wizard.handle_callback(self.key, "account:amiroo")
+        self.wizard.handle_callback(self.key, "action:new_order")
+        pairs = self.wizard.handle_callback(self.key, f"asset:{asset}")
+        cb = _callbacks(pairs)[_labels(pairs).index(next(label for label in _labels(pairs) if pair_label in label))]
+        self.wizard.handle_callback(self.key, cb)
+        self.wizard.handle_callback(self.key, f"side:{side}")
+        self.wizard.handle_text(self.key, qty)
+        return self.wizard.handle_text(self.key, price)
+
+    def _place(self, preview) -> Any:
+        place = next(cb for cb in _callbacks(preview) if str(cb).startswith("place:"))
+        return self.wizard.handle_callback(self.key, place), place
+
+    def test_buy_sol_usdc_submits_limit(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        assert preview is not None
+        self.assertIn("Required: 10.10 USDC", preview.text)
+        screen, _ = self._place(preview)
+        self.assertIn("✅ LIMIT order submitted", screen.text)
+        self.assertIn("BUY 0.1 SOL/USDC", screen.text)
+        self.assertIn("Order ID: 999001", screen.text)
+        orders = [r for r in self.desk.requests if r.get("operation") == "new_order"]
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["symbol"], "SOLUSDC")
+        self.assertEqual(orders[0]["side"], "BUY")
+        self.assertEqual(orders[0]["order_type"], "LIMIT")
+        self.assertEqual(orders[0]["quantity"], "0.1")
+        self.assertEqual(orders[0]["price"], "101")
+
+    def test_sell_sol_usdc_uses_base_balance(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "sell", "0.1", "101")
+        assert preview is not None
+        self.assertIn("Required: 0.1 SOL", preview.text)
+        self.assertIn("Available: 100 SOL", preview.text)
+        screen, _ = self._place(preview)
+        self.assertIn("SELL 0.1 SOL/USDC", screen.text)
+        orders = [r for r in self.desk.requests if r.get("operation") == "new_order"]
+        self.assertEqual(orders[-1]["side"], "SELL")
+        self.assertEqual(orders[-1]["symbol"], "SOLUSDC")
+
+    def test_buy_sol_usdt(self) -> None:
+        preview = self._preview("SOL", "SOL/USDT", "buy", "0.1", "110")
+        screen, _ = self._place(preview)
+        self.assertIn("SOL/USDT", screen.text)
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "new_order"][-1]["symbol"], "SOLUSDT")
+
+    def test_buy_sui_usdc(self) -> None:
+        preview = self._preview("SUI", "SUI/USDC", "buy", "1", "1.23")
+        screen, _ = self._place(preview)
+        self.assertIn("SUI/USDC", screen.text)
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "new_order"][-1]["symbol"], "SUIUSDC")
+
+    def test_quantity_normalization(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.129", "101")
+        assert preview is not None
+        self.assertIn("Quantity: 0.12 SOL", preview.text)
+        screen, _ = self._place(preview)
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "new_order"][-1]["quantity"], "0.12")
+        self.assertIn("0.12 SOL/USDC", screen.text)
+
+    def test_price_normalization(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101.239")
+        assert preview is not None
+        self.assertIn("Limit price: 101.23 USDC", preview.text)
+        self._place(preview)
+        self.assertEqual([r for r in self.desk.requests if r.get("operation") == "new_order"][-1]["price"], "101.23")
+
+    def test_insufficient_quote_blocks_buy(self) -> None:
+        self.desk.balances["USDC"] = "1"
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        assert preview is not None
+        self.assertIn("Insufficient USDC", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+
+    def test_insufficient_base_blocks_sell(self) -> None:
+        self.desk.balances["SOL"] = "0.01"
+        preview = self._preview("SOL", "SOL/USDC", "sell", "0.1", "101")
+        assert preview is not None
+        self.assertIn("Insufficient SOL", preview.text)
+        self.assertFalse(any(str(cb).startswith("place:") for cb in _callbacks(preview)))
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+
+    def test_api_disabled_symbol_blocks_submission(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        assert preview is not None
+        for row in self.desk.instruments:
+            if row["symbol"] == "SOLUSDC":
+                row["api_enabled_for_key"] = False
+                row["api_eligible"] = False
+        screen, _ = self._place(preview)
+        self.assertIn("not API-enabled", screen.text)
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
+
+    def test_double_confirmation_submits_once(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        screen1, place = self._place(preview)
+        screen2 = self.wizard.handle_callback(self.key, place)
+        self.assertEqual(len([r for r in self.desk.requests if r.get("operation") == "new_order"]), 1)
+        self.assertIn("999001", screen1.text)
+        self.assertIn("999001", screen2.text)
+
+    def test_exchange_rejection_displays_failure(self) -> None:
+        self.desk.reject_new_order = True
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        screen, _ = self._place(preview)
+        self.assertIn("❌ LIMIT order failed", screen.text)
+        self.assertIn("exchange rejected order", screen.text)
+        self.assertIn("No order was placed", screen.text)
+
+    def test_ambiguous_timeout_does_not_retry(self) -> None:
+        self.desk.timeout_new_order = True
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        screen, place = self._place(preview)
+        self.assertIn("unknown", screen.text.lower())
+        self.assertIn("Not retried", screen.text)
+        self.wizard.handle_callback(self.key, place)
+        self.assertEqual(len([r for r in self.desk.requests if r.get("operation") == "new_order"]), 1)
+
+    def test_successful_response_displays_order_id(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        screen, _ = self._place(preview)
+        self.assertIn("Order ID: 999001", screen.text)
+        self.assertIn("Status: NEW", screen.text)
+
+    def test_ladder_and_cancel_remain_unavailable(self) -> None:
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        screen = self.wizard.handle_callback(self.key, "account:amiroo")
+        labels = _labels(screen)
+        self.assertIn("➕ New Order", labels)
+        self.assertNotIn("🪜 Ladder", labels)
+        self.assertNotIn("❌ Cancel Orders", labels)
+
+    def test_trade_namespace_still_separate(self) -> None:
+        screen = self.wizard.open(self.key)
+        self.assertTrue(all(not cb.startswith("trade:") for cb in _callbacks(screen)))
+        self.assertIsNone(trade_exchange_name_from_filename("x_mexc_agent_spot.py"))
+        self.assertEqual(trade_exchange_name_from_filename("x_mexc_agent.py"), "mexc")
 
 
 class TradeSpotCommandRegistrationTests(unittest.TestCase):

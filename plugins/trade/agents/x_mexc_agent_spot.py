@@ -1,16 +1,12 @@
-"""MEXC Spot read-only agent for /tradespot.
+"""MEXC Spot agent for /tradespot.
 
 Uses the existing MEXC credential convention from ``x_mexc_agent.py``:
 ``MEXC_<ALIAS>_ACCESSKEY`` + ``MEXC_<ALIAS>_SECRETKEY`` (plus common
 API-key/secret aliases). This agent is strictly separate from the futures
 ``x_mexc_agent.py`` used by /trade.
 
-Phase 1 is READ-ONLY:
-  - balance
-  - orders / open_orders
-  - list_instruments / resolve_instrument / market_price
-
-No write operation is advertised or executed here.
+Read operations plus a single LIMIT ``new_order``. Ladder and cancel remain
+disabled.
 """
 
 from __future__ import annotations
@@ -25,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import socket
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -34,6 +31,7 @@ from ..canonical import (
     CanonicalInstrument,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
+    CanonicalOrderResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -163,6 +161,7 @@ def capabilities() -> List[str]:
         "list_instruments",
         "resolve_instrument",
         "market_price",
+        "new_order",
     ]
 
 
@@ -201,6 +200,8 @@ def _json_request(method: str, url: str, headers: Mapping[str, str]) -> Any:
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8")
+    except (TimeoutError, socket.timeout) as exc:
+        raise urllib.error.URLError("timed out") from exc
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         try:
@@ -246,11 +247,19 @@ def _signed_request(
 
 
 def _response_error(payload: Any, fallback: str) -> Optional[str]:
-    if isinstance(payload, dict) and ("code" in payload or "msg" in payload or "message" in payload):
-        # MEXC success payloads for these endpoints carry domain fields like balances/symbols,
-        # not code/msg. If code/msg is present, treat it as an error body.
-        if "balances" not in payload and "symbols" not in payload:
-            return str(payload.get("msg") or payload.get("message") or payload.get("code") or fallback)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("orderId") is not None or "balances" in payload:
+        return None
+    code = payload.get("code")
+    if code in (None, 0, "0", 200, "200"):
+        if "msg" not in payload and "message" not in payload:
+            return None
+        if code in (0, "0", 200, "200"):
+            return None
+        return None
+    if "code" in payload or "msg" in payload or "message" in payload:
+        return str(payload.get("msg") or payload.get("message") or payload.get("code") or fallback)
     return None
 
 
@@ -432,6 +441,8 @@ def _instrument_from_market(row: Mapping[str, Any]) -> Dict[str, Any]:
         "baseAssetPrecision": row.get("baseAssetPrecision"),
         "quoteAssetPrecision": row.get("quoteAssetPrecision"),
         "quotePrecision": row.get("quotePrecision"),
+        "baseSizePrecision": row.get("baseSizePrecision"),
+        "quoteAmountPrecision": row.get("quoteAmountPrecision"),
         "tick_size": tick_size,
         "step_size": step_size,
         "min_qty": min_qty,
@@ -678,8 +689,238 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
         exchange=name,
         account=str(account or ""),
         code="NOT_IMPLEMENTED",
-        message="MEXC Spot phase 1 is read-only; writes are disabled.",
+        message="MEXC Spot does not enable this write operation.",
     )
+
+
+def _increment_from_precision(value: Any) -> Decimal:
+    text = str(value or "").strip()
+    if not text:
+        return Decimal("0")
+    try:
+        if "." in text or text.startswith("0"):
+            inc = Decimal(text)
+            return inc if inc > 0 else Decimal("0")
+        places = int(text)
+        if places < 0:
+            return Decimal("0")
+        return Decimal("1").scaleb(-places)
+    except Exception:  # noqa: BLE001
+        try:
+            inc = Decimal(text)
+            return inc if inc > 0 else Decimal("0")
+        except Exception:  # noqa: BLE001
+            return Decimal("0")
+
+
+def _quantize_down(value: Decimal, increment: Decimal) -> Decimal:
+    if increment <= 0:
+        return value
+    steps = (value / increment).to_integral_value(rounding=ROUND_DOWN)
+    return steps * increment
+
+
+def _size_increment(info: Mapping[str, Any]) -> Decimal:
+    for key in ("step_size", "baseSizePrecision"):
+        inc = _increment_from_precision(info.get(key))
+        if inc > 0:
+            return inc
+    return _increment_from_precision(info.get("baseAssetPrecision"))
+
+
+def _price_increment(info: Mapping[str, Any]) -> Decimal:
+    inc = _increment_from_precision(info.get("tick_size"))
+    if inc > 0:
+        return inc
+    for key in ("quotePrecision", "quoteAssetPrecision"):
+        inc = _increment_from_precision(info.get(key))
+        if inc > 0:
+            return inc
+    return Decimal("0")
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    reason = str(getattr(exc, "reason", "")).lower()
+    return "timed out" in text or "timeout" in text or "timed out" in reason or "timeout" in reason
+
+
+def _new_order(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return _missing_account("new_order", account)
+    side = str(request.get("side") or "").strip().upper()
+    order_type = str(request.get("order_type") or request.get("type") or "LIMIT").strip().upper()
+    symbol = str(request.get("symbol") or "").strip().upper().replace("/", "")
+    if side not in {"BUY", "SELL"}:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_SIDE",
+            message="Side must be BUY or SELL.",
+        )
+    if order_type != "LIMIT":
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="LIMIT_ONLY",
+            message="MEXC Spot /tradespot accepts LIMIT orders only.",
+        )
+    qty = _to_decimal(request.get("quantity") or request.get("qty") or request.get("volume"))
+    price = _to_decimal(request.get("price") or request.get("limit_price"))
+    if qty <= 0 or price <= 0:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_ORDER",
+            message="Quantity and limit price must be positive.",
+        )
+    row = _market_row(symbol)
+    if row is None:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INSTRUMENT_NOT_FOUND",
+            message="MEXC spot symbol not found.",
+        )
+    info = _instrument_from_market(row)
+    order_types = {str(x).upper() for x in info.get("orderTypes") or []}
+    if order_types and "LIMIT" not in order_types:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="LIMIT_NOT_ALLOWED",
+            message="LIMIT is not an allowed order type for this symbol.",
+        )
+    if not info.get("isSpotTradingAllowed") or not info.get("api_eligible"):
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="SYMBOL_NOT_TRADABLE",
+            message="Symbol is not API-enabled for spot trading.",
+        )
+    try:
+        self_set, _self_err = _self_symbols(credentials)
+    except Exception:  # noqa: BLE001
+        self_set = None
+    if self_set is not None and str(info["symbol"]) not in self_set:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="SYMBOL_NOT_API_ENABLED",
+            message="Symbol is not API-enabled for this key.",
+        )
+    qty = _quantize_down(qty, _size_increment(info))
+    price = _quantize_down(price, _price_increment(info))
+    if qty <= 0 or price <= 0:
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="INVALID_ORDER",
+            message="Normalized quantity or price is not positive.",
+        )
+    qty_text = _format_decimal(qty)
+    price_text = _format_decimal(price)
+    client_id = str(request.get("client_order_id") or request.get("newClientOrderId") or "").strip()
+    params: Dict[str, Any] = {
+        "symbol": str(info["symbol"]),
+        "side": side,
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": qty_text,
+        "price": price_text,
+    }
+    if client_id:
+        params["newClientOrderId"] = client_id[:32]
+    try:
+        payload = _signed_request(credentials, "POST", "/api/v3/order", params)
+        err = _response_error(payload, "order rejected")
+        if err:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="EXCHANGE_REJECTED",
+                message=_redact(sanitize_error_message(err), credentials),
+                exchange_reason=_redact(sanitize_error_message(err), credentials),
+            )
+        if not isinstance(payload, dict) or payload.get("orderId") is None:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="ORDER_STATUS_UNKNOWN",
+                message="MEXC did not return an order id; status is unknown. Not retried.",
+            )
+        order_id = payload.get("orderId")
+        status = str(payload.get("status") or "NEW")
+        return make_success(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            order=CanonicalOrderResult(
+                symbol=str(info["symbol"]),
+                side=side,
+                order_type="LIMIT",
+                requested_volume=qty_text,
+                requested_price=price_text,
+                submitted_volume=str(payload.get("origQty") or qty_text),
+                submitted_price=str(payload.get("price") or price_text),
+                verified=True,
+                status=status,
+                exchange_order_id=order_id,
+                client_order_id=payload.get("clientOrderId") or (client_id or None),
+            ),
+            data={
+                "source": "mexc_spot_order",
+                "orderId": order_id,
+                "status": status,
+                "symbol": str(info["symbol"]),
+                "side": side,
+                "quantity": qty_text,
+                "price": price_text,
+            },
+        )
+    except urllib.error.URLError as exc:
+        if _is_timeout_error(exc):
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="ORDER_STATUS_UNKNOWN",
+                message="MEXC request timed out after transmission. Order status is unknown; not retried.",
+            )
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="MEXC_SPOT_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_timeout_error(exc):
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=credentials["account"],
+                code="ORDER_STATUS_UNKNOWN",
+                message="MEXC request timed out after transmission. Order status is unknown; not retried.",
+            )
+        return make_failure(
+            operation="new_order",
+            exchange=name,
+            account=credentials["account"],
+            code="MEXC_SPOT_ERROR",
+            message=_redact(sanitize_error_message(str(exc)), credentials),
+        )
 
 
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
@@ -695,7 +936,9 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _resolve_instrument(account, request)
     if op == "market_price":
         return _market_price(account, request)
-    if op in {"new_order", "ladder", "cancel_orders", "cancel_order_group", "cancel_order"}:
+    if op == "new_order":
+        return _new_order(account, request)
+    if op in {"ladder", "cancel_orders", "cancel_order_group", "cancel_order"}:
         return _unsupported(op, account)
     return make_failure(
         operation=op,

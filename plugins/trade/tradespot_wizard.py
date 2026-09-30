@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from .canonical import CanonicalResponse
@@ -153,6 +154,9 @@ class SpotWizardState:
     order_side: Optional[str] = None
     order_quantity: Optional[str] = None
     order_limit_price: Optional[str] = None
+    confirm_token: Optional[str] = None
+    confirm_consumed: bool = False
+    last_submit_screen: Optional["Screen"] = None
 
 
 class TradeSpotWizard:
@@ -213,6 +217,8 @@ class TradeSpotWizard:
             return self._handle_limit_price_callback(chat_key, suffix)
         if state.state == "new_order_preview":
             return self._handle_preview_callback(chat_key, suffix)
+        if state.state == "order_result":
+            return self._handle_order_result_callback(chat_key, suffix)
         if state.state in {"balance", "orders", "unsupported"}:
             return self._handle_result_screen(chat_key, suffix)
         return self.open(chat_key)
@@ -370,6 +376,9 @@ class TradeSpotWizard:
         state.order_side = None
         state.order_quantity = None
         state.order_limit_price = None
+        state.confirm_token = None
+        state.confirm_consumed = False
+        state.last_submit_screen = None
 
     def _render_new_order_assets(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
@@ -666,23 +675,132 @@ class TradeSpotWizard:
         state.order_limit_price = value
         return self._render_order_preview(chat_key)
 
+    def _format_decimal(self, value: Decimal) -> str:
+        text = format(value.normalize(), "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
+
+    def _increment_from(self, value: Any) -> Decimal:
+        text = str(value or "").strip()
+        if not text:
+            return Decimal("0")
+        try:
+            if "." in text or (text.startswith("0") and text != "0"):
+                inc = Decimal(text)
+                return inc if inc > 0 else Decimal("0")
+            places = int(text)
+            if places < 0:
+                return Decimal("0")
+            return Decimal("1").scaleb(-places)
+        except (InvalidOperation, ValueError):
+            try:
+                inc = Decimal(text)
+                return inc if inc > 0 else Decimal("0")
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
+
+    def _quantize_down(self, value: Decimal, increment: Decimal) -> Decimal:
+        if increment <= 0:
+            return value
+        steps = (value / increment).to_integral_value(rounding=ROUND_DOWN)
+        return steps * increment
+
+    def _size_increment(self, item: Mapping[str, Any]) -> Decimal:
+        for key in ("step_size", "baseSizePrecision"):
+            inc = self._increment_from(item.get(key))
+            if inc > 0:
+                return inc
+        return self._increment_from(item.get("baseAssetPrecision"))
+
+    def _price_increment(self, item: Mapping[str, Any]) -> Decimal:
+        inc = self._increment_from(item.get("tick_size"))
+        if inc > 0:
+            return inc
+        for key in ("quotePrecision", "quoteAssetPrecision"):
+            inc = self._increment_from(item.get(key))
+            if inc > 0:
+                return inc
+        return Decimal("0")
+
+    def _re_resolve_instrument(self, state: SpotWizardState) -> Optional[Dict[str, Any]]:
+        item = dict(state.selected_instrument or {})
+        symbol = str(item.get("symbol") or "").upper()
+        response = self._desk.execute(
+            {
+                "operation": "resolve_instrument",
+                "exchange": state.exchange or "",
+                "account": state.account or "",
+                "symbol": symbol,
+            }
+        )
+        data = getattr(response, "data", None)
+        resolved = None
+        if response.success:
+            if getattr(response, "instrument", None) is not None:
+                resolved = dict(response.instrument.to_dict())  # type: ignore[union-attr]
+            if isinstance(data, dict):
+                inst = data.get("instrument")
+                if isinstance(inst, dict):
+                    resolved = {**(resolved or {}), **inst}
+        if resolved:
+            item.update(resolved)
+            state.selected_instrument = item
+            return item
+        return item if item else None
+
+    def _holding_for(self, state: SpotWizardState, asset: str) -> Decimal:
+        response = self._desk.execute(
+            {
+                "operation": "balance",
+                "exchange": state.exchange or "",
+                "account": state.account or "",
+            }
+        )
+        totals: Dict[str, Decimal] = {}
+        for row in _balance_assets(response):
+            if not isinstance(row, Mapping):
+                continue
+            symbol = _asset_symbol(row)
+            if not symbol:
+                continue
+            totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(row)
+        return totals.get(str(asset).upper(), Decimal("0"))
+
+    def _instrument_tradable(self, item: Mapping[str, Any]) -> Optional[str]:
+        if item.get("api_enabled_for_key") is False or item.get("api_eligible") is False:
+            return "Symbol is not API-enabled for this key."
+        if item.get("isSpotTradingAllowed") is False:
+            return "Symbol is not enabled for spot trading."
+        order_types = {str(x).upper() for x in (item.get("orderTypes") or [])}
+        if order_types and "LIMIT" not in order_types:
+            return "LIMIT is not an allowed order type for this symbol."
+        return None
+
     def _render_order_preview(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
         state.state = "new_order_preview"
-        item = state.selected_instrument or {}
+        state.confirm_consumed = False
+        state.last_submit_screen = None
+        item = self._re_resolve_instrument(state) or {}
         pair = self._selected_pair_name(state)
         side = str(state.order_side or "").upper()
         base = str(item.get("baseAsset") or "BASE").upper()
         quote = str(item.get("quoteAsset") or "QUOTE").upper()
-        qty = Decimal(str(state.order_quantity or "0"))
-        price = Decimal(str(state.order_limit_price or "0"))
-        notional = qty * price
-        if side == "BUY":
-            balance_line = f"Required balance: {quote}"
-            estimate_line = f"Estimated cost: {self._format_decimal(notional)} {quote}"
-        else:
-            balance_line = f"Required balance: {base}"
-            estimate_line = f"Estimated proceeds: {self._format_decimal(notional)} {quote}"
+        try:
+            qty = Decimal(str(state.order_quantity or "0"))
+            price = Decimal(str(state.order_limit_price or "0"))
+        except (InvalidOperation, ValueError):
+            qty = Decimal("0")
+            price = Decimal("0")
+        qty = self._quantize_down(qty, self._size_increment(item))
+        price = self._quantize_down(price, self._price_increment(item))
+        state.order_quantity = self._format_decimal(qty)
+        state.order_limit_price = self._format_decimal(price)
+        quote_like = quote in _MEXC_QUOTE_ASSETS
+        required = (qty * price) if side == "BUY" else qty
+        required_asset = quote if side == "BUY" else base
+        available = self._holding_for(state, required_asset)
+        after = available - required
+        tradable_error = self._instrument_tradable(item)
         lines = [
             f"🟦 MEXC Spot — {pair}",
             "LIMIT order preview",
@@ -690,27 +808,195 @@ class TradeSpotWizard:
             f"Side: {side}",
             f"Quantity: {state.order_quantity} {base}",
             f"Limit price: {state.order_limit_price} {quote}",
-            balance_line,
-            estimate_line,
             "",
-            "Live submission is disabled in this phase.",
         ]
-        return Screen("\n".join(lines), [[_button_row("Confirm", "confirm_disabled")], [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]], "new_order_preview")
-
-    def _format_decimal(self, value: Decimal) -> str:
-        text = format(value.normalize(), "f")
-        return text.rstrip("0").rstrip(".") if "." in text else text
+        if side == "BUY":
+            lines.extend(
+                [
+                    f"Required: {_format_inventory_amount(required, quote=quote_like)} {quote}",
+                    f"Available: {_format_inventory_amount(available, quote=quote_like)} {quote}",
+                    f"After order: {_format_inventory_amount(after, quote=quote_like)} {quote}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"Required: {_format_inventory_amount(required, quote=False)} {base}",
+                    f"Available: {_format_inventory_amount(available, quote=False)} {base}",
+                    f"After order: {_format_inventory_amount(after, quote=False)} {base}",
+                ]
+            )
+        buttons: List[List[Dict[str, str]]]
+        if qty <= 0 or price <= 0:
+            lines.extend(["", "Invalid quantity or price."])
+            state.confirm_token = None
+            buttons = [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]]
+        elif tradable_error:
+            lines.extend(["", tradable_error])
+            state.confirm_token = None
+            buttons = [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]]
+        elif after < 0:
+            lines.extend(["", f"Insufficient {required_asset}."])
+            state.confirm_token = None
+            buttons = [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]]
+        else:
+            token = secrets.token_hex(8)
+            state.confirm_token = token
+            buttons = [
+                [_button_row("Confirm & Place Order", f"place:{token}")],
+                [_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")],
+            ]
+        return Screen("\n".join(lines), buttons, "new_order_preview")
 
     def _handle_preview_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
         if suffix == "back":
             return self._render_limit_price_prompt(chat_key)
+        if suffix in {"cancel", "close"}:
+            self._clear_order_state(state)
+            return self._render_action(chat_key)
         if suffix == "confirm_disabled":
-            return Screen(
-                "🟦 MEXC Spot\n\nLive order submission is disabled. No order was placed.",
-                [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
-                "new_order_preview",
-            )
+            return self._render_order_preview(chat_key)
+        if suffix.startswith("place:"):
+            return self._submit_limit_order(chat_key, suffix[len("place:") :])
         return self._render_order_preview(chat_key)
+
+    def _submit_limit_order(self, chat_key: Tuple[Any, ...], token: str) -> Screen:
+        state = self._state_for(chat_key)
+        if not token or token != (state.confirm_token or ""):
+            return self._render_order_preview(chat_key)
+        if state.confirm_consumed:
+            if state.last_submit_screen is not None:
+                return state.last_submit_screen
+            return Screen(
+                "🟦 MEXC Spot\n\nThis confirmation was already used. No additional order was submitted.",
+                [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
+                "order_result",
+            )
+        state.confirm_consumed = True
+        item = self._re_resolve_instrument(state) or {}
+        tradable_error = self._instrument_tradable(item)
+        if tradable_error:
+            screen = Screen(
+                f"🟦 MEXC Spot\n\n{tradable_error}\nNo order was placed.",
+                [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "order_result",
+            )
+            state.last_submit_screen = screen
+            state.state = "order_result"
+            return screen
+        side = str(state.order_side or "").upper()
+        base = str(item.get("baseAsset") or "").upper()
+        quote = str(item.get("quoteAsset") or "").upper()
+        try:
+            qty = Decimal(str(state.order_quantity or "0"))
+            price = Decimal(str(state.order_limit_price or "0"))
+        except (InvalidOperation, ValueError):
+            qty = Decimal("0")
+            price = Decimal("0")
+        qty = self._quantize_down(qty, self._size_increment(item))
+        price = self._quantize_down(price, self._price_increment(item))
+        if qty <= 0 or price <= 0:
+            screen = Screen(
+                "🟦 MEXC Spot\n\nInvalid quantity or price.\nNo order was placed.",
+                [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "order_result",
+            )
+            state.last_submit_screen = screen
+            state.state = "order_result"
+            return screen
+        required_asset = quote if side == "BUY" else base
+        required = (qty * price) if side == "BUY" else qty
+        available = self._holding_for(state, required_asset)
+        if available < required:
+            screen = Screen(
+                f"🟦 MEXC Spot\n\nInsufficient {required_asset}.\nNo order was placed.",
+                [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "order_result",
+            )
+            state.last_submit_screen = screen
+            state.state = "order_result"
+            return screen
+        pair = self._selected_pair_name(state)
+        response = self._desk.execute(
+            {
+                "operation": "new_order",
+                "exchange": state.exchange or "",
+                "account": state.account or "",
+                "symbol": str(item.get("symbol") or ""),
+                "side": side,
+                "order_type": "LIMIT",
+                "quantity": self._format_decimal(qty),
+                "price": self._format_decimal(price),
+                "client_order_id": token,
+            }
+        )
+        if not response.success:
+            err = getattr(response, "error", None)
+            code = getattr(err, "code", "") if err is not None else ""
+            message = getattr(err, "message", "Order was not placed.") if err is not None else "Order was not placed."
+            title = "⚠️ Order status unknown" if code == "ORDER_STATUS_UNKNOWN" else "❌ LIMIT order failed"
+            extra = "\nNot retried." if code == "ORDER_STATUS_UNKNOWN" else "\nNo order was placed."
+            screen = Screen(
+                f"{title}\n\n{message}{extra}",
+                [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "order_result",
+            )
+            state.last_submit_screen = screen
+            state.state = "order_result"
+            return screen
+        order = getattr(response, "order", None)
+        order_id = getattr(order, "exchange_order_id", None) if order is not None else None
+        if order_id is None:
+            data = getattr(response, "data", None)
+            if isinstance(data, dict):
+                order_id = data.get("orderId")
+        status = getattr(order, "status", None) if order is not None else None
+        if not status:
+            data = getattr(response, "data", None)
+            if isinstance(data, dict):
+                status = data.get("status")
+        notional = qty * price
+        quote_like = quote in _MEXC_QUOTE_ASSETS
+        screen = Screen(
+            "\n".join(
+                [
+                    "✅ LIMIT order submitted",
+                    "",
+                    f"MEXC — {state.account or ''}",
+                    f"{side} {self._format_decimal(qty)} {pair}",
+                    f"Price: {self._format_decimal(price)} {quote}",
+                    f"Estimated value: {_format_inventory_amount(notional, quote=quote_like)} {quote}",
+                    "",
+                    f"Order ID: {order_id if order_id is not None else '—'}",
+                    f"Status: {status or 'NEW'}",
+                ]
+            ),
+            [
+                [_button_row("New Order", "new_order")],
+                [_button_row("Open Orders", "orders")],
+                [_button_row(*BUTTON_BACK)],
+            ],
+            "order_result",
+        )
+        state.last_submit_screen = screen
+        state.state = "order_result"
+        return screen
+
+    def _handle_order_result_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "back":
+            return self._render_action(chat_key)
+        if suffix in {"cancel", "close"}:
+            self._clear_order_state(state)
+            return self._render_action(chat_key)
+        if suffix == "new_order":
+            return self._render_new_order_assets(chat_key)
+        if suffix == "orders":
+            return self._render_orders(chat_key)
+        if state.last_submit_screen is not None:
+            return state.last_submit_screen
+        return self._render_action(chat_key)
 
     def _result_buttons(self) -> List[List[Dict[str, str]]]:
         return [[_button_row(*BUTTON_REFRESH)], [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]

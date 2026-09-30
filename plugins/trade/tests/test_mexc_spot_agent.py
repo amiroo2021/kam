@@ -47,13 +47,13 @@ class MexcSpotEnvTests(unittest.TestCase):
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
             self.assertEqual(spot.list_accounts(), ["amiroo"])
 
-    def test_capabilities_are_read_only(self) -> None:
+    def test_capabilities_include_limit_new_order_only(self) -> None:
         caps = set(spot.capabilities())
         self.assertIn("balance", caps)
         self.assertIn("orders", caps)
         self.assertIn("open_orders", caps)
         self.assertIn("list_instruments", caps)
-        self.assertNotIn("new_order", caps)
+        self.assertIn("new_order", caps)
         self.assertNotIn("ladder", caps)
         self.assertNotIn("cancel_orders", caps)
 
@@ -227,13 +227,126 @@ class MexcSpotParsingTests(unittest.TestCase):
         assert data is not None
         self.assertEqual(data["instrument"]["symbol"], "SOLUSDT")
 
-    def test_write_operations_are_not_possible(self) -> None:
+    def test_ladder_and_cancel_remain_unimplemented(self) -> None:
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
-            for op in ("new_order", "ladder", "cancel_orders", "cancel_order_group"):
+            for op in ("ladder", "cancel_orders", "cancel_order_group"):
                 resp = spot.execute({"operation": op, "exchange": "mexc", "account": "amiroo"})
                 self.assertFalse(resp.success)
                 self.assertIsNotNone(resp.error)
                 self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+
+    def _solusdc_market(self) -> Dict[str, Any]:
+        return {
+            "symbol": "SOLUSDC",
+            "baseAsset": "SOL",
+            "quoteAsset": "USDC",
+            "baseAssetPrecision": 2,
+            "quotePrecision": 2,
+            "baseSizePrecision": "0.01",
+            "orderTypes": ["LIMIT", "MARKET"],
+            "isSpotTradingAllowed": True,
+            "status": "1",
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE", "minQty": "0.01", "stepSize": "0.01"},
+            ],
+        }
+
+    def test_new_order_posts_signed_limit_and_returns_id(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        def fake_signed(credentials, method, path, params=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = dict(params or {})
+            captured["secret_in_params"] = "secret" in str(params)
+            return {"symbol": "SOLUSDC", "orderId": 555, "status": "NEW", "origQty": "0.1", "price": "101"}
+
+        info = {"by_symbol": {"SOLUSDC": self._solusdc_market()}, "symbols": [self._solusdc_market()], "ts": 1.0}
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_exchange_info", return_value=info):
+                with mock.patch.object(spot, "_self_symbols", return_value=({"SOLUSDC"}, None)):
+                    with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                        resp = spot.execute({
+                            "operation": "new_order",
+                            "exchange": "mexc",
+                            "account": "amiroo",
+                            "symbol": "SOLUSDC",
+                            "side": "BUY",
+                            "order_type": "LIMIT",
+                            "quantity": "0.129",
+                            "price": "101.239",
+                            "client_order_id": "tok123",
+                        })
+        self.assertTrue(resp.success)
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v3/order")
+        self.assertEqual(captured["params"]["type"], "LIMIT")
+        self.assertEqual(captured["params"]["side"], "BUY")
+        self.assertEqual(captured["params"]["quantity"], "0.12")
+        self.assertEqual(captured["params"]["price"], "101.23")
+        self.assertFalse(captured["secret_in_params"])
+        self.assertEqual(str(resp.order.exchange_order_id), "555")
+        self.assertNotIn("secret", str(resp.data))
+
+    def test_new_order_rejects_market(self) -> None:
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            resp = spot.execute({
+                "operation": "new_order",
+                "account": "amiroo",
+                "symbol": "SOLUSDC",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": "1",
+                "price": "1",
+            })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "LIMIT_ONLY")
+
+    def test_new_order_timeout_is_unknown_and_not_retried(self) -> None:
+        import urllib.error
+
+        calls = {"n": 0}
+
+        def boom(*_a, **_k):
+            calls["n"] += 1
+            raise urllib.error.URLError("timed out")
+        info = {"by_symbol": {"SOLUSDC": self._solusdc_market()}, "symbols": [self._solusdc_market()], "ts": 1.0}
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_exchange_info", return_value=info):
+                with mock.patch.object(spot, "_self_symbols", return_value=({"SOLUSDC"}, None)):
+                    with mock.patch.object(spot, "_signed_request", side_effect=boom):
+                        resp = spot.execute({
+                            "operation": "new_order",
+                            "account": "amiroo",
+                            "symbol": "SOLUSDC",
+                            "side": "BUY",
+                            "order_type": "LIMIT",
+                            "quantity": "0.1",
+                            "price": "101",
+                        })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "ORDER_STATUS_UNKNOWN")
+        self.assertEqual(calls["n"], 1)
+
+    def test_new_order_exchange_rejection(self) -> None:
+        info = {"by_symbol": {"SOLUSDC": self._solusdc_market()}, "symbols": [self._solusdc_market()], "ts": 1.0}
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_exchange_info", return_value=info):
+                with mock.patch.object(spot, "_self_symbols", return_value=({"SOLUSDC"}, None)):
+                    with mock.patch.object(spot, "_signed_request", return_value={"code": -2010, "msg": "insufficient USDC"}):
+                        resp = spot.execute({
+                            "operation": "new_order",
+                            "account": "amiroo",
+                            "symbol": "SOLUSDC",
+                            "side": "BUY",
+                            "order_type": "LIMIT",
+                            "quantity": "0.1",
+                            "price": "101",
+                        })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "EXCHANGE_REJECTED")
+        self.assertIn("insufficient USDC", resp.error.message)
 
 
 class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
@@ -256,7 +369,9 @@ class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
         self.assertIsNotNone(agent)
         self.assertTrue(str(getattr(agent, "__file__", "")).endswith("x_mexc_agent_spot.py"))
         assert agent is not None
-        self.assertNotIn("new_order", agent.capabilities())
+        self.assertIn("new_order", agent.capabilities())
+        self.assertNotIn("ladder", agent.capabilities())
+        self.assertNotIn("cancel_orders", agent.capabilities())
 
 
 if __name__ == "__main__":
