@@ -20,8 +20,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from plugins.trade.canonical import (  # noqa: E402
     CanonicalBalance,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalResponse,
+    make_failure,
     make_success,
 )
 from plugins.trade.spotdesk import (  # noqa: E402
@@ -132,6 +134,92 @@ class FakeSpotDesk:
         return make_success(op, ex, acct, data={"ok": True})
 
 
+class FakeMexcSpotDesk:
+    def __init__(self) -> None:
+        self.requests: List[Dict[str, Any]] = []
+        self.price_failures: set[str] = set()
+        self.instruments: List[Dict[str, Any]] = [
+            self._inst("SOLUSDT", "SOL", "USDT", quote_precision=2),
+            self._inst("SOLUSDC", "SOL", "USDC", quote_precision=2),
+            self._inst("SOLBTC", "SOL", "BTC", quote_precision=8),
+            self._inst("ETHUSDT", "ETH", "USDT", quote_precision=2),
+            self._inst("HYPEUSDT", "HYPE", "USDT", quote_precision=4),
+            self._inst("SUIUSDT", "SUI", "USDT", quote_precision=4),
+            self._inst("BTCUSDT", "BTC", "USDT", quote_precision=2),
+            self._inst("BTCUSDC", "BTC", "USDC", quote_precision=2),
+            self._inst("SOLDELIST", "SOL", "DELIST", status="0"),
+            self._inst("SOLNOAPI", "SOL", "NOAPI", api_enabled=False),
+            self._inst("SOLNOSPOT", "SOL", "NOSPOT", spot_allowed=False),
+        ]
+        self.prices = {
+            "SOLUSDT": "110.30",
+            "SOLUSDC": "110.10",
+            "SOLBTC": "0.00123",
+            "ETHUSDT": "4000.12",
+            "HYPEUSDT": "47.1234",
+            "SUIUSDT": "1.2345",
+            "BTCUSDT": "114000.12",
+            "BTCUSDC": "113990.11",
+        }
+
+    def _inst(
+        self,
+        symbol: str,
+        base: str,
+        quote: str,
+        *,
+        quote_precision: int = 2,
+        status: str = "1",
+        api_enabled: bool = True,
+        spot_allowed: bool = True,
+    ) -> Dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "baseAsset": base,
+            "quoteAsset": quote,
+            "display_name": f"{base}/{quote}",
+            "status": status,
+            "isSpotTradingAllowed": spot_allowed,
+            "orderTypes": ["LIMIT", "MARKET", "LIMIT_MAKER"],
+            "quotePrecision": quote_precision,
+            "baseSizePrecision": "0.01",
+            "api_enabled_for_key": api_enabled,
+            "api_eligible": api_enabled and spot_allowed and status == "1",
+        }
+
+    def list_exchanges(self) -> List[str]:
+        return ["mexc"]
+
+    def list_accounts(self, exchange: str) -> List[Any]:
+        return ["amiroo"] if exchange == "mexc" else []
+
+    def capabilities(self, exchange: str) -> List[str]:
+        if exchange != "mexc":
+            return []
+        return ["balance", "orders", "open_orders", "list_instruments", "resolve_instrument", "market_price"]
+
+    def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
+        self.requests.append(dict(request))
+        op = str(request.get("operation") or "")
+        if op == "list_instruments":
+            q = str(request.get("query") or "").upper().replace("/", "")
+            rows = [dict(x) for x in self.instruments if not q or q in x["symbol"] or q == x["baseAsset"]]
+            return make_success(op, "mexc", "amiroo", data={"instruments": rows, "count": len(rows)})
+        if op == "market_price":
+            symbol = str(request.get("symbol") or "").upper()
+            if symbol in self.price_failures:
+                return make_failure(op, "mexc", "amiroo", code="PRICE_UNAVAILABLE", message="price unavailable")
+            price = self.prices.get(symbol, "1")
+            return make_success(
+                op,
+                "mexc",
+                "amiroo",
+                market_price=CanonicalMarketPrice(requested_symbol=symbol, market=symbol, mark_price=price, price=price),
+                data={"symbol": symbol, "price": price},
+            )
+        return make_success(op, "mexc", "amiroo", data={})
+
+
 class TradeSpotWizardNavigationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.desk = FakeSpotDesk()
@@ -195,6 +283,145 @@ class TradeSpotWizardNavigationTests(unittest.TestCase):
         screen = self.wizard.open(self.key)
         self.assertTrue(all(not cb.startswith("trade:") for cb in _callbacks(screen)))
         self.assertTrue(all(not cb.startswith("tradespot:") for cb in _callbacks(screen)))
+
+
+class TradeSpotMexcNewOrderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.key = ("chat-mexc",)
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        self.wizard.handle_callback(self.key, "account:amiroo")
+
+    def _open_new_order(self) -> Any:
+        self.wizard.open(self.key)
+        self.wizard.handle_callback(self.key, "exchange:mexc")
+        self.wizard.handle_callback(self.key, "account:amiroo")
+        return self.wizard.handle_callback(self.key, "action:new_order")
+
+    def test_new_order_initially_shows_quick_pick_assets_and_other(self) -> None:
+        screen = self._open_new_order()
+        self.assertIn("MEXC Spot — New Order", screen.text)
+        labels = _labels(screen)
+        for label in ["SOL", "ETH", "HYPE", "SUI", "Other"]:
+            self.assertIn(label, labels)
+
+    def test_clicking_sol_discovers_quote_markets_and_prices_dynamically(self) -> None:
+        self._open_new_order()
+        screen = self.wizard.handle_callback(self.key, "asset:SOL")
+        labels = _labels(screen)
+        self.assertTrue(any("SOL/USDT" in label and "110.30" in label for label in labels))
+        self.assertTrue(any("SOL/USDC" in label and "110.10" in label for label in labels))
+        self.assertTrue(any("SOL/BTC" in label and "0.00123" in label for label in labels))
+        self.assertFalse(any("SOL/NOAPI" in label for label in labels))
+        self.assertFalse(any("SOL/NOSPOT" in label for label in labels))
+        self.assertFalse(any("SOL/DELIST" in label for label in labels))
+        list_requests = [r for r in self.desk.requests if r.get("operation") == "list_instruments"]
+        self.assertEqual(list_requests[-1]["query"], "SOL")
+
+    def test_quick_pick_filters_each_base_asset(self) -> None:
+        for asset, expected in [("ETH", "ETH/USDT"), ("HYPE", "HYPE/USDT"), ("SUI", "SUI/USDT")]:
+            self._open_new_order()
+            screen = self.wizard.handle_callback(self.key, f"asset:{asset}")
+            labels = _labels(screen)
+            self.assertTrue(any(expected in label for label in labels), (asset, labels))
+            self.assertTrue(all(label.startswith(asset + "/") or label in {"⬅️ Back", "❌ Close"} for label in labels))
+
+    def test_no_hard_coded_assumption_that_usdt_or_usdc_exists(self) -> None:
+        self.desk.instruments = [self.desk._inst("SOLBTC", "SOL", "BTC", quote_precision=8)]
+        self.desk.prices = {"SOLBTC": "0.00123"}
+        self._open_new_order()
+        screen = self.wizard.handle_callback(self.key, "asset:SOL")
+        labels = _labels(screen)
+        self.assertTrue(any("SOL/BTC" in label for label in labels))
+        self.assertFalse(any("SOL/USDT" in label for label in labels))
+        self.assertFalse(any("SOL/USDC" in label for label in labels))
+
+    def test_other_base_asset_finds_all_btc_pairs(self) -> None:
+        self._open_new_order()
+        self.wizard.handle_callback(self.key, "asset:other")
+        screen = self.wizard.handle_text(self.key, "BTC")
+        assert screen is not None
+        labels = _labels(screen)
+        self.assertTrue(any("BTC/USDT" in label for label in labels))
+        self.assertTrue(any("BTC/USDC" in label for label in labels))
+
+    def test_other_complete_pair_resolves_slash_and_compact_symbols(self) -> None:
+        for value in ["BTC/USDC", "BTCUSDC"]:
+            self._open_new_order()
+            self.wizard.handle_callback(self.key, "asset:other")
+            screen = self.wizard.handle_text(self.key, value)
+            assert screen is not None
+            labels = _labels(screen)
+            self.assertTrue(any("BTC/USDC" in label for label in labels), value)
+            self.assertFalse(any("BTC/USDT" in label for label in labels), value)
+
+    def test_invalid_symbol_gives_useful_retry_error(self) -> None:
+        self._open_new_order()
+        self.wizard.handle_callback(self.key, "asset:other")
+        screen = self.wizard.handle_text(self.key, "NOTREAL")
+        assert screen is not None
+        self.assertIn("No API-enabled tradable MEXC spot pair found", screen.text)
+        self.assertIn("Enter a spot symbol or pair", screen.text)
+
+    def test_one_failed_ticker_lookup_does_not_break_pair_picker(self) -> None:
+        self.desk.price_failures.add("SOLUSDC")
+        self._open_new_order()
+        screen = self.wizard.handle_callback(self.key, "asset:SOL")
+        labels = _labels(screen)
+        self.assertTrue(any("SOL/USDT" in label and "110.30" in label for label in labels))
+        self.assertTrue(any("SOL/USDC" in label and "price unavailable" in label for label in labels))
+
+    def test_selected_pair_stores_base_quote_and_side_semantics(self) -> None:
+        self._open_new_order()
+        pairs = self.wizard.handle_callback(self.key, "asset:SOL")
+        callbacks = _callbacks(pairs)
+        sol_usdc_cb = callbacks[_labels(pairs).index(next(label for label in _labels(pairs) if "SOL/USDC" in label))]
+        side = self.wizard.handle_callback(self.key, sol_usdc_cb)
+        self.assertIn("MEXC Spot — SOL/USDC", side.text)
+        state = self.wizard._state_for(self.key)
+        self.assertEqual(state.selected_instrument["symbol"], "SOLUSDC")  # type: ignore[index]
+        self.assertEqual(state.selected_instrument["baseAsset"], "SOL")  # type: ignore[index]
+        self.assertEqual(state.selected_instrument["quoteAsset"], "USDC")  # type: ignore[index]
+
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "10")
+        preview = self.wizard.handle_text(self.key, "110.10")
+        assert preview is not None
+        self.assertIn("Required balance: USDC", preview.text)
+        self.assertIn("Estimated cost: 1101 USDC", preview.text)
+
+        self._open_new_order()
+        pairs = self.wizard.handle_callback(self.key, "asset:SOL")
+        sol_usdc_cb = _callbacks(pairs)[_labels(pairs).index(next(label for label in _labels(pairs) if "SOL/USDC" in label))]
+        self.wizard.handle_callback(self.key, sol_usdc_cb)
+        self.wizard.handle_callback(self.key, "side:sell")
+        self.wizard.handle_text(self.key, "10")
+        preview = self.wizard.handle_text(self.key, "110.10")
+        assert preview is not None
+        self.assertIn("Required balance: SOL", preview.text)
+        self.assertIn("Estimated proceeds: 1101 USDC", preview.text)
+
+    def test_back_from_pair_selection_returns_to_asset_picker(self) -> None:
+        self._open_new_order()
+        self.wizard.handle_callback(self.key, "asset:SOL")
+        screen = self.wizard.handle_callback(self.key, "back")
+        labels = _labels(screen)
+        for label in ["SOL", "ETH", "HYPE", "SUI", "Other"]:
+            self.assertIn(label, labels)
+
+    def test_confirm_does_not_submit_live_order(self) -> None:
+        self._open_new_order()
+        pairs = self.wizard.handle_callback(self.key, "asset:SOL")
+        sol_usdc_cb = _callbacks(pairs)[_labels(pairs).index(next(label for label in _labels(pairs) if "SOL/USDC" in label))]
+        self.wizard.handle_callback(self.key, sol_usdc_cb)
+        self.wizard.handle_callback(self.key, "side:buy")
+        self.wizard.handle_text(self.key, "1")
+        self.wizard.handle_text(self.key, "110")
+        screen = self.wizard.handle_callback(self.key, "confirm_disabled")
+        self.assertIn("No order was placed", screen.text)
+        self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
 
 
 class TradeSpotCommandRegistrationTests(unittest.TestCase):
