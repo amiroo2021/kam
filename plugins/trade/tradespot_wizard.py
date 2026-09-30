@@ -60,37 +60,78 @@ def _asset_symbol(item: Mapping[str, Any]) -> str:
     return str(item.get("asset") or item.get("symbol") or "").strip().upper()
 
 
-def _asset_amount_raw(item: Mapping[str, Any]) -> str:
-    for key in ("total", "amount", "balance"):
-        value = item.get(key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return ""
+def _to_amount(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    text = str(value).strip()
+    if not text:
+        return Decimal("0")
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
 
 
-def _asset_amount_map(assets: List[Any]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
+def _asset_total_decimal(item: Mapping[str, Any]) -> Decimal:
+    total = item.get("total")
+    if total is not None and str(total).strip() != "":
+        return _to_amount(total)
+    free = item.get("free")
+    locked = item.get("locked")
+    if (free is not None and str(free).strip() != "") or (locked is not None and str(locked).strip() != ""):
+        return _to_amount(free) + _to_amount(locked)
+    for key in ("amount", "balance"):
+        raw = item.get(key)
+        if raw is not None and str(raw).strip() != "":
+            return _to_amount(raw)
+    return Decimal("0")
+
+
+def _thousands(text: str) -> str:
+    sign = ""
+    if text.startswith("-"):
+        sign, text = "-", text[1:]
+    if "." in text:
+        whole, frac = text.split(".", 1)
+        return f"{sign}{int(whole or '0'):,}.{frac}"
+    return f"{sign}{int(text or '0'):,}"
+
+
+def _format_inventory_amount(value: Decimal, *, quote: bool) -> str:
+    if quote:
+        quantized = value.quantize(_QUOTE_CENTS, rounding=ROUND_HALF_UP)
+        return _thousands(format(quantized, "f"))
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if not text or text == "-":
+        text = "0"
+    return _thousands(text)
+
+
+def _mexc_inventory_lines(assets: List[Any]) -> List[str]:
+    totals: Dict[str, Decimal] = {}
     for item in assets:
         if not isinstance(item, Mapping):
             continue
         symbol = _asset_symbol(item)
-        amount = _asset_amount_raw(item)
-        if symbol and amount:
-            out[symbol] = amount
-    return out
-
-
-def _format_quote_amount(raw: Optional[str]) -> str:
-    if raw is None or not str(raw).strip():
-        return "0.00"
-    try:
-        value = Decimal(str(raw).strip())
-    except (InvalidOperation, ValueError):
-        return "0.00"
-    return format(value.quantize(_QUOTE_CENTS, rounding=ROUND_HALF_UP), "f")
+        if not symbol:
+            continue
+        totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(item)
+    lines = [
+        f"{symbol}: {_format_inventory_amount(totals.get(symbol, Decimal('0')), quote=True)}"
+        for symbol in _MEXC_QUOTE_ASSETS
+    ]
+    others = sorted(
+        (symbol, amount)
+        for symbol, amount in totals.items()
+        if symbol not in _MEXC_QUOTE_ASSETS and amount > 0
+    )
+    lines.extend(
+        f"{symbol}: {_format_inventory_amount(amount, quote=False)}"
+        for symbol, amount in others
+    )
+    return lines
 
 
 @dataclass(frozen=True)
@@ -691,27 +732,20 @@ class TradeSpotWizard:
             ]
             assets = _balance_assets(response)
             if str(exchange).lower() == "mexc":
-                quotes = _asset_amount_map(assets)
-                for symbol in _MEXC_QUOTE_ASSETS:
-                    lines.append(f"{symbol}: {_format_quote_amount(quotes.get(symbol))}")
-            elif response.balance is not None:
-                lines.append(f"Balance: {response.balance.value} {response.balance.unit}")
-            extra = [
-                item
-                for item in assets
-                if isinstance(item, dict)
-                and _asset_symbol(item) not in _MEXC_QUOTE_ASSETS
-            ] if str(exchange).lower() == "mexc" else [
-                item for item in assets if isinstance(item, dict)
-            ]
-            extra_lines = []
-            for item in extra[:20]:
-                symbol = _asset_symbol(item)
-                amount = _asset_amount_raw(item)
-                if symbol and amount:
-                    extra_lines.append(f"• {symbol}: {amount}")
-            if extra_lines:
-                lines.extend(["", "Assets", *extra_lines])
+                lines.extend(["Assets", *_mexc_inventory_lines(assets)])
+            else:
+                if response.balance is not None:
+                    lines.append(f"Balance: {response.balance.value} {response.balance.unit}")
+                extra_lines = []
+                for item in assets[:20]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    symbol = _asset_symbol(item)
+                    amount = _asset_total_decimal(item)
+                    if symbol and amount > 0:
+                        extra_lines.append(f"• {symbol}: {_format_inventory_amount(amount, quote=False)}")
+                if extra_lines:
+                    lines.extend(["", "Assets", *extra_lines])
         else:
             lines = ["🟦 Spot Trading", "💰 Balance"]
             lines.extend(_render_error_lines(response.error, "Balance unavailable."))
