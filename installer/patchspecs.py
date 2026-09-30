@@ -210,20 +210,20 @@ except Exception as exc:  # noqa: BLE001
     )
 '''
 
-_TRADESPOT_COMMAND_BLOCK = '''\\
-if cmd_body == "tradespot":
-    try:
-        from plugins.trade.tradespot_wizard import handle_tradespot_command
+_TRADESPOT_COMMAND_BLOCK = """
+    if cmd_body == "tradespot":
+        try:
+            from plugins.trade.tradespot_wizard import handle_tradespot_command as _tradespot_cmd
 
-        handled = await _tradespot_cmd(self, msg)
-        if handled:
-            return
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "[%s] /tradespot command dispatch failed: %s",
-            self.name, exc, exc_info=True,
-        )
-'''
+            handled = await _tradespot_cmd(self, msg)
+            if handled:
+                return
+        except Exception as exc:
+            logger.error(
+                "[%s] /tradespot command dispatch failed: %s",
+                self.name, exc, exc_info=True,
+            )
+"""
 
 # --- Seam C: /trade slash command -----------------------------------------
 _COMMAND_BLOCK = '''\\
@@ -925,7 +925,7 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
         PatchSpec(
             seam="tradespot slash command dispatch",
             relative_path=TELEGRAM_ADAPTER,
-            anchor_before=cmd_before,
+            anchor_before='            cmd_body = first_token.lstrip("/").split("@", 1)[0].lower()',
             anchor_after=cmd_after,
             block=_TRADESPOT_COMMAND_BLOCK,
             insertion_indent="        ",
@@ -937,10 +937,8 @@ def trade_adapter_specs(hermes_root: Optional[Path] = None) -> List[PatchSpec]:
                 "_on_command",
             ],
             method_after_substrings=[
-                "await self._ensure_forum_commands(msg)",
-                "await self._ensure_forum_commands(update.message)",
-                "_ensure_forum_commands",
-                "is_command=True",
+                'cmd_body = first_token.lstrip("/").split("@", 1)[0].lower()',
+                'if cmd_body == "trade":',
             ],
         ),
     ]
