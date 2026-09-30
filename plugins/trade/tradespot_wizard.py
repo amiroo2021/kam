@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from .canonical import CanonicalResponse
@@ -43,7 +43,54 @@ _READ_ONLY_ORDER_CAPS = {"orders", "positions_orders"}
 _MUTATING_ACTIONS = {"ladder", "cancel_orders"}
 _QUICK_PICK_BASE_ASSETS = ("SOL", "ETH", "HYPE", "SUI")
 _PAIR_PAGE_SIZE = 8
+_MEXC_QUOTE_ASSETS = ("USDT", "USDC")
+_QUOTE_CENTS = Decimal("0.01")
 
+
+def _balance_assets(response: CanonicalResponse) -> List[Any]:
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        assets = data.get("assets")
+        if isinstance(assets, list):
+            return assets
+    return []
+
+
+def _asset_symbol(item: Mapping[str, Any]) -> str:
+    return str(item.get("asset") or item.get("symbol") or "").strip().upper()
+
+
+def _asset_amount_raw(item: Mapping[str, Any]) -> str:
+    for key in ("total", "amount", "balance"):
+        value = item.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _asset_amount_map(assets: List[Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in assets:
+        if not isinstance(item, Mapping):
+            continue
+        symbol = _asset_symbol(item)
+        amount = _asset_amount_raw(item)
+        if symbol and amount:
+            out[symbol] = amount
+    return out
+
+
+def _format_quote_amount(raw: Optional[str]) -> str:
+    if raw is None or not str(raw).strip():
+        return "0.00"
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return "0.00"
+    return format(value.quantize(_QUOTE_CENTS, rounding=ROUND_HALF_UP), "f")
 
 
 @dataclass(frozen=True)
@@ -633,7 +680,7 @@ class TradeSpotWizard:
         exchange = state.exchange or ""
         account = state.account or ""
         response = self._desk.execute({"operation": "balance", "exchange": exchange, "account": account})
-        if response.success and response.balance is not None:
+        if response.success and (response.balance is not None or _balance_assets(response)):
             lines = [
                 "🟦 Spot Trading",
                 "💰 Balance",
@@ -641,19 +688,30 @@ class TradeSpotWizard:
                 f"Exchange: {exchange}",
                 f"Account: {account}",
                 "",
-                f"Balance: {response.balance.value} {response.balance.unit}",
             ]
-            data = getattr(response, "data", None)
-            if isinstance(data, dict):
-                assets = data.get("assets")
-                if isinstance(assets, list) and assets:
-                    lines.extend(["", "Assets"])
-                    for item in assets[:20]:
-                        if isinstance(item, dict):
-                            symbol = str(item.get("asset") or item.get("symbol") or "").strip()
-                            amount = str(item.get("amount") or item.get("balance") or "").strip()
-                            if symbol and amount:
-                                lines.append(f"• {symbol}: {amount}")
+            assets = _balance_assets(response)
+            if str(exchange).lower() == "mexc":
+                quotes = _asset_amount_map(assets)
+                for symbol in _MEXC_QUOTE_ASSETS:
+                    lines.append(f"{symbol}: {_format_quote_amount(quotes.get(symbol))}")
+            elif response.balance is not None:
+                lines.append(f"Balance: {response.balance.value} {response.balance.unit}")
+            extra = [
+                item
+                for item in assets
+                if isinstance(item, dict)
+                and _asset_symbol(item) not in _MEXC_QUOTE_ASSETS
+            ] if str(exchange).lower() == "mexc" else [
+                item for item in assets if isinstance(item, dict)
+            ]
+            extra_lines = []
+            for item in extra[:20]:
+                symbol = _asset_symbol(item)
+                amount = _asset_amount_raw(item)
+                if symbol and amount:
+                    extra_lines.append(f"• {symbol}: {amount}")
+            if extra_lines:
+                lines.extend(["", "Assets", *extra_lines])
         else:
             lines = ["🟦 Spot Trading", "💰 Balance"]
             lines.extend(_render_error_lines(response.error, "Balance unavailable."))

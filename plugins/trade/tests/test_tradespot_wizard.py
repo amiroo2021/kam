@@ -466,5 +466,116 @@ class TradeSpotCommandRegistrationTests(unittest.TestCase):
         self.assertIn("Spot Trading", adapter.sent[-1]["text"])
 
 
+class FakeMexcBalanceDesk:
+    def __init__(self, assets: List[Dict[str, Any]], balance: CanonicalBalance | None = None) -> None:
+        self.assets = assets
+        self.balance = balance or CanonicalBalance("0.00", "USDT")
+
+    def list_exchanges(self) -> List[str]:
+        return ["mexc"]
+
+    def list_accounts(self, exchange: str) -> List[Any]:
+        return ["amiroo"] if exchange == "mexc" else []
+
+    def capabilities(self, exchange: str) -> List[str]:
+        return ["balance"] if exchange == "mexc" else []
+
+    def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
+        op = str(request.get("operation") or "")
+        return make_success(
+            op,
+            "mexc",
+            "amiroo",
+            balance=self.balance,
+            data={"assets": list(self.assets)},
+        )
+
+
+class TradeSpotMexcBalanceScreenTests(unittest.TestCase):
+    def _open_balance(self, assets: List[Dict[str, Any]], balance: CanonicalBalance | None = None):
+        wizard = TradeSpotWizard(spotdesk=FakeMexcBalanceDesk(assets, balance))  # type: ignore[arg-type]
+        key = ("mexc-balance",)
+        wizard.open(key)
+        wizard.handle_callback(key, "exchange:mexc")
+        wizard.handle_callback(key, "account:amiroo")
+        return wizard.handle_callback(key, "action:balance")
+
+    def _asset_lines(self, text: str) -> List[str]:
+        lines = text.splitlines()
+        if "Assets" not in lines:
+            return []
+        start = lines.index("Assets") + 1
+        return [ln for ln in lines[start:] if ln.startswith("• ")]
+
+    def test_usdt_and_usdc_both_nonzero(self) -> None:
+        screen = self._open_balance(
+            [
+                {"asset": "USDT", "total": "10.25", "free": "10", "locked": "0.25"},
+                {"asset": "USDC", "total": "3.50", "free": "3.5", "locked": "0"},
+                {"asset": "SOL", "total": "2", "amount": "2"},
+            ]
+        )
+        self.assertIn("USDT: 10.25", screen.text)
+        self.assertIn("USDC: 3.50", screen.text)
+        self.assertNotIn("Balance:", screen.text)
+        asset_blob = "\n".join(self._asset_lines(screen.text))
+        self.assertIn("SOL", asset_blob)
+        self.assertNotIn("USDT", asset_blob)
+        self.assertNotIn("USDC", asset_blob)
+
+    def test_usdt_nonzero_usdc_zero(self) -> None:
+        screen = self._open_balance(
+            [
+                {"asset": "USDT", "total": "0.09"},
+                {"asset": "MX", "total": "1.25"},
+            ],
+            balance=CanonicalBalance("0.09", "USDT"),
+        )
+        self.assertIn("USDT: 0.09", screen.text)
+        self.assertIn("USDC: 0.00", screen.text)
+        self.assertNotIn("Balance:", screen.text)
+        asset_blob = "\n".join(self._asset_lines(screen.text))
+        self.assertIn("MX", asset_blob)
+        self.assertNotIn("USDT", asset_blob)
+        self.assertNotIn("USDC", asset_blob)
+
+    def test_usdt_zero_usdc_nonzero(self) -> None:
+        screen = self._open_balance(
+            [{"asset": "USDC", "total": "7.10"}],
+            balance=CanonicalBalance("7.10", "USDT"),
+        )
+        self.assertIn("USDT: 0.00", screen.text)
+        self.assertIn("USDC: 7.10", screen.text)
+        self.assertNotIn("Balance:", screen.text)
+
+    def test_both_usdt_and_usdc_zero(self) -> None:
+        screen = self._open_balance(
+            [{"asset": "SOL", "amount": "2"}],
+            balance=CanonicalBalance("0.00", "USDT"),
+        )
+        self.assertIn("USDT: 0.00", screen.text)
+        self.assertIn("USDC: 0.00", screen.text)
+        self.assertNotIn("Balance:", screen.text)
+        asset_blob = "\n".join(self._asset_lines(screen.text))
+        self.assertIn("SOL", asset_blob)
+        self.assertNotIn("USDT", asset_blob)
+        self.assertNotIn("USDC", asset_blob)
+
+    def test_usdt_usdc_not_duplicated_in_assets(self) -> None:
+        screen = self._open_balance(
+            [
+                {"asset": "USDT", "total": "1.00"},
+                {"asset": "USDC", "total": "2.00"},
+                {"asset": "ETH", "total": "0.5"},
+            ]
+        )
+        self.assertIn("USDT: 1.00", screen.text)
+        self.assertIn("USDC: 2.00", screen.text)
+        asset_blob = "\n".join(self._asset_lines(screen.text))
+        self.assertEqual(asset_blob.count("USDT"), 0)
+        self.assertEqual(asset_blob.count("USDC"), 0)
+        self.assertIn("ETH", asset_blob)
+
+
 if __name__ == "__main__":
     unittest.main()
