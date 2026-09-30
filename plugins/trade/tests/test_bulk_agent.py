@@ -382,6 +382,43 @@ class TestBulkAgent(unittest.TestCase):
         self.assertFalse(resp.ladder.verified)
         self.assertTrue(resp.data["verification_delayed"])
 
+    def test_ladder_result_construction_failure_after_write_is_not_retry_safe(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 1, "lotSize": 0.1}
+        after = {"openOrders": [{"symbol": "BTC-USD", "orderId": "o1", "size": 0.5, "price": 100}]}
+
+        class BrokenCanonicalLadderResult:
+            def __init__(self, *args, **kwargs):
+                raise TypeError("simulated local schema failure")
+
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_submit_order", return_value={"status": "ok", "orderIds": ["o1"]}) as submit, \
+             mock.patch.object(bulk, "_live_account", return_value=after), \
+             mock.patch.object(bulk, "CanonicalLadderResult", BrokenCanonicalLadderResult), \
+             mock.patch.object(bulk.time, "sleep", return_value=None):
+            resp = bulk.execute({"operation": "ladder", "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "buy", "distribution": "uniform", "order_count": "2", "total_volume": "1", "start_price": "100", "end_price": "101"})
+        self.assertFalse(resp.success)
+        self.assertNotEqual(resp.error.code, "BULK_REQUEST_FAILED")
+        self.assertEqual(resp.error.code, "ORDER_STATUS_UNKNOWN")
+        self.assertIn("One or more orders may already have been submitted", resp.error.message)
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(resp.data["accepted_child_count"], 2)
+        self.assertEqual(resp.data["accepted_order_ids"], ["o1"])
+
+    def test_ladder_ambiguous_submission_exception_is_not_retry_safe(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 1, "lotSize": 0.1}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_submit_order", side_effect=TimeoutError("timed out after transmission")) as submit, \
+             mock.patch.object(bulk.time, "sleep", return_value=None):
+            resp = bulk.execute({"operation": "ladder", "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "buy", "distribution": "uniform", "order_count": "2", "total_volume": "1", "start_price": "100", "end_price": "101"})
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "ORDER_STATUS_UNKNOWN")
+        self.assertIn("One or more orders may already have been submitted", resp.error.message)
+        self.assertEqual(submit.call_count, 1)
+
     def test_cancel_group_submits_target_order_ids(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
         market = {"symbol": "BTC-USD", "baseAsset": "BTC", "quoteAsset": "USD", "tickSize": 0.5, "lotSize": 0.001}

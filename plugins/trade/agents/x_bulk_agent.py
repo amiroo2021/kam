@@ -318,6 +318,12 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return "http 429" in text or "too many requests" in text or "rate limit" in text or "rate_limited" in text
 
 
+POST_WRITE_STATUS_UNKNOWN_MESSAGE = (
+    "One or more orders may already have been submitted. "
+    "Do not retry this ladder until open orders are reconciled."
+)
+
+
 def _retry_after_seconds(exc: BaseException) -> Optional[float]:
     """Parse Retry-After from a Bulk HTTP error when the exchange provides one."""
     raw = getattr(exc, "retry_after", None)
@@ -374,6 +380,85 @@ def _submit_order_with_retries(
             time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def _is_ambiguous_submission_error(exc: BaseException) -> bool:
+    """Return True when a POST /order attempt may have reached Bulk."""
+    if isinstance(exc, TimeoutError):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "remote end closed",
+            "http post failed without a response",
+        )
+    )
+
+
+def _bulk_order_ids_from_payload(payload: Any) -> list[Any]:
+    """Best-effort order-id extraction from Bulk POST /order responses."""
+    out: list[Any] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key in ("orderId", "order_id", "oid", "id"):
+                if key in value and value[key] not in (None, ""):
+                    out.append(value[key])
+            for key in ("orderIds", "order_ids", "oids", "ids"):
+                child = value.get(key)
+                if isinstance(child, list):
+                    for item in child:
+                        if item not in (None, ""):
+                            out.append(item)
+            for child in value.values():
+                if isinstance(child, (Mapping, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    deduped: list[Any] = []
+    for item in out:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _non_retry_safe_ladder_failure(
+    account: str,
+    *,
+    reason: str,
+    accepted_count: int,
+    requested_count: int,
+    accepted_order_ids: list[Any],
+    batch_plan: list[Dict[str, Any]],
+    batches: list[Dict[str, Any]],
+) -> CanonicalResponse:
+    response = make_failure(
+        "ladder",
+        name,
+        account,
+        "ORDER_STATUS_UNKNOWN",
+        f"{POST_WRITE_STATUS_UNKNOWN_MESSAGE} Detail: {sanitize_error_message(reason)}",
+        exchange_reason=sanitize_error_message(reason),
+    )
+    object.__setattr__(response, "data", {
+        "accepted_child_count": accepted_count,
+        "requested_order_count": requested_count,
+        "accepted_order_ids": list(accepted_order_ids),
+        "batch_plan": list(batch_plan),
+        "batches": list(batches),
+        "status_unknown": True,
+        "retry_safe": False,
+    })
+    return response
 
 
 def _display_symbol(symbol: Any) -> str:
@@ -1016,9 +1101,11 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
     requested = int(_decimal(request.get("order_count")))
     action_batches = _chunk_list(actions, LADDER_BATCH_SIZE)
     child_batches = _chunk_list(children, LADDER_BATCH_SIZE)
+    batch_plan = [{"index": i, "size": len(batch)} for i, batch in enumerate(action_batches)]
     batches: list[Dict[str, Any]] = []
     accepted_actions = 0
     accepted_volume = Decimal("0")
+    accepted_order_ids: list[Any] = []
     first_error: Optional[str] = None
     rate_limited = False
     last_payload: Any = None
@@ -1044,9 +1131,13 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
             batch_meta["ok"] = ok
             batch_meta["bulk_status"] = _extract_status(payload) if isinstance(payload, Mapping) else None
             if ok:
+                order_ids = _bulk_order_ids_from_payload(payload)
+                accepted_order_ids.extend(order_ids)
                 accepted_actions += len(batch_actions)
                 accepted_volume += sum((sz for _p, sz in batch_children), Decimal("0"))
                 batch_meta["accepted"] = len(batch_actions)
+                if order_ids:
+                    batch_meta["order_ids"] = order_ids
             else:
                 text = json.dumps(payload, sort_keys=True)[:300]
                 batch_meta["error"] = _redact(text, credentials)
@@ -1073,6 +1164,18 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
                     len(children),
                 )
                 break
+            if _is_ambiguous_submission_error(exc):
+                batch_meta["status_unknown"] = True
+                batches.append(batch_meta)
+                return _non_retry_safe_ladder_failure(
+                    account,
+                    reason=err,
+                    accepted_count=accepted_actions,
+                    requested_count=requested,
+                    accepted_order_ids=accepted_order_ids,
+                    batch_plan=batch_plan,
+                    batches=batches,
+                )
             if first_error is None:
                 first_error = batch_meta["error"]
             batches.append(batch_meta)
@@ -1102,9 +1205,8 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
             rate_limited=True,
             exchange_reason=first_error,
             batches=batches,
-            batch_plan=[{"index": i, "size": len(b)} for i, b in enumerate(action_batches)],
         )
-        return make_failure(
+        response = make_failure(
             "ladder",
             name,
             account,
@@ -1112,6 +1214,19 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
             first_error or "Bulk rate-limited the ladder batch transaction; wait briefly and try again.",
             ladder=result,
         )
+        object.__setattr__(response, "data", {
+            "requested": requested,
+            "succeeded": 0,
+            "failed": len(children),
+            "batch_size": LADDER_BATCH_SIZE,
+            "batch_count": len(batches),
+            "batch_plan": batch_plan,
+            "batches": batches,
+            "rate_limited": True,
+            "batch_pause_seconds": LADDER_BATCH_PAUSE_SECONDS,
+            "batch_max_retries": LADDER_BATCH_MAX_RETRIES,
+        })
+        return response
 
     verification_error = None
     submitted = accepted_actions
@@ -1138,32 +1253,46 @@ def _ladder(credentials: Mapping[str, str], account: str, request: Mapping[str, 
     else:
         status = "failed"
 
-    result = CanonicalLadderResult(
-        symbol=_display_symbol(symbol),
-        side=side,
-        distribution=str(request.get("distribution") or "uniform"),
-        requested_order_count=requested,
-        submitted_order_count=submitted,
-        requested_volume=requested_volume,
-        submitted_volume=_plain_decimal(accepted_volume if accepted_actions else planned_volume if status != "failed" else "0"),
-        batch_count=len(batches),
-        verified=verified,
-        partial=partial or (not verified and accepted_actions > 0),
-        status=status,
-        accepted_child_count=accepted_actions,
-        omitted_order_count=max(0, len(children) - accepted_actions),
-        rate_limited=True if rate_limited else (_is_rate_limit_error(RuntimeError(verification_error)) if verification_error else None),
-        exchange_reason=first_error or verification_error,
-        batches=batches,
-        batch_plan=[{"index": i, "size": len(b)} for i, b in enumerate(action_batches)],
-    )
+    try:
+        result = CanonicalLadderResult(
+            symbol=_display_symbol(symbol),
+            side=side,
+            distribution=str(request.get("distribution") or "uniform"),
+            requested_order_count=requested,
+            submitted_order_count=submitted,
+            requested_volume=requested_volume,
+            submitted_volume=_plain_decimal(accepted_volume if accepted_actions else planned_volume if status != "failed" else "0"),
+            batch_count=len(batches),
+            verified=verified,
+            partial=partial or (not verified and accepted_actions > 0),
+            status=status,
+            accepted_child_count=accepted_actions,
+            omitted_order_count=max(0, len(children) - accepted_actions),
+            child_order_ids=list(accepted_order_ids) or None,
+            rate_limited=True if rate_limited else (_is_rate_limit_error(RuntimeError(verification_error)) if verification_error else None),
+            exchange_reason=first_error or verification_error,
+            batches=batches,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if accepted_actions > 0:
+            return _non_retry_safe_ladder_failure(
+                account,
+                reason=str(exc),
+                accepted_count=accepted_actions,
+                requested_count=requested,
+                accepted_order_ids=accepted_order_ids,
+                batch_plan=batch_plan,
+                batches=batches,
+            )
+        raise
     data: Dict[str, Any] = {
         "requested": requested,
         "succeeded": accepted_actions,
         "failed": max(0, len(children) - accepted_actions),
         "batch_size": LADDER_BATCH_SIZE,
         "batch_count": len(batches),
-        "batch_plan": result.batch_plan,
+        "batch_plan": batch_plan,
+        "accepted_order_ids": list(accepted_order_ids),
         "batches": batches,
         "rate_limited": bool(rate_limited),
         "batch_pause_seconds": LADDER_BATCH_PAUSE_SECONDS,
