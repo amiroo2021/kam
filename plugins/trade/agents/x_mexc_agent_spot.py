@@ -603,6 +603,11 @@ def _list_instruments(account: str, request: Mapping[str, Any]) -> CanonicalResp
 
 def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     requested = str(request.get("symbol") or request.get("query") or "").strip().upper()
+    if not requested:
+        base = str(request.get("base") or request.get("baseAsset") or "").strip().upper()
+        quote = str(request.get("quote") or request.get("quoteAsset") or "").strip().upper()
+        if base and quote:
+            requested = f"{base}{quote}"
     row = _market_row(requested)
     if row is None:
         return make_failure(

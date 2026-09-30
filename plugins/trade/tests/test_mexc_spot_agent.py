@@ -196,6 +196,37 @@ class MexcSpotParsingTests(unittest.TestCase):
         self.assertEqual(rows["SOLUSDC"]["step_size"], "0.001")
         self.assertEqual(rows["SOLUSDC"]["min_notional"], "1")
 
+    def test_resolve_instrument_accepts_base_quote_fields(self) -> None:
+        exchange_info = {
+            "symbols": [
+                {
+                    "symbol": "SOLUSDT",
+                    "baseAsset": "SOL",
+                    "quoteAsset": "USDT",
+                    "baseAssetPrecision": 4,
+                    "quoteAssetPrecision": 4,
+                    "quotePrecision": 4,
+                    "orderTypes": ["LIMIT", "MARKET"],
+                    "isSpotTradingAllowed": True,
+                    "status": "1",
+                    "filters": [],
+                }
+            ]
+        }
+        with mock.patch.object(spot, "_public_request", return_value=exchange_info):
+            resp = spot.execute({
+                "operation": "resolve_instrument",
+                "exchange": "mexc",
+                "account": "amiroo",
+                "base": "SOL",
+                "quote": "USDT",
+            })
+        self.assertTrue(resp.success)
+        data = resp.data
+        self.assertIsNotNone(data)
+        assert data is not None
+        self.assertEqual(data["instrument"]["symbol"], "SOLUSDT")
+
     def test_write_operations_are_not_possible(self) -> None:
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
             for op in ("new_order", "ladder", "cancel_orders", "cancel_order_group"):
