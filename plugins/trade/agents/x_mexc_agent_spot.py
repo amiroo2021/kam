@@ -176,6 +176,8 @@ def capabilities() -> List[str]:
     # submits them in deterministic <=20-child batches. MARKET orders remain
     # rejected (`LIMIT_ONLY`); `cancel_order_group` / `cancel_order` /
     # `market_order` remain NOT_IMPLEMENTED.
+    # Phase 4+6: read-only ladder_reconcile / ladder_list_unresolved so the
+    # wizard can recover durable execution IDs after a gateway restart.
     return [
         "balance",
         "orders",
@@ -186,6 +188,8 @@ def capabilities() -> List[str]:
         "new_order",
         "cancel_orders",
         "ladder",
+        "ladder_reconcile",
+        "ladder_list_unresolved",
     ]
 
 
@@ -985,6 +989,19 @@ def _ladder_record_path(account: str, execution_id: str) -> Path:
     return _ladder_record_dir(account) / f"{execution_id}.json"
 
 
+def _json_safe(value: Any) -> Any:
+    """Return ``value`` as JSON-serializable primitives for durable records."""
+    if isinstance(value, Decimal):
+        return _format_decimal(value)
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _ladder_persist_atomic(path: Path, payload: Dict[str, Any]) -> None:
     """Write ``payload`` to ``path`` atomically (tmp + fsync + os.replace).
 
@@ -1457,8 +1474,23 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                 "quantity",
                 "price",
             ),
+            "request": {
+                "endpoint": "/api/v3/batchOrders",
+                "method": "POST",
+                "param_names": ["batchOrders", "recvWindow", "timestamp", "signature"],
+                "order_count": len(batch_payload),
+                "first_2_order_objects": [dict(x) for x in batch_payload[:2]],
+                "last_order_object": dict(batch_payload[-1]) if batch_payload else None,
+            },
         }
         outcome = _submit_batch_orders(credentials, batch_payload)
+        record["response"] = {
+            "kind": outcome.kind,
+            "http_status": outcome.http_status,
+            "mexc_code": outcome.mexc_code,
+            "mexc_message": outcome.mexc_message,
+            "shape": "list" if isinstance(outcome.payload, list) else ("object" if isinstance(outcome.payload, Mapping) else type(outcome.payload).__name__),
+        }
         if outcome.kind == "OK":
             results = outcome.payload if isinstance(outcome.payload, list) else []
         elif outcome.kind in ("HTTP_RATE_LIMITED", "AMBIGUOUS_TIMEOUT",
@@ -1654,6 +1686,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             else:
                 child["submission_classification"] = "NOT_ATTEMPTED"
         persisted["updated_at"] = int(time.time())
+        persisted["batches"] = _json_safe(batch_records)
         if stopped_early:
             persisted["submission_state"] = "STOPPED_EARLY"
         elif rejected_count == 0 and unknown_count == 0:

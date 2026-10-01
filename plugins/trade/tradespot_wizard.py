@@ -1018,8 +1018,12 @@ class TradeSpotWizard:
         unknown = (data.get("unknown") if isinstance(data, dict) else 0) or 0
         not_attempted = (data.get("not_attempted") if isinstance(data, dict) else 0) or 0
         warn = ""
-        if unknown or not_attempted:
+        if unknown:
             warn = "\n\n⚠️ Submission status is uncertain for some children.\nDo not retry the ladder until open orders are reconciled."
+        elif rejected and not_attempted:
+            warn = f"\n\n⚠️ MEXC rejected {rejected} orders. The remaining {not_attempted} orders were not submitted."
+        elif rejected:
+            warn = "\n\n⚠️ MEXC rejected one or more orders."
         body = (
             f"🟦 Ladder submission result\n\n"
             f"{base}/{quote} {side}\n"

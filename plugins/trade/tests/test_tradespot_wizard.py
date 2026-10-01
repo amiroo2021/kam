@@ -1808,6 +1808,90 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self.assertIn("Accepted VWAP: — USDC", result.text)
         self.assertIn("Accepted volume: 0 SUI", result.text)
 
+    def test_rejected_and_not_attempted_result_uses_rejection_warning_not_uncertain(self) -> None:
+        """If MEXC explicitly rejects a batch and later batches were not sent,
+        the result must not claim uncertainty when unknown == 0."""
+        from plugins.trade.canonical import CanonicalLadderResult, CanonicalResponse
+
+        def fake_ladder(_req, *args, **kwargs):
+            return CanonicalResponse(
+                success=True,
+                operation="ladder",
+                exchange="mexc",
+                account="amiroo",
+                ladder=CanonicalLadderResult(
+                    symbol="SUIUSDC",
+                    side="BUY",
+                    distribution="half_gaussian",
+                    requested_order_count=100,
+                    submitted_order_count=0,
+                    requested_volume="100",
+                    submitted_volume="0",
+                    batch_count=5,
+                    verified=False,
+                    partial=True,
+                    status="partial",
+                    accepted_child_count=0,
+                    omitted_order_count=100,
+                    child_order_ids=[],
+                    batches=[],
+                    exchange_reason="explicit MEXC rejection",
+                ),
+                data={
+                    "accepted": 0,
+                    "rejected": 20,
+                    "unknown": 0,
+                    "not_attempted": 80,
+                    "planned_vwap": "0.6336709",
+                    "accepted_vwap": None,
+                },
+            )
+
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        with self._mock.patch.object(self._spot, "execute", side_effect=fake_ladder):
+            result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("⚠️ MEXC rejected 20 orders. The remaining 80 orders were not submitted.", result.text)
+        self.assertNotIn("Submission status is uncertain for some children", result.text)
+        self.assertNotIn("Do not retry the ladder", result.text)
+
+    def test_rejected_without_unknown_or_not_attempted_uses_rejection_warning(self) -> None:
+        from plugins.trade.canonical import CanonicalLadderResult, CanonicalResponse
+
+        def fake_ladder(_req, *args, **kwargs):
+            return CanonicalResponse(
+                success=True,
+                operation="ladder",
+                exchange="mexc",
+                account="amiroo",
+                ladder=CanonicalLadderResult(
+                    symbol="SUIUSDC",
+                    side="BUY",
+                    distribution="uniform",
+                    requested_order_count=5,
+                    submitted_order_count=0,
+                    requested_volume="5",
+                    submitted_volume="0",
+                    batch_count=1,
+                    verified=False,
+                    partial=True,
+                    status="partial",
+                    accepted_child_count=0,
+                    omitted_order_count=5,
+                    child_order_ids=[],
+                    batches=[],
+                    exchange_reason="explicit MEXC rejection",
+                ),
+                data={"accepted": 0, "rejected": 5, "unknown": 0, "not_attempted": 0},
+            )
+
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        with self._mock.patch.object(self._spot, "execute", side_effect=fake_ladder):
+            result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("⚠️ MEXC rejected one or more orders.", result.text)
+        self.assertNotIn("Submission status is uncertain for some children", result.text)
+
 
 class TradeSpotMexcLadderEditingTests(unittest.TestCase):
     """Back navigation from ladder screens must preserve inputs and offer edit

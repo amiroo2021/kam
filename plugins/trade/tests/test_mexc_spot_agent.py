@@ -1222,6 +1222,46 @@ class MexcSpotLadderBatchAndReconciliationTests(unittest.TestCase):
         # The MEXC code must be preserved on the result.
         self.assertEqual(resp.ladder.batches[0]["child_results"][0]["error_code"], 30002)
 
+    def test_http_rejection_persists_redacted_batch_diagnostics(self) -> None:
+        """Durable records must keep enough first-batch evidence to explain a
+        live rejection later, without secrets/signatures/signed query strings."""
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="HTTP_REJECTED",
+                http_status=400,
+                mexc_code=30002,
+                mexc_message="Minimum notional",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="tradespot_diag_") as tmp_home:
+            os.environ["HERMES_HOME"] = tmp_home
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                    resp = spot.execute(self._request(25, distribution="half_gaussian"))
+            self.assertIsNotNone(resp.data)
+            data = resp.data or {}
+            execution_id = data["execution_id"]
+            record_path = spot._ladder_record_path("amiroo", execution_id)
+            persisted = json.loads(record_path.read_text())
+
+        self.assertEqual(persisted["submission_state"], "STOPPED_EARLY")
+        self.assertIn("batches", persisted)
+        self.assertEqual(len(persisted["batches"]), 1)
+        batch0 = persisted["batches"][0]
+        self.assertEqual(batch0["request"]["endpoint"], "/api/v3/batchOrders")
+        self.assertEqual(batch0["request"]["method"], "POST")
+        self.assertEqual(batch0["request"]["order_count"], 20)
+        self.assertEqual(batch0["request"]["param_names"], ["batchOrders", "recvWindow", "timestamp", "signature"])
+        child_results = data.get("child_results") or []
+        self.assertEqual(batch0["request"]["first_2_order_objects"][0]["newClientOrderId"], child_results[0]["client_order_id"])
+        self.assertEqual(batch0["response"]["http_status"], 400)
+        self.assertEqual(batch0["response"]["mexc_code"], 30002)
+        self.assertEqual(batch0["response"]["mexc_message"], "Minimum notional")
+        serialized = json.dumps(batch0, sort_keys=True)
+        self.assertNotIn("signature=", serialized)
+        self.assertNotIn("X-MEXC-APIKEY", serialized)
+        self.assertNotIn("secret", serialized.lower())
+
     def test_5xx_server_error_classified(self) -> None:
         """HTTP 5xx is conservatively classified UNKNOWN per MEXC's own docs.
 
