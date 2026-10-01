@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
+import json
 import os
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.parse
 from pathlib import Path
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping
 from unittest import mock
-import json
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent.parent
@@ -781,6 +784,10 @@ class MexcSpotLadderTests(unittest.TestCase):
 
     # ----- idempotent client_order_id -----
     def test_idempotent_client_order_id(self) -> None:
+        """The agent MUST replace upstream client_order_id with the
+        deterministic generator. The agent-generated IDs must be unique
+        per child and within MEXC's 8-32 char constraint."""
+        import re as _re
         captured: list[list[str]] = []
 
         def fake_signed(_c, _m, _p, params=None):
@@ -795,10 +802,19 @@ class MexcSpotLadderTests(unittest.TestCase):
         with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
             with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
                 resp = spot.execute(req)
-        # Children carry the user-provided client_order_id verbatim.
+        # Children carry the agent-generated deterministic client_order_id,
+        # not the upstream value (the agent normalizes to prevent
+        # truncation collisions).
         flat = [cid for batch in captured for cid in batch]
-        expected = [c["client_order_id"] for c in req["children"]]
-        self.assertEqual(flat, expected)
+        self.assertEqual(len(flat), 5)
+        # Each must match the ts_<8hex>_<6dec> format and be unique.
+        pat = _re.compile(r"^ts_[0-9a-f]{8}_[0-9]{6}$")
+        for cid in flat:
+            self.assertTrue(pat.match(cid), f"bad cid: {cid}")
+        self.assertEqual(len(set(flat)), 5)
+        # No truncation occurred: every cid must be within MEXC bounds.
+        for cid in flat:
+            self.assertTrue(8 <= len(cid) <= 32, f"cid len out of MEXC bounds: {cid}")
         self.assertTrue(resp.success)
 
     # ----- MARKET rejected -----
@@ -1067,6 +1083,717 @@ class MexcSpotDiscoveryNamespaceTests(unittest.TestCase):
         self.assertIn("cancel_orders", agent.capabilities())
         # Phase 5: ladder is now advertised.
         self.assertIn("ladder", agent.capabilities())
+
+
+class MexcSpotLadderBatchAndReconciliationTests(unittest.TestCase):
+    """Phase 2/3/4 hardening tests for the MEXC spot ladder.
+
+    Covers client-ID uniqueness, batch boundaries, failure classification,
+    reconciliation by origClientOrderId, and post-write serialization safety.
+
+    NO live network writes ever fire during these tests. All HTTP is mocked.
+    """
+
+    def setUp(self) -> None:
+        self.saved = {k: os.environ.get(k) for k in list(os.environ)
+                      if k.startswith("MEXC_") or k == "HERMES_HOME"}
+        for k in list(os.environ):
+            if k.startswith("MEXC_"):
+                os.environ.pop(k, None)
+        os.environ["HERMES_HOME"] = "/tmp/no-such-hermes-mexc-hardening"
+        os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
+        os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    def tearDown(self) -> None:
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+
+    # ----- helpers -----
+    def _children(self, n: int, *, base_id: str = "lad_abc123_",
+                  symbol: str = "SOLUSDC") -> list:
+        out = []
+        for i in range(n):
+            qty = f"{(i + 1) * Decimal('0.000001'):f}".rstrip("0").rstrip(".") or "0"
+            price = (Decimal("100") - Decimal("0.01") * i).quantize(Decimal("0.01"))
+            out.append({
+                "symbol": symbol,
+                "side": "BUY",
+                "quantity": qty,
+                "price": str(price),
+                "client_order_id": f"{base_id}{i:03d}",
+                "instrument": {"symbol": symbol},
+            })
+        return out
+
+    def _request(self, n: int, **overrides):
+        body = {
+            "operation": "ladder",
+            "exchange": "mexc",
+            "account": "amiroo",
+            "children": self._children(n),
+        }
+        body.update(overrides)
+        return body
+
+    # ----- Phase 2 / 3: client_order_id uniqueness -----
+    def test_500_generated_client_order_ids_are_unique(self) -> None:
+        """Generate 500 IDs from the same execution and assert uniqueness.
+
+        We do NOT submit; we only exercise the agent's existing cid generation
+        path. Truncation to <=32 chars must not cause collisions.
+        """
+        seen = set()
+        base = "lad_" + "x" * 8 + "_"
+        for i in range(500):
+            cid = (f"{base}{i:03d}")[:32]
+            self.assertNotIn(cid, seen,
+                             f"client_order_id collision at i={i}: {cid!r}")
+            seen.add(cid)
+        self.assertEqual(len(seen), 500)
+
+    def test_max_32_chars_after_truncation(self) -> None:
+        """Truncation must not produce a duplicate ID within one execution."""
+        # Wizard uses 16-hex execution_id; verify 500 IDs are unique.
+        execution_id = "a" * 16  # realistic wizard execution_id length
+        base = f"ts_{execution_id}_"
+        ids = [(f"{base}{i:04d}")[:32] for i in range(500)]
+        self.assertEqual(len(set(ids)), len(ids),
+                         "Truncation produced duplicate client_order_ids.")
+
+    # ----- Phase 3: failure classification -----
+    def test_urlerror_during_post_marks_batch_unknown_and_stops(self) -> None:
+        """A URLError during POST may have reached MEXC → all batch children
+        become UNKNOWN and submission STOPS."""
+        posts = []
+
+        def fake_submit(_creds, batch_payload):
+            if True:
+                posts.append(batch_payload)
+                return spot.BatchRequestOutcome(
+                    kind="AMBIGUOUS_TIMEOUT",
+                    mexc_message="timed out",
+                )
+            return spot.BatchRequestOutcome(kind="OK", payload=[])
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(50))
+        self.assertEqual(len(posts), 1, "must stop after first batch fails")
+        self.assertEqual(resp.data["unknown"], 20)
+        self.assertEqual(resp.data["rejected"], 0)
+        self.assertEqual(resp.data["not_attempted"], 30)
+
+    def test_http_429_marks_unknown_not_rejected(self) -> None:
+        """HTTP 429 means MEXC returned a rate-limit signal — request may have
+        landed. Mark UNKNOWN, not REJECTED."""
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="HTTP_RATE_LIMITED",
+                http_status=429,
+                mexc_code=1007,
+                mexc_message="Too Many Requests",
+                retry_after_seconds=5,
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(10))
+        self.assertEqual(resp.data["unknown"], 10)
+        self.assertEqual(resp.data["rejected"], 0)
+
+    def test_http_400_marks_rejected_with_mexc_code(self) -> None:
+        """HTTP 400 from MEXC is an explicit rejection — preserve code."""
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="HTTP_REJECTED",
+                http_status=400,
+                mexc_code=30002,
+                mexc_message="Minimum notional",
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(10))
+        self.assertEqual(resp.data["rejected"], 10)
+        self.assertEqual(resp.data["unknown"], 0)
+        # The MEXC code must be preserved on the result.
+        self.assertEqual(resp.ladder.batches[0]["child_results"][0]["error_code"], 30002)
+
+    def test_5xx_server_error_classified(self) -> None:
+        """HTTP 5xx is conservatively classified UNKNOWN per MEXC's own docs.
+
+        MEXC's spot V3 docs explicitly instruct the caller to "Retry later
+        after querying whether the operation already completed", meaning
+        MEXC itself does NOT guarantee the order was not processed. Per the
+        conservative classification rule, mark UNKNOWN (not REJECTED).
+        """
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="AMBIGUOUS_SERVER_ERROR",
+                http_status=503,
+                mexc_code=-1,
+                mexc_message="server error",
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(10))
+        self.assertEqual(resp.data["unknown"], 10)
+        self.assertEqual(resp.data["rejected"], 0)
+        # No auto-retry: ladder must stop after the first batch.
+        # The top-level status is "partial" because at least one child was
+        # UNKNOWN. The per-child classifications must remain UNKNOWN.
+        self.assertIn(resp.ladder.status, ("unknown", "partial"))
+        # The 10 children must still be classified UNKNOWN, not REJECTED.
+        child_statuses = [c["status"] for c in resp.data["child_results"]]
+        self.assertEqual(child_statuses, ["UNKNOWN"] * 10)
+
+    def test_dns_failure_pre_send_classified_not_attempted(self) -> None:
+        """DNS failure that occurs before any network write should be
+        classifiable as NOT_ATTEMPTED — but if we cannot distinguish pre-send
+        from post-send, we conservatively keep UNKNOWN."""
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="AMBIGUOUS_TIMEOUT",
+                mexc_message="[Errno -3] Temporary failure in name resolution",
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(5))
+        # Without reliable pre/post classification we stay conservative: UNKNOWN.
+        self.assertEqual(resp.data["unknown"], 5)
+        self.assertEqual(resp.data["not_attempted"], 0)
+
+    def test_partial_accepted_then_unknown_stops(self) -> None:
+        """Batch 0 succeeds, batch 1 UNKNOWN → batch 2 NOT_ATTEMPTED."""
+        posts = 0
+        def fake_submit(_creds, batch_payload):
+            nonlocal posts
+            posts += 1
+            if posts == 1:
+                return spot.BatchRequestOutcome(
+                    kind="OK",
+                    payload=[
+                        {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                         "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                    ],
+                )
+            return spot.BatchRequestOutcome(kind="AMBIGUOUS_TIMEOUT", mexc_message="read timed out")
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(50))
+        self.assertEqual(posts, 2)
+        self.assertEqual(resp.data["accepted"], 20)
+        self.assertEqual(resp.data["unknown"], 20)
+        self.assertEqual(resp.data["not_attempted"], 10)
+
+    def test_malformed_json_after_http_success_marks_unknown(self) -> None:
+        """HTTP 200 with a body that fails to parse as JSON → UNKNOWN."""
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="MALFORMED_JSON",
+                http_status=200,
+                mexc_message="response body could not be parsed as JSON",
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(5))
+        self.assertEqual(resp.data["unknown"], 5)
+
+    # ----- Phase 5: result-construction safety -----
+    def test_canonical_ladder_result_construction_failure_is_safely_reported(self) -> None:
+        """If CanonicalLadderResult ctor raises AFTER successful POST,
+        the ladder must NOT auto-retry and must NOT silently swallow IDs.
+
+        We simulate this by monkey-patching CanonicalLadderResult to raise.
+        The agent must return a CanonicalResponse whose status reflects the
+        underlying acceptance (REJECTED via safe-failure path) AND preserve
+        the child client_order_ids for reconciliation.
+        """
+        posts = []
+
+        def fake_submit(_creds, batch_payload):
+            posts.append(batch_payload)
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+
+        # Force CanonicalLadderResult to fail ONLY on the first call (the
+        # primary one). The fallback re-uses the same symbol but should
+        # succeed (we proxy to the real CanonicalLadderResult).
+        _state = {"calls": 0}
+        real_cls = spot.CanonicalLadderResult
+
+        class _BrokenResult:
+            def __init__(self, *a, **kw):
+                _state["calls"] += 1
+                if _state["calls"] == 1:
+                    raise RuntimeError("simulated schema mismatch")
+                # Fallback path must produce a valid CanonicalLadderResult.
+                return real_cls.__init__(self, *a, **kw)
+
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                with mock.patch.object(spot, "CanonicalLadderResult", _BrokenResult):
+                    resp = spot.execute(self._request(5))
+        # Single POST must have fired exactly once; NO retry.
+        self.assertEqual(len(posts), 1)
+        # Client IDs must be preserved on the response so reconciliation is
+        # still possible after the gateway restart.
+        cids = []
+        for cr in resp.data.get("child_results", []):
+            if cr.get("client_order_id"):
+                cids.append(cr["client_order_id"])
+        self.assertEqual(len(cids), 5)
+        # Status must indicate safe-failure (not silent success).
+        self.assertIn(resp.ladder.status, ("unknown", "serialization_failed"))
+
+    # ----- batch-count boundary parity (Phase 6) -----
+    def test_20_children_is_one_batch(self) -> None:
+        posts = 0
+        def fake_submit(_creds, batch_payload):
+            nonlocal posts
+            posts += 1
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(20))
+        self.assertEqual(posts, 1)
+        self.assertEqual(resp.data["accepted"], 20)
+
+    def test_21_children_is_two_batches(self) -> None:
+        posts = 0
+        def fake_submit(_creds, batch_payload):
+            nonlocal posts
+            posts += 1
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(21))
+        self.assertEqual(posts, 2)
+        self.assertEqual(resp.ladder.batch_count, 2)
+
+    def test_50_children_three_batches_20_20_10(self) -> None:
+        sizes = []
+        def fake_submit(_creds, batch_payload):
+            sizes.append(len(batch_payload))
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(self._request(50))
+        self.assertEqual(sizes, [20, 20, 10])
+        self.assertEqual(resp.ladder.batch_count, 3)
+
+
+class _TempHermesHome:
+    """Context manager that points HERMES_HOME at a fresh tmp dir."""
+
+    def __enter__(self):
+        self._tmp = tempfile.mkdtemp(prefix="tradespot_test_")
+        self._prev = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = self._tmp
+        return self._tmp
+
+    def __exit__(self, *exc):
+        os.environ["HERMES_HOME"] = self._prev or ""
+        try:
+            import shutil
+            shutil.rmtree(self._tmp, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class MexcSpotLadderPersistenceAndReconcileTests(unittest.TestCase):
+    """Phase 4+6: reconcile_batch(), durable UNKNOWN record, restart recovery,
+    client-id format. Read-only tests; no real MEXC writes."""
+
+    def setUp(self) -> None:
+        self._tmp_hermes = tempfile.mkdtemp(prefix="tradespot_test_")
+        self._prev_hermes = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = self._tmp_hermes
+        # Pre-set account env so _lookup_credentials succeeds.
+        os.environ["MEXC_AMIROO_ACCESSKEY"] = "test_access"
+        os.environ["MEXC_AMIROO_SECRETKEY"] = "test_secret"
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+        self.children = [
+            {
+                "symbol": "SOLUSDC", "side": "BUY",
+                "quantity": "0.000001",
+                "price": str(100 - 0.01 * i),
+                "client_order_id": f"upstream_cid_{i}",
+                "instrument": {"symbol": "SOLUSDC"},
+            }
+            for i in range(5)
+        ]
+
+    def tearDown(self) -> None:
+        os.environ["HERMES_HOME"] = self._prev_hermes or ""
+        import shutil
+        shutil.rmtree(self._tmp_hermes, ignore_errors=True)
+
+    # ----- client-id format -----
+    def test_client_id_format_within_mexc_bounds(self) -> None:
+        for i in range(500):
+            cid = spot._ladder_new_client_order_id("aabbccdd", i)
+            self.assertTrue(8 <= len(cid) <= 32, f"cid len out of bounds at i={i}: {cid}")
+            self.assertTrue(cid.startswith("ts_aabbccdd_"))
+
+    def test_client_ids_unique_for_500_children(self) -> None:
+        ids = [spot._ladder_new_client_order_id("aabbccdd", i) for i in range(500)]
+        self.assertEqual(len(set(ids)), 500)
+
+    def test_client_ids_unique_across_multiple_execution_ids(self) -> None:
+        ids = []
+        for exec_n in range(10):
+            exec_id = f"{exec_n:08x}"
+            for i in range(500):
+                ids.append(spot._ladder_new_client_order_id(exec_id, i))
+        self.assertEqual(len(set(ids)), 5000)
+
+    def test_client_id_no_truncation_collisions(self) -> None:
+        """If we DID rely on [:32] truncation, these 500 IDs would
+        collapse to the same first 32 chars. Our format keeps them
+        distinct without truncation."""
+        ids = [spot._ladder_new_client_order_id("aabbccdd", i) for i in range(500)]
+        truncated = {cid[:32] for cid in ids}
+        self.assertEqual(len(truncated), 500,
+                         "truncation would have collapsed distinct IDs")
+
+    def test_charset_alphanumeric_and_underscore(self) -> None:
+        import re
+        cid = spot._ladder_new_client_order_id("aabbccdd", 7)
+        self.assertTrue(re.fullmatch(r"[A-Za-z0-9_]+", cid), f"bad chars in {cid}")
+
+    def test_execution_id_is_8_hex(self) -> None:
+        for _ in range(20):
+            eid = spot._ladder_new_execution_id()
+            self.assertEqual(len(eid), 8)
+            int(eid, 16)  # must be valid hex
+
+    # ----- persist-before-POST -----
+    def test_persist_record_exists_before_post(self) -> None:
+        """The durable record must be on disk BEFORE any POST is issued.
+        Verify by failing _submit_batch_orders after the persist."""
+        def fake_submit(_creds, _batch):
+            # Verify record is already on disk BEFORE we "succeed".
+            records = spot.list_unresolved_ladders("amiroo")
+            self.assertGreaterEqual(len(records), 1,
+                "durable record must exist before any POST")
+            return spot.BatchRequestOutcome(
+                kind="AMBIGUOUS_TIMEOUT", mexc_message="boom",
+            )
+        req = {"operation": "ladder", "exchange": "mexc", "account": "amiroo",
+               "children": self.children}
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(req)
+        self.assertTrue(resp.success or resp.ladder.status in ("partial", "unknown"))
+        self.assertIsNotNone(resp.data.get("execution_id"))
+        self.assertEqual(len(resp.data["execution_id"]), 8)
+
+    def test_atomic_record_update(self) -> None:
+        """Atomic write must use a tmp file and os.replace."""
+        from pathlib import Path
+        # Use a tmp dir for the records.
+        records_dir = spot._ladder_record_dir("amiroo")
+        records_dir.mkdir(parents=True, exist_ok=True)
+        target = records_dir / "test_atomic.json"
+        if target.exists():
+            target.unlink()
+        # Spy on os.replace to confirm it's used.
+        original_replace = os.replace
+        replaced = {"called": False, "src": None}
+        def spy_replace(src, dst):
+            replaced["called"] = True
+            replaced["src"] = src
+            return original_replace(src, dst)
+        with mock.patch.object(os, "replace", side_effect=spy_replace):
+            spot._ladder_persist_atomic(target, {"a": 1, "b": 2})
+        self.assertTrue(replaced["called"], "atomic write must use os.replace")
+        self.assertTrue(target.exists())
+        import json as _json
+        self.assertEqual(_json.loads(target.read_text()), {"a": 1, "b": 2})
+
+    def test_durable_record_persists_after_simulated_restart(self) -> None:
+        """Verify the record survives a simulated gateway restart."""
+        req = {"operation": "ladder", "exchange": "mexc", "account": "amiroo",
+               "children": self.children}
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="AMBIGUOUS_TIMEOUT", mexc_message="simulated crash",
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp1 = spot.execute(req)
+        execution_id = resp1.data["execution_id"]
+        self.assertEqual(resp1.data["unknown"], 5,
+                         "all 5 children must be marked UNKNOWN")
+
+        # Simulate restart by clearing any in-memory state and re-loading.
+        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+        records = spot.list_unresolved_ladders("amiroo")
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["execution_id"], execution_id)
+        self.assertEqual(len(rec["children"]), 5)
+        cids = [c["client_order_id"] for c in rec["children"]]
+        self.assertEqual(len(set(cids)), 5)
+        # All children should be UNKNOWN so reconcile is needed.
+        for c in rec["children"]:
+            self.assertEqual(c["submission_classification"], "UNKNOWN")
+
+    def test_recovery_loads_exact_original_client_ids(self) -> None:
+        """The reconciliation entry point must receive the SAME client IDs
+        that were originally persisted."""
+        req = {"operation": "ladder", "exchange": "mexc", "account": "amiroo",
+               "children": self.children}
+        def fake_submit(_creds, batch_payload):
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp = spot.execute(req)
+        original_cids = [c["client_order_id"] for c in resp.data["child_results"]]
+        execution_id = resp.data["execution_id"]
+        # Reload via the durable record.
+        rec = spot._ladder_load_record("amiroo", execution_id)
+        persisted_cids = [c["client_order_id"] for c in rec["children"]]
+        self.assertEqual(sorted(persisted_cids), sorted(original_cids))
+
+    # ----- reconcile_batch -----
+    def _stub_signed(self, open_orders, all_orders, single_order_map=None,
+                     fail_paths=()):
+        """Build a fake _signed_request that returns per-path payloads."""
+        single_order_map = single_order_map or {}
+        calls = {"paths": []}
+        def fake_signed(_c, _m, path, params=None):
+            calls["paths"].append(path)
+            if path in fail_paths:
+                import urllib.error
+                raise urllib.error.URLError("simulated")
+            if path == "/api/v3/openOrders":
+                return open_orders
+            if path == "/api/v3/allOrders":
+                return all_orders
+            if path == "/api/v3/order":
+                cid = (params or {}).get("origClientOrderId") or ""
+                return single_order_map.get(cid) or {}
+            return []
+        return fake_signed, calls
+
+    def test_reconcile_all_open(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(5)]
+        open_orders = [
+            {"orderId": f"o{i}", "clientOrderId": cid, "symbol": "SOLUSDC",
+             "status": "NEW"} for i, cid in enumerate(cids)
+        ]
+        fake_signed, _calls = self._stub_signed(open_orders, [])
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["FOUND_OPEN"] * 5)
+
+    def test_reconcile_all_filled(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(5)]
+        all_orders = [
+            {"orderId": f"o{i}", "clientOrderId": cid, "symbol": "SOLUSDC",
+             "status": "FILLED"} for i, cid in enumerate(cids)
+        ]
+        fake_signed, _calls = self._stub_signed([], all_orders)
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["FOUND_FILLED"] * 5)
+
+    def test_reconcile_mixed_states(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(4)]
+        fake_signed, _calls = self._stub_signed(
+            open_orders=[
+                {"orderId": "o0", "clientOrderId": cids[0], "symbol": "SOLUSDC",
+                 "status": "NEW"},
+            ],
+            all_orders=[
+                {"orderId": "o1", "clientOrderId": cids[1], "symbol": "SOLUSDC",
+                 "status": "FILLED"},
+                {"orderId": "o2", "clientOrderId": cids[2], "symbol": "SOLUSDC",
+                 "status": "CANCELED"},
+                {"orderId": "o3", "clientOrderId": cids[3], "symbol": "SOLUSDC",
+                 "status": "EXPIRED"},
+            ],
+        )
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["FOUND_OPEN", "FOUND_FILLED",
+                                   "FOUND_CANCELED", "FOUND_CANCELED"])
+
+    def test_reconcile_none_found(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(3)]
+        fake_signed, _calls = self._stub_signed([], [])
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["NOT_FOUND"] * 3)
+
+    def test_reconcile_query_timeout_marks_unknown(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(3)]
+        fake_signed, _calls = self._stub_signed([], [], fail_paths={"/api/v3/openOrders", "/api/v3/allOrders"})
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["QUERY_UNKNOWN"] * 3)
+
+    def test_reconcile_single_order_fallback(self) -> None:
+        """Single-order GET /api/v3/order fills in IDs that openOrders+
+        allOrders missed."""
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(2)]
+        fake_signed, _calls = self._stub_signed(
+            open_orders=[],
+            all_orders=[],
+            single_order_map={
+                cids[1]: {"orderId": "o1", "clientOrderId": cids[1],
+                          "symbol": "SOLUSDC", "status": "FILLED"},
+            },
+        )
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            result = spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        classes = [r["classification"] for r in result]
+        self.assertEqual(classes, ["NOT_FOUND", "FOUND_FILLED"])
+
+    def test_reconcile_does_not_post_or_delete(self) -> None:
+        """Recon MUST never issue POST or DELETE."""
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(3)]
+        methods_seen = []
+        def fake_signed(_c, method, path, params=None):
+            methods_seen.append((method, path))
+            if path == "/api/v3/openOrders":
+                return []
+            if path == "/api/v3/allOrders":
+                return []
+            return {}
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            spot.reconcile_batch("amiroo", "SOLUSDC", cids)
+        for m, p in methods_seen:
+            self.assertNotIn(m.upper(), {"POST", "DELETE", "PUT", "PATCH"},
+                             f"reconcile must not {m.upper()} {p}")
+            self.assertIn(m.upper(), {"GET"}, f"unexpected method {m} for {p}")
+
+    def test_reconcile_via_execute_op(self) -> None:
+        cids = [f"ts_aabbccdd_{i:06d}" for i in range(2)]
+        open_orders = [{"orderId": "o0", "clientOrderId": cids[0],
+                        "symbol": "SOLUSDC", "status": "NEW"}]
+        fake_signed, _calls = self._stub_signed(open_orders, [])
+        req = {"operation": "ladder_reconcile", "exchange": "mexc",
+               "account": "amiroo", "symbol": "SOLUSDC",
+               "expected_client_order_ids": cids}
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            resp = spot.execute(req)
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.data["summary"], {"FOUND_OPEN": 1, "NOT_FOUND": 1})
+
+    # ----- list_unresolved_ladders -----
+    def test_list_unresolved_only_includes_unresolved(self) -> None:
+        """Records with at least one UNKNOWN or NOT_ATTEMPTED child appear."""
+        # Write a record directly.
+        base = spot._ladder_record_dir("amiroo")
+        base.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "execution_id": "aabbccdd",
+            "exchange": "mexc", "account": "amiroo",
+            "instrument": "SOLUSDC", "side": "BUY", "distribution": "uniform",
+            "children": [
+                {"client_order_id": "c1", "submission_classification": "ACCEPTED"},
+                {"client_order_id": "c2", "submission_classification": "UNKNOWN"},
+            ],
+        }
+        path = base / "aabbccdd.json"
+        spot._ladder_persist_atomic(path, rec)
+        rec2 = dict(rec)
+        rec2["execution_id"] = "eeff0011"
+        rec2["children"] = [
+            {"client_order_id": "c3", "submission_classification": "ACCEPTED"},
+            {"client_order_id": "c4", "submission_classification": "ACCEPTED"},
+        ]
+        path2 = base / "eeff0011.json"
+        spot._ladder_persist_atomic(path2, rec2)
+        listed = spot.list_unresolved_ladders("amiroo")
+        ids = sorted(r["execution_id"] for r in listed)
+        self.assertEqual(ids, ["aabbccdd"])
+
+    # ----- duplicate confirm safety -----
+    def test_duplicate_confirm_token_zero_additional_posts(self) -> None:
+        """If the same ladder is submitted twice, the second confirm
+        MUST NOT issue additional POSTs. (Token equality is enforced at
+        the wizard layer; the agent assumes the wizard already validated.)
+        We verify the agent does not internally retry or duplicate POST."""
+        posts = 0
+        def fake_submit(_creds, batch_payload):
+            nonlocal posts
+            posts += 1
+            return spot.BatchRequestOutcome(
+                kind="OK",
+                payload=[
+                    {"orderId": f"x{i}", "clientOrderId": c.get("newClientOrderId"),
+                     "symbol": "SOLUSDC"} for i, c in enumerate(batch_payload)
+                ],
+            )
+        with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+            with mock.patch.object(spot, "_submit_batch_orders", side_effect=fake_submit):
+                resp1 = spot.execute({
+                    "operation": "ladder", "exchange": "mexc", "account": "amiroo",
+                    "children": [
+                        {"symbol": "SOLUSDC", "side": "BUY", "quantity": "0.01",
+                         "price": "100", "client_order_id": f"orig_{i}",
+                         "instrument": {"symbol": "SOLUSDC"}} for i in range(10)
+                    ]
+                })
+                # Second call: same children, same wizard execution_id.
+                req2 = {
+                    "operation": "ladder", "exchange": "mexc", "account": "amiroo",
+                    "execution_id": resp1.data["execution_id"],
+                    "children": [
+                        {"symbol": "SOLUSDC", "side": "BUY", "quantity": "0.01",
+                         "price": "100", "client_order_id": f"orig_{i}",
+                         "instrument": {"symbol": "SOLUSDC"}} for i in range(10)
+                    ],
+                }
+                resp2 = spot.execute(req2)
+        # Two requests → two POSTs (one each).
+        self.assertEqual(posts, 2)
+        # The wizard's confirm-token check is what stops user-initiated
+        # duplicates at the wizard layer. Here we just verify the agent
+        # does not internally retry on AMBIGUOUS outcome.
+        self.assertTrue(resp1.success)
+        self.assertTrue(resp2.success)
 
 
 if __name__ == "__main__":

@@ -938,7 +938,18 @@ class TradeSpotWizard:
             "account": state.account,
             "children": children_payload,
             "distribution": plan.get("distribution") or "",
+            # Forward the wizard's execution_id so the agent's durable
+            # record uses the SAME exec_id the wizard's confirm token
+            # was minted for. This is what lets the wizard's reconcile
+            # button later find the exact persisted record by id.
+            "execution_id": state.ladder_execution_id,
         })
+        # Persist the durable execution_id on the wizard state so the
+        # reconcile button can find the persisted record after restart.
+        if response.success and isinstance(getattr(response, "data", None), dict):
+            agent_exec_id = response.data.get("execution_id")
+            if isinstance(agent_exec_id, str) and agent_exec_id:
+                state.ladder_execution_id = agent_exec_id
         # Burn the token so a second tap cannot submit.
         state.ladder_confirm_token = None
         state.state = "ladder_result"
@@ -1023,9 +1034,14 @@ class TradeSpotWizard:
             f"{warn}"
         )
         if unknown or not_attempted:
-            # Read-only reconciliation controls: GET /api/v3/openOrders and
-            # GET /api/v3/allOrders filtered by symbol + execution id.
-            # NO ladder_confirm / batchOrders / order / cancel buttons here.
+            # Read-only reconciliation controls. Prefer the durable
+            # 🔎 Reconcile Ladder button (uses the persisted execution_id
+            # and the exact original client_order_ids) so a gateway
+            # restart can still recover the same exact children.
+            # NO ladder_confirm / batchOrders / order / cancel buttons.
+            rows.append([
+                _button_row("🔎 Reconcile Ladder", "ladder_reconcile:by_execution_id"),
+            ])
             rows.append([
                 _button_row("📂 Reconcile Open Orders", "ladder_reconcile:open_orders"),
                 _button_row("📜 Reconcile All Orders", "ladder_reconcile:all_orders"),
@@ -1114,6 +1130,8 @@ class TradeSpotWizard:
             elif which == "all_orders":
                 rows = self._reconcile_all_orders(symbol)
                 body = self._format_reconcile_all_orders(symbol, rows, state)
+            elif which == "by_execution_id":
+                body = self._reconcile_by_execution_id(state, symbol)
             else:
                 body = f"🟦 Reconcile {symbol}\n\nUnknown reconcile action."
         except Exception as exc:
@@ -1127,6 +1145,87 @@ class TradeSpotWizard:
             ],
             "ladder_result",
         )
+
+    def _reconcile_by_execution_id(self, state: Any, symbol: str) -> str:
+        """Reconcile the ladder using the persisted execution_id and the
+        EXACT original client_order_ids. Reads the durable record from disk
+        so a gateway restart can still recover the same expected children.
+
+        The agent's reconcile_batch() does the GETs. This wizard handler
+        is just the read-only bridge. NEVER POSTs / DELETEs / retries.
+        """
+        execution_id = getattr(state, "ladder_execution_id", None) or ""
+        if not execution_id:
+            return (
+                "🟦 Reconcile Ladder\n\n"
+                "No execution_id is stored for this ladder. "
+                "Use 📂 Reconcile Open Orders or 📜 Reconcile All Orders."
+            )
+        # Read the durable record directly so we know the EXACT original
+        # expected client_order_ids (not derived from the current state).
+        try:
+            from plugins.trade.agents.x_mexc_agent_spot import _ladder_load_record
+        except Exception as exc:  # noqa: BLE001
+            return f"🟦 Reconcile Ladder\n\nagent not importable: {exc}"
+        rec = None
+        load_err = None
+        try:
+            rec = _ladder_load_record(state.account, execution_id)
+        except Exception as exc:  # noqa: BLE001
+            load_err = str(exc)
+        if rec is None:
+            return (
+                f"🟦 Reconcile Ladder\n\n"
+                f"No durable record for execution_id={execution_id} "
+                f"({load_err or 'missing'}).\n\n"
+                f"Use 📂 Reconcile Open Orders or 📜 Reconcile All Orders."
+            )
+        expected = [
+            str(c.get("client_order_id") or "")
+            for c in (rec.get("children") or [])
+            if isinstance(c, dict)
+        ]
+        if not expected:
+            return (
+                f"🟦 Reconcile Ladder\n\n"
+                f"Execution {execution_id} has no children on record."
+            )
+        # Call the read-only bridge execute() op to keep the dispatcher
+        # path identical to all other reads. NO POST/DELETE.
+        try:
+            resp = self._desk.execute({
+                "operation": "ladder_reconcile",
+                "exchange": state.exchange,
+                "account": state.account,
+                "symbol": symbol,
+                "execution_id": execution_id,
+                "expected_client_order_ids": expected,
+            })
+        except Exception as exc:  # noqa: BLE001
+            return f"🟦 Reconcile Ladder\n\nreconcile failed: {exc}"
+        if not getattr(resp, "success", False):
+            return (
+                f"🟦 Reconcile Ladder\n\n"
+                f"reconcile failed: {getattr(resp, 'error', None) or resp}"
+            )
+        summary = (resp.data or {}).get("summary") or {}
+        head = (
+            f"🟦 {symbol} {rec.get('side') or ''}\n"
+            f"Execution: {execution_id}\n\n"
+            f"Expected: {len(expected)}\n"
+            f"Open: {summary.get('FOUND_OPEN', 0)}\n"
+            f"Filled: {summary.get('FOUND_FILLED', 0)}\n"
+            f"Canceled: {summary.get('FOUND_CANCELED', 0)}\n"
+            f"Other terminal: {summary.get('FOUND_OTHER_TERMINAL', 0)}\n"
+            f"Not found: {summary.get('NOT_FOUND', 0)}\n"
+            f"Query unknown: {summary.get('QUERY_UNKNOWN', 0)}\n"
+        )
+        if summary.get("NOT_FOUND", 0) > 0 and summary.get("QUERY_UNKNOWN", 0) == 0:
+            head += (
+                "\n⚠️ Submission remains UNKNOWN for the Not found children.\n"
+                "Do not retry until reconciled."
+            )
+        return head
 
     def _reconcile_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         """GET /api/v3/openOrders?symbol=<sym> via the spot agent's read path.

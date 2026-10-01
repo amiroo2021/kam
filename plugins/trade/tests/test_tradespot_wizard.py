@@ -351,6 +351,13 @@ class FakeMexcSpotDesk:
             # same submit path the live deployment will use.
             from plugins.trade.agents import x_mexc_agent_spot as spot
             return spot.execute(request)
+        if op == "ladder_reconcile":
+            # Read-only bridge: delegate to the real agent.
+            from plugins.trade.agents import x_mexc_agent_spot as spot
+            return spot.execute(request)
+        if op == "ladder_list_unresolved":
+            from plugins.trade.agents import x_mexc_agent_spot as spot
+            return spot.execute(request)
         return make_success(op, "mexc", "amiroo", data={})
 
 
@@ -1526,8 +1533,92 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self.assertTrue(any("reconcile_open" in c or "open_orders" in c for c in cbs))
         self.assertTrue(any("reconcile_all" in c or "all_orders" in c for c in cbs))
         self.assertTrue(any("ack" in c or "close" in c for c in cbs))
+        # New: durable reconcile-by-execution-id button.
+        self.assertTrue(any("by_execution_id" in c for c in cbs),
+                        f"missing by_execution_id button in {cbs}")
         # None of those are ladder_confirm: triggers.
         self.assertFalse(any(c.startswith("ladder_confirm:") for c in cbs))
+
+    def test_reconcile_by_execution_id_uses_durable_record(self) -> None:
+        """The 🔎 Reconcile Ladder button must use the durable execution_id
+        to load the exact original client_order_ids, then call the agent's
+        reconcile_batch via execute('ladder_reconcile')."""
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+        import urllib.error
+        import json as _json
+
+        # Pre-seed the spot agent's durable record to mimic persist-before-POST.
+        execution_id = "abcdef01"
+        rec = {
+            "version": 1,
+            "execution_id": execution_id,
+            "exchange": "mexc",
+            "account": "amiroo",
+            "instrument": "SOLUSDC",
+            "exchange_symbol": "SOLUSDC",
+            "side": "BUY",
+            "distribution": "uniform",
+            "children": [
+                {"index": 0, "client_order_id": "ts_abcdef01_000000",
+                 "submission_classification": "UNKNOWN", "quantity": "0.01",
+                 "price": "100"},
+                {"index": 1, "client_order_id": "ts_abcdef01_000001",
+                 "submission_classification": "UNKNOWN", "quantity": "0.01",
+                 "price": "100"},
+            ],
+        }
+        spot._ladder_persist_atomic(
+            spot._ladder_record_path("amiroo", execution_id), rec,
+        )
+
+        reconcile_calls = []
+
+        def fake_signed(_c, method, path, params=None):
+            # NEVER POST/DELETE: only GETs allowed.
+            if method.upper() == "POST":
+                raise AssertionError("reconcile must not POST")
+            if method.upper() == "DELETE":
+                raise AssertionError("reconcile must not DELETE")
+            if path == "/api/v3/openOrders":
+                reconcile_calls.append("open")
+                return [{"orderId": "x0", "clientOrderId": "ts_abcdef01_000000",
+                         "symbol": "SOLUSDC", "status": "NEW"}]
+            if path == "/api/v3/allOrders":
+                reconcile_calls.append("all")
+                return [{"orderId": "x1", "clientOrderId": "ts_abcdef01_000001",
+                         "symbol": "SOLUSDC", "status": "FILLED"}]
+            if path == "/api/v3/order":
+                reconcile_calls.append("single")
+                return {}
+            return []
+
+        self._install_patch(fake_signed)
+        self._post_calls.clear()
+
+        # Manually wire the wizard state to know about this execution_id.
+        self.wizard.open(self.key)
+        state = self.wizard._state_for(self.key)
+        state.exchange = "mexc"
+        state.account = "amiroo"
+        state.selected_instrument = {"symbol": "SOLUSDC", "base": "SOL", "quote": "USDC"}
+        state.ladder_execution_id = execution_id
+        state.state = "ladder_result"
+        out = self.wizard.handle_callback(self.key, "ladder_reconcile:by_execution_id")
+        # The body must mention the execution_id and the reconciliation summary.
+        self.assertIn(execution_id, out.text)
+        self.assertIn("Expected: 2", out.text)
+        self.assertIn("Open: 1", out.text)
+        self.assertIn("Filled: 1", out.text)
+        # Only GETs were called.
+        self.assertIn("open", reconcile_calls)
+        self.assertIn("all", reconcile_calls)
+        # NO POST/DELETE.
+        self.assertEqual(self._post_calls, [])
+        # Clean up the persisted record.
+        import os as _os
+        path = spot._ladder_record_path("amiroo", execution_id)
+        if path.exists():
+            path.unlink()
 
     def test_unknown_dash_for_accepted_vwap_and_required(self) -> None:
         """When all 5 children are UNKNOWN, neither Accepted VWAP nor Required

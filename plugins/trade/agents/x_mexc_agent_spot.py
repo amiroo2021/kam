@@ -17,11 +17,14 @@ import json
 import logging
 import os
 import re
+import secrets
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import socket
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -267,6 +270,141 @@ def _signed_request(
     )
 
 
+@dataclass(frozen=True)
+class BatchRequestOutcome:
+    """Structured result of a single POST /api/v3/batchOrders attempt.
+
+    ``kind`` is the critical classification used by ``_ladder`` to decide
+    whether to mark a batch ACCEPTED, REJECTED, UNKNOWN, or NOT_ATTEMPTED.
+    The classifier intentionally errs on the side of UNKNOWN whenever the
+    network write may have reached MEXC — we never auto-retry ambiguous
+    batches.
+    """
+    kind: str  # OK | HTTP_REJECTED | HTTP_RATE_LIMITED | HTTP_SERVER_ERROR | MALFORMED_JSON | AMBIGUOUS_TIMEOUT | LOCAL_ERROR | OTHER_LOCAL
+    payload: Any = None
+    http_status: Optional[int] = None
+    mexc_code: Optional[Any] = None
+    mexc_message: Optional[str] = None
+    retry_after_seconds: Optional[int] = None
+
+
+def _submit_batch_orders(
+    credentials: Mapping[str, str],
+    batch_payload: List[Mapping[str, Any]],
+) -> BatchRequestOutcome:
+    """Issue POST /api/v3/batchOrders and return a structured outcome.
+
+    Never raises. The caller (``_ladder``) decides how to mark each child
+    based on ``outcome.kind``:
+
+    * ``OK``                  → parse ``payload`` as the MEXC per-child list.
+    * ``HTTP_RATE_LIMITED``   → mark the entire batch UNKNOWN (the request
+                                 may have reached MEXC; do not auto-retry).
+    * ``HTTP_REJECTED``       → mark the entire batch REJECTED, preserve
+                                 MEXC ``code``/``msg``.
+    * ``HTTP_SERVER_ERROR``   → mark the entire batch REJECTED, preserve
+                                 server-side reason if present.
+    * ``AMBIGUOUS_TIMEOUT``   → mark the entire batch UNKNOWN (request may
+                                 have been transmitted; do not auto-retry).
+    * ``MALFORMED_JSON``      → mark the entire batch UNKNOWN (response
+                                 received but unparseable).
+    * ``LOCAL_ERROR``         → mark the entire batch UNKNOWN (the request
+                                 may have reached MEXC; we lost visibility).
+    """
+    body = json.dumps(batch_payload)
+    params = {
+        "batchOrders": body,
+        "recvWindow": "5000",
+    }
+    try:
+        payload = _signed_request(credentials, "POST", "/api/v3/batchOrders", params)
+    except (TimeoutError, socket.timeout):
+        return BatchRequestOutcome(
+            kind="AMBIGUOUS_TIMEOUT",
+            mexc_message="connect/read timeout — request may have reached MEXC",
+        )
+    except urllib.error.URLError as exc:
+        return BatchRequestOutcome(
+            kind="AMBIGUOUS_TIMEOUT",
+            mexc_message=f"URLError: {exc.reason}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return BatchRequestOutcome(
+            kind="LOCAL_ERROR",
+            mexc_message=sanitize_error_message(str(exc)),
+        )
+    # Two paths: a list (200 OK with per-child results) OR a dict with
+    # code/msg/http_status (HTTPError path inside _json_request).
+    if isinstance(payload, list):
+        # MEXC returns a JSON array directly when 200 OK. The caller will
+        # handle it. We return the list in `payload` and tag kind=OK.
+        return BatchRequestOutcome(
+            kind="OK",
+            payload=payload,
+            http_status=200,
+        )
+    if not isinstance(payload, Mapping):
+        # Non-dict, non-list → MALFORMED_JSON (or unexpected shape).
+        return BatchRequestOutcome(
+            kind="MALFORMED_JSON",
+            mexc_message=f"unexpected payload type: {type(payload).__name__}",
+        )
+    http_status = payload.get("http_status")
+    code = payload.get("code")
+    msg = payload.get("msg")
+    if isinstance(http_status, int) and 500 <= http_status < 600:
+        # Per MEXC spot V3 docs, 5xx is "Internal error. Please try again" +
+        # "Retry later after querying whether the operation already
+        # completed." That explicit instruction tells us MEXC itself does
+        # NOT guarantee the order was not processed. Per the conservative
+        # classification rule: classify as UNKNOWN.
+        return BatchRequestOutcome(
+            kind="AMBIGUOUS_SERVER_ERROR",
+            http_status=http_status,
+            mexc_code=code,
+            mexc_message=str(msg) if msg else None,
+        )
+    if isinstance(http_status, int) and http_status == 429:
+        retry_after: Optional[int] = None
+        ra = payload.get("retry_after")
+        if isinstance(ra, (int, float)):
+            retry_after = int(ra)
+        elif isinstance(ra, str):
+            try:
+                retry_after = int(ra)
+            except Exception:  # noqa: BLE001
+                retry_after = None
+        return BatchRequestOutcome(
+            kind="HTTP_RATE_LIMITED",
+            http_status=http_status,
+            mexc_code=code,
+            mexc_message=str(msg) if msg else None,
+            retry_after_seconds=retry_after,
+        )
+    if isinstance(http_status, int) and 400 <= http_status < 600:
+        return BatchRequestOutcome(
+            kind="HTTP_REJECTED",
+            http_status=http_status,
+            mexc_code=code,
+            mexc_message=str(msg) if msg else None,
+        )
+    if code is not None or msg:
+        # dict without explicit http_status but with code/msg → treat as
+        # REJECTED. This covers MEXC responses that carry only code/msg.
+        return BatchRequestOutcome(
+            kind="HTTP_REJECTED",
+            http_status=http_status,
+            mexc_code=code,
+            mexc_message=str(msg) if msg else None,
+        )
+    # Bare dict (e.g. empty {} or unrecognized) → MALFORMED_JSON.
+    return BatchRequestOutcome(
+        kind="MALFORMED_JSON",
+        http_status=http_status,
+        mexc_message=str(msg) if msg else None,
+    )
+
+
 def _response_error(payload: Any, fallback: str) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -296,7 +434,9 @@ def _to_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-def _format_decimal(value: Decimal) -> str:
+def _format_decimal(value: Optional[Decimal]) -> str:
+    if value is None:
+        return ""
     q = value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     text = format(q.normalize(), "f")
     if "." in text:
@@ -787,6 +927,362 @@ def _ladder_child_status(child_result: Mapping[str, Any]) -> str:
     return "UNKNOWN"
 
 
+# MEXC spot V3 docs: clientOrderId must be 8-32 chars. We pick a
+# deterministic, collision-resistant format that survives 500 children
+# across multiple execution IDs without needing the [:32] truncation slice.
+#
+# Format:    ts_<8hex_exec>_<6decimal_idx>
+# Length:    3 + 8 + 1 + 6 = 18 chars     (within 8-32 constraint)
+# Capacity:  256 execs  ×  1,000,000 children per exec
+#
+# The hex execution_id suffix prevents accidental collisions across
+# different ladder sessions of the same minute.
+MEXC_SPOT_MAX_CLIENT_ORDER_ID_LEN = 32
+MEXC_SPOT_MIN_CLIENT_ORDER_ID_LEN = 8
+_LADDER_CLIENT_ID_PREFIX = "ts_"
+_LADDER_EXEC_ID_HEX_LEN = 8
+_LADDER_INDEX_DEC_LEN = 6
+
+
+def _ladder_new_execution_id() -> str:
+    """Return an 8-hex-char execution ID suitable for client_order_ids.
+
+    Combined with the ``_LADDER_EXEC_ID_HEX_LEN`` / ``_LADDER_INDEX_DEC_LEN``
+    constants this format gives 256 unique executions × 1M children per exec
+    without collisions.
+    """
+    return secrets.token_hex(_LADDER_EXEC_ID_HEX_LEN // 2)[:_LADDER_EXEC_ID_HEX_LEN]
+
+
+def _ladder_new_client_order_id(execution_id: str, child_index: int) -> str:
+    """Return a deterministic client_order_id in MEXC-valid 8-32 char range.
+
+    The format ``ts_<8hex_exec>_<6decimal_idx>`` keeps every ID unique
+    across up to 1M children per execution without relying on a
+    truncation slice. Callers MUST use this generator instead of the
+    raw ``client_order_id`` from the upstream request so we never depend
+    on ``[:32]`` to remove ambiguity.
+    """
+    if not (isinstance(execution_id, str) and len(execution_id) == _LADDER_EXEC_ID_HEX_LEN):
+        raise ValueError(f"execution_id must be {_LADDER_EXEC_ID_HEX_LEN} hex chars")
+    idx_str = f"{int(child_index):0{_LADDER_INDEX_DEC_LEN}d}"
+    cid = f"{_LADDER_CLIENT_ID_PREFIX}{execution_id}_{idx_str}"
+    if not (MEXC_SPOT_MIN_CLIENT_ORDER_ID_LEN <= len(cid) <= MEXC_SPOT_MAX_CLIENT_ORDER_ID_LEN):
+        raise ValueError(f"client_order_id len {len(cid)} out of MEXC bounds")
+    return cid
+
+
+def _ladder_record_dir(account: str) -> Path:
+    """Return the durable-record directory for ``account``."""
+    base = Path(os.environ.get("HERMES_HOME") or "/root/.hermes") / "cache" / "tradespot" / "mexc-spot"
+    # Sanitize the account alias to keep it filesystem-safe.
+    safe_account = re.sub(r"[^A-Za-z0-9_.-]", "_", account or "unknown") or "unknown"
+    return base / safe_account
+
+
+def _ladder_record_path(account: str, execution_id: str) -> Path:
+    """Return the atomic-record JSON path for ``account/execution_id``."""
+    return _ladder_record_dir(account) / f"{execution_id}.json"
+
+
+def _ladder_persist_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    """Write ``payload`` to ``path`` atomically (tmp + fsync + os.replace).
+
+    Never raises. Any error during the write is captured in the parent
+    function's error log; we never crash the ladder pipeline on a
+    persistence failure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:  # noqa: BLE001
+                # Some filesystems (e.g. tmpfs on some kernels) do not
+                # support fsync. The atomic rename still gives us
+                # crash-consistency at the inode level.
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
+def _ladder_load_record(account: str, execution_id: str) -> Optional[Dict[str, Any]]:
+    """Read a durable record from disk. None if missing or malformed."""
+    path = _ladder_record_path(account, execution_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def list_unresolved_ladders(account: str) -> List[Dict[str, Any]]:
+    """List durable ladder records for ``account`` whose submission contains
+    at least one UNKNOWN or NOT_ATTEMPTED child. Read-only; never submits.
+
+    Returned records are stable, JSON-clean dicts (NOT the live
+    CanonicalLadderResult dataclass). The wizard uses this to rebuild the
+    reconciliation UI after a gateway restart.
+
+    A record is "unresolved" iff:
+      * at least one child has ``submission_classification`` ∈ {UNKNOWN,
+        NOT_ATTEMPTED}, OR
+      * at least one child has ``reconciliation_classification``
+        == QUERY_UNKNOWN
+    """
+    base = _ladder_record_dir(account)
+    if not base.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for path in sorted(base.glob("*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(rec, dict):
+            continue
+        children = rec.get("children") or []
+        unresolved = any(
+            isinstance(c, dict)
+            and (
+                c.get("submission_classification") in {"UNKNOWN", "NOT_ATTEMPTED"}
+                or c.get("reconciliation_classification") == "QUERY_UNKNOWN"
+            )
+            for c in children
+        )
+        if not unresolved:
+            continue
+        out.append(rec)
+    return out
+
+
+def reconcile_batch(
+    account: str,
+    symbol: str,
+    expected_client_order_ids: List[str],
+    known_exchange_order_ids: Optional[List[str]] = None,
+    execution_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """GET-only reconciliation against the live MEXC spot account.
+
+    Algorithm:
+      1. GET /api/v3/openOrders?symbol=<sym>
+         (open orders, server-side filter by symbol)
+      2. GET /api/v3/allOrders?symbol=<sym>&limit=1000
+         (recent history, filtered by symbol)
+      3. For every expected child still unresolved after steps 1+2:
+         GET /api/v3/order?symbol=<sym>&origClientOrderId=<cid>
+         (single-order lookup, per MEXC spot V3 Query Order docs)
+
+    Classification (exactly one per expected child):
+      FOUND_OPEN              matched in /openOrders
+      FOUND_FILLED            matched in /allOrders with status FILLED
+      FOUND_CANCELED          matched in /allOrders with status CANCELED / EXPIRED
+      FOUND_OTHER_TERMINAL    matched in /allOrders with another terminal state
+      NOT_FOUND               every applicable GET returned success and the
+                              expected client ID was absent in the response
+      QUERY_UNKNOWN           any required GET failed/timed out/malformed;
+                              reconciliation itself is incomplete
+
+    NEVER performs POST / DELETE. NEVER retries. NEVER re-submits.
+    """
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        raise ValueError(f"unknown MEXC account '{account}'")
+
+    # Track which expected IDs are still unresolved as we walk the GETs.
+    remaining = {str(cid): i for i, cid in enumerate(expected_client_order_ids)}
+    rows: Dict[int, Dict[str, Any]] = {}
+    # Pre-populate with NOT_FOUND placeholders so the result has one row
+    # per expected child even if reconciliation times out.
+    for i, cid in enumerate(expected_client_order_ids):
+        rows[i] = {
+            "index": i,
+            "client_order_id": str(cid),
+            "exchange_order_id": None,
+            "classification": "NOT_FOUND",
+            "exchange_status": None,
+            "executed_qty": None,
+            "cumulative_quote_qty": None,
+            "query_source": None,
+            "query_error": None,
+        }
+    # Optional: short-circuit IDs we already know.
+    for kid in known_exchange_order_ids or []:
+        kid_s = str(kid or "")
+        if kid_s and kid_s in remaining:
+            rows[remaining[kid_s]]["exchange_order_id"] = kid_s
+
+    def _status_from_open_or_all(payload: Any, kind: str) -> List[Mapping[str, Any]]:
+        if isinstance(payload, list):
+            return [r for r in payload if isinstance(r, Mapping)]
+        if isinstance(payload, Mapping):
+            for k in ("orders", "rows", "data"):
+                v = payload.get(k)
+                if isinstance(v, list):
+                    return [r for r in v if isinstance(r, Mapping)]
+        return []
+
+    def _classify_status(status: str) -> str:
+        s = (status or "").upper()
+        if s in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+            return "FOUND_OPEN"
+        if s in {"FILLED"}:
+            return "FOUND_FILLED"
+        if s in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+            return "FOUND_CANCELED"
+        return "FOUND_OTHER_TERMINAL"
+
+    def _match_order_by_cid(order: Mapping[str, Any], cid: str) -> bool:
+        return str(order.get("clientOrderId") or "") == cid or str(order.get("origClientOrderId") or "") == cid
+
+    # Step 1+2: openOrders + allOrders, filtered by symbol.
+    query_failed = False
+    query_error_msg: Optional[str] = None
+
+    try:
+        open_payload = _signed_request(credentials, "GET", "/api/v3/openOrders", {"symbol": symbol})
+        for order in _status_from_open_or_all(open_payload, "openOrders"):
+            cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+            if cid in remaining:
+                idx = remaining.pop(cid)
+                rows[idx].update({
+                    "classification": _classify_status(str(order.get("status") or "")),
+                    "exchange_status": str(order.get("status") or ""),
+                    "exchange_order_id": str(order.get("orderId") or ""),
+                    "executed_qty": str(order.get("executedQty") or ""),
+                    "cumulative_quote_qty": str(order.get("cumulativeQuoteQty") or ""),
+                    "query_source": "openOrders",
+                    "query_error": None,
+                })
+                # best-effort: also capture orderId for FILLED if same id
+                # appears in allOrders later.
+    except Exception as exc:  # noqa: BLE001
+        query_failed = True
+        query_error_msg = sanitize_error_message(str(exc))
+
+    try:
+        all_payload = _signed_request(credentials, "GET", "/api/v3/allOrders", {"symbol": symbol, "limit": 1000})
+        for order in _status_from_open_or_all(all_payload, "allOrders"):
+            cid = str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+            if cid in remaining:
+                idx = remaining.pop(cid)
+                rows[idx].update({
+                    "classification": _classify_status(str(order.get("status") or "")),
+                    "exchange_status": str(order.get("status") or ""),
+                    "exchange_order_id": str(order.get("orderId") or ""),
+                    "executed_qty": str(order.get("executedQty") or ""),
+                    "cumulative_quote_qty": str(order.get("cumulativeQuoteQty") or ""),
+                    "query_source": "allOrders",
+                    "query_error": None,
+                })
+    except Exception as exc:  # noqa: BLE001
+        query_failed = True
+        query_error_msg = sanitize_error_message(str(exc))
+
+    # Step 3: per-ID single-order lookup for unresolved.
+    if remaining:
+        for cid, idx in list(remaining.items()):
+            try:
+                single = _signed_request(
+                    credentials,
+                    "GET",
+                    "/api/v3/order",
+                    {"symbol": symbol, "origClientOrderId": cid},
+                )
+                if isinstance(single, Mapping) and _match_order_by_cid(single, cid):
+                    rows[idx].update({
+                        "classification": _classify_status(str(single.get("status") or "")),
+                        "exchange_status": str(single.get("status") or ""),
+                        "exchange_order_id": str(single.get("orderId") or ""),
+                        "executed_qty": str(single.get("executedQty") or ""),
+                        "cumulative_quote_qty": str(single.get("cumulativeQuoteQty") or ""),
+                        "query_source": "single",
+                        "query_error": None,
+                    })
+                    remaining.pop(cid, None)
+            except Exception as exc:  # noqa: BLE001
+                # Single-order failure does NOT mark the whole query as
+                # QUERY_UNKNOWN; only bulk failures do. We still note the
+                # error so the wizard can surface it.
+                rows[idx]["query_error"] = sanitize_error_message(str(exc))
+                query_failed = True
+                if query_error_msg is None:
+                    query_error_msg = rows[idx]["query_error"]
+
+    # If any of the bulk queries failed, unresolved rows that we did not
+    # already classify are QUERY_UNKNOWN (NOT NOT_FOUND). The user's spec
+    # requires "all successful applicable GET reconciliation sources were
+    # checked" for NOT_FOUND — if some failed, the source set is incomplete.
+    if query_failed:
+        for cid, idx in remaining.items():
+            if rows[idx]["classification"] == "NOT_FOUND":
+                rows[idx]["classification"] = "QUERY_UNKNOWN"
+                if rows[idx]["query_error"] is None:
+                    rows[idx]["query_error"] = query_error_msg
+
+    # Return rows in input order. Caller can group by classification.
+    return [rows[i] for i in range(len(expected_client_order_ids))]
+
+
+def update_ladder_reconciliation(
+    account: str,
+    execution_id: str,
+    reconciled: List[Dict[str, Any]],
+    query_error: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update the durable record with reconciliation_classification per child.
+
+    Read-modify-write. Returns the updated record (or None if no record
+    exists for this account/execution_id). NEVER raises.
+    """
+    rec = _ladder_load_record(account, execution_id)
+    if rec is None:
+        return None
+    children = rec.get("children") or []
+    if not isinstance(children, list):
+        return rec
+    rec_index = {c.get("client_order_id"): c for c in children if isinstance(c, dict)}
+    now = int(time.time())
+    for row in reconciled:
+        cid = row.get("client_order_id")
+        if cid in rec_index:
+            rec_index[cid]["reconciliation_classification"] = row.get("classification")
+            rec_index[cid]["exchange_order_id"] = row.get("exchange_order_id") or rec_index[cid].get("exchange_order_id")
+            rec_index[cid]["last_reconciled_status"] = row.get("exchange_status")
+    rec["updated_at"] = now
+    rec["last_reconciliation_at"] = now
+    if query_error:
+        rec["last_reconciliation_error"] = query_error
+    try:
+        _ladder_persist_atomic(_ladder_record_path(account, execution_id), rec)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error(
+            "ladder_persist_failed account=%s execution_id=%s err=%s",
+            account, execution_id, sanitize_error_message(str(exc)),
+        )
+    return rec
+
+
 def _vwap(children: List[Mapping[str, Any]], qty_key: str, price_key: str) -> Optional[Decimal]:
     """Decimal VWAP across accepted children. None if no accepted qty."""
     total_qty = Decimal("0")
@@ -861,7 +1357,73 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         Decimal("0"),
     )
 
-    batches = _ladder_plan_batches(children_in)
+    # PERSIST BEFORE POST.
+    # Generate the durable execution_id BEFORE any network write. Use
+    # the wizard's execution_id if the upstream supplied one (so the
+    # confirm-token round-trip matches), otherwise mint a fresh 8-hex
+    # ID via _ladder_new_execution_id().
+    upstream_execution_id = str(request.get("execution_id") or "").strip()
+    if upstream_execution_id:
+        execution_id = upstream_execution_id[:_LADDER_EXEC_ID_HEX_LEN]
+        if len(execution_id) != _LADDER_EXEC_ID_HEX_LEN:
+            execution_id = _ladder_new_execution_id()
+    else:
+        execution_id = _ladder_new_execution_id()
+
+    # Regenerate every child with the deterministic client_order_id
+    # generator. This replaces any raw upstream client_order_id (which
+    # may be too long, contain forbidden chars, or collide) and gives us
+    # collision-free IDs even for 500 children.
+    prepared_children: List[Dict[str, Any]] = []
+    for idx, child in enumerate(children_in):
+        cid = _ladder_new_client_order_id(execution_id, idx)
+        prepared = dict(child)
+        prepared["client_order_id"] = cid
+        prepared_children.append(prepared)
+
+    durable_record: Dict[str, Any] = {
+        "version": 1,
+        "execution_id": execution_id,
+        "exchange": "mexc",
+        "account": credentials["account"],
+        "instrument": symbol,
+        "exchange_symbol": symbol,
+        "side": side,
+        "distribution": str(request.get("distribution") or ""),
+        "created_at": int(time.time()),
+        "updated_at": int(time.time()),
+        "submission_state": "PREPARED",
+        "planned_vwap": _format_decimal(_vwap(
+            [{"quantity": c.get("quantity"), "price": c.get("price")} for c in children_in],
+            "quantity", "price",
+        )),
+        "children": [
+            {
+                "index": idx,
+                "client_order_id": c["client_order_id"],
+                "exchange_order_id": None,
+                "quantity": str(c.get("quantity") or ""),
+                "price": str(c.get("price") or ""),
+                "submission_classification": "NOT_ATTEMPTED",
+                "reconciliation_classification": None,
+                "batch_index": None,
+            }
+            for idx, c in enumerate(prepared_children)
+        ],
+        "last_reconciliation_at": None,
+        "last_reconciliation_error": None,
+    }
+    try:
+        _ladder_persist_atomic(_ladder_record_path(credentials["account"], execution_id), durable_record)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error(
+            "ladder_persist_pre_failed account=%s execution_id=%s err=%s",
+            credentials["account"], execution_id, sanitize_error_message(str(exc)),
+        )
+        # We do NOT fail the ladder on a persistence error — the user may
+        # still want to attempt the live submission. We only warn.
+
+    batches = _ladder_plan_batches(prepared_children)
     batch_records: List[Dict[str, Any]] = []
     accepted_qty = Decimal("0")
     accepted_notional = Decimal("0")
@@ -896,18 +1458,27 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
                 "price",
             ),
         }
-        try:
-            payload = _signed_request(credentials, "POST", "/api/v3/batchOrders", params)
-        except urllib.error.URLError:
-            # Ambiguous timeout: request may have been transmitted. Mark
-            # this batch's children UNKNOWN and STOP. Do not retry.
+        outcome = _submit_batch_orders(credentials, batch_payload)
+        if outcome.kind == "OK":
+            results = outcome.payload if isinstance(outcome.payload, list) else []
+        elif outcome.kind in ("HTTP_RATE_LIMITED", "AMBIGUOUS_TIMEOUT",
+                              "MALFORMED_JSON", "LOCAL_ERROR"):
+            # Mark this batch's children UNKNOWN and STOP. Do not retry.
             record["status"] = "UNKNOWN"
+            record["error_code"] = (
+                "HTTP_429" if outcome.kind == "HTTP_RATE_LIMITED"
+                else "MALFORMED_RESPONSE" if outcome.kind == "MALFORMED_JSON"
+                else "TRANSPORT_ERROR"
+            )
+            record["exchange_reason"] = outcome.mexc_message
+            record["http_status"] = outcome.http_status
             record["child_results"] = [
                 {
                     "client_order_id": str(c.get("client_order_id") or ""),
                     "status": "UNKNOWN",
                     "quantity": str(c.get("quantity") or ""),
                     "price": str(c.get("price") or ""),
+                    "message": outcome.mexc_message or outcome.kind,
                 }
                 for c in batch
             ]
@@ -915,93 +1486,190 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             stopped_early = True
             batch_records.append(record)
             break
-        except Exception as exc:  # noqa: BLE001
+        elif outcome.kind == "HTTP_REJECTED":
+            # MEXC explicitly rejected the batch (HTTP 4xx other than 429).
+            # Mark the entire batch REJECTED, preserve MEXC code/message.
             record["status"] = "REJECTED"
-            record["error_code"] = "TRANSPORT_ERROR"
-            record["exchange_reason"] = sanitize_error_message(str(exc))
+            record["error_code"] = "HTTP_4XX"
+            record["exchange_reason"] = outcome.mexc_message or outcome.mexc_code
+            record["http_status"] = outcome.http_status
             record["child_results"] = [
                 {
                     "client_order_id": str(c.get("client_order_id") or ""),
                     "status": "REJECTED",
                     "quantity": str(c.get("quantity") or ""),
                     "price": str(c.get("price") or ""),
-                    "message": record["exchange_reason"],
+                    "error_code": outcome.mexc_code,
+                    "message": outcome.mexc_message,
                 }
                 for c in batch
             ]
             rejected_count += len(batch)
             stopped_early = True
+            exchange_reason = outcome.mexc_message or str(outcome.mexc_code)
+            batch_records.append(record)
+            break
+        elif outcome.kind == "AMBIGUOUS_SERVER_ERROR":
+            # MEXC returned 5xx. MEXC's own docs explicitly tell the caller
+            # to "Retry later after querying whether the operation already
+            # completed" — meaning MEXC does NOT guarantee the order was
+            # not processed. Per the conservative classification rule:
+            # mark UNKNOWN, stop the ladder.
+            record["status"] = "UNKNOWN"
+            record["error_code"] = "HTTP_5XX"
+            record["exchange_reason"] = (
+                outcome.mexc_message
+                or outcome.mexc_code
+                or "MEXC 5xx; request may have reached MEXC"
+            )
+            record["http_status"] = outcome.http_status
+            record["child_results"] = [
+                {
+                    "client_order_id": str(c.get("client_order_id") or ""),
+                    "status": "UNKNOWN",
+                    "quantity": str(c.get("quantity") or ""),
+                    "price": str(c.get("price") or ""),
+                    "error_code": outcome.mexc_code,
+                    "message": outcome.mexc_message or "MEXC 5xx — outcome not proven.",
+                }
+                for c in batch
+            ]
+            unknown_count += len(batch)
+            stopped_early = True
             exchange_reason = record["exchange_reason"]
             batch_records.append(record)
             break
-
-        results = payload if isinstance(payload, list) else []
-        record["exchange_order_ids"] = []
-        record["child_results"] = []
-        record["accepted_vwap"] = None
-        accepted_qty_batch = Decimal("0")
-        accepted_notional_batch = Decimal("0")
-        for child_in, child_result in zip(batch, results):
-            status = _ladder_child_status(child_result)
-            child_record: Dict[str, Any] = {
-                "client_order_id": str(child_in.get("client_order_id") or ""),
-                "status": status,
-                "quantity": str(child_in.get("quantity") or ""),
-                "price": str(child_in.get("price") or ""),
-            }
-            if isinstance(child_result, Mapping):
-                if child_result.get("orderId") is not None:
-                    child_record["exchange_order_id"] = str(child_result.get("orderId"))
-                if child_result.get("code") is not None:
-                    child_record["error_code"] = child_result.get("code")
-                if child_result.get("msg") is not None:
-                    child_record["message"] = str(child_result.get("msg"))
-            record["child_results"].append(child_record)
-            if status == "ACCEPTED":
-                accepted_count += 1
-                try:
-                    q = Decimal(str(child_in.get("quantity") or "0"))
-                    p = Decimal(str(child_in.get("price") or "0"))
-                except Exception:  # noqa: BLE001
-                    q = Decimal("0")
-                    p = Decimal("0")
-                accepted_qty_batch += q
-                accepted_notional_batch += q * p
-                order_id = child_result.get("orderId") if isinstance(child_result, Mapping) else None
-                if order_id is not None:
-                    record["exchange_order_ids"].append(str(order_id))
-                    accepted_order_ids.append(str(order_id))
-            elif status == "REJECTED":
-                rejected_count += 1
-            else:
-                unknown_count += 1
-        if len(results) < len(batch):
-            for child_in in batch[len(results):]:
-                record["child_results"].append({
-                    "client_order_id": str(child_in.get("client_order_id") or ""),
+        else:
+            # Unknown outcome kind — treat as UNKNOWN, stop.
+            record["status"] = "UNKNOWN"
+            record["error_code"] = "UNKNOWN_OUTCOME"
+            record["exchange_reason"] = outcome.mexc_message or outcome.kind
+            record["child_results"] = [
+                {
+                    "client_order_id": str(c.get("client_order_id") or ""),
                     "status": "UNKNOWN",
+                    "quantity": str(c.get("quantity") or ""),
+                    "price": str(c.get("price") or ""),
+                    "message": "Unknown outcome kind.",
+                }
+                for c in batch
+            ]
+            unknown_count += len(batch)
+            stopped_early = True
+            batch_records.append(record)
+            break
+
+        if outcome.kind == "OK":
+            record["exchange_order_ids"] = []
+            record["child_results"] = []
+            record["accepted_vwap"] = None
+            accepted_qty_batch = Decimal("0")
+            accepted_notional_batch = Decimal("0")
+            for child_in, child_result in zip(batch, results):
+                status = _ladder_child_status(child_result)
+                child_record: Dict[str, Any] = {
+                    "client_order_id": str(child_in.get("client_order_id") or ""),
+                    "status": status,
                     "quantity": str(child_in.get("quantity") or ""),
                     "price": str(child_in.get("price") or ""),
-                    "message": "MEXC returned no per-child result.",
-                })
-                unknown_count += 1
-        record["status"] = "ACCEPTED" if (rejected_count + unknown_count == 0) else "PARTIAL"
-        record["accepted_vwap"] = (
-            (accepted_notional_batch / accepted_qty_batch) if accepted_qty_batch > 0 else None
-        )
-        batch_records.append(record)
-        accepted_qty += accepted_qty_batch
-        accepted_notional += accepted_notional_batch
-        # If MEXC returned any rejected child reasons, surface the latest one.
-        if not exchange_reason:
-            for child_result in results:
-                if isinstance(child_result, Mapping) and child_result.get("msg"):
-                    exchange_reason = str(child_result.get("msg"))
-                    break
+                }
+                if isinstance(child_result, Mapping):
+                    if child_result.get("orderId") is not None:
+                        child_record["exchange_order_id"] = str(child_result.get("orderId"))
+                    if child_result.get("code") is not None:
+                        child_record["error_code"] = child_result.get("code")
+                    if child_result.get("msg") is not None:
+                        child_record["message"] = str(child_result.get("msg"))
+                record["child_results"].append(child_record)
+                if status == "ACCEPTED":
+                    accepted_count += 1
+                    try:
+                        q = Decimal(str(child_in.get("quantity") or "0"))
+                        p = Decimal(str(child_in.get("price") or "0"))
+                    except Exception:  # noqa: BLE001
+                        q = Decimal("0")
+                        p = Decimal("0")
+                    accepted_qty_batch += q
+                    accepted_notional_batch += q * p
+                    order_id = child_result.get("orderId") if isinstance(child_result, Mapping) else None
+                    if order_id is not None:
+                        record["exchange_order_ids"].append(str(order_id))
+                        accepted_order_ids.append(str(order_id))
+                elif status == "REJECTED":
+                    rejected_count += 1
+                else:
+                    unknown_count += 1
+            # End of per-child loop. Anything below runs once per batch.
+            if len(results) < len(batch):
+                for child_in in batch[len(results):]:
+                    record["child_results"].append({
+                        "client_order_id": str(child_in.get("client_order_id") or ""),
+                        "status": "UNKNOWN",
+                        "quantity": str(child_in.get("quantity") or ""),
+                        "price": str(child_in.get("price") or ""),
+                        "message": "MEXC returned no per-child result.",
+                    })
+                    unknown_count += 1
+            record["status"] = "ACCEPTED" if (rejected_count + unknown_count == 0) else "PARTIAL"
+            record["accepted_vwap"] = (
+                (accepted_notional_batch / accepted_qty_batch) if accepted_qty_batch > 0 else None
+            )
+            batch_records.append(record)
+            accepted_qty += accepted_qty_batch
+            accepted_notional += accepted_notional_batch
+            # If MEXC returned any rejected child reasons, surface the latest one.
+            if not exchange_reason:
+                for child_result in results:
+                    if isinstance(child_result, Mapping) and child_result.get("msg"):
+                        exchange_reason = str(child_result.get("msg"))
+                        break
 
     # Children in batches not attempted (after stopped_early) → NOT_ATTEMPTED.
     attempted_total = sum(len(r["children_attempted"]) for r in batch_records)
     not_attempted_count = requested_order_count - attempted_total
+
+    # PERSIST-AFTER-ALL-BATCHES. Update the durable record with the
+    # final per-child submission_classification so a gateway restart
+    # can still load the execution and reconcile the exact original
+    # client IDs.
+    try:
+        # Build a {client_order_id: classification} map from the run.
+        cid_class: Dict[str, str] = {}
+        for rec in batch_records:
+            for child_res in rec.get("child_results", []) or []:
+                if not isinstance(child_res, Mapping):
+                    continue
+                cid = str(child_res.get("client_order_id") or "")
+                if cid:
+                    cid_class[cid] = str(child_res.get("status") or "UNKNOWN")
+        persisted = _ladder_load_record(credentials["account"], execution_id)
+        if persisted is None:
+            persisted = dict(durable_record)
+        for child in persisted.get("children", []) or []:
+            if not isinstance(child, dict):
+                continue
+            cid = str(child.get("client_order_id") or "")
+            if cid in cid_class:
+                child["submission_classification"] = cid_class[cid]
+            else:
+                child["submission_classification"] = "NOT_ATTEMPTED"
+        persisted["updated_at"] = int(time.time())
+        if stopped_early:
+            persisted["submission_state"] = "STOPPED_EARLY"
+        elif rejected_count == 0 and unknown_count == 0:
+            persisted["submission_state"] = "ACCEPTED"
+        elif rejected_count > 0 and unknown_count == 0:
+            persisted["submission_state"] = "PARTIAL_REJECTED"
+        else:
+            persisted["submission_state"] = "PARTIAL_UNKNOWN"
+        _ladder_persist_atomic(
+            _ladder_record_path(credentials["account"], execution_id), persisted,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).error(
+            "ladder_persist_post_failed account=%s execution_id=%s err=%s",
+            credentials["account"], execution_id, sanitize_error_message(str(exc)),
+        )
 
     # Reconciliation: re-read open orders to match accepted/unknown children
     # by newClientOrderId. Read-only GET; no automatic retry or cancel.
@@ -1039,24 +1707,57 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     partial = accepted_qty < requested_volume or rejected_count > 0 or unknown_count > 0 or stopped_early
     success = (not stopped_early) and rejected_count == 0 and unknown_count == 0 and not_attempted_count == 0
 
-    ladder_result = CanonicalLadderResult(
-        symbol=symbol,
-        side=side,
-        distribution=str(request.get("distribution") or "ladder"),
-        requested_order_count=requested_order_count,
-        submitted_order_count=accepted_count,
-        requested_volume=_format_decimal(requested_volume),
-        submitted_volume=_format_decimal(accepted_qty),
-        batch_count=len(batches),
-        verified=bool(success and accepted_count == requested_order_count),
-        partial=partial,
-        status="success" if success else ("partial" if partial else "unknown"),
-        accepted_child_count=accepted_count,
-        omitted_order_count=rejected_count + unknown_count + not_attempted_count,
-        child_order_ids=list(accepted_order_ids),
-        batches=batch_records,
-        exchange_reason=exchange_reason,
-    )
+    # Phase 5: wrap CanonicalLadderResult construction in try/except so a
+    # local serialization/schema failure cannot silently convert the result
+    # into a retry-safe generic failure. If construction raises, we still
+    # surface the ladder's batch records and child client_order_ids so the
+    # user can reconcile via openOrders/allOrders.
+    try:
+        ladder_result = CanonicalLadderResult(
+            symbol=symbol,
+            side=side,
+            distribution=str(request.get("distribution") or "ladder"),
+            requested_order_count=requested_order_count,
+            submitted_order_count=accepted_count,
+            requested_volume=_format_decimal(requested_volume),
+            submitted_volume=_format_decimal(accepted_qty),
+            batch_count=len(batches),
+            verified=bool(success and accepted_count == requested_order_count),
+            partial=partial,
+            status="success" if success else ("partial" if partial else "unknown"),
+            accepted_child_count=accepted_count,
+            omitted_order_count=rejected_count + unknown_count + not_attempted_count,
+            child_order_ids=list(accepted_order_ids),
+            batches=batch_records,
+            exchange_reason=exchange_reason,
+        )
+        serialization_failed = False
+    except Exception as exc:  # noqa: BLE001
+        # Build a safe-failure CanonicalLadderResult using ONLY fields that
+        # have been part of the live contract for many commits. This must
+        # never silently swallow the batch_records (which carry the
+        # child client_order_ids needed for reconciliation).
+        ladder_result = CanonicalLadderResult(
+            symbol=symbol,
+            side=side,
+            distribution=str(request.get("distribution") or "ladder"),
+            requested_order_count=requested_order_count,
+            submitted_order_count=accepted_count,
+            requested_volume=_format_decimal(requested_volume),
+            submitted_volume=_format_decimal(accepted_qty),
+            batch_count=len(batches),
+            verified=False,
+            partial=True,
+            status="serialization_failed",
+            accepted_child_count=accepted_count,
+            omitted_order_count=rejected_count + unknown_count + not_attempted_count,
+            child_order_ids=list(accepted_order_ids),
+            batches=batch_records,
+            exchange_reason=(
+                f"RESULT_SERIALIZATION_FAILED: {sanitize_error_message(str(exc))}"
+            ),
+        )
+        serialization_failed = True
     # Stash the accepted/accepted-vwap/planned-vwap in data for the wizard.
     data = {
         "planned_child_count": requested_order_count,
@@ -1066,6 +1767,8 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         "rejected": rejected_count,
         "unknown": unknown_count,
         "not_attempted": not_attempted_count,
+        "execution_id": execution_id,
+        "submission_state": durable_record.get("submission_state"),
         "child_results": [
             dict(child)
             for batch in batch_records
@@ -1503,6 +2206,10 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _cancel_orders(account, request)
     if op == "ladder":
         return _ladder(account, request)
+    if op == "ladder_reconcile":
+        return _execute_reconcile_batch(account, request)
+    if op == "ladder_list_unresolved":
+        return _execute_list_unresolved(account)
     if op in {"cancel_order_group", "cancel_order"}:
         return _unsupported(op, account)
     return make_failure(
@@ -1514,4 +2221,93 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     )
 
 
-__all__ = ["name", "list_accounts", "capabilities", "execute"]
+def _execute_reconcile_batch(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Read-only GET bridge: reconcile_batch via the standard execute() entry.
+
+    Never POSTs / DELETEs. Only GETs openOrders + allOrders + single-order.
+    """
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not symbol:
+        return make_failure(
+            operation="ladder_reconcile",
+            exchange=name,
+            account=account,
+            code="MISSING_SYMBOL",
+            message="reconcile requires `symbol`.",
+        )
+    expected = list(request.get("expected_client_order_ids") or [])
+    if not expected:
+        return make_failure(
+            operation="ladder_reconcile",
+            exchange=name,
+            account=account,
+            code="MISSING_EXPECTED_IDS",
+            message="reconcile requires `expected_client_order_ids`.",
+        )
+    known = list(request.get("known_exchange_order_ids") or [])
+    exec_id = request.get("execution_id")
+    try:
+        rows = reconcile_batch(
+            account=account,
+            symbol=symbol,
+            expected_client_order_ids=expected,
+            known_exchange_order_ids=known,
+            execution_id=exec_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="ladder_reconcile",
+            exchange=name,
+            account=account,
+            code="MEXC_SPOT_RECONCILE_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    by_class: Dict[str, int] = {}
+    for r in rows:
+        by_class[str(r.get("classification") or "NOT_FOUND")] = by_class.get(str(r.get("classification") or "NOT_FOUND"), 0) + 1
+    if isinstance(exec_id, str) and exec_id:
+        try:
+            update_ladder_reconciliation(account, exec_id, rows)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "ladder_reconcile_update_failed account=%s execution_id=%s",
+                account, exec_id,
+            )
+    return make_success(
+        operation="ladder_reconcile",
+        exchange=name,
+        account=account,
+        data={
+            "rows": rows,
+            "summary": by_class,
+            "execution_id": exec_id,
+        },
+    )
+
+
+def _execute_list_unresolved(account: str) -> CanonicalResponse:
+    """Read-only bridge: list unresolved ladder records for an account."""
+    try:
+        records = list_unresolved_ladders(account)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation="ladder_list_unresolved",
+            exchange=name,
+            account=account,
+            code="MEXC_SPOT_LIST_UNRESOLVED_FAILED",
+            message=sanitize_error_message(str(exc)),
+        )
+    return make_success(
+        operation="ladder_list_unresolved",
+        exchange=name,
+        account=account,
+        data={"records": records, "count": len(records)},
+    )
+
+
+__all__ = [
+    "name", "list_accounts", "capabilities", "execute",
+    # Read-only helpers usable by the wizard and tests.
+    "reconcile_batch", "list_unresolved_ladders", "update_ladder_reconciliation",
+    "_ladder_new_execution_id", "_ladder_new_client_order_id",
+]
