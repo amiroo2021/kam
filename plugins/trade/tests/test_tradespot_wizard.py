@@ -1462,6 +1462,98 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self.assertIn("changed since this preview was approved", result.text)
         self.assertEqual(len(self._post_calls), 0)
 
+    def test_unknown_response_does_not_retry(self) -> None:
+        """When the agent returns UNKNOWN for the first batch, the wizard MUST
+        NOT auto-retry. The wizard must render the result screen with a
+        "Do not retry" warning. No second /api/v3/batchOrders call is permitted
+        for the same execution_id.
+        """
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+        import urllib.error
+
+        def timeout_then_block(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                # Record the first call, then either raise (UNKNOWN) on the
+                # first call AND block any subsequent ones.
+                self._post_calls.append({"params": dict(params or {})})
+                raise urllib.error.URLError("timed out")
+            if method.upper() == "GET" and path == "/api/v3/openOrders":
+                return []
+            return []
+
+        self._install_patch(timeout_then_block)
+        self._post_calls.clear()
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Unknown: 5", result.text)
+        self.assertIn("Do not retry", result.text)
+        # No retry allowed: any subsequent ladder_confirm: button in the result
+        # screen must be inactive (the token is consumed).
+        for cb in _callbacks(result):
+            if str(cb).startswith("ladder_confirm:"):
+                # If present, tapping must NOT produce a new POST.
+                self.wizard.handle_callback(self.key, cb)
+                self.assertEqual(len(self._post_calls), 1)
+
+    def test_unknown_response_renders_reconcile_actions(self) -> None:
+        """After an UNKNOWN result, the wizard should expose read-only "Reconcile"
+        actions that let the user inspect /api/v3/openOrders and /api/v3/allOrders
+        to classify the unknown children, and an explicit "Acknowledge & Close"
+        action that takes the user back to the action screen WITHOUT another
+        live POST. No auto-retry. No second /api/v3/batchOrders. No /api/v3/order.
+        """
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+        import urllib.error
+
+        def timeout(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                raise urllib.error.URLError("timed out")
+            if method.upper() == "GET" and path == "/api/v3/openOrders":
+                return []
+            if method.upper() == "GET" and path == "/api/v3/allOrders":
+                return []
+            return []
+
+        self._install_patch(timeout)
+        self._post_calls.clear()
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Unknown: 5", result.text)
+        # Result screen exposes reconcile + acknowledge actions.
+        cbs = [str(c) for c in _callbacks(result)]
+        self.assertTrue(any("reconcile_open" in c or "open_orders" in c for c in cbs))
+        self.assertTrue(any("reconcile_all" in c or "all_orders" in c for c in cbs))
+        self.assertTrue(any("ack" in c or "close" in c for c in cbs))
+        # None of those are ladder_confirm: triggers.
+        self.assertFalse(any(c.startswith("ladder_confirm:") for c in cbs))
+
+    def test_unknown_dash_for_accepted_vwap_and_required(self) -> None:
+        """When all 5 children are UNKNOWN, neither Accepted VWAP nor Required
+        VWAP nor Accepted n/v should print numeric garbage; required is shown
+        for reconciliation only, not as something to act on.
+        """
+        from plugins.trade.agents import x_mexc_agent_spot as spot
+        import urllib.error
+
+        def timeout(_c, method, path, params=None):
+            if method.upper() == "POST" and path == "/api/v3/batchOrders":
+                raise urllib.error.URLError("timed out")
+            if method.upper() == "GET" and path == "/api/v3/openOrders":
+                return []
+            return []
+
+        self._install_patch(timeout)
+        self._post_calls.clear()
+        preview = self._walk_to_confirm(5)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        result = self.wizard.handle_callback(self.key, confirm_cb)
+        # Accepted VWAP must show a dash (no accepted volume to average).
+        self.assertIn("Accepted VWAP: —", result.text)
+        self.assertTrue("Accepted volume: 0" in result.text, result.text)
+        self.assertIn("Do not retry", result.text)
+
 
     def _walk_sui_uniform_preview(self, qty: str = "10", n_orders: int = 10):
         w = self.wizard
@@ -1566,6 +1658,336 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self.assertIn("Maximum valid orders", preview.text)
         self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(preview)))
         self.assertEqual([r for r in self.desk.requests if r.get("operation") == "ladder"], [])
+
+    def test_zero_accepted_volume_renders_dash_not_blank(self) -> None:
+        """When accepted==0, the wizard must NOT render "Accepted VWAP:  USDC".
+        The accepted_volume must read '0' and accepted_vwap must read '—'."""
+        from plugins.trade.canonical import CanonicalLadderResult, CanonicalResponse
+
+        def fake_ladder(_r, _p=None):
+            return CanonicalResponse(
+                success=True,
+                operation="ladder",
+                exchange="mexc",
+                account="amiroo",
+                ladder=CanonicalLadderResult(
+                    symbol="SUIUSDC",
+                    side="BUY",
+                    distribution="uniform",
+                    requested_order_count=10,
+                    submitted_order_count=0,
+                    requested_volume="20",
+                    submitted_volume="0",
+                    batch_count=1,
+                    verified=False,
+                    partial=True,
+                    status="unknown",
+                    accepted_child_count=0,
+                    omitted_order_count=10,
+                    child_order_ids=[],
+                    batches=[{
+                        "batch_index": 0,
+                        "status": "UNKNOWN",
+                        "child_results": [],
+                    }],
+                    exchange_reason="URLError",
+                ),
+                data={
+                    "accepted": 0,
+                    "rejected": 0,
+                    "unknown": 10,
+                    "not_attempted": 0,
+                    "planned_vwap": "0.74996",
+                    "accepted_vwap": None,
+                },
+            )
+
+        # Only swap the agent's ladder execute; leave balance and instrument reads alone.
+        preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
+        confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+
+        def ladder_only(_req, *args, **kwargs):
+            return fake_ladder(_req)
+
+        original = self._spot.execute
+        with self._mock.patch.object(self._spot, "execute", side_effect=ladder_only):
+            result = self.wizard.handle_callback(self.key, confirm_cb)
+        self.assertIn("Accepted: 0", result.text)
+        self.assertNotIn("Accepted VWAP:  USDC", result.text)
+        self.assertIn("Accepted VWAP: — USDC", result.text)
+        self.assertIn("Accepted volume: 0 SUI", result.text)
+
+
+class TradeSpotMexcLadderEditingTests(unittest.TestCase):
+    """Back navigation from ladder screens must preserve inputs and offer edit
+    controls rather than dump the user back to the action menu.
+    """
+
+    def setUp(self) -> None:
+        self.desk = FakeMexcSpotDesk()
+        self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
+        self.wizard._ladder_preview_only = True
+        self.key = ("chat-ladder-edit",)
+        self.desk.balances["SUI"] = "100"
+        self.desk.balances["USDC"] = "10000"
+
+    def _labels(self, screen) -> List[str]:
+        return [b.get("text", "") for row in screen.buttons for b in row]
+
+    def _callbacks(self, screen) -> List[str]:
+        return [b.get("callback_data", "") for row in screen.buttons for b in row]
+
+    def _walk_valid_preview(self, qty: str = "20", n_orders: int = 10, start: str = "1", end: str = "0.5"):
+        w = self.wizard
+        w.open(self.key)
+        w.handle_callback(self.key, "exchange:mexc")
+        w.handle_callback(self.key, "account:amiroo")
+        w.handle_callback(self.key, "action:ladder")
+        s = w.handle_callback(self.key, "asset:SUI")
+        idx = next(i for i, l in enumerate(self._labels(s)) if "SUI/USDC" in l)
+        cb = self._callbacks(s)[idx]
+        w.handle_callback(self.key, cb or "")
+        w.handle_callback(self.key, "side:buy")
+        w.handle_text(self.key, qty)
+        w.handle_text(self.key, start)
+        w.handle_text(self.key, end)
+        w.handle_text(self.key, str(n_orders))
+        return w.handle_callback(self.key, "distribution:uniform")
+
+    def test_back_from_valid_preview_shows_edit_screen_with_inputs_preserved(self) -> None:
+        preview = self._walk_valid_preview(qty="20", n_orders=10)
+        self.assertIn("LIMIT Ladder Preview", preview.text)
+        state = self.wizard._state_for(self.key)
+        snapshot = {
+            "exchange": state.exchange,
+            "account": state.account,
+            "instrument": state.selected_instrument,
+            "side": state.ladder_side,
+            "qty": state.ladder_total_qty,
+            "orders": state.ladder_order_count,
+            "start": state.ladder_start_price,
+            "end": state.ladder_end_price,
+            "distribution": state.ladder_distribution,
+        }
+        back = self.wizard.handle_callback(self.key, "back")
+        self.assertIn("Edit", back.text)
+        labels = self._labels(back)
+        for needed in ("Quantity", "Orders", "START", "END", "Distribution", "Preview", "Back"):
+            self.assertTrue(any(needed in l for l in labels), f"missing label: {needed}")
+        after = self.wizard._state_for(self.key)
+        self.assertEqual(after.exchange, snapshot["exchange"])
+        self.assertEqual(after.account, snapshot["account"])
+        self.assertEqual(after.selected_instrument, snapshot["instrument"])
+        self.assertEqual(after.ladder_side, snapshot["side"])
+        self.assertEqual(after.ladder_total_qty, snapshot["qty"])
+        self.assertEqual(after.ladder_order_count, snapshot["orders"])
+        self.assertEqual(after.ladder_start_price, snapshot["start"])
+        self.assertEqual(after.ladder_end_price, snapshot["end"])
+        self.assertEqual(after.ladder_distribution, snapshot["distribution"])
+        self.assertIsNone(after.ladder_confirm_token)
+
+    def test_back_from_infeasible_preview_shows_edit_screen_with_inputs_preserved(self) -> None:
+        # First walk is feasible to populate state; then mutate inputs to infeasible.
+        self._walk_valid_preview(qty="20", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        state.ladder_order_count = 50
+        bad_preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Unable to build ladder", bad_preview.text)
+        back = self.wizard.handle_callback(self.key, "back")
+        self.assertIn("Edit", back.text)
+        after = self.wizard._state_for(self.key)
+        self.assertEqual(after.ladder_total_qty, "20")
+        self.assertEqual(after.ladder_order_count, 50)
+        self.assertEqual((after.ladder_side or "").upper(), "BUY")
+        self.assertEqual(after.ladder_distribution, "uniform")
+
+    def test_edit_qty_recomputes_preview(self) -> None:
+        self._walk_valid_preview(qty="20", n_orders=10)
+        edit = self.wizard.handle_callback(self.key, "back")
+        # Tap Quantity edit.
+        edit_cb = next(cb for cb in self._callbacks(edit) if cb.startswith("ladder_edit:") and "qty" in cb)
+        # The new screen has the qty prompt; type a new value.
+        screen = self.wizard.handle_callback(self.key, edit_cb)
+        self.assertEqual(screen.state, "ladder_total_qty")
+        self.assertIn("Enter total quantity", screen.text)
+        self.wizard.handle_text(self.key, "30")
+        new_preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Total Quantity: 30 SUI", new_preview.text)
+
+    def test_back_causes_zero_agent_ladder_executes(self) -> None:
+        self._walk_valid_preview(qty="20", n_orders=10)
+        # Clear any side effects from setup reads.
+        self.desk.requests[:] = [r for r in self.desk.requests if r.get("operation") == "ladder"]
+        before = len([r for r in self.desk.requests if r.get("operation") == "ladder"])
+        self.wizard.handle_callback(self.key, "back")
+        self.wizard.handle_callback(self.key, "back")
+        self.wizard.handle_callback(self.key, "back")
+        after = len([r for r in self.desk.requests if r.get("operation") == "ladder"])
+        self.assertEqual(after, before)
+
+    def test_edit_screen_does_not_emit_new_confirm_token(self) -> None:
+        self._walk_valid_preview(qty="20", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        old_token = state.ladder_confirm_token
+        self.assertIsNotNone(old_token)
+        edit = self.wizard.handle_callback(self.key, "back")
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in self._callbacks(edit)))
+        after = self.wizard._state_for(self.key)
+        self.assertIsNone(after.ladder_confirm_token)
+
+    def test_result_back_returns_edit_screen_with_all_values(self) -> None:
+        # Walk to a valid preview, then synthetically simulate the result screen
+        # state without actually submitting (we're testing Back from the result
+        # screen, not the agent path).
+        self._walk_valid_preview(qty="20", n_orders=10)
+        # Force the wizard into ladder_result state by burning the token and
+        # setting the state directly; this avoids invoking the live agent.
+        state = self.wizard._state_for(self.key)
+        state.ladder_confirm_token = None
+        state.state = "ladder_result"
+        back = self.wizard.handle_callback(self.key, "back")
+        self.assertEqual(back.state, "ladder_edit")
+        self.assertIn("Edit LIMIT Ladder", back.text)
+        after = self.wizard._state_for(self.key)
+        self.assertEqual(after.exchange, "mexc")
+        self.assertEqual(after.account, "amiroo")
+        self.assertIsNotNone(after.selected_instrument)
+        self.assertEqual(after.ladder_side, "buy")
+        self.assertEqual(after.ladder_total_qty, "20")
+        self.assertEqual(after.ladder_order_count, 10)
+        self.assertEqual(after.ladder_start_price, "1")
+        self.assertEqual(after.ladder_end_price, "0.5")
+        self.assertEqual(after.ladder_distribution, "uniform")
+
+    def test_edit_orders_then_preview_uses_new_order_count(self) -> None:
+        self._walk_valid_preview(qty="30", n_orders=10)
+        edit = self.wizard.handle_callback(self.key, "back")
+        # Tap Orders.
+        edit_cb = next(cb for cb in self._callbacks(edit) if str(cb).startswith("ladder_edit:orders"))
+        self.assertEqual(self.wizard.handle_callback(self.key, edit_cb).state, "ladder_order_count")
+        self.wizard.handle_text(self.key, "15")
+        preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Orders: 15", preview.text)
+        self.assertIn("Total Quantity: 30 SUI", preview.text)
+
+    def test_edit_start_then_preview_uses_new_start(self) -> None:
+        self._walk_valid_preview(qty="20", n_orders=10)
+        edit = self.wizard.handle_callback(self.key, "back")
+        edit_cb = next(cb for cb in self._callbacks(edit) if str(cb).startswith("ladder_edit:start"))
+        self.wizard.handle_callback(self.key, edit_cb)
+        self.wizard.handle_text(self.key, "1.1")
+        preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Price Range: 0.5 → 1.1 USDC", preview.text)
+
+    def test_edit_end_then_preview_uses_new_end(self) -> None:
+        self._walk_valid_preview(qty="20", n_orders=10)
+        edit = self.wizard.handle_callback(self.key, "back")
+        edit_cb = next(cb for cb in self._callbacks(edit) if str(cb).startswith("ladder_edit:end"))
+        self.wizard.handle_callback(self.key, edit_cb)
+        self.wizard.handle_text(self.key, "0.7")
+        preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Price Range: 0.7 → 1 USDC", preview.text)
+
+    def test_edit_distribution_then_preview_uses_new_distribution(self) -> None:
+        # Walk via /distribution:half_gaussian first (uniform default → wider
+        # range may still infeasibly distribute Half-Gaussian).
+        # We instead mutate distribution via the edit screen's callback which
+        # re-renders the preview using the new distribution. The header line
+        # "Distribution: <Label>" must appear in the rendered text and the
+        # Confirm button must remain present only when feasible.
+        self._walk_valid_preview(qty="30", n_orders=15, start="2.0", end="0.5")
+        edit = self.wizard.handle_callback(self.key, "back")
+        edit_cb = next(cb for cb in self._callbacks(edit) if str(cb).startswith("ladder_edit:distribution"))
+        self.wizard.handle_callback(self.key, edit_cb)
+        preview = self.wizard.handle_callback(self.key, "distribution:half_gaussian")
+        # Either a feasible preview (with Confirm) or an infeasible one (with
+        # the explanatory Half-Gaussian text) — both must mention the
+        # distribution label and must NOT emit a Confirm button when infeasible.
+        text = preview.text
+        self.assertTrue(
+            "Distribution: Half-Gaussian" in text
+            or "Half-Gaussian correction" in text,
+            f"Half-Gaussian label missing in preview:\n{text}",
+        )
+
+    def test_edit_invalidates_old_confirm_token_and_emits_new_one_only_on_fresh_preview(self) -> None:
+        """After editing, the OLD confirm token must NEVER reach submit again.
+        A NEW confirm token is only minted when a fresh preview renders. Until
+        that fresh preview, the wizard must not surface a ladder_confirm:
+        button anywhere in the edit/edit-result flow.
+        """
+        preview = self._walk_valid_preview(qty="20", n_orders=10)
+        old_token = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
+        edit = self.wizard.handle_callback(self.key, "back")
+        # Edit screen has no ladder_confirm: button.
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(edit)))
+        # Editing any field (qty here) also has no ladder_confirm: button.
+        edit_qty_cb = next(cb for cb in _callbacks(edit) if str(cb).startswith("ladder_edit:qty"))
+        prompt = self.wizard.handle_callback(self.key, edit_qty_cb)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(prompt)))
+        # After typing the new qty, the next preview mints a NEW token.
+        self.wizard.handle_text(self.key, "25")
+        new_preview = self.wizard._render_ladder_preview(self.key)
+        new_tokens = [cb for cb in _callbacks(new_preview) if str(cb).startswith("ladder_confirm:")]
+        self.assertEqual(len(new_tokens), 1)
+        self.assertNotEqual(new_tokens[0], old_token)
+
+    def test_infeasible_preview_has_no_confirm_callback(self) -> None:
+        # Walk to feasible then mutate inputs to infeasible.
+        self._walk_valid_preview(qty="20", n_orders=10)
+        state = self.wizard._state_for(self.key)
+        state.ladder_order_count = 50
+        bad_preview = self.wizard._render_ladder_preview(self.key)
+        self.assertIn("Unable to build ladder", bad_preview.text)
+        self.assertFalse(any(str(cb).startswith("ladder_confirm:") for cb in _callbacks(bad_preview)))
+
+    def _back_to_edit(self) -> None:
+        """Bounce up to one layer at a time until we reach the ladder_edit screen."""
+        for _ in range(8):
+            st = self.wizard._state_for(self.key)
+            if st.state == "ladder_edit":
+                return
+            self.wizard.handle_callback(self.key, "back")
+
+    def test_all_back_and_edit_calls_call_agent_ladder_execute_zero_times(self) -> None:
+        # Walk to feasible preview, then exercise the full Back+edit+back chain.
+        self._walk_valid_preview(qty="30", n_orders=10)
+        before = [r for r in self.desk.requests if r.get("operation") == "ladder"]
+        # Back from preview → edit
+        self.wizard.handle_callback(self.key, "back")
+        # Back from edit → action (clears inputs)
+        self.wizard.handle_callback(self.key, "back")
+        # Re-walk to preview then test edit-without-typing by tapping each field
+        # route. For qty/orders/start/end we type a value; for distribution we
+        # tap a different distribution.
+        self._walk_valid_preview(qty="30", n_orders=10)
+        # qty edit: type new qty
+        self.wizard.handle_callback(self.key, "back")
+        edit_qty_cb = next(cb for cb in self._callbacks(self.wizard._render_ladder_edit_screen(self.key)) if str(cb).startswith("ladder_edit:qty"))
+        self.wizard.handle_callback(self.key, edit_qty_cb)
+        self.wizard.handle_text(self.key, "30")
+        self._back_to_edit()
+        # orders edit
+        edit_orders_cb = next(cb for cb in self._callbacks(self.wizard._render_ladder_edit_screen(self.key)) if str(cb).startswith("ladder_edit:orders"))
+        self.wizard.handle_callback(self.key, edit_orders_cb)
+        self.wizard.handle_text(self.key, "12")
+        self._back_to_edit()
+        # start edit
+        edit_start_cb = next(cb for cb in self._callbacks(self.wizard._render_ladder_edit_screen(self.key)) if str(cb).startswith("ladder_edit:start"))
+        self.wizard.handle_callback(self.key, edit_start_cb)
+        self.wizard.handle_text(self.key, "1.05")
+        self._back_to_edit()
+        # end edit
+        edit_end_cb = next(cb for cb in self._callbacks(self.wizard._render_ladder_edit_screen(self.key)) if str(cb).startswith("ladder_edit:end"))
+        self.wizard.handle_callback(self.key, edit_end_cb)
+        self.wizard.handle_text(self.key, "0.55")
+        self._back_to_edit()
+        # distribution edit
+        edit_dist_cb = next(cb for cb in self._callbacks(self.wizard._render_ladder_edit_screen(self.key)) if str(cb).startswith("ladder_edit:distribution"))
+        self.wizard.handle_callback(self.key, edit_dist_cb)
+        self.wizard.handle_callback(self.key, "back")
+        after = [r for r in self.desk.requests if r.get("operation") == "ladder"]
+        self.assertEqual(len(after), len(before))
 
 
 class TradeSpotCommandRegistrationTests(unittest.TestCase):

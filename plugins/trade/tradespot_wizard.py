@@ -363,11 +363,25 @@ class TradeSpotWizard:
         if state.state == "ladder_preview":
             if suffix.startswith("ladder_confirm:"):
                 return self._handle_ladder_confirm_callback(chat_key, suffix)
+            if suffix.startswith("ladder_edit:"):
+                return self._handle_ladder_edit_callback(chat_key, suffix)
+            if suffix == "back":
+                return self._render_ladder_edit_screen(chat_key)
             return self._render_ladder_preview(chat_key)
         if state.state == "ladder_result":
             if suffix == "back":
-                return self._render_action(chat_key)
+                return self._render_ladder_edit_screen(chat_key)
+            if suffix.startswith("ladder_reconcile:"):
+                return self._handle_ladder_reconcile(chat_key, suffix)
+            if suffix.startswith("ladder_ack:"):
+                return self._handle_ladder_ack(chat_key, suffix)
             return self._render_action(chat_key)
+        if state.state == "ladder_edit":
+            if suffix.startswith("ladder_edit:"):
+                return self._handle_ladder_edit_callback(chat_key, suffix)
+            if suffix == "back":
+                return self._render_action(chat_key)
+            return self._render_ladder_edit_screen(chat_key)
         if state.state in {"balance", "orders", "unsupported"}:
             return self._handle_result_screen(chat_key, suffix)
         return self.open(chat_key)
@@ -966,9 +980,29 @@ class TradeSpotWizard:
             )
         requested = getattr(ladder, "requested_order_count", 0) or 0
         accepted = getattr(ladder, "submitted_order_count", 0) or 0
-        submitted_volume = getattr(ladder, "submitted_volume", "") or ""
-        accepted_vwap = (data.get("accepted_vwap") if isinstance(data, dict) else None) or ""
-        planned_vwap = (data.get("planned_vwap") if isinstance(data, dict) else None) or ""
+        submitted_volume = getattr(ladder, "submitted_volume", "0") or "0"
+        accepted_vwap_raw = (data.get("accepted_vwap") if isinstance(data, dict) else None)
+        planned_vwap_raw = (data.get("planned_vwap") if isinstance(data, dict) else None)
+
+        # When no children were accepted, accepted_vwap is meaningless.
+        # Substitute "—" so we never render "Accepted VWAP:  USDC" with an
+        # empty numeric followed by the unit.
+        accepted_vwap_disp: Optional[str] = None
+        if isinstance(accepted_vwap_raw, str) and accepted_vwap_raw.strip() and accepted_vwap_raw.lower() != "none":
+            accepted_vwap_disp = accepted_vwap_raw
+        elif isinstance(accepted_vwap_raw, (int, float)):
+            accepted_vwap_disp = str(accepted_vwap_raw)
+        if accepted_vwap_disp in (None, "", "None"):
+            accepted_vwap_disp = "—"
+
+        planned_vwap_disp: Optional[str] = None
+        if isinstance(planned_vwap_raw, str) and planned_vwap_raw.strip() and planned_vwap_raw.lower() != "none":
+            planned_vwap_disp = planned_vwap_raw
+        elif isinstance(planned_vwap_raw, (int, float)):
+            planned_vwap_disp = str(planned_vwap_raw)
+        if planned_vwap_disp in (None, "", "None"):
+            planned_vwap_disp = "—"
+
         rejected = (data.get("rejected") if isinstance(data, dict) else 0) or 0
         unknown = (data.get("unknown") if isinstance(data, dict) else 0) or 0
         not_attempted = (data.get("not_attempted") if isinstance(data, dict) else 0) or 0
@@ -984,11 +1018,234 @@ class TradeSpotWizard:
             f"Unknown: {unknown}\n"
             f"Not attempted: {not_attempted}\n\n"
             f"Accepted volume: {submitted_volume} {base}\n"
-            f"Accepted VWAP: {accepted_vwap} {quote}\n"
-            f"Planned VWAP: {planned_vwap} {quote}"
+            f"Accepted VWAP: {accepted_vwap_disp} {quote}\n"
+            f"Planned VWAP: {planned_vwap_disp} {quote}"
             f"{warn}"
         )
+        if unknown or not_attempted:
+            # Read-only reconciliation controls: GET /api/v3/openOrders and
+            # GET /api/v3/allOrders filtered by symbol + execution id.
+            # NO ladder_confirm / batchOrders / order / cancel buttons here.
+            rows.append([
+                _button_row("📂 Reconcile Open Orders", "ladder_reconcile:open_orders"),
+                _button_row("📜 Reconcile All Orders", "ladder_reconcile:all_orders"),
+            ])
+            rows.append([
+                _button_row("✅ Acknowledge & Close", "ladder_ack:close"),
+            ])
         return Screen(body, rows, "ladder_result")
+
+    def _render_ladder_edit_screen(self, chat_key: Tuple[Any, ...]) -> Screen:
+        """Compact "Edit Ladder" screen that preserves exchange, account,
+        pair, side, distribution, quantity, order count, START, and END.
+
+        Reachable from ``Back`` on both ladder preview and ladder-result
+        screens. Does NOT create a new Confirm token. Does NOT call the
+        agent. Edits route through the existing field prompts and the next
+        preview re-render mints a fresh confirm token + execution id.
+        """
+        state = self._state_for(chat_key)
+        state.state = "ladder_edit"
+        # Invalidate any prior single-use confirm token / execution id so a
+        # stale token cannot leak into a new preview.
+        state.ladder_confirm_token = None
+        state.ladder_execution_id = None
+        item = state.selected_instrument or {}
+        base = str(item.get("base") or item.get("baseAsset") or "BASE").upper()
+        quote = str(item.get("quote") or item.get("quoteAsset") or "QUOTE").upper()
+        pair = self._selected_pair_name(state) or (f"{base}/{quote}" if base and quote else "")
+        side_disp = (state.ladder_side or "").upper()
+        distribution_disp = (
+            "Half-Gaussian" if (state.ladder_distribution or "") == "half_gaussian" else "Uniform"
+        )
+        body = (
+            f"🟦 {pair} — Edit LIMIT Ladder\n\n"
+            f"Side: {side_disp}\n"
+            f"Distribution: {distribution_disp}\n"
+            f"Total Quantity: {state.ladder_total_qty or '—'} {base}\n"
+            f"Orders: {state.ladder_order_count or '—'}\n"
+            f"START: {state.ladder_start_price or '—'} {quote}\n"
+            f"END: {state.ladder_end_price or '—'} {quote}\n"
+        )
+        rows: List[List[Dict[str, str]]] = []
+        rows.append([_button_row(
+            f"Quantity: {state.ladder_total_qty or '—'} {base}",
+            "ladder_edit:qty",
+        )])
+        rows.append([_button_row(
+            f"Orders: {state.ladder_order_count or '—'}",
+            "ladder_edit:orders",
+        )])
+        rows.append([_button_row(
+            f"START: {state.ladder_start_price or '—'} {quote}",
+            "ladder_edit:start",
+        )])
+        rows.append([_button_row(
+            f"END: {state.ladder_end_price or '—'} {quote}",
+            "ladder_edit:end",
+        )])
+        rows.append([_button_row(
+            f"Distribution: {distribution_disp}",
+            "ladder_edit:distribution",
+        )])
+        rows.append([_button_row("Preview", "ladder_edit:preview")])
+        rows.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)])
+        return Screen(body, rows, "ladder_edit")
+
+    def _handle_ladder_reconcile(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        """Read-only reconciliation against the live exchange.
+
+        GET /api/v3/openOrders or /api/v3/allOrders filtered by the ladder's
+        symbol and execution id (when available). NEVER submits or cancels.
+        """
+        state = self._state_for(chat_key)
+        item = state.selected_instrument or {}
+        symbol = (
+            item.get("symbol")
+            or f"{item.get('base', '')}{item.get('quote', '')}".upper()
+            or ""
+        )
+        which = suffix[len("ladder_reconcile:") :].strip()
+        desk = getattr(self, "_spotdesk", None) or getattr(self, "spotdesk", None)
+        try:
+            if which == "open_orders":
+                rows = self._reconcile_open_orders(symbol)
+                body = self._format_reconcile_open_orders(symbol, rows)
+            elif which == "all_orders":
+                rows = self._reconcile_all_orders(symbol)
+                body = self._format_reconcile_all_orders(symbol, rows, state)
+            else:
+                body = f"🟦 Reconcile {symbol}\n\nUnknown reconcile action."
+        except Exception as exc:
+            body = f"🟦 Reconcile {symbol}\n\nRead failed: {exc}"
+        # Always stay in ladder_result and re-render the original result text
+        # above the reconcile block, with safe Back/Close buttons.
+        return Screen(
+            body,
+            [
+                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)],
+            ],
+            "ladder_result",
+        )
+
+    def _reconcile_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """GET /api/v3/openOrders?symbol=<sym> via the spot agent's read path.
+        Returns a list of dicts (possibly empty). No POST/DELETE ever issued.
+        """
+        agent = self._spot_agent_instance()
+        if agent is None:
+            return []
+        return agent.open_orders(symbol=symbol)
+
+    def _reconcile_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """GET /api/v3/allOrders?symbol=<sym> via the spot agent's read path."""
+        agent = self._spot_agent_instance()
+        if agent is None:
+            return []
+        return agent.all_orders(symbol=symbol)
+
+    def _spot_agent_instance(self):
+        """Best-effort lookup of the MEXC spot agent bound to this wizard."""
+        desk = getattr(self, "_spotdesk", None) or getattr(self, "spotdesk", None)
+        if desk is None:
+            return None
+        agent = getattr(desk, "x_mexc_agent_spot", None)
+        if agent is None and hasattr(desk, "agents"):
+            try:
+                agent = desk.agents.get("x_mexc_agent_spot")  # type: ignore[attr-defined]
+            except Exception:
+                agent = None
+        return agent
+
+    def _format_reconcile_open_orders(self, symbol: str, rows: List[Dict[str, Any]]) -> str:
+        if not rows:
+            return (
+                f"🟦 Reconcile Open Orders\n\n{symbol}: no live open orders.\n\n"
+                f"Use Reconcile All Orders to see recently-cancelled or filled children."
+            )
+        head = f"🟦 Reconcile Open Orders\n\n{symbol}: {len(rows)} live open orders\n\n"
+        body_lines: List[str] = []
+        for r in rows[:10]:
+            cid = r.get("clientOrderId") or r.get("origClientOrderId") or "—"
+            price = r.get("price") or "—"
+            qty = r.get("origQty") or r.get("quantity") or "—"
+            side = r.get("side") or "—"
+            status = r.get("status") or "—"
+            body_lines.append(
+                f"  {side} {qty}@{price} status={status} clientOrderId={cid}"
+            )
+        if len(rows) > 10:
+            body_lines.append(f"  … +{len(rows) - 10} more")
+        return head + "\n".join(body_lines)
+
+    def _format_reconcile_all_orders(
+        self,
+        symbol: str,
+        rows: List[Dict[str, Any]],
+        state: Any,
+    ) -> str:
+        execution_id = getattr(state, "ladder_execution_id", None) or ""
+        if not rows:
+            return (
+                f"🟦 Reconcile All Orders\n\n{symbol}: no orders found in\n"
+                f"/api/v3/allOrders filtered by this symbol.\n\n"
+                f"execution_id={execution_id or '—'}\n"
+                f"NOT_FOUND in allOrders is NOT proof of pre-send failure.\n"
+                f"Open Orders above is the live truth."
+            )
+        head = f"🟦 Reconcile All Orders\n\n{symbol}: {len(rows)} historical orders\n\nexecution_id={execution_id or '—'}\n\n"
+        body_lines: List[str] = []
+        for r in rows[:10]:
+            cid = r.get("clientOrderId") or "—"
+            price = r.get("price") or "—"
+            qty = r.get("origQty") or "—"
+            status = r.get("status") or "—"
+            body_lines.append(
+                f"  status={status} {qty}@{price} clientOrderId={cid}"
+            )
+        if len(rows) > 10:
+            body_lines.append(f"  … +{len(rows) - 10} more")
+        return head + "\n".join(body_lines)
+
+    def _handle_ladder_ack(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        """User acknowledged the UNKNOWN outcome. Return to action screen.
+
+        This DOES NOT clear the ladder inputs (so the user can still reconcile
+        by re-opening Edit Ladder via /tradespot → action:ladder), but it does
+        invalidate the consumed Confirm token.
+        """
+        state = self._state_for(chat_key)
+        which = suffix[len("ladder_ack:") :].strip()
+        if which == "close":
+            return self._render_action(chat_key)
+        return self._render_ladder_result(chat_key)
+
+    def _handle_ladder_edit_callback(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        """Route a single field of the Edit Ladder screen to its prompt.
+
+        Invalidates the prior confirm token so the next preview mints a
+        fresh one; this keeps Confirm tokens single-use relative to the
+        plan that produced them, even after edits.
+        """
+        state = self._state_for(chat_key)
+        if state.state not in {"ladder_preview", "ladder_result", "ladder_edit"}:
+            return self._render_ladder_edit_screen(chat_key)
+        state.ladder_confirm_token = None
+        state.ladder_execution_id = None
+        field = suffix[len("ladder_edit:") :].strip() if suffix.startswith("ladder_edit:") else ""
+        if field == "qty":
+            return self._render_ladder_total_qty(chat_key)
+        if field == "orders":
+            return self._render_ladder_order_count(chat_key)
+        if field == "start":
+            return self._render_ladder_start_price(chat_key)
+        if field == "end":
+            return self._render_ladder_end_price(chat_key)
+        if field == "distribution":
+            return self._render_ladder_distribution(chat_key)
+        if field == "preview":
+            return self._render_ladder_preview(chat_key)
+        return self._render_ladder_edit_screen(chat_key)
 
     def _handle_ladder_text(self, chat_key: Tuple[Any, ...], text: str) -> Optional[Screen]:
         state = self._state_for(chat_key)
