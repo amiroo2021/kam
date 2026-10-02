@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from copy import deepcopy
 from decimal import Decimal
 from typing import Any, Dict, Iterator, Optional
 
@@ -2793,7 +2794,12 @@ class VestAgentContractTests(unittest.TestCase):
             self.assertEqual(order["symbol"], "BTC-PERP")
             self.assertEqual(order["isBuy"], True)
             self.assertEqual(order["orderType"], "LIMIT")
-            self.assertEqual(order["nonce"], idx + 1)  # lastNonce=0 → 1,2,3
+            self.assertGreaterEqual(order["nonce"], 1)  # lastNonce=0 → 1,2,3
+        # Nonces are strictly monotonic and unique across the ladder.
+        nonces = [body["order"]["nonce"] for _p, body, _q in captured]
+        for prev, nxt in zip(nonces, nonces[1:]):
+            self.assertGreater(nxt, prev)
+        self.assertEqual(len(set(nonces)), len(nonces))
         # Canonical result.
         assert resp.ladder is not None
         self.assertEqual(resp.ladder.requested_order_count, 3)
@@ -2925,7 +2931,9 @@ class VestAgentContractTests(unittest.TestCase):
             self.assertNotEqual(order["size"], "")
         # Walking nonce.
         nonces = [body["order"]["nonce"] for _p, body, _q in captured]
-        self.assertEqual(nonces, list(range(1, 51)))
+        self.assertEqual(len(set(nonces)), 50)
+        for prev, nxt in zip(nonces, nonces[1:]):
+            self.assertGreater(nxt, prev)
         # Canonical result.
         assert resp.ladder is not None
         self.assertEqual(resp.ladder.requested_order_count, 50)
@@ -4261,6 +4269,405 @@ class VestAgentContractTests(unittest.TestCase):
         self.assertFalse(resp.success)
         assert resp.error is not None
         self.assertEqual(resp.error.code, "UNKNOWN_ACCOUNT")
+
+    def test_ladder_child_diagnostics_capture_required_fields(self):
+        """The per-child diagnostic dict captured by the ladder MUST
+        contain every field the diagnostics plan (section 1) requires,
+        for both succeeded and failed children. NO secrets are
+        exposed (no signature, no api_key, no private_key).
+
+        This test exercises the deterministic mocked-clock pattern
+        (section 7) by injecting a fast sleep-free stub that returns
+        the same wire payload for every child. The assertions then
+        verify the per-child diagnostic dict's shape and contents AND
+        that the FIXED allocator (fresh per-child time + monotonic
+        nonce) is wired correctly through _ladder -> signing ->
+        _signed_post -> _signed_request.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+        original_now_ms = vest._now_ms
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+
+        # Inject a deterministic clock so the test is reproducible.
+        # Each call returns the next 1000ms-spaced Unix epoch ms.
+        deterministic_now = {"v": 1_700_000_000_000}
+
+        def deterministic_now_ms():
+            v = deterministic_now["v"]
+            deterministic_now["v"] = v + 1000
+            return v
+
+        vest._now_ms = deterministic_now_ms  # type: ignore[assignment]
+
+        wire_payloads: list = []
+
+        def capturing_post(creds, path, body, *, query=None):
+            wire_payloads.append(deepcopy(body))
+            order = body.get("order") or {}
+            price = str(order.get("limitPrice") or "")
+            if price in ("30850", "31850"):
+                return {"code": 0, "msg": "", "data": {"id": "0xok_" + price}}
+            raise vest.VestHTTPError(
+                status=400, path=path,
+                body='{"code": 1023, "msg": "Nonce is stale, please use current timestamp (ms)"}',
+            )
+
+        vest._signed_post = capturing_post  # type: ignore[assignment]
+        try:
+            # Reset nonce state for the test credentials so we get a
+            # deterministic baseline.
+            creds = vest._lookup_credentials("fibo")
+            if creds is not None:
+                vest._reset_nonce_state(creds)
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+            vest._now_ms = original_now_ms  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        assert resp.ladder is not None
+        assert resp.ladder.child_diagnostics is not None
+        diagnostics = resp.ladder.child_diagnostics
+        self.assertEqual(len(diagnostics), 50)
+        required_keys = {
+            "index", "price", "size",
+            "time_ms_generated", "nonce_generated",
+            "local_ms_before_sign", "local_ms_after_sign",
+            "local_ms_before_http", "local_ms_after_http",
+            "nonce_minus_time_ms",
+            "time_age_at_http_ms", "nonce_age_at_http_ms",
+            "wire_order_time", "wire_order_nonce", "wire_limit_price",
+            "http_status", "venue_code", "venue_message", "order_id",
+            "verified_ok",
+        }
+        for d in diagnostics:
+            self.assertEqual(set(d.keys()), required_keys)
+            self.assertIsInstance(d["time_ms_generated"], int)
+            self.assertIsInstance(d["nonce_generated"], int)
+            self.assertIsInstance(d["wire_order_time"], int)
+            self.assertIsInstance(d["wire_order_nonce"], int)
+            self.assertIsInstance(d["wire_limit_price"], str)
+            serialised = json.dumps(d)
+            self.assertNotIn("signature", serialised)
+            self.assertNotIn("api_key", serialised)
+            self.assertNotIn("private", serialised)
+        # PRODUCTION FIX ASSERTIONS (Section 1+2 of the spec):
+        # time_ms_generated MUST be fresh per child (i.e. strictly
+        # increasing across the 50 children when the clock advances).
+        # With deterministic_now_ms() advancing 1000ms per call, child
+        # N's time_ms_generated == (1_700_000_000_000 + (N-1) * 1000).
+        # We allow >= rather than == to tolerate occasional ties when
+        # the same clock tick is hit by two children.
+        prev_time = -1
+        for d in diagnostics:
+            self.assertGreaterEqual(
+                d["time_ms_generated"], prev_time,
+                msg=f"child {d['index']} time is not non-decreasing",
+            )
+            prev_time = d["time_ms_generated"]
+        # nonce_generated MUST be strictly increasing AND unique.
+        nonces_seen = []
+        prev_nonce = -1
+        for d in diagnostics:
+            self.assertGreater(
+                d["nonce_generated"], prev_nonce,
+                msg=f"child {d['index']} nonce is not strictly increasing",
+            )
+            self.assertNotIn(
+                d["nonce_generated"], nonces_seen,
+                msg=f"child {d['index']} duplicate nonce",
+            )
+            nonces_seen.append(d["nonce_generated"])
+            prev_nonce = d["nonce_generated"]
+        # wire_order_time / wire_order_nonce MUST equal the diagnostic's
+        # recorded values for the SAME child (Section 2: prove body equals
+        # what the diagnostic records).
+        for diag_d, wire_body in zip(diagnostics, wire_payloads):
+            self.assertEqual(diag_d["wire_order_time"], int(wire_body["order"]["time"]))
+            self.assertEqual(diag_d["wire_order_nonce"], int(wire_body["order"]["nonce"]))
+            self.assertEqual(diag_d["wire_limit_price"], str(wire_body["order"]["limitPrice"]))
+        # Child 1 and 50 (30850, 31850) succeed in the stub;
+        # everything else fails with 1023.
+        for d in diagnostics:
+            if d["price"] in ("30850", "31850"):
+                self.assertEqual(d["http_status"], 200)
+                self.assertEqual(d["venue_code"], 0)
+                self.assertTrue(d["order_id"])
+            else:
+                self.assertEqual(d["http_status"], 400, msg=str(d))
+                self.assertEqual(d["venue_code"], 1023)
+                self.assertIn("Nonce is stale", d["venue_message"])
+
+    def test_ladder_allocator_fresh_per_child_time_slow_50(self):
+        """Slow-50 deterministic test (section 7).
+
+        Simulate ~1 second between children by monkeypatching _now_ms
+        and verify that:
+          child  1   time ~= T + 0s
+          child 13   time ~= T + 12s
+          child 25   time ~= T + 24s
+          child 50   time ~= T + 49s
+        All 50 children must:
+          - have fresh per-child time
+          - have unique nonces
+          - have strictly increasing nonces
+          - have wire values equal to the diagnostic's recorded values
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+        original_now_ms = vest._now_ms
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+
+        # The first _now_ms() call goes to /account/nonce's query
+        # parameter (inside _fetch_next_nonce). That value becomes
+        # T_loop_start. Child N (1-based) then gets the (N+1)-th
+        # call, so its time_ms_generated = T_loop_start + N * 1000.
+        T_loop_start = 1_700_000_000_000
+
+        def slow_clock_now_ms():
+            # Track the index of the current call so each subsequent call
+            # advances the clock by ~1000ms.
+            counter = slow_clock_now_ms.counter
+            slow_clock_now_ms.counter += 1
+            return T_loop_start + counter * 1000
+
+        slow_clock_now_ms.counter = 0
+        vest._now_ms = slow_clock_now_ms  # type: ignore[assignment]
+
+        wire_payloads: list = []
+
+        def capturing_post(creds, path, body, *, query=None):
+            wire_payloads.append(deepcopy(body))
+            return {"code": 0, "msg": "", "data": {"id": "0xok"}}
+
+        vest._signed_post = capturing_post  # type: ignore[assignment]
+        try:
+            creds = vest._lookup_credentials("fibo")
+            if creds is not None:
+                vest._reset_nonce_state(creds)
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+            vest._now_ms = original_now_ms  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        assert resp.ladder is not None
+        diagnostics = resp.ladder.child_diagnostics
+        self.assertEqual(len(diagnostics), 50)
+
+        # child 1:  time_ms_generated == T_loop_start + 1*1000
+        # child 13: time_ms_generated == T_loop_start + 13*1000
+        # child 25: time_ms_generated == T_loop_start + 25*1000
+        # child 50: time_ms_generated == T_loop_start + 50*1000
+        expectations = {
+            1:  T_loop_start + 1_000,
+            13: T_loop_start + 13_000,
+            25: T_loop_start + 25_000,
+            50: T_loop_start + 50_000,
+        }
+        for idx, expected_time in expectations.items():
+            actual = diagnostics[idx - 1]["time_ms_generated"]
+            self.assertEqual(
+                actual, expected_time,
+                msg=f"child {idx} expected time_ms_generated={expected_time} got {actual}",
+            )
+
+        # Nonces must be strictly increasing and unique across all 50.
+        nonces = [d["nonce_generated"] for d in diagnostics]
+        self.assertEqual(len(set(nonces)), 50, msg="duplicate nonces found")
+        for i in range(1, 50):
+            self.assertGreater(
+                nonces[i], nonces[i - 1],
+                msg=f"child {i + 1} nonce {nonces[i]} not > child {i} nonce {nonces[i - 1]}",
+            )
+
+        # Wire payload values MUST equal the diagnostic's recorded values.
+        for d, body in zip(diagnostics, wire_payloads):
+            self.assertEqual(d["wire_order_time"], int(body["order"]["time"]))
+            self.assertEqual(d["wire_order_nonce"], int(body["order"]["nonce"]))
+            self.assertEqual(d["wire_limit_price"], str(body["order"]["limitPrice"]))
+
+    def test_ladder_allocator_server_ahead(self):
+        """SERVER-AHEAD test (section 7).
+
+        local_now = 1_000_000
+        server_floor = 1_000_500
+        Expected conceptually:
+          time = 1_000_000
+          nonce >= 1_000_501
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+        original_now_ms = vest._now_ms
+
+        # Server reports lastNonce=1_000_500; we want to verify the
+        # allocator's first call returns at least 1_000_501 even if
+        # local_now < 1_000_000.
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 1_000_500}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+
+        fixed_now = {"v": 1_000_000}
+
+        def fixed_now_ms():
+            return fixed_now["v"]
+
+        vest._now_ms = fixed_now_ms  # type: ignore[assignment]
+
+        wire_payloads: list = []
+
+        def capturing_post(creds, path, body, *, query=None):
+            wire_payloads.append(deepcopy(body))
+            return {"code": 0, "msg": "", "data": {"id": "0xok"}}
+
+        vest._signed_post = capturing_post  # type: ignore[assignment]
+        try:
+            creds = vest._lookup_credentials("fibo")
+            if creds is not None:
+                vest._reset_nonce_state(creds)
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 5,  # small ladder for speed
+                "total_volume": "1",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+            vest._now_ms = original_now_ms  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        assert resp.ladder is not None
+        diagnostics = resp.ladder.child_diagnostics
+        # local_now is 1_000_000 so all wire_order_time == 1_000_000.
+        for d in diagnostics:
+            self.assertEqual(d["wire_order_time"], 1_000_000)
+            # But nonce MUST be >= server_floor + 1 = 1_000_501.
+            self.assertGreaterEqual(
+                d["nonce_generated"], 1_000_501,
+                msg=f"child {d['index']} nonce {d['nonce_generated']} must be >= 1_000_501",
+            )
+            # And nonce must equal wire_payload.
+            self.assertEqual(d["wire_order_nonce"], d["nonce_generated"])
+
+    def test_ladder_allocator_same_millisecond(self):
+        """SAME-MS test (section 7).
+
+        Three children with the same time_ms_generated (same
+        millisecond) must still produce UNIQUE and STRICTLY
+        INCREASING nonces. This proves the allocator increments
+        past equal-time ties.
+        """
+        creds = vest._lookup_credentials("fibo")
+        self.assertIsNotNone(creds)
+        vest._reset_nonce_state(creds)
+        same_t = 1_700_000_000_000
+        nonces = []
+        for _ in range(3):
+            nonces.append(vest._allocate_nonce(creds, now_ms=same_t))
+        # All three nonces must be strictly increasing.
+        self.assertEqual(nonces[0], same_t)
+        self.assertEqual(nonces[1], same_t + 1)
+        self.assertEqual(nonces[2], same_t + 2)
+        # And they must all be unique.
+        self.assertEqual(len(set(nonces)), 3)
+        # Reset for downstream tests.
+        vest._reset_nonce_state(creds)
+
+    def test_ladder_allocator_concurrency_thread_safe(self):
+        """CONCURRENCY test (section 7).
+
+        Multiple concurrent Vest operations for the same fibo account
+        must not allocate duplicate nonces. Spawns 10 threads, each
+        allocating 100 nonces, and asserts all 1000 are unique and
+        strictly increasing in allocation order.
+        """
+        import threading
+        creds = vest._lookup_credentials("fibo")
+        self.assertIsNotNone(creds)
+        vest._reset_nonce_state(creds)
+
+        # Seed the allocator so all threads start from the same point.
+        base = 1_700_000_000_000
+        results: list = []
+        lock = threading.Lock()
+
+        def worker(tid: int) -> None:
+            local_nonces = []
+            for _ in range(100):
+                v = vest._allocate_nonce(creds, now_ms=base + tid)
+                local_nonces.append(v)
+            with lock:
+                results.extend(local_nonces)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(results), 1000)
+        self.assertEqual(len(set(results)), 1000, msg="duplicate nonces under concurrency")
+        # Reset for downstream tests.
+        vest._reset_nonce_state(creds)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1514,12 +1514,105 @@ def _now_ms() -> int:
     """Return the current Unix timestamp in milliseconds (int).
 
     Per Vest's docs the ``time`` field is in milliseconds since epoch.
+    Tests may monkeypatch this function to inject a deterministic clock.
     """
     return int(time.time() * 1000)
 
 
+# --------------------------------------------------------------------------
+# Per-account nonce allocator state.
+#
+# Vest's INVALID_NONCE (1023) rule requires that the ``time`` field sent
+# in ``POST /orders`` track the wall clock at submission, not a frozen
+# value captured before the loop. The previous implementation captured
+# ``time_ms = _now_ms()`` once before iterating the children and used a
+# walking ``start_nonce + index`` offset; that caused children 13-50 to
+# fail with HTTP 400 code=1023 once the elapsed run time exceeded
+# Vest's per-account staleness window (~12s in observed runs).
+#
+# The replacement allocator:
+#   * regenerates ``time_ms`` INSIDE the loop (per child)
+#   * allocates ``nonce = max(time_ms, server_floor+1, local_floor+1)``
+#     so the nonce is always >= the server's lastNonce AND >= the
+#     previous local allocation AND >= the current wall clock
+#   * is account-scoped (key derived from the credentials dict) and
+#     thread-safe (serialised by ``_account_nonce_lock``)
+# --------------------------------------------------------------------------
+
+# Module-level state. Each dict is keyed by ``_account_nonce_key(creds)``
+# so different Vest accounts cannot share trivalences.
+_server_last_nonce: Dict[str, int] = {}
+_local_last_nonce: Dict[str, int] = {}
+_account_nonce_lock = threading.Lock()
+
+
+def _account_nonce_key(credentials: Dict[str, Any]) -> str:
+    """Return the stable per-account key for nonce-state lookups.
+
+    The Vest account is identified by ``VEST_FIBO_PUBLIC_KEY`` (lowercased,
+    with the ``0x`` prefix normalised). Two equal credentials produce
+    the same key so concurrent threads / successive runs share state.
+    """
+    pk = str((credentials or {}).get("public_key") or "").strip().lower()
+    if not pk:
+        pk = "unknown"
+    return pk
+
+
+def _seed_server_last_nonce(credentials: Dict[str, Any], server_last_nonce: int) -> None:
+    """Update the cached server floor for ``credentials``.
+
+    Called once at the start of an operation (new_order, ladder,
+    cancel) so subsequent ``_allocate_nonce`` calls know the floor.
+    The floor only ratchets forward; never regresses on a stale fetch.
+    """
+    key = _account_nonce_key(credentials)
+    with _account_nonce_lock:
+        if server_last_nonce > _server_last_nonce.get(key, 0):
+            _server_last_nonce[key] = int(server_last_nonce)
+
+
+def _allocate_nonce(credentials: Dict[str, Any], *, now_ms: Optional[int] = None) -> int:
+    """Return the next nonce for ``credentials`` and update local state.
+
+    The returned nonce satisfies
+        nonce >= max(time_ms, server_last_nonce + 1, prev_local + 1)
+    so the venue never rejects with code=1023 (stale) nor with a
+    duplicate (in-flight collision). Thread-safe via
+    ``_account_nonce_lock``. ``now_ms`` is exposed so tests can inject
+    a deterministic clock.
+    """
+    key = _account_nonce_key(credentials)
+    if now_ms is None:
+        now_ms = _now_ms()
+    with _account_nonce_lock:
+        server_floor = _server_last_nonce.get(key, 0) + 1
+        local_floor = _local_last_nonce.get(key, 0) + 1
+        candidate = int(now_ms)
+        if candidate < server_floor:
+            candidate = server_floor
+        if candidate < local_floor:
+            candidate = local_floor
+        _local_last_nonce[key] = candidate
+        return candidate
+
+
+def _reset_nonce_state(credentials: Dict[str, Any]) -> None:
+    """Drop the cached nonce state for ``credentials``.
+
+    Used by tests and by post-failure recovery if the venue returns a
+    stale-nonce 1023 that suggests our allocator is out of sync with
+    the server.
+    """
+    key = _account_nonce_key(credentials)
+    with _account_nonce_lock:
+        _local_last_nonce.pop(key, None)
+        _server_last_nonce.pop(key, None)
+
+
 def _fetch_next_nonce(credentials: Dict[str, Any]) -> int:
-    """Fetch and return the next usable nonce from ``GET /account/nonce``.
+    """Fetch the next usable nonce from ``GET /account/nonce`` AND
+    seed the per-account allocator floor.
 
     Per the docs the server returns ``{"lastNonce": N}`` — the next
     nonce the operator should use is ``N + 1``. The endpoint is
@@ -1559,6 +1652,9 @@ def _fetch_next_nonce(credentials: Dict[str, Any]) -> int:
             path=_PATH_ACCOUNT_NONCE,
             body=f"unexpected lastNonce: {last!r}",
         ) from None
+    # Seed the per-account server-floor so per-child _allocate_nonce
+    # can never return a value below Vest's recorded lastNonce.
+    _seed_server_last_nonce(credentials, last_int)
     return last_int + 1
 
 
@@ -2999,7 +3095,6 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         )
 
     next_nonce = start_nonce
-    time_ms = _now_ms()
     succeeded: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
     # Structured failure rows that survive end-to-end to the
@@ -3008,7 +3103,23 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     # that look at ``data["failed"]`` continue to work; ``failed_children``
     # is the canonical structured form.
     failed_children: List[Dict[str, Any]] = []
+    # Per-child diagnostic capture. SAFE fields only (never API key,
+    # never private key, never signature). Populated alongside the
+    # failed_children list so a single failed production ladder    # gives enough data to reason about INVALID_NONCE / INVALID_LIMIT_PRICE
+    # without a rerun.
+    child_diagnostics: List[Dict[str, Any]] = []
     for child_index, child in enumerate(children):
+        # PRODUCTION FIX (Oct 02 2026): regenerate ``time`` and
+        # allocate ``nonce`` per child so the signature uses a fresh
+        # ``time`` value tracking the actual wall clock at submission.
+        # Vest rejects frozen-time ladders with HTTP 400 code=1023
+        # once the elapsed run time crosses the venue staleness window.
+        # The nonce is account-scoped and respects both the server
+        # floor (from GET /account/nonce at ladder start) and the
+        # previously-issued local nonce.
+        time_ms_generated = _now_ms()
+        next_nonce = _allocate_nonce(credentials, now_ms=time_ms_generated)
+        local_ms_before_sign = int(time.time() * 1000)
         payload = _build_new_order_payload(
             symbol=resolved_symbol,
             order_type="LIMIT",
@@ -3016,15 +3127,43 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             size_text=child["size_text"],
             limit_price_text=child["price_text"],
             reduce_only=False,
-            time_ms=time_ms,
+            time_ms=time_ms_generated,
             nonce=next_nonce,
             recv_window_ms=DEFAULT_RECV_WINDOW_MS,
             signing_key=signing_key,
         )
+        local_ms_after_sign = int(time.time() * 1000)
+        # Wire-payload safe fields captured BEFORE the HTTP POST.
+        # We intentionally do NOT include signature, api_key, or
+        # sign_private_key anywhere in this dict.
+        wire_order_time = int(payload["order"]["time"])
+        wire_order_nonce = int(payload["order"]["nonce"])
+        wire_limit_price = str(payload["order"]["limitPrice"])
+        nonce_minus_time_ms = wire_order_nonce - wire_order_time
+        local_ms_before_http = int(time.time() * 1000)
+        diag: Dict[str, Any] = {
+            "index": child_index + 1,
+            "price": child["price_text"],
+            "size": child["size_text"],
+            "time_ms_generated": time_ms_generated,
+            "nonce_generated": next_nonce,
+            "local_ms_before_sign": local_ms_before_sign,
+            "local_ms_after_sign": local_ms_after_sign,
+            "local_ms_before_http": local_ms_before_http,
+            "nonce_minus_time_ms": nonce_minus_time_ms,
+            "wire_order_time": wire_order_time,
+            "wire_order_nonce": wire_order_nonce,
+            "wire_limit_price": wire_limit_price,
+            "http_status": None,
+            "venue_code": None,
+            "venue_message": None,
+            "order_id": None,
+            "verified_ok": None,
+        }
         try:
             response_payload = _submit_new_order(credentials, payload)
         except VestHTTPError as exc:
-            # 4xx / 5xx envelope from Vest. ``exc.body`` may carry a JSON
+            # 4xx / 5xx envelope from Vest. exc.body may carry a JSON
             # error envelope; try to parse it for venue_code/venue_message.
             venue_code, venue_message = _parse_vest_error_envelope_text(exc.body)
             failed.append(
@@ -3035,17 +3174,24 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                     "body": str(exc.body)[:200],
                 }
             )
+            http_status_int = int(exc.status) if str(exc.status).isdigit() else None
             failed_children.append(
                 {
                     "index": child_index + 1,
                     "price": child["price_text"],
                     "size": child["size_text"],
-                    "http_status": int(exc.status) if str(exc.status).isdigit() else None,
+                    "http_status": http_status_int,
                     "venue_code": venue_code,
                     "venue_message": venue_message,
                 }
             )
-            next_nonce += 1
+            diag["http_status"] = http_status_int
+            diag["venue_code"] = venue_code
+            diag["venue_message"] = venue_message
+            diag["local_ms_after_http"] = int(time.time() * 1000)
+            diag["time_age_at_http_ms"] = diag["local_ms_before_http"] - time_ms_generated
+            diag["nonce_age_at_http_ms"] = diag["local_ms_before_http"] - next_nonce
+            child_diagnostics.append(diag)
             continue
         except Exception as exc:  # noqa: BLE001
             failed.append(
@@ -3066,8 +3212,14 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                     "venue_message": _redact(sanitize_error_message(str(exc)))[:200] or None,
                 }
             )
-            next_nonce += 1
+            diag["venue_code"] = "VEST_ERROR"
+            diag["venue_message"] = _redact(sanitize_error_message(str(exc)))[:200] or None
+            diag["local_ms_after_http"] = int(time.time() * 1000)
+            diag["time_age_at_http_ms"] = diag["local_ms_before_http"] - time_ms_generated
+            diag["nonce_age_at_http_ms"] = diag["local_ms_before_http"] - next_nonce
+            child_diagnostics.append(diag)
             continue
+        local_ms_after_http = int(time.time() * 1000)
         order_id = _extract_order_id(response_payload)
         if not order_id:
             # 200 OK but no id — Vest returned an inline error envelope.
@@ -3090,7 +3242,13 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                     "venue_message": venue_message or "no order id in response",
                 }
             )
-            next_nonce += 1
+            diag["http_status"] = 200
+            diag["venue_code"] = venue_code or "MALFORMED_RESPONSE"
+            diag["venue_message"] = venue_message or "no order id in response"
+            diag["local_ms_after_http"] = local_ms_after_http
+            diag["time_age_at_http_ms"] = diag["local_ms_before_http"] - time_ms_generated
+            diag["nonce_age_at_http_ms"] = diag["local_ms_before_http"] - next_nonce
+            child_diagnostics.append(diag)
             continue
         verified_ok, _ = _verify_order_status(
             credentials, order_id, expected_statuses=RESTING_ORDER_STATUSES
@@ -3103,7 +3261,15 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 "verified_ok": verified_ok,
             }
         )
-        next_nonce += 1
+        diag["http_status"] = 200
+        diag["venue_code"] = 0
+        diag["venue_message"] = "ok"
+        diag["order_id"] = order_id
+        diag["verified_ok"] = verified_ok
+        diag["local_ms_after_http"] = local_ms_after_http
+        diag["time_age_at_http_ms"] = diag["local_ms_before_http"] - time_ms_generated
+        diag["nonce_age_at_http_ms"] = diag["local_ms_before_http"] - next_nonce
+        child_diagnostics.append(diag)
     # Build a sanitized group-level exchange_reason when any child failed.
     # The wizard / phase2 surfaces this when the top-level exchange_reason
     # is None. We never embed the signed body / signature / API key here —
@@ -3160,6 +3326,7 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 for p in succeeded
             ],
             exchange_reason=exchange_reason,
+            child_diagnostics=child_diagnostics,
         ),
         # Surface the per-failed-child rows alongside the canonical
         # ``ladder`` field so callers (and the wizard UI) can show the
