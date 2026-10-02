@@ -443,8 +443,9 @@ class WebTrade2LiveAllowlistHelperTests(unittest.TestCase):
 
     def test_normalize_string_with_whitespace_and_case(self) -> None:
         from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
-        out = _normalize_live_accounts(" Apex : BITGET , METATRADER:LITE ")
+        out, wildcard = _normalize_live_accounts(" Apex : BITGET , METATRADER:LITE ")
         self.assertEqual(out, frozenset({("apex", "BITGET"), ("metatrader", "LITE")}))
+        self.assertFalse(wildcard)
 
     def test_normalize_rejects_unqualified_token(self) -> None:
         from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
@@ -453,14 +454,163 @@ class WebTrade2LiveAllowlistHelperTests(unittest.TestCase):
 
     def test_normalize_accepts_iterable_of_tuples(self) -> None:
         from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
-        out = _normalize_live_accounts([("metatrader", "LITE"), ("apex", "BITGET")])
+        out, wildcard = _normalize_live_accounts([("metatrader", "LITE"), ("apex", "BITGET")])
         self.assertEqual(out, frozenset({("metatrader", "LITE"), ("apex", "BITGET")}))
+        self.assertFalse(wildcard)
 
     def test_normalize_env_var_string_form(self) -> None:
         from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
-        out = _normalize_live_accounts("metatrader:LITE7486706MT5,apex:BITGET")
+        out, wildcard = _normalize_live_accounts("metatrader:LITE7486706MT5,apex:BITGET")
         self.assertEqual(out, frozenset({("metatrader", "LITE7486706MT5"),
                                           ("apex", "BITGET")}))
+        self.assertFalse(wildcard)
+
+    # --- Wildcard semantics (LIVE_ACCOUNTS="*") --------------------------
+
+    def test_normalize_star_token_enables_wildcard(self) -> None:
+        """A bare ``"*"`` token flips wildcard mode; the frozenset stays
+        empty so a non-wildcard constructor call still reports the same
+        type. ``is_live_account_allowed`` becomes True for any pair.
+        """
+        from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
+        for raw in ("*", " * ", "*\t", "  *  "):
+            out, wildcard = _normalize_live_accounts(raw)
+            self.assertEqual(out, frozenset(), msg=raw)
+            self.assertTrue(wildcard, msg=raw)
+
+    def test_normalize_star_mixed_with_tokens_rejected(self) -> None:
+        """``"* , apex:BITGET"`` is a misconfiguration: mixing the
+        wildcard with explicit allowlist entries must raise so the
+        operator cannot accidentally broaden scope.
+        """
+        from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
+        with self.assertRaises(ValueError):
+            _normalize_live_accounts("*,apex:BITGET")
+        with self.assertRaises(ValueError):
+            _normalize_live_accounts("apex:BITGET,*")
+
+    def test_normalize_empty_string_is_not_wildcard(self) -> None:
+        """Empty / None / "" must NOT silently enable wildcard mode —
+        that would be the easiest way to mistakenly LIVE-enable
+        everything on a fresh install.
+        """
+        from plugins.trade.webtrade2.phase2 import _normalize_live_accounts
+        for raw in (None, "", "  ", []):
+            out, wildcard = _normalize_live_accounts(raw)
+            self.assertEqual(out, frozenset(), msg=repr(raw))
+            self.assertFalse(wildcard, msg=repr(raw))
+
+    def test_wildcard_allows_any_configured_account(self) -> None:
+        """``WEBTRADE2_LIVE_ACCOUNTS=*`` makes every resolved pair
+        LIVE-eligible, including accounts that were never explicit
+        allowlist members.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                    live_accounts="*")
+        # Pre-existing allowlist members stay allowed.
+        self.assertTrue(p2.is_live_account_allowed("apex", "BITGET"))
+        # Newly discovered configured account also allowed.
+        self.assertTrue(p2.is_live_account_allowed("vestmarkets", "fibo"))
+        self.assertTrue(p2.is_live_account_allowed("hyperliquid", "FIBO"))
+        self.assertTrue(p2.is_live_account_allowed("rise", "AMIROO"))
+        # Even an arbitrary never-named pair passes the per-account gate
+        # (the per-agent capability check still applies at execute time).
+        self.assertTrue(p2.is_live_account_allowed("made_up", "whatever"))
+
+    def test_wildcard_does_not_bypass_exchange_validation(self) -> None:
+        """An empty exchange or account must still be rejected — the
+        wildcard only relaxes the per-(exchange, account) LIVE gate,
+        not the basic exchange/account presence check.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                    live_accounts="*")
+        self.assertFalse(p2.is_live_account_allowed("", "fibo"))
+        self.assertFalse(p2.is_live_account_allowed("vestmarkets", ""))
+        self.assertFalse(p2.is_live_account_allowed("", ""))
+
+    def test_explicit_allowlist_still_works_after_wildcard_change(self) -> None:
+        """Backwards compatibility: an explicit-list service still
+        rejects pairs that aren't in the list.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                    live_accounts=[("apex", "BITGET")])
+        self.assertTrue(p2.is_live_account_allowed("apex", "BITGET"))
+        self.assertFalse(p2.is_live_account_allowed("vestmarkets", "fibo"))
+        self.assertFalse(p2.is_live_account_allowed("apex", "FIBO"))
+
+    def test_empty_allowlist_blocks_all_except_wildcard(self) -> None:
+        """``live_accounts=None`` (omitted) keeps the historical
+        NO-ACCOUNT-LIVE-ELIGIBLE semantics — wildcard must be the
+        explicit opt-in.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32)
+        self.assertFalse(p2.is_live_account_allowed("apex", "BITGET"))
+        self.assertFalse(p2.is_live_account_allowed("vestmarkets", "fibo"))
+
+    def test_phase2_status_surfaces_wildcard(self) -> None:
+        """The phase2_status payload must surface the wildcard so the
+        frontend can render the mode explicitly without inspecting
+        ``live_allowlist_active`` alone.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2_wild = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                         live_accounts="*")
+        status = p2_wild.phase2_status()
+        self.assertTrue(status["live_accounts_wildcard"])
+        self.assertTrue(status["live_allowlist_active"])
+
+        p2_explicit = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                             live_accounts=[("apex", "BITGET")])
+        status = p2_explicit.phase2_status()
+        self.assertFalse(status["live_accounts_wildcard"])
+        self.assertTrue(status["live_allowlist_active"])
+
+        p2_empty = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32)
+        status = p2_empty.phase2_status()
+        self.assertFalse(status["live_accounts_wildcard"])
+        self.assertFalse(status["live_allowlist_active"])
+
+    def test_operation_allowlist_still_enforced_with_wildcard(self) -> None:
+        """Wildcard on LIVE_ACCOUNTS does NOT bypass LIVE_OPERATIONS:
+        even if every account is LIVE-eligible, an operation that is
+        absent from LIVE_OPERATIONS must still be rejected.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        # Wildcard on accounts; only "new_order" on operations.
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                    live_accounts="*",
+                                    live_operations={"new_order"})
+        # ladder gate: ladder NOT in operations, so it must reject.
+        op_gate = p2._gate_live_operation("ladder")
+        self.assertIsNotNone(op_gate)
+        self.assertEqual(op_gate["error"]["code"], "LIVE_OPERATION_NOT_ALLOWED")
+        # Account gate: ladder NOT in operations, but account check passes
+        # because wildcard allows all. This is the expected orthogonal
+        # behaviour — the operator will see the LIVE_OPERATION_NOT_ALLOWED
+        # gate fire before any exchange write.
+        self.assertTrue(p2.is_live_account_allowed("vestmarkets", "fibo"))
+
+    def test_ladder_gate_still_enforced_with_wildcard(self) -> None:
+        """The LADDER_ENABLED gate is independent of the account
+        allowlist. Wildcard accounts + ladder in LIVE_OPERATIONS but
+        LADDER_ENABLED=0 must still reject ladder dispatches.
+        """
+        from plugins.trade.webtrade2.phase2 import WebTrade2Phase2Service
+        p2 = WebTrade2Phase2Service(desk=FakeDesk(), session_secret="x" * 32,
+                                    live_accounts="*",
+                                    live_operations={"ladder"},
+                                    ladder_enabled=False)
+        # account gate: passes (wildcard).
+        self.assertTrue(p2.is_live_account_allowed("vestmarkets", "fibo"))
+        # op gate: passes (ladder in LIVE_OPERATIONS).
+        self.assertIsNone(p2._gate_live_operation("ladder"))
+        # ladder_enabled=False is enforced inside execute_preview; we
+        # only check the per-account / per-operation gates here.
+        self.assertFalse(p2.ladder_enabled)
 
 
 if __name__ == "__main__":

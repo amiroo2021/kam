@@ -121,20 +121,39 @@ def _safe_error(resp: Any) -> Dict[str, str]:
 # Generic helper for "is this (exchange, account) LIVE-eligible?".
 #
 # Accepted inputs (deterministic, testable, no silent wildcard):
-#   None / empty string / empty iterable  -> empty frozenset
+#   None / empty string / empty iterable  -> empty frozenset, wildcard=False
 #   iterable of (exchange, account) tuples
-#       -> frozenset({(exchange.lower(), account.strip()), ...})
+#       -> frozenset({(exchange.lower(), account.strip()), ...}), wildcard=False
 #   str of the form "ex1:acc1,ex2:acc2"  -> same
+#   str of the form "*"  (literal star, optionally whitespace-padded)
+#       -> empty frozenset, wildcard=True. Means "any (exchange, account)
+#       that resolves through TradeDesk/agent discovery is eligible".
 #   str with a single token like "acc1"   -> ValueError (must be qualified)
 #
 # IMPORTANT: empty allowlist means NO account is LIVE-eligible. The helper
-# never expands an entry into a wildcard; the canonical form is always
-# (exchange, account) and lookups require both fields to match.
+# never expands an entry into a wildcard unless the literal "*" sentinel
+# is supplied. The canonical form is always (exchange, account) and
+# lookups require both fields to match.
 
-def _normalize_live_accounts(value: Any) -> "frozenset[tuple[str, str]]":
+# Sentinel for the all-accounts wildcard. The literal "*" is the only
+# accepted token; it is intentionally NOT a prefix syntax (`ex:*`) so an
+# operator cannot accidentally allow every account on a single exchange.
+_LIVE_ACCOUNTS_WILDCARD = "*"
+
+
+def _normalize_live_accounts(value: Any) -> Tuple["frozenset[tuple[str, str]]", bool]:
+    """Parse the LIVE_ACCOUNTS env value into ``(accounts, wildcard)``.
+
+    Returns ``(frozenset(), True)`` for the wildcard "*" form and
+    ``(frozenset(), False)`` for empty / None / "" inputs. For
+    backwards-compatible explicit lists, returns
+    ``(frozenset({(ex, acc), ...}), False)``. Unqualified single
+    tokens (e.g. ``"BITGET"`` without an exchange prefix) raise
+    ``ValueError`` regardless of wildcard state.
+    """
     raw: List[str] = []
     if value is None or value == "":
-        return frozenset()
+        return frozenset(), False
     if isinstance(value, str):
         for token in value.split(","):
             token = token.strip()
@@ -157,11 +176,29 @@ def _normalize_live_accounts(value: Any) -> "frozenset[tuple[str, str]]":
             f"Invalid live_accounts type: {type(value).__name__}; expected string, list, or None."
         )
 
+    # Wildcard: a single "*" token, or a single star after stripping.
+    # Anything else with a star inside a qualified token (e.g. "ex:*")
+    # is NOT recognised and falls through to the qualifier parser so
+    # misconfigurations surface as ValueError instead of silently
+    # broadening scope.
+    if len(raw) == 1 and raw[0].strip() == _LIVE_ACCOUNTS_WILDCARD:
+        return frozenset(), True
+
     out: set[tuple[str, str]] = set()
     for token in raw:
         token = token.strip()
         if not token:
             continue
+        if token == _LIVE_ACCOUNTS_WILDCARD:
+            # A wildcard mixed with explicit tokens is a misconfiguration;
+            # the operator must pick one mode, not both. Surface this so
+            # the unit file cannot accidentally allow every account while
+            # also allowlisting a specific pair (the latter would mask the
+            # former and hide an unintended scope broadening).
+            raise ValueError(
+                "live_accounts wildcard '*' must be the only token; "
+                f"got mixed input with extra entries: {raw!r}."
+            )
         if ":" not in token:
             raise ValueError(
                 f"Invalid live_accounts token: {token!r}; must be qualified as 'exchange:account'."
@@ -172,7 +209,7 @@ def _normalize_live_accounts(value: Any) -> "frozenset[tuple[str, str]]":
         if not ex or not acc:
             raise ValueError(f"Invalid live_accounts token: {token!r}; empty exchange or account.")
         out.add((ex, acc))
-    return frozenset(out)
+    return frozenset(out), False
 
 
 # Canonical operation names that can ever be LIVE-eligible.
@@ -269,7 +306,18 @@ class WebTrade2Phase2Service:
         # is gated exclusively through this frozenset. The allowlist is
         # NOT a preview blocker — previews still run regardless of LIVE
         # eligibility so DRY_RUN tests can validate behavior.
-        self.live_accounts: "frozenset[tuple[str, str]]" = _normalize_live_accounts(live_accounts)
+        #
+        # When ``live_accounts_wildcard`` is True, the empty frozenset is
+        # the intentional wildcard state — every (exchange, account)
+        # that resolves through TradeDesk/agent discovery becomes
+        # eligible. Wildcard mode does NOT bypass exchange/account
+        # resolution; the trade still has to be supported by the agent.
+        self.live_accounts: "frozenset[tuple[str, str]]"
+        self.live_accounts_wildcard: bool
+        (
+            self.live_accounts,
+            self.live_accounts_wildcard,
+        ) = _normalize_live_accounts(live_accounts)
         # Step 9 (Pre-LIVE hardening): operation-level LIVE allowlist.
         # Empty set means NO mutation operation may dispatch in LIVE mode
         # regardless of the account allowlist. Ladders remain governed
@@ -291,7 +339,8 @@ class WebTrade2Phase2Service:
             # This is a per-account boolean so the frontend can render a
             # per-account LIVE-eligible hint WITHOUT exposing the rest of
             # the allowlist or any secret material.
-            "live_allowlist_active": bool(self.live_accounts),
+            "live_allowlist_active": bool(self.live_accounts)
+            or self.live_accounts_wildcard,
             # Step 9: True iff at least one mutation operation has been
             # explicitly allowlisted via WEBTRADE2_LIVE_OPERATIONS.
             "live_operations_active": bool(self.live_operations),
@@ -299,6 +348,11 @@ class WebTrade2Phase2Service:
             # Never contains wildcards. Empty list -> NO operation may
             # dispatch in LIVE mode.
             "live_operations": sorted(self.live_operations),
+            # Step 8: True iff LIVE_ACCOUNTS="*" wildcard mode is on.
+            # When True, every (exchange, account) that resolves through
+            # TradeDesk is eligible, subject to operation gates and
+            # per-agent capability.
+            "live_accounts_wildcard": bool(self.live_accounts_wildcard),
         }
 
     def phase2_capabilities(self, exchange: str, account: str = "") -> Dict[str, Any]:
@@ -317,10 +371,17 @@ class WebTrade2Phase2Service:
             "close_position": "close_position" in caps,
             "reduce_only": "reduce_only" in caps,
             # True iff this (exchange, account) is in the LIVE allowlist
-            # AND the server is configured for LIVE writes.
-            "live_allowed_for_account": bool(self.live_accounts) and (
-                self.is_live_account_allowed(exchange, account)
-                if account else bool(self.live_accounts)
+            # AND the server is configured for LIVE writes. Wildcard mode
+            # (live_accounts_wildcard=True) is treated like an active
+            # allowlist for the purpose of this boolean — the per-account
+            # gate is satisfied as long as the (exchange, account)
+            # resolves through TradeDesk.
+            "live_allowed_for_account": (
+                (bool(self.live_accounts) or self.live_accounts_wildcard)
+                and (
+                    self.is_live_account_allowed(exchange, account)
+                    if account else (bool(self.live_accounts) or self.live_accounts_wildcard)
+                )
             ),
             "dry_run": self.dry_run,
         }
@@ -329,14 +390,23 @@ class WebTrade2Phase2Service:
 
     def is_live_account_allowed(self, exchange: str, account: str) -> bool:
         """Generic helper. Returns True iff (exchange, account) is in the
-        LIVE allowlist. Empty allowlist -> always False. Comparison is
+        LIVE allowlist. Empty allowlist -> always False unless wildcard
+        mode (``live_accounts_wildcard=True``) is enabled, in which case
+        every resolved (exchange, account) is allowed. Comparison is
         case-insensitive on exchange, exact on account after stripping.
+
+        Wildcard mode does NOT bypass exchange/account validation —
+        the trade still has to reach a working agent via TradeDesk
+        dispatch. The wildcard only relaxes the per-(exchange, account)
+        LIVE allowlist check.
         """
-        if not self.live_accounts:
-            return False
         ex = str(exchange or "").strip().lower()
         acc = str(account or "").strip()
         if not ex or not acc:
+            return False
+        if self.live_accounts_wildcard:
+            return True
+        if not self.live_accounts:
             return False
         return (ex, acc) in self.live_accounts
 

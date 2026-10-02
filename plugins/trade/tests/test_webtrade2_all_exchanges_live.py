@@ -582,7 +582,13 @@ class TestCapabilityDrivenUI:
 
 
 class TestLiveAccountListParity:
-    """The deployed LIVE_ACCOUNTS list must match the configured list."""
+    """The deployed LIVE_ACCOUNTS list must match the configured list.
+
+    When the wildcard sentinel ``*`` is deployed, every entry in the
+    reference list is implicitly allowed; the parity test passes iff
+    either (a) every explicit entry is present in the unit, or (b) the
+    wildcard sentinel is deployed.
+    """
 
     def test_service_unit_live_accounts_matches_test_value(self) -> None:
         from pathlib import Path
@@ -590,6 +596,12 @@ class TestLiveAccountListParity:
         if not unit_path.exists():
             pytest.skip("service unit not present in this environment")
         content = unit_path.read_text()
+        # Wildcard mode (the * sentinel) is a valid alternative to the
+        # full explicit list — it is the deployment the LIVE hardening
+        # workflow converged on so a single approved change can ship
+        # without re-syncing every (exchange, account) line.
+        if "WEBTRADE2_LIVE_ACCOUNTS=*" in content:
+            return
         for entry in LIVE_ACCOUNTS:
             assert entry in content, (
                 f"LIVE_ACCOUNTS entry {entry!r} not present in deployed unit"
