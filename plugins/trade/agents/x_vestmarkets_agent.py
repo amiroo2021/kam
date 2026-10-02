@@ -1727,6 +1727,44 @@ def _extract_order_id(payload: Dict[str, Any]) -> Optional[str]:
     return text if text else None
 
 
+def _parse_vest_error_envelope(payload: Any) -> Tuple[Optional[int], Optional[str]]:
+    """Parse a Vest error envelope from an already-decoded JSON payload.
+
+    Vest returns inline errors as ``{"code": <int>, "msg": "..."}`` on
+    success HTTP status codes. This helper extracts ``(venue_code,
+    venue_message)`` from such envelopes; returns ``(None, None)`` if
+    the payload doesn't match the envelope shape.
+    """
+    if not isinstance(payload, dict):
+        return None, None
+    raw_code = payload.get("code")
+    if not isinstance(raw_code, int):
+        return None, None
+    raw_msg = payload.get("msg") or ""
+    return raw_code, str(raw_msg) or None
+
+
+def _parse_vest_error_envelope_text(body_text: str) -> Tuple[Optional[int], Optional[str]]:
+    """Parse a Vest error envelope from a raw response body string.
+
+    Vest's 4xx/5xx response bodies may carry a JSON envelope. This
+    helper tries to parse it; returns ``(None, None)`` if the body
+    isn't a recognised Vest error envelope or isn't JSON.
+    """
+    if not body_text:
+        return None, None
+    text = body_text.strip()
+    if not text:
+        return None, None
+    if not (text.startswith("{") or text.startswith("[")):
+        return None, None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None, None
+    return _parse_vest_error_envelope(payload)
+
+
 def _verify_order_status(
     credentials: Dict[str, Any],
     order_id: str,
@@ -1957,6 +1995,59 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 code="INVALID_PRICE",
                 message="Limit price must be a positive decimal string.",
             )
+        # Quantize the caller-supplied limit price to the venue tick.
+        # Vest's pre-trade validation rejects prices that are not
+        # multiples of the venue's smallest tick band (e.g. NDX
+        # enforces 0.25 even though priceDecimals implies 0.01). We
+        # use the same ``_vest_quantize_price`` helper as the ladder
+        # so a hand-typed new_order behaves identically to a ladder
+        # child at the same price.
+        try:
+            catalog_rows = _fetch_catalog(credentials)
+        except VestHTTPError as exc:
+            return _map_http_error_to_failure(
+                exc, operation="new_order", account=account
+            )
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=account,
+                code="VEST_ERROR",
+                message=_redact(sanitize_error_message(str(exc))),
+            )
+        # ``_fetch_catalog`` returns a list of catalog-row dicts (not
+        # the raw ``/exchangeInfo`` envelope). Match the requested
+        # symbol case-insensitively.
+        if not isinstance(catalog_rows, list):
+            catalog_rows = []
+        catalog_match: Optional[Dict[str, Any]] = None
+        for row in catalog_rows:
+            if not isinstance(row, dict):
+                continue
+            row_sym = str(row.get("symbol") or "").strip().upper()
+            if row_sym == requested_symbol:
+                catalog_match = row
+                break
+        if catalog_match is None:
+            return make_failure(
+                operation="new_order",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_NOT_FOUND",
+                message=(
+                    f"Vest catalog has no entry for {requested_symbol!r}; "
+                    "cannot quantize the limit price."
+                ),
+            )
+        quantized_price = _vest_quantize_price(price_decimal, catalog_match)
+        # Use the quantized price verbatim — Vest rejects anything that
+        # is not a multiple of the venue tick, so quantization is
+        # mandatory and silent. Operators who want strict no-quantile
+        # behavior must pre-validate their price against the venue
+        # tickSizes themselves before submitting.
+        price_decimal = quantized_price
+        price_text = _decimal_text(price_decimal)
     else:
         price_decimal = None
         price_text = "0"
@@ -2416,6 +2507,91 @@ def _ladder_quantize_to_increment(value: Decimal, increment: Decimal) -> Decimal
     return units * increment
 
 
+def _vest_price_increment_from_row(row: Dict[str, Any]) -> Decimal:
+    """Return the venue tick size (smallest valid price increment) for a
+    Vest catalog row.
+
+    The catalog row may come from one of two sources with different
+    field-name conventions:
+
+    - ``/exchangeInfo`` raw response — uses ``priceDecimals`` /
+      ``tickSizes`` (PascalCase).
+    - ``_fetch_catalog`` transformed rows — uses ``price_decimals`` /
+      ``tickSizes`` (snake_case) because the fetch helper normalises
+      the field names.
+
+    This helper accepts both spellings so callers do not need to know
+    which shape they have.
+
+    Vest's ``/exchangeInfo`` returns two relevant fields:
+
+    - ``priceDecimals`` / ``price_decimals`` — the maximum number of
+      decimal places a price may carry. The implied precision
+      increment is ``10 ** -priceDecimals``.
+    - ``tickSizes`` — an ordered list of price-band ticks (smallest
+      first). The active tick for a given price depends on the price
+      band, but the smallest entry (``tickSizes[0]``) is the most
+      restrictive increment and is always a valid tick for any price
+      in any band (coarser ticks divide cleanly into it).
+
+    For most instruments ``tickSizes[0] == 10 ** -priceDecimals`` so
+    the two fields agree. For a small set of index / futures-style
+    contracts (NDX-USD-PERP, SPX-USD-PERP, HG-PERP, SI-PERP, ...) the
+    venue publishes a coarser ``tickSizes[0]`` than the
+    ``priceDecimals``-derived increment. The agent previously used only
+    the ``priceDecimals``-derived increment, which caused 48 of 50
+    children on a real NDX ladder (30850 → 31850) to be rejected by
+    Vest's pre-trade validation as off-tick.
+
+    The correct rule is therefore the **max** of the two — the price
+    must satisfy both the maximum decimal precision and the smallest
+    band tick. The returned value is the smallest price increment that
+    is guaranteed-valid for the venue.
+    """
+    pd_raw = row.get("priceDecimals")
+    if pd_raw is None:
+        pd_raw = row.get("price_decimals")
+    pd: Optional[int] = None
+    if isinstance(pd_raw, int):
+        pd = pd_raw
+    elif pd_raw is not None:
+        try:
+            pd = int(str(pd_raw).strip())
+        except (TypeError, ValueError):
+            pd = None
+    precision_increment = (
+        Decimal(10) ** -pd if pd is not None and pd >= 0 else Decimal("0.01")
+    )
+
+    tick_sizes_raw = row.get("tickSizes")
+    if tick_sizes_raw is None:
+        tick_sizes_raw = row.get("tick_sizes")
+    smallest_tick: Optional[Decimal] = None
+    if isinstance(tick_sizes_raw, list):
+        for entry in tick_sizes_raw:
+            try:
+                candidate = Decimal(str(entry))
+            except Exception:  # noqa: BLE001
+                continue
+            if candidate <= 0:
+                continue
+            if smallest_tick is None or candidate < smallest_tick:
+                smallest_tick = candidate
+
+    if smallest_tick is not None and smallest_tick > precision_increment:
+        return smallest_tick
+    return precision_increment
+
+
+def _vest_quantize_price(value: Decimal, row: Dict[str, Any]) -> Decimal:
+    """Snap ``value`` to the venue tick. Pure Decimal arithmetic.
+
+    Round-half-up to the nearest multiple of ``_vest_price_increment_from_row(row)``.
+    """
+    increment = _vest_price_increment_from_row(row)
+    return _ladder_quantize_to_increment(value, increment)
+
+
 def _ladder_build_prices(
     start_price: Decimal,
     end_price: Decimal,
@@ -2751,7 +2927,14 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                     "price_decimals or size_decimals."
                 ),
             )
-        price_increment = Decimal(10) ** -price_decimals
+        # Vest's ``/exchangeInfo`` row carries both ``priceDecimals``
+        # and ``tickSizes``. The venue enforces the **max** of the two
+        # as the minimum valid price increment — the priceDecimals
+        # value alone is too coarse (e.g. for NDX-USD-PERP it gives
+        # 0.01 but the actual venue tick is 0.25; submitting 30870.41
+        # is rejected). ``_vest_price_increment_from_row`` returns the
+        # correct combined increment.
+        price_increment = _vest_price_increment_from_row(row)
         size_increment = Decimal(10) ** -size_decimals
 
         try:
@@ -2819,7 +3002,13 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     time_ms = _now_ms()
     succeeded: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
-    for child in children:
+    # Structured failure rows that survive end-to-end to the
+    # phase2 executor and the HTTP response. ``failed`` above keeps
+    # the legacy shape (price/size/code/body) so existing callers
+    # that look at ``data["failed"]`` continue to work; ``failed_children``
+    # is the canonical structured form.
+    failed_children: List[Dict[str, Any]] = []
+    for child_index, child in enumerate(children):
         payload = _build_new_order_payload(
             symbol=resolved_symbol,
             order_type="LIMIT",
@@ -2835,12 +3024,25 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         try:
             response_payload = _submit_new_order(credentials, payload)
         except VestHTTPError as exc:
+            # 4xx / 5xx envelope from Vest. ``exc.body`` may carry a JSON
+            # error envelope; try to parse it for venue_code/venue_message.
+            venue_code, venue_message = _parse_vest_error_envelope_text(exc.body)
             failed.append(
                 {
                     "price": child["price_text"],
                     "size": child["size_text"],
                     "code": str(exc.status),
                     "body": str(exc.body)[:200],
+                }
+            )
+            failed_children.append(
+                {
+                    "index": child_index + 1,
+                    "price": child["price_text"],
+                    "size": child["size_text"],
+                    "http_status": int(exc.status) if str(exc.status).isdigit() else None,
+                    "venue_code": venue_code,
+                    "venue_message": venue_message,
                 }
             )
             next_nonce += 1
@@ -2854,16 +3056,38 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                     "body": _redact(sanitize_error_message(str(exc)))[:200],
                 }
             )
+            failed_children.append(
+                {
+                    "index": child_index + 1,
+                    "price": child["price_text"],
+                    "size": child["size_text"],
+                    "http_status": None,
+                    "venue_code": "VEST_ERROR",
+                    "venue_message": _redact(sanitize_error_message(str(exc)))[:200] or None,
+                }
+            )
             next_nonce += 1
             continue
         order_id = _extract_order_id(response_payload)
         if not order_id:
+            # 200 OK but no id — Vest returned an inline error envelope.
+            venue_code, venue_message = _parse_vest_error_envelope(response_payload)
             failed.append(
                 {
                     "price": child["price_text"],
                     "size": child["size_text"],
                     "code": "MALFORMED_RESPONSE",
                     "body": "no id in response",
+                }
+            )
+            failed_children.append(
+                {
+                    "index": child_index + 1,
+                    "price": child["price_text"],
+                    "size": child["size_text"],
+                    "http_status": 200,
+                    "venue_code": venue_code or "MALFORMED_RESPONSE",
+                    "venue_message": venue_message or "no order id in response",
                 }
             )
             next_nonce += 1
@@ -2880,6 +3104,27 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             }
         )
         next_nonce += 1
+    # Build a sanitized group-level exchange_reason when any child failed.
+    # The wizard / phase2 surfaces this when the top-level exchange_reason
+    # is None. We never embed the signed body / signature / API key here —
+    # only the first failure's http_status + venue_code + venue_message.
+    exchange_reason: Optional[str] = None
+    if failed_children:
+        first = failed_children[0]
+        bits = []
+        if first.get("http_status") is not None:
+            bits.append(f"HTTP {first['http_status']}")
+        if first.get("venue_code") is not None:
+            bits.append(f"code={first['venue_code']}")
+        if first.get("venue_message"):
+            bits.append(str(first["venue_message"])[:160])
+        exchange_reason = (
+            f"{len(failed_children)} of {len(children)} children rejected; "
+            f"first failure at index={first.get('index')}: " + " ".join(bits)
+        ) if bits else (
+            f"{len(failed_children)} of {len(children)} children rejected; "
+            f"first failure at index={first.get('index')}"
+        )
     return make_success(
         operation="ladder",
         exchange=name,
@@ -2914,12 +3159,24 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 }
                 for p in succeeded
             ],
+            exchange_reason=exchange_reason,
         ),
         # Surface the per-failed-child rows alongside the canonical
         # ``ladder`` field so callers (and the wizard UI) can show the
         # exact reason for any failure without re-parsing the ladder.
         # Empty on full success; otherwise one row per failed child.
-        data={"failed": failed} if failed else {},
+        #
+        # ``failed`` keeps the legacy shape (price/size/code/body) so
+        # existing callers that look at ``data["failed"]`` continue to
+        # work; ``failed_children`` is the canonical structured form
+        # with ``index``, ``price``, ``size``, ``http_status``,
+        # ``venue_code``, ``venue_message``.
+        data=({
+            "failed": failed,
+            "failed_children": failed_children,
+        } if failed else {
+            "failed_children": [],
+        }),
     )
 
 
@@ -3148,6 +3405,16 @@ def _fetch_catalog(credentials: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "maint_margin_ratio": row.get("maintMarginRatio"),
                         "taker_fee": row.get("takerFee"),
                         "isolated": row.get("isolated"),
+                        # Preserve the venue tick-band list so downstream
+                        # code can quantize prices to the actual venue
+                        # tick (e.g. CME NQ futures enforce 0.25 even
+                        # though priceDecimals=2 implies 0.01). Stored
+                        # under both spellings (PascalCase ``tickSizes``
+                        # matching the upstream API plus the snake_case
+                        # ``tick_sizes`` alias) so callers can read
+                        # either without re-fetching.
+                        "tickSizes": row.get("tickSizes"),
+                        "tick_sizes": row.get("tickSizes"),
                     }
                 )
         _catalog_cache = {"ts": now, "rows": rows, "lock": None}
@@ -3350,12 +3617,24 @@ def _instrument_from_catalog_row(
     *,
     mark_price: Optional[Decimal] = None,
 ) -> CanonicalInstrument:
-    """Build a CanonicalInstrument from a parsed catalog row."""
+    """Build a CanonicalInstrument from a parsed catalog row.
+
+    ``price_increment`` is sourced from the venue's ``tickSizes`` (the
+    smallest entry) when present, because Vest's exchange-side
+    pre-trade validation rejects prices that are not multiples of the
+    smallest tick band — see the live NDX 48/50 failure where
+    ``priceDecimals=2`` would imply ``0.01`` but the venue enforces
+    ``0.25`` (the canonical CME E-mini NQ tick). For instruments
+    without ``tickSizes`` we fall back to ``10 ** -priceDecimals``.
+    """
     native = str(row.get("symbol") or "").strip()
     base = str(row.get("base") or "").strip()
     quote = str(row.get("quote") or "USDC").strip()
     price_decimals = _decimal_or_none(row.get("price_decimals"))
     size_decimals = _decimal_or_none(row.get("size_decimals"))
+    price_increment = _vest_price_increment_from_row(row)
+    if price_increment is None and price_decimals is not None:
+        price_increment = Decimal(10) ** -int(price_decimals)
     return CanonicalInstrument(
         requested_symbol=requested,
         symbol=native,
@@ -3366,8 +3645,8 @@ def _instrument_from_catalog_row(
         quote=quote or None,
         market_type="perp",
         price_increment=(
-            str(Decimal(10) ** -int(price_decimals))
-            if price_decimals is not None
+            _decimal_text(price_increment)
+            if price_increment is not None
             else None
         ),
         size_increment=(

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -65,6 +66,7 @@ class FakeLadder:
     accepted_child_count: int = 5
     submitted_order_count: int = 5
     partial: bool = False
+    exchange_reason: Optional[str] = None
 
 
 @dataclass
@@ -74,6 +76,7 @@ class FakeCanonical:
     order: Any = None
     cancel_group: Any = None
     ladder: Any = None
+    data: Any = None
 
 
 class FakeDesk:
@@ -646,6 +649,111 @@ class WebTrade2Phase2Tests(unittest.TestCase):
         self.assertEqual(out.get("accepted"), 5)
         self.assertEqual(out.get("requested"), 8)
         self.assertIn("5 of 8", out.get("message", ""))
+
+    def test_partial_ladder_propagates_failed_children_and_exchange_reason(self) -> None:
+        """When the agent returns per-child failure rows + an
+        exchange_reason, the phase2 executor must surface BOTH end-to-end
+        so the HTTP response carries the actionable signal to the
+        wizard / Telegram consumer.
+
+        We exercise the phase2 execute_preview ladder path directly via
+        the service to bypass the per-agent ladder cap and force the
+        branch where the agent returns data.failed_children.
+        """
+        cfg_mod = _import("plugins.trade.webtrade2.config")
+        p2_mod = _import("plugins.trade.webtrade2.phase2")
+
+        cfg = cfg_mod.WebTrade2Config.from_values(
+            password="test-password",
+            session_secret="x" * 32,
+            port=9009,
+            write_enabled=True,
+            dry_run=False,
+            preview_ttl_seconds=300,
+            ladder_enabled=True,
+            live_accounts=[("hyperliquid", "fibo")],
+            live_operations=["ladder"],
+        )
+
+        failed_children = [
+            {
+                "index": i + 1,
+                "price": str(30870.41 + i * 20),
+                "size": "0.005",
+                "http_status": 422,
+                "venue_code": 3019,
+                "venue_message": "INVALID_TICK_SIZE",
+            }
+            for i in range(48)
+        ]
+
+        class PartialVestDesk(FakeDesk):
+            def execute(self, request):
+                if request.get("operation") == "ladder":
+                    self.calls.append(dict(request))
+                    return FakeCanonical(
+                        success=True,
+                        ladder=FakeLadder(
+                            requested_order_count=50,
+                            accepted_child_count=2,
+                            submitted_order_count=2,
+                            partial=True,
+                            exchange_reason=(
+                                "48 of 50 children rejected; "
+                                "first failure at index=1: HTTP 422 "
+                                "code=3019 INVALID_TICK_SIZE"
+                            ),
+                        ),
+                        data={"failed_children": failed_children},
+                    )
+                return super().execute(request)
+
+        desk = PartialVestDesk()
+        p2 = p2_mod.WebTrade2Phase2Service(
+            desk=desk,
+            session_secret="x" * 32,
+            write_enabled=True,
+            dry_run=False,
+            preview_ttl_seconds=300,
+            ladder_enabled=True,
+            live_accounts=[("hyperliquid", "fibo")],
+            live_operations=["ladder"],
+        )
+        # Issue a preview so we have a token.
+        preview = p2.preview_ladder(
+            exchange="hyperliquid",
+            account="fibo",
+            symbol="BTC",
+            side="sell",
+            distribution="uniform",
+            order_count=50,
+            total_size="5",
+            start_price="90",
+            end_price="100",
+        )
+        self.assertTrue(preview.get("success"))
+        pid = preview.get("preview_id")
+        self.assertTrue(pid)
+
+        # Execute the preview — the desk returns a partial ladder with
+        # 48 failed children + an exchange_reason.
+        out = p2.execute_preview(pid)
+        self.assertEqual(out.get("status"), "PARTIALLY_SUBMITTED")
+        self.assertEqual(out.get("accepted"), 2)
+        self.assertEqual(out.get("requested"), 50)
+        # exchange_reason propagated from the agent's ladder.exchange_reason.
+        self.assertIn("48 of 50", out.get("exchange_reason", ""))
+        # failed_children propagated from the agent's resp.data["failed_children"].
+        children = out.get("failed_children") or []
+        self.assertEqual(len(children), 48)
+        for child in children:
+            self.assertEqual(child["http_status"], 422)
+            self.assertEqual(child["venue_code"], 3019)
+            self.assertEqual(child["venue_message"], "INVALID_TICK_SIZE")
+            serialised = json.dumps(child)
+            self.assertNotIn("signature", serialised)
+            self.assertNotIn("api_key", serialised)
+            self.assertNotIn("private", serialised)
 
     # ---- 19. no automatic retry after partial/unknown -----------------
 

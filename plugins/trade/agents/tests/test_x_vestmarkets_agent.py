@@ -849,6 +849,33 @@ class VestAgentContractTests(unittest.TestCase):
         req.update(overrides)
         return req
 
+    def _stub_btc_catalog(self):
+        """Vest-shaped BTC-PERP catalog row (priceDecimals=2,
+        tickSizes[0]=0.01) — used by the new_order tests that exercise
+        the price-quantization path.
+        """
+        return {
+            "symbol": "BTC-PERP",
+            "display_name": "Bitcoin Perpetual",
+            "base": "BTC",
+            "quote": "USDC",
+            "size_decimals": 4,
+            "price_decimals": 2,
+            "init_margin_ratio": "0.020000",
+            "maint_margin_ratio": "0.010000",
+            "taker_fee": "0",
+            "isolated": False,
+            "tickSizes": ["0.01", "0.1", "1", "10", "100"],
+        }
+
+    def _catalog_response_for(self, *rows):
+        """Return an ``/exchangeInfo``-shaped dict containing the given
+        catalog row(s). Tests that need to mock the catalog fetch use
+        this from a ``seed_get`` that branches on
+        ``path == "/exchangeInfo"``.
+        """
+        return {"symbols": list(rows)}
+
     def _mock_signed_get(self, return_value):
         original = vest._signed_get
         # Accept the optional ``query`` kwarg so this matches the production
@@ -1097,8 +1124,12 @@ class VestAgentContractTests(unittest.TestCase):
         # GET /orders?id=0xabc returns a NEW row matching the id.
         captured: list = []
         original_post = self._mock_signed_post(captured)
-        # Mock the GETs the agent makes: nonce, then verify.
+        # Mock the GETs the agent makes: catalog, nonce, then verify.
+        btc_row = self._stub_btc_catalog()
+        catalog_payload = self._catalog_response_for(btc_row)
         def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
             if path == "/account/nonce":
                 return {"lastNonce": 5}
             if path.startswith("/orders?id="):
@@ -1207,8 +1238,14 @@ class VestAgentContractTests(unittest.TestCase):
         self.assertEqual(resp.error.code, "INVALID_ORDER_TYPE")
 
     def test_new_order_handles_nonce_failure(self):
-        # /account/nonce 500s → VEST_ERROR.
+        # /account/nonce 500s → VEST_ERROR. Catalog must also be
+        # reachable so the agent can quantize the limit price before
+        # failing on the nonce fetch.
+        btc_row = self._stub_btc_catalog()
+        catalog_payload = self._catalog_response_for(btc_row)
         def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
             if path == "/account/nonce":
                 raise vest.VestHTTPError(status=500, path=path, body="boom")
             raise AssertionError(f"unexpected GET {path}")
@@ -1228,7 +1265,11 @@ class VestAgentContractTests(unittest.TestCase):
         def fake_reject(creds, path, body):
             raise vest.VestHTTPError(status=402, path=path, body="MARGIN_CHECK_FAILED")
         vest._signed_post = fake_reject  # type: ignore[assignment]
+        btc_row = self._stub_btc_catalog()
+        catalog_payload = self._catalog_response_for(btc_row)
         def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
             if path == "/account/nonce":
                 return {"lastNonce": 0}
             raise AssertionError(f"unexpected GET {path}")
@@ -2816,7 +2857,10 @@ class VestAgentContractTests(unittest.TestCase):
 
     def _stub_ndx_catalog(self):
         """Return a Vest-shaped NDX catalog row with size_decimal s=4,
-        price_decimals=2 — the live values for NDX-USD-PERP.
+        price_decimals=2 — the live values for NDX-USD-PERP. Includes
+        the venue ``tickSizes`` so the price-quantization path exercises
+        the coarser 0.25 band that triggered the original 48/50 ladder
+        rejection in production.
         """
         return {
             "symbol": "NDX-USD-PERP",
@@ -2829,6 +2873,7 @@ class VestAgentContractTests(unittest.TestCase):
             "maint_margin_ratio": "0.010000",
             "taker_fee": "0",
             "isolated": False,
+            "tickSizes": ["0.25", "0.5", "1", "10"],
         }
 
     def test_ladder_half_gaussian_expands_to_50_children(self):
@@ -3143,6 +3188,299 @@ class VestAgentContractTests(unittest.TestCase):
         assert resp.data is not None
         self.assertEqual(len(resp.data.get("failed") or []), 25)
 
+    def test_ladder_partial_failure_exposes_structured_failed_children(self):
+        """Every failed child must surface as a structured row with
+        ``index``, ``price``, ``size``, ``http_status``, ``venue_code``
+        and ``venue_message`` — the canonical fields the phase2 executor
+        propagates up the stack to the HTTP response and Telegram.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+
+        attempts = {"n": 0}
+
+        def selective_post(creds, path, body, *, query=None):
+            attempts["n"] += 1
+            # The first and last children succeed; the 48 middle
+            # children return a 422 with a JSON Vest error envelope.
+            # Mirror the live NDX 48/50 failure we diagnosed.
+            order = body.get("order") or {}
+            price = str(order.get("limitPrice") or "")
+            if price in ("30850", "31850"):
+                return {"code": 0, "msg": "", "data": {"id": "0xok_" + price}}
+            raise vest.VestHTTPError(
+                status=422, path=path,
+                body='{"code": 3019, "msg": "INVALID_TICK_SIZE"}',
+            )
+
+        vest._signed_post = selective_post  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.status, "partial")
+        self.assertEqual(resp.ladder.omitted_order_count, 48)
+        self.assertEqual(resp.ladder.submitted_order_count, 2)
+        # exchange_reason is populated on the ladder for partial
+        # submissions — exactly the field phase2 propagates up.
+        assert resp.ladder.exchange_reason is not None
+        self.assertIn("48 of 50", resp.ladder.exchange_reason)
+        self.assertIn("HTTP 422", resp.ladder.exchange_reason)
+        self.assertIn("3019", resp.ladder.exchange_reason)
+        # data.failed_children: 48 structured rows, no secrets exposed.
+        assert resp.data is not None
+        failed_children = resp.data.get("failed_children") or []
+        self.assertEqual(len(failed_children), 48)
+        for child in failed_children:
+            self.assertIn("index", child)
+            self.assertIn("price", child)
+            self.assertIn("size", child)
+            self.assertIn("http_status", child)
+            self.assertIn("venue_code", child)
+            self.assertIn("venue_message", child)
+            self.assertEqual(child["http_status"], 422)
+            self.assertEqual(child["venue_code"], 3019)
+            self.assertEqual(child["venue_message"], "INVALID_TICK_SIZE")
+            # The signed body / signature / API key are NOT in the row.
+            serialised = json.dumps(child)
+            self.assertNotIn("signature", serialised)
+            self.assertNotIn("api_key", serialised)
+            self.assertNotIn("private", serialised)
+        # Indices are 1-based and match the request order (children 2..49).
+        indices = [c["index"] for c in failed_children]
+        self.assertEqual(indices, list(range(2, 50)))
+        # Legacy ``failed`` list also preserved for back-compat.
+        self.assertEqual(len(resp.data.get("failed") or []), 48)
+
+    def test_ladder_ndx_uses_coarser_tick_band_for_off_tick_prices(self):
+        """The known 30850 → 31850 NDX ladder (NDX enforces a 0.25 tick
+        band even though priceDecimals=2) must generate exactly 50
+        distinct, tick-aligned prices. This is the regression test for
+        the production 48/50 failure: with the static ``price_decimals``
+        increment of 0.01 the 48 in-between prices (30870.41, 30890.82,
+        …) are NOT multiples of 0.25 and Vest rejects them. The fix
+        uses ``tickSizes[0] = 0.25`` so every generated price lands on
+        the venue tick.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured, unique_ids=True)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.requested_order_count, 50)
+        self.assertEqual(resp.ladder.submitted_order_count, 50)
+        self.assertEqual(resp.ladder.status, "success")
+        # Every captured price must be a multiple of 0.25 (NDX tick).
+        from decimal import Decimal as _D
+        TICK = _D("0.25")
+        prices = [_D(body["order"]["limitPrice"]) for _p, body, _q in captured]
+        self.assertEqual(len(prices), 50)
+        self.assertEqual(len(set(prices)), 50, msg="duplicate prices in ladder")
+        for p in prices:
+            self.assertEqual(p % TICK, _D("0"), msg=f"price {p} off the 0.25 tick")
+        # Endpoints preserved (30850 first, 31850 last).
+        self.assertEqual(prices[0], _D("30850"))
+        self.assertEqual(prices[-1], _D("31850"))
+        # Monotonically increasing.
+        for prev, nxt in zip(prices, prices[1:]):
+            self.assertLess(prev, nxt)
+        # Total size = 5 (sum of half_gaussian sizes).
+        sizes = [_D(body["order"]["size"]) for _p, body, _q in captured]
+        total_size = sum(sizes, _D("0"))
+        self.assertEqual(total_size.quantize(_D("0.0001")), _D("5.0000"))
+        # No retry / single POST per child.
+        self.assertEqual(len(captured), 50)
+
+    def test_vest_price_increment_from_row_combines_ticks_and_decimals(self):
+        """``_vest_price_increment_from_row`` returns the max of
+        ``10 ** -priceDecimals`` and ``tickSizes[0]``. NDX (where
+        tickSizes[0]=0.25 > 10**-2=0.01) returns 0.25; BTC (where
+        tickSizes[0]=0.01 = 10**-2) returns 0.01; a raw row missing
+        tickSizes falls back to priceDecimals.
+        """
+        from plugins.trade.agents.x_vestmarkets_agent import (
+            _vest_price_increment_from_row,
+            _vest_quantize_price,
+        )
+        from decimal import Decimal as _D
+        # NDX (raw API form: PascalCase keys).
+        ndx_raw = {"priceDecimals": 2, "tickSizes": ["0.25", "0.5", "1", "10"]}
+        self.assertEqual(_vest_price_increment_from_row(ndx_raw), _D("0.25"))
+        # NDX (transformed form: snake_case keys).
+        ndx_snake = {"price_decimals": 2, "tickSizes": ["0.25", "0.5", "1", "10"]}
+        self.assertEqual(_vest_price_increment_from_row(ndx_snake), _D("0.25"))
+        # BTC: tickSizes[0] == 10**-priceDecimals.
+        btc = {"priceDecimals": 2, "tickSizes": ["0.01", "0.1", "1", "10", "100"]}
+        self.assertEqual(_vest_price_increment_from_row(btc), _D("0.01"))
+        # No tickSizes: fall back to priceDecimals.
+        plain = {"priceDecimals": 2}
+        self.assertEqual(_vest_price_increment_from_row(plain), _D("0.01"))
+        # Quantize NDX off-tick 30870.41 → 30870.50 (nearest 0.25).
+        self.assertEqual(
+            _vest_quantize_price(_D("30870.41"), ndx_raw), _D("30870.50")
+        )
+        self.assertEqual(
+            _vest_quantize_price(_D("30870.12"), ndx_raw), _D("30870.00")
+        )
+        # Endpoints already tick-aligned → unchanged.
+        self.assertEqual(_vest_quantize_price(_D("30850"), ndx_raw), _D("30850"))
+        self.assertEqual(_vest_quantize_price(_D("31850"), ndx_raw), _D("31850"))
+
+    def test_new_order_quantizes_off_tick_price_to_tick_aligned_value(self):
+        """Hand-typed LIMIT new_order must use the same quantizer as the
+        ladder: an off-tick price is rounded to the nearest tick, but a
+        price more than half a tick away is rejected with PRICE_OFF_TICK
+        so the operator can resubmit with a tick-aligned price rather
+        than silently moving their limit.
+        """
+        # On-tick price passes through.
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+        ndx_row = self._stub_ndx_catalog()
+        catalog_payload = {"symbols": [ndx_row]}
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [
+                    {
+                        "id": "0xok",
+                        "symbol": "NDX-USD-PERP",
+                        "isBuy": True,
+                        "orderType": "LIMIT",
+                        "limitPrice": "30850",
+                        "size": "0.001",
+                        "status": "NEW",
+                    }
+                ]
+            raise AssertionError(f"unexpected GET {path}")
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute(self._new_order_request(
+                symbol="NDX-USD-PERP",
+                price="30850",  # already tick-aligned (30850 mod 0.25 = 0).
+            ))
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        # The agent POSTed at the tick-aligned price (unchanged here).
+        self.assertEqual(captured[0][1]["order"]["limitPrice"], "30850")
+
+    def test_new_order_off_tick_price_is_silently_quantized_to_nearest_tick(self):
+        """Hand-typed LIMIT new_order must use the same quantizer as the
+        ladder: an off-tick price is rounded to the nearest tick
+        silently. The same exchange_tick that the ladder enforces is
+        honored by new_order so the two code paths stay consistent.
+        No POST is made for the original (off-tick) price — only the
+        quantized price is sent to Vest.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+        ndx_row = self._stub_ndx_catalog()
+        catalog_payload = {"symbols": [ndx_row]}
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [
+                    {
+                        "id": "0xok",
+                        "symbol": "NDX-USD-PERP",
+                        "isBuy": True,
+                        "orderType": "LIMIT",
+                        "limitPrice": "30870.50",
+                        "size": "0.001",
+                        "status": "NEW",
+                    }
+                ]
+            raise AssertionError(f"unexpected GET {path}")
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute(self._new_order_request(
+                symbol="NDX-USD-PERP",
+                price="30870.41",  # off-tick; nearest 0.25 tick = 30870.50.
+            ))
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        # Exactly one POST went to Vest, and it carried the QUANTIZED price.
+        self.assertEqual(len(captured), 1)
+        body = captured[0][1]
+        # Vest accepts the same numeric value either as "30870.50" or
+        # "30870.5" — the wire format depends on the agent's price
+        # formatter. Compare numerically.
+        from decimal import Decimal as _D
+        posted_price = _D(body["order"]["limitPrice"])
+        self.assertEqual(posted_price, _D("30870.50"))
+        self.assertNotEqual(posted_price, _D("30870.41"))
+
     def test_ladder_unknown_instrument_returns_instrument_not_found(self):
         captured: list = []
         original_post = self._mock_signed_post(captured)
@@ -3448,7 +3786,11 @@ class VestAgentContractTests(unittest.TestCase):
                 credentials=creds,
             )
         vest._signed_post = fake  # type: ignore[assignment]
+        btc_row = self._stub_btc_catalog()
+        catalog_payload = self._catalog_response_for(btc_row)
         def seed_get(creds, path, *, query=None):
+            if path == "/exchangeInfo":
+                return catalog_payload
             if path == "/account/nonce":
                 return {"lastNonce": 0}
             raise AssertionError(f"unexpected GET {path}")

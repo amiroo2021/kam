@@ -1197,6 +1197,32 @@ class WebTrade2Phase2Service:
             }
             if ladder:
                 out["ladder"] = ladder
+            # Propagate the canonical exchange_reason (set by the agent
+            # on the ladder result when any child was rejected) up to
+            # the top-level response so the wizard / Telegram can render
+            # it without re-parsing the ladder. We only set this when
+            # the agent actually populated it — never invent a reason
+            # here.
+            agent_exchange_reason: Optional[str] = None
+            if isinstance(ladder, dict):
+                _er = ladder.get("exchange_reason")
+                if isinstance(_er, str) and _er.strip():
+                    agent_exchange_reason = _er.strip()
+            if agent_exchange_reason and not out.get("exchange_reason"):
+                out["exchange_reason"] = agent_exchange_reason
+            # Propagate structured per-child failure rows from the
+            # agent's ``resp.data["failed_children"]`` so the HTTP
+            # response carries them end-to-end. The ladder field above
+            # may also carry these if the canonical schema eventually
+            # gains a ``failed_children`` slot, but the data-side path
+            # is what the Vest agent populates today. We do NOT touch
+            # the legacy ``failed`` list (kept for backward
+            # compatibility with other consumers).
+            failed_children = getattr(resp, "data", None)
+            if isinstance(failed_children, dict):
+                _fc = failed_children.get("failed_children")
+                if isinstance(_fc, list):
+                    out["failed_children"] = _fc
             if ok:
                 self._audit(
                     operation="ladder",
