@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -74,7 +75,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -181,12 +182,20 @@ RESTING_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED")
 DEFAULT_RECV_WINDOW_MS = 60_000
 
 # Conservative ladder cap. Vest does not document a per-account or
-# per-instrument open-order ceiling so we cap at a small number; the
-# wizard's ladder screen surfaces this via
-# ``ladder_max_orders_per_instrument``. The batch POST itself is one
-# placement per call — we issue them serially with a single nonce walk
-# so the server doesn't see a duplicate nonce race.
-LADDER_MAX_ORDERS_PER_INSTRUMENT = 20
+# per-instrument open-order ceiling so we cap at a value comfortably
+# above the wizard's default 50-order use-case (and well above what any
+# reasonable retail operator would submit in one sweep). The wizard's
+# ladder screen surfaces this via ``ladder_max_orders_per_instrument``.
+#
+# History: this constant was 20 originally and the wizard's 50-order
+# Half-Gaussian NDX SELL ladder hit ``TOO_MANY_CHILDREN``. Bumped to 100
+# so the canonical 50-child NDX SELL ladder (and similar sweeps) fits.
+# Phase2 ``preview_ladder`` independently caps ``n`` at 500.
+#
+# The batch POST itself is one placement per call — we issue them
+# serially with a single nonce walk so the server doesn't see a
+# duplicate nonce race.
+LADDER_MAX_ORDERS_PER_INSTRUMENT = 100
 LADDER_MAX_BATCH = 5
 
 # Order-verification polling.
@@ -2369,8 +2378,130 @@ def _cancel_order_group(account: str, request: Dict[str, Any]) -> CanonicalRespo
     )
 
 
+def _ladder_distribution_weights(order_count: int, distribution: str) -> List[Decimal]:
+    """Return per-child weights summing (approximately) to 1.0.
+
+    Same shape as the other agents' helpers — ``uniform`` is a flat
+    ``1/N`` vector, ``half_gaussian`` is the half-Gaussian ``σ=1``
+    truncated to ``z∈[0,3]``. ``z=0`` is at the largest weight
+    (last child, the highest price on a SELL ladder = best exit for
+    a SELL); ``z=3`` is at the smallest weight (first child, the
+    worst exit). Identical math to ``x_hyperliquid_agent``,
+    ``x_apex_agent``, ``x_pacifica_agent``, etc. — kept in lockstep
+    so the wizard sees the same VWAP across exchanges.
+    """
+    if order_count <= 0:
+        return []
+    distribution_key = str(distribution or "").strip().lower()
+    if distribution_key == "uniform":
+        return [Decimal("1")] * order_count
+    if distribution_key != "half_gaussian":
+        raise ValueError("UNSUPPORTED_DISTRIBUTION")
+    if order_count == 1:
+        return [Decimal("1")]
+    span = Decimal(order_count - 1)
+    weights: List[Decimal] = []
+    for index in range(order_count):
+        z = Decimal("3") * (span - Decimal(index)) / span
+        weight = math.exp(-(float(z) ** 2) / 2.0)
+        weights.append(Decimal(str(weight)))
+    return weights
+
+
+def _ladder_quantize_to_increment(value: Decimal, increment: Decimal) -> Decimal:
+    """Snap ``value`` to the nearest multiple of ``increment``."""
+    if increment <= 0:
+        raise ValueError("INVALID_INCREMENT")
+    units = (value / increment).to_integral_value(rounding=ROUND_HALF_UP)
+    return units * increment
+
+
+def _ladder_build_prices(
+    start_price: Decimal,
+    end_price: Decimal,
+    order_count: int,
+    price_increment: Decimal,
+) -> List[Decimal]:
+    """Lay out ladder prices evenly between start/end, snap to ticks.
+
+    Enforces monotonicity after tick quantization (which can collapse
+    adjacent prices to the same tick). Direction follows start→end
+    irrespective of side — the side-specific orientation (BUY = start
+    above end; SELL = start below end) is the caller's responsibility.
+    """
+    if order_count <= 0:
+        return []
+    if order_count == 1:
+        return [_ladder_quantize_to_increment(
+            (start_price + end_price) / Decimal("2"), price_increment
+        )]
+    step = (end_price - start_price) / Decimal(order_count - 1)
+    raw_prices = [
+        start_price + step * Decimal(index) for index in range(order_count)
+    ]
+    prices = [_ladder_quantize_to_increment(p, price_increment) for p in raw_prices]
+    if start_price <= end_price:
+        for index in range(1, len(prices)):
+            if prices[index] < prices[index - 1]:
+                prices[index] = prices[index - 1]
+    else:
+        for index in range(1, len(prices)):
+            if prices[index] > prices[index - 1]:
+                prices[index] = prices[index - 1]
+    return prices
+
+
+def _ladder_allocate_sizes(
+    total_volume: Decimal,
+    order_count: int,
+    size_increment: Decimal,
+    distribution: str,
+) -> Tuple[List[Decimal], Decimal]:
+    """Allocate ``total_volume`` across ``order_count`` children by weight.
+
+    Each child's size is rounded DOWN to ``size_increment`` (so the kept
+    total never exceeds the requested volume); the residual whole-unit
+    count is distributed to the children with the largest fractional
+    remainders. Returns ``(sizes, kept_volume)``.
+    """
+    if size_increment <= 0:
+        raise ValueError("INVALID_INCREMENT")
+    total_units = int(
+        (total_volume / size_increment).to_integral_value(rounding=ROUND_HALF_UP)
+    )
+    if total_units < order_count:
+        raise ValueError("INSUFFICIENT_VOLUME_FOR_ORDER_COUNT")
+    weights = _ladder_distribution_weights(order_count, distribution)
+    if not weights:
+        raise ValueError("INVALID_ORDER_COUNT")
+    total_weight = sum(weights, Decimal("0"))
+    if total_weight <= 0:
+        raise ValueError("INVALID_DISTRIBUTION")
+    raw_units = [
+        Decimal(total_units) * weight / total_weight for weight in weights
+    ]
+    base_units = [
+        int(unit.to_integral_value(rounding=ROUND_DOWN)) for unit in raw_units
+    ]
+    residual = total_units - sum(base_units)
+    remainders = [
+        raw_units[index] - Decimal(base_units[index]) for index in range(order_count)
+    ]
+    allocation = list(base_units)
+    if residual > 0:
+        order_indices = sorted(
+            range(order_count),
+            key=lambda index: (remainders[index], -index),
+            reverse=True,
+        )
+        for index in order_indices[:residual]:
+            allocation[index] += 1
+    sizes = [Decimal(units) * size_increment for units in allocation]
+    return sizes, Decimal(total_units) * size_increment
+
+
 def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
-    """Place a ladder of ``LADDER_MAX_BATCH`` children per parent.
+    """Place a ladder of children per parent.
 
     Vest's docs do not mention batch placement. We emulate the wizard's
     "🪜 Ladder" flow by issuing one signed ``POST /orders`` per rung
@@ -2378,6 +2509,23 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     with a monotonic nonce walk so no nonce is reused within the
     sweep. Each child is verified individually for ``NEW`` /
     ``PARTIALLY_FILLED`` status via :func:`_verify_order_status`.
+
+    Two input shapes are supported, matching the canonical contract
+    used by the other exchange agents:
+
+    1. **Manual children** — caller passes ``children=[{price, size},
+       ...]`` and we submit them verbatim (after decimal validation).
+       This is the path used for a uniform manual ladder.
+
+    2. **Distribution expansion** — caller passes ``symbol``, ``side``,
+       ``distribution`` (e.g. ``half_gaussian``), ``order_count``,
+       ``total_volume``, ``start_price``, ``end_price``. We resolve
+       the instrument, derive ``price_increment`` / ``size_increment``
+       from the catalog, run the shared Half-Gaussian / uniform
+       expansion (same math as ``x_hyperliquid_agent`` /
+       ``x_apex_agent`` / etc.), and submit the children in canonical
+       order. ``distribution`` (new, optional, kept for
+       ``uniform``) round-trips the values back into ``data``.
     """
     credentials = _lookup_credentials(account)
     if not credentials:
@@ -2399,63 +2547,260 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             code="INVALID_REQUEST",
             message="Ladder requires symbol and side (buy/sell).",
         )
-    children_raw = request.get("children")
-    if not isinstance(children_raw, list) or not children_raw:
-        return make_failure(
-            operation="ladder",
-            exchange=name,
-            account=account,
-            code="INVALID_CHILDREN",
-            message="Ladder requires a non-empty children list.",
-        )
-    if len(children_raw) > LADDER_MAX_ORDERS_PER_INSTRUMENT:
-        return make_failure(
-            operation="ladder",
-            exchange=name,
-            account=account,
-            code="TOO_MANY_CHILDREN",
-            message=(
-                f"Ladder exceeds {LADDER_MAX_ORDERS_PER_INSTRUMENT} children "
-                f"(got {len(children_raw)})."
-            ),
-        )
 
-    children: List[Dict[str, Any]] = []
-    for child in children_raw:
-        if not isinstance(child, dict):
-            continue
-        price_text = str(child.get("price") or "").strip()
-        size_text = str(child.get("size") or "").strip()
-        price_decimal = _decimal_or_none(price_text)
-        size_decimal = _decimal_or_none(size_text)
-        if (
-            price_decimal is None
-            or price_decimal <= 0
-            or size_decimal is None
-            or size_decimal <= 0
-        ):
+    # --- Path 1: caller-supplied children (manual / uniform override) ---
+    children_raw = request.get("children")
+    if children_raw is not None:
+        if not isinstance(children_raw, list) or not children_raw:
             return make_failure(
                 operation="ladder",
                 exchange=name,
                 account=account,
-                code="INVALID_CHILD",
-                message="Each ladder child needs positive price and size.",
+                code="INVALID_CHILDREN",
+                message="Ladder requires a non-empty children list.",
             )
-        children.append(
-            {
-                "price_text": _decimal_text(price_decimal),
-                "size_text": _decimal_text(size_decimal),
-            }
+        if len(children_raw) > LADDER_MAX_ORDERS_PER_INSTRUMENT:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="TOO_MANY_CHILDREN",
+                message=(
+                    f"Ladder exceeds {LADDER_MAX_ORDERS_PER_INSTRUMENT} children "
+                    f"(got {len(children_raw)})."
+                ),
+            )
+        children: List[Dict[str, Any]] = []
+        for child in children_raw:
+            if not isinstance(child, dict):
+                continue
+            price_text = str(child.get("price") or "").strip()
+            size_text = str(child.get("size") or "").strip()
+            price_decimal = _decimal_or_none(price_text)
+            size_decimal = _decimal_or_none(size_text)
+            if (
+                price_decimal is None
+                or price_decimal <= 0
+                or size_decimal is None
+                or size_decimal <= 0
+            ):
+                return make_failure(
+                    operation="ladder",
+                    exchange=name,
+                    account=account,
+                    code="INVALID_CHILD",
+                    message="Each ladder child needs positive price and size.",
+                )
+            children.append(
+                {
+                    "price_text": _decimal_text(price_decimal),
+                    "size_text": _decimal_text(size_decimal),
+                }
+            )
+        if not children:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_CHILDREN",
+                message="Ladder children list is empty after validation.",
+            )
+        distribution = "manual"
+        resolved_symbol = requested_symbol
+        requested_volume_text = _decimal_text(
+            sum(
+                (_decimal_or_none(child["size_text"]) or Decimal("0"))
+                for child in children
+            )
         )
-    if not children:
-        return make_failure(
-            operation="ladder",
-            exchange=name,
-            account=account,
-            code="INVALID_CHILDREN",
-            message="Ladder children list is empty after validation.",
-        )
+    else:
+        # --- Path 2: distribution expansion (canonical Half-Gaussian / uniform) ---
+        distribution = str(request.get("distribution") or "half_gaussian").strip().lower()
+        if distribution not in {"half_gaussian", "uniform"}:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="UNSUPPORTED_DISTRIBUTION",
+                message=(
+                    f"Ladder distribution {distribution!r} is not supported; "
+                    "use half_gaussian or uniform."
+                ),
+            )
 
+        order_count_raw = request.get("order_count") or request.get("orders")
+        try:
+            order_count = int(str(order_count_raw).strip())
+        except Exception:  # noqa: BLE001
+            order_count = 0
+        if order_count <= 0:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_ORDER_COUNT",
+                message="Ladder requires a positive order_count.",
+            )
+        if order_count > LADDER_MAX_ORDERS_PER_INSTRUMENT:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="TOO_MANY_CHILDREN",
+                message=(
+                    f"Ladder exceeds {LADDER_MAX_ORDERS_PER_INSTRUMENT} children "
+                    f"(got {order_count})."
+                ),
+            )
+
+        total_volume = _decimal_or_none(request.get("total_volume") or request.get("volume"))
+        if total_volume is None or total_volume <= 0:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_VOLUME",
+                message="Ladder requires a positive total_volume.",
+            )
+        start_price = _decimal_or_none(request.get("start_price"))
+        end_price = _decimal_or_none(request.get("end_price"))
+        if start_price is None or end_price is None:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_PRICE",
+                message="Ladder requires start_price and end_price.",
+            )
+        if requested_side == "buy" and end_price >= start_price:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_LADDER_DIRECTION",
+                message="BUY ladders require end_price below start_price.",
+            )
+        if requested_side == "sell" and end_price <= start_price:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_LADDER_DIRECTION",
+                message="SELL ladders require end_price above start_price.",
+            )
+
+        # Resolve the instrument to get price_increment / size_increment.
+        # We do NOT call /exchangeInfo here — the existing catalog
+        # cache populated by ``_fetch_catalog`` is reused via
+        # ``_vest_resolve_symbol``. This keeps the live ladder call
+        # count at 1 + N (resolve + N child POSTs + verify) — exactly
+        # one extra HTTP round-trip before the child loop.
+        try:
+            catalog = _fetch_catalog(credentials)
+        except VestHTTPError as exc:
+            return _map_http_error_to_failure(
+                exc, operation="ladder", account=account
+            )
+        matches = _vest_resolve_symbol(requested_symbol, catalog)
+        if not matches:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_NOT_FOUND",
+                message=f"Vest symbol '{requested_symbol}' is not available.",
+            )
+        if len(matches) > 1:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_AMBIGUOUS",
+                message=f"Vest symbol '{requested_symbol}' is ambiguous.",
+            )
+        row = matches[0]
+        resolved_symbol = str(row.get("symbol") or requested_symbol).strip()
+        price_decimals_raw = row.get("price_decimals")
+        size_decimals_raw = row.get("size_decimals")
+        price_decimals = (
+            int(price_decimals_raw)
+            if isinstance(price_decimals_raw, int)
+            else (
+                int(str(price_decimals_raw).strip())
+                if price_decimals_raw is not None
+                else None
+            )
+        )
+        size_decimals = (
+            int(size_decimals_raw)
+            if isinstance(size_decimals_raw, int)
+            else (
+                int(str(size_decimals_raw).strip())
+                if size_decimals_raw is not None
+                else None
+            )
+        )
+        if price_decimals is None or size_decimals is None:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INSTRUMENT_PRECISION_UNKNOWN",
+                message=(
+                    f"Vest catalog row for {resolved_symbol!r} is missing "
+                    "price_decimals or size_decimals."
+                ),
+            )
+        price_increment = Decimal(10) ** -price_decimals
+        size_increment = Decimal(10) ** -size_decimals
+
+        try:
+            prices = _ladder_build_prices(
+                start_price, end_price, order_count, price_increment
+            )
+            sizes, kept_volume = _ladder_allocate_sizes(
+                total_volume=total_volume,
+                order_count=order_count,
+                size_increment=size_increment,
+                distribution=distribution,
+            )
+        except ValueError as exc:
+            code = str(exc) or "INVALID_LADDER_REQUEST"
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code=code,
+                message=f"Ladder preflight rejected the request: {code}.",
+            )
+
+        # Drop any child that quantized to size=0 (size_increment >
+        # total_volume / N would produce that). The kept child count
+        # is what we submit; the wizard reports ``omitted_order_count``
+        # so the operator sees the discrepancy.
+        children = []
+        omitted_zero_size = 0
+        for price, size in zip(prices, sizes):
+            if size <= 0:
+                omitted_zero_size += 1
+                continue
+            children.append(
+                {
+                    "price_text": _decimal_text(price),
+                    "size_text": _decimal_text(size),
+                }
+            )
+        if not children:
+            return make_failure(
+                operation="ladder",
+                exchange=name,
+                account=account,
+                code="INVALID_LADDER_REQUEST",
+                message="Ladder produced no children after quantization.",
+            )
+        requested_volume_text = _decimal_text(kept_volume)
+
+    # --- Common submission loop (single-order primitive per child) ------
     try:
         signing_key = _normalize_signing_key(credentials["sign_private_key"])
         start_nonce = _fetch_next_nonce(credentials)
@@ -2476,7 +2821,7 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     failed: List[Dict[str, str]] = []
     for child in children:
         payload = _build_new_order_payload(
-            symbol=requested_symbol,
+            symbol=resolved_symbol,
             order_type="LIMIT",
             is_buy=(requested_side == "buy"),
             size_text=child["size_text"],
@@ -2540,12 +2885,12 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         exchange=name,
         account=account,
         ladder=CanonicalLadderResult(
-            symbol=requested_symbol,
+            symbol=resolved_symbol,
             side=requested_side,
-            distribution="manual",
+            distribution=distribution,
             requested_order_count=len(children),
             submitted_order_count=len(succeeded),
-            requested_volume=str(sum(Decimal(child["size_text"]) for child in children)),
+            requested_volume=requested_volume_text,
             submitted_volume=str(
                 sum(
                     Decimal(placement["size"])
@@ -2570,6 +2915,11 @@ def _ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
                 for p in succeeded
             ],
         ),
+        # Surface the per-failed-child rows alongside the canonical
+        # ``ladder`` field so callers (and the wizard UI) can show the
+        # exact reason for any failure without re-parsing the ladder.
+        # Empty on full success; otherwise one row per failed child.
+        data={"failed": failed} if failed else {},
     )
 
 

@@ -860,7 +860,7 @@ class VestAgentContractTests(unittest.TestCase):
         vest._signed_get = _mock  # type: ignore[assignment]
         return original
 
-    def _mock_signed_post(self, capture_list):
+    def _mock_signed_post(self, capture_list, *, unique_ids: bool = False):
         """Patch ``_signed_post`` to capture the body the agent POSTed
         and return a canned response.
 
@@ -868,10 +868,20 @@ class VestAgentContractTests(unittest.TestCase):
         entry is ``(path, body_dict, query_dict_or_None)``. The query
         dict is what the agent passes via ``query=`` (e.g. for the
         cancel endpoint's required ``time`` query parameter).
+
+        By default each call returns ``{"id": "0xabc"}`` (matching the
+        GET ``/orders?id=0xabc`` verify mock used by the single-order
+        tests). Tests that need per-call unique ids (e.g. ladder tests
+        asserting ``len(set(child_order_ids)) == n``) pass
+        ``unique_ids=True`` to receive ``0x000000000001``,
+        ``0x000000000002``, ... per call.
         """
         original = vest._signed_post
 
+        counter = {"n": 0}
+
         def fake(creds, path, body, *, query=None):
+            counter["n"] += 1
             # Make a deep-ish copy of body so the caller can't touch
             # the captured object after the fact.
             body_copy = json.loads(json.dumps(body))
@@ -880,8 +890,11 @@ class VestAgentContractTests(unittest.TestCase):
             # POST /orders returns {'id': "0x..."}; POST /orders/cancel
             # also returns {'id': "0x..."}. Default to ``0xabc`` so the
             # verify step can match against the GET /orders?id=0xabc
-            # mock below.
-            return {"id": "0xabc"}
+            # mock below. Ladder tests opt into a unique counter so
+            # ``len(set(child_order_ids)) == n`` exercises the venue's
+            # real behaviour.
+            order_id = f"0x{counter['n']:012x}" if unique_ids else "0xabc"
+            return {"id": order_id}
 
         vest._signed_post = fake  # type: ignore[assignment]
         return original
@@ -2783,6 +2796,546 @@ class VestAgentContractTests(unittest.TestCase):
         self.assertFalse(resp.success)
         assert resp.error is not None
         self.assertEqual(resp.error.code, "INVALID_CHILD")
+
+    # --- Phase 3.10: ladder distribution expansion (Half-Gaussian / uniform) -
+
+    def _stub_catalog_for(self, ndx_row):
+        """Patch ``_fetch_catalog`` to return a one-row catalog.
+
+        ``ndx_row`` may be either a single catalog-row dict (the helper
+        wraps it in a one-element list) or a list of catalog-row dicts
+        (used by tests that need multiple instruments on the wire).
+        """
+        original = vest._fetch_catalog
+        if isinstance(ndx_row, list):
+            catalog = list(ndx_row)
+        else:
+            catalog = [ndx_row]
+        vest._fetch_catalog = lambda creds: catalog  # type: ignore[assignment]
+        return original
+
+    def _stub_ndx_catalog(self):
+        """Return a Vest-shaped NDX catalog row with size_decimal s=4,
+        price_decimals=2 — the live values for NDX-USD-PERP.
+        """
+        return {
+            "symbol": "NDX-USD-PERP",
+            "display_name": "NASDAQ 100 E-mini Futures",
+            "base": "NDX-USD",
+            "quote": "USDC",
+            "size_decimals": 4,
+            "price_decimals": 2,
+            "init_margin_ratio": "0.020000",
+            "maint_margin_ratio": "0.010000",
+            "taker_fee": "0",
+            "isolated": False,
+        }
+
+    def test_ladder_half_gaussian_expands_to_50_children(self):
+        """User scenario: SELL NDX, Half Gaussian, 50 orders, total_volume=5,
+        30850 → 31850. The wizard hits INVALID_CHILDREN without expansion.
+        With expansion, exactly 50 valid children are submitted.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured, unique_ids=True)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        # nonce GET → 0; verify GET /orders?id=<id> → NEW
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        self.assertEqual(len(captured), 50)
+        # All 50 are POST /orders with SELL + LIMIT.
+        for path, body, _query in captured:
+            self.assertEqual(path, "/orders")
+            order = body["order"]
+            self.assertEqual(order["symbol"], "NDX-USD-PERP")
+            self.assertEqual(order["isBuy"], False)
+            self.assertEqual(order["orderType"], "LIMIT")
+            self.assertNotEqual(order["limitPrice"], "")
+            self.assertNotEqual(order["size"], "")
+        # Walking nonce.
+        nonces = [body["order"]["nonce"] for _p, body, _q in captured]
+        self.assertEqual(nonces, list(range(1, 51)))
+        # Canonical result.
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.requested_order_count, 50)
+        self.assertEqual(resp.ladder.submitted_order_count, 50)
+        self.assertEqual(resp.ladder.distribution, "half_gaussian")
+        self.assertEqual(resp.ladder.symbol, "NDX-USD-PERP")
+        self.assertEqual(resp.ladder.side, "sell")
+        self.assertEqual(resp.ladder.status, "success")
+        self.assertFalse(resp.ladder.partial)
+        self.assertEqual(resp.ladder.omitted_order_count, 0)
+        # 50 unique order_ids (regression: counter-based mock returns
+        # 0x000000000001..50 so the set is 50 distinct ids).
+        assert resp.ladder.child_order_ids is not None
+        self.assertEqual(len(set(resp.ladder.child_order_ids)), 50)
+
+    def test_ladder_half_gaussian_price_range_and_size_progression(self):
+        """Sizes must be monotonically increasing (smallest at the
+        start price = worst exit, largest at the end price = best
+        exit) and the price range must span 30850 → 31850 subject
+        only to the tick increment (0.01).
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        from decimal import Decimal
+        prices = [Decimal(p[1]["order"]["limitPrice"]) for p in captured]
+        sizes = [Decimal(p[1]["order"]["size"]) for p in captured]
+        # Range.
+        self.assertEqual(prices[0], Decimal("30850.00"))
+        self.assertEqual(prices[-1], Decimal("31850.00"))
+        # Monotonic prices.
+        self.assertTrue(all(prices[i] <= prices[i+1] for i in range(len(prices)-1)),
+                        msg="prices not monotonic")
+        # Monotonic sizes (Half-Gaussian weights grow toward z=0).
+        self.assertTrue(all(sizes[i] <= sizes[i+1] for i in range(len(sizes)-1)),
+                        msg="sizes not monotonic increasing")
+        # No zero-size children.
+        self.assertTrue(all(s > 0 for s in sizes))
+        # Quantized kept total equals the requested total (5.0000 /
+        # 0.0001 lot = 50000 units, perfectly divisible by 50 children).
+        self.assertEqual(sum(sizes), Decimal("5.0000"))
+        # No two adjacent prices collapsed past the tick (price increment
+        # is 0.01 — 1000 / 49 ≈ 20.41 step so they're all distinct).
+        self.assertEqual(len(set(prices)), 50)
+
+    def test_ladder_uniform_distribution_supported(self):
+        """``uniform`` is the canonical secondary distribution; the
+        agent must accept it and produce 50 evenly-sized children
+        summing to 5.0.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "uniform",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        self.assertEqual(len(captured), 50)
+        from decimal import Decimal
+        sizes = [Decimal(p[1]["order"]["size"]) for p in captured]
+        # 5.0 / 50 = 0.1 per child (uniform) exactly.
+        for s in sizes:
+            self.assertEqual(s, Decimal("0.1000"))
+
+    def test_ladder_rejects_buy_direction_with_end_above_start(self):
+        """Direction rule: BUY ladders require end_price below start_price."""
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "buy",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",  # wrong for BUY
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "INVALID_LADDER_DIRECTION")
+        # No POSTs were sent.
+        self.assertEqual(len(captured), 0)
+
+    def test_ladder_rejects_sell_direction_with_end_below_start(self):
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "31850",
+                "end_price": "30850",  # wrong for SELL
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "INVALID_LADDER_DIRECTION")
+        self.assertEqual(len(captured), 0)
+
+    def test_ladder_rejects_unsupported_distribution(self):
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "random",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "UNSUPPORTED_DISTRIBUTION")
+        self.assertEqual(len(captured), 0)
+
+    def test_ladder_one_post_per_child_partial_failure(self):
+        """Half of the children fail on POST. The agent returns a
+        partial result; the failing children are recorded in
+        ``data.failed`` and the surviving children keep their order
+        ids. NO retry is attempted for the failed children.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+
+        posts_per_oid = {0: 0}
+        # Wrap the original _signed_post: every odd child returns a 422.
+        original_signed_post = vest._signed_post
+
+        def selective_post(creds, path, body, *, query=None):
+            posts_per_oid[0] += 1
+            try:
+                oid = body["order"]["id"]
+            except Exception:  # noqa: BLE001
+                oid = "0xfallback"
+            if posts_per_oid[0] % 2 == 1:
+                raise vest.VestHTTPError(
+                    status=422, path=path,
+                    body='{"detail":[{"type":"missing","loc":["query","time"],"msg":"oops"}]}',
+                )
+            return {"code": 0, "msg": "", "data": {"id": oid}}
+
+        vest._signed_post = selective_post  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_signed_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+
+        self.assertTrue(resp.success, msg=str(resp.error))
+        # The agent still reports a top-level success for the operation
+        # itself (the submit loop ran to completion); the canonical
+        # ladder surfaces the partial state via ``status="partial"``
+        # and ``submitted_order_count``.
+        assert resp.ladder is not None
+        self.assertEqual(resp.ladder.status, "partial")
+        self.assertEqual(resp.ladder.requested_order_count, 50)
+        self.assertEqual(resp.ladder.submitted_order_count, 25)
+        self.assertEqual(resp.ladder.omitted_order_count, 25)
+        # Captured POSTs = 25 successful (the 25 failed POSTs aren't
+        # captured — they raise before reaching _mock_signed_post's
+        # append). Total attempts = 50.
+        self.assertEqual(posts_per_oid[0], 50)
+        # Failure rows live in data.failed (one per failed child).
+        assert resp.data is not None
+        self.assertEqual(len(resp.data.get("failed") or []), 25)
+
+    def test_ladder_unknown_instrument_returns_instrument_not_found(self):
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NOPE-INVALID",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "INSTRUMENT_NOT_FOUND")
+        # No POSTs were sent.
+        self.assertEqual(len(captured), 0)
+
+    def test_ladder_each_child_uses_single_order_primitive_path(self):
+        """Each child is submitted via the existing /orders POST
+        (the same path the single-order ``new_order`` operation uses).
+        The order body shape must match what ``_build_new_order_payload``
+        produces for a standalone new_order.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 3,  # tiny test
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        # Each child body is a /orders POST (NOT /orders/cancel, NOT
+        # any bulk endpoint). The body shape matches the single-order
+        # new_order contract.
+        for path, body, _q in captured:
+            self.assertEqual(path, "/orders")
+            self.assertIn("order", body)
+            order = body["order"]
+            self.assertIn("symbol", order)
+            self.assertIn("isBuy", order)
+            self.assertIn("orderType", order)
+            self.assertEqual(order["orderType"], "LIMIT")
+            self.assertIn("time", order)
+            self.assertIn("nonce", order)
+            # ``signature`` and ``recvWindow`` are siblings of ``order``
+            # in the body envelope (matches ``_build_new_order_payload``
+            # and the documented Vest JSON shape).
+            self.assertIn("signature", body)
+            self.assertTrue(body["signature"].startswith("0x"))
+            self.assertIn("recvWindow", body)
+
+    def test_ladder_rejects_negative_volume(self):
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "0",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "INVALID_VOLUME")
+
+    def test_ladder_invalid_children_no_longer_surfaces(self):
+        """Regression: the live failure was ``INVALID_CHILDREN`` when
+        the wizard sent a distribution-style request. With the new
+        expansion logic, that exact request must NOT produce
+        ``INVALID_CHILDREN`` — it produces a successful ladder with
+        50 children.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        original_catalog = self._stub_catalog_for(self._stub_ndx_catalog())
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 50,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        self.assertNotEqual(
+            resp.error.code if resp.error else None, "INVALID_CHILDREN"
+        )
+
+    def test_ladder_does_not_touch_hype_orders(self):
+        """The ladder path resolves one symbol from the catalog and
+        submits children only for that symbol. ``HYPE-PERP`` must not
+        appear in any child POST body.
+        """
+        captured: list = []
+        original_post = self._mock_signed_post(captured)
+        # Catalog with both HYPE and NDX; only NDX should be submitted.
+        hype_row = {
+            "symbol": "HYPE-PERP",
+            "display_name": "Hyperliquid",
+            "base": "HYPE",
+            "quote": "USDC",
+            "size_decimals": 2,
+            "price_decimals": 4,
+            "isolated": False,
+        }
+        original_catalog = self._stub_catalog_for([self._stub_ndx_catalog(), hype_row])
+        original_get = vest._signed_get
+
+        def seed_get(creds, path, *, query=None):
+            if path == "/account/nonce":
+                return {"lastNonce": 0}
+            if path.startswith("/orders?id="):
+                return [{"id": path.split("=", 1)[1], "status": "NEW"}]
+            raise AssertionError(f"unexpected GET {path}")
+
+        vest._signed_get = seed_get  # type: ignore[assignment]
+        try:
+            resp = vest.execute({
+                "operation": "ladder",
+                "account": "fibo",
+                "symbol": "NDX-USD-PERP",
+                "side": "sell",
+                "distribution": "half_gaussian",
+                "order_count": 5,
+                "total_volume": "5",
+                "start_price": "30850",
+                "end_price": "31850",
+            })
+        finally:
+            vest._signed_post = original_post  # type: ignore[assignment]
+            vest._signed_get = original_get  # type: ignore[assignment]
+            vest._fetch_catalog = original_catalog  # type: ignore[assignment]
+        self.assertTrue(resp.success, msg=str(resp.error))
+        for path, body, _q in captured:
+            self.assertEqual(path, "/orders")
+            self.assertNotEqual(body["order"]["symbol"], "HYPE-PERP")
 
     # --- Phase 3.9: get_exact_order --------------------------------------
 
