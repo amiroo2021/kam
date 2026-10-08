@@ -246,6 +246,145 @@ class ArcusMarketCacheTtlTests(unittest.TestCase):
         self.assertEqual(gate._ttl_for_path("/v1/markets"), arc._ARCUS_MARKETS_CACHE_TTL_SECONDS)
 
 
+class ArcusTpslAuthRegressionTests(unittest.TestCase):
+    """TP/SL batch auth and diagnostics regressions (offline, no live HTTP)."""
+
+    def test_tpsl_batch_includes_address_query_param_matching_wallet(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Resp(text='{"responses":[{"orderId":"abc"}]}')
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post):
+            gate.wait_for_slot.return_value = 0.0
+            out = hl._arcus_batch_place_tpsl(
+                _creds(), 1, "sell", "0.10000000", 10_000_000,
+                [("TAKE_PROFIT", 700_000, "tp-client")],
+            )
+        self.assertEqual(out, [{"orderId": "abc"}])
+        self.assertEqual(captured["url"], "http://test/v1/batchPlaceOrders")
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
+
+    def test_tpsl_successful_response_body_and_headers_remain_unchanged(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return Resp(text='{"responses":[{"orderId":"abc","status":"OPEN"}]}')
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post):
+            gate.wait_for_slot.return_value = 0.0
+            out = hl._arcus_batch_place_tpsl(
+                _creds(), 1, "sell", "0.10000000", 10_000_000,
+                [("TAKE_PROFIT", 700_000, "tp-client")],
+            )
+        body = json.loads(captured["data"].decode("utf-8"))
+        self.assertEqual(out, [{"orderId": "abc", "status": "OPEN"}])
+        self.assertEqual(body["grouping"], "positionTpsl")
+        self.assertEqual(body["orders"][0]["accountIndex"], 0)
+        self.assertEqual(body["orders"][0]["address"], _creds()["wallet"])
+        self.assertIn("signature", body["orders"][0])
+        self.assertIn("X-API-Key", captured["headers"])
+        self.assertIn("X-Timestamp", captured["headers"])
+        self.assertIn("X-Signature", captured["headers"])
+
+    def test_new_order_signed_post_request_behavior_is_unchanged(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
+        typed_payload = {
+            "ad": _creds()["wallet"].lower(), "ai": 0, "ct": 123456789,
+            "g": 1234567890000, "m": 1, "op": hl._ARCUS_OP_PLACE,
+            "p": 700000, "q": 10000000, "r": 0, "s": 0, "t": 0, "v": 1,
+        }
+        body = {"address": _creds()["wallet"], "accountIndex": 0, "marketId": 1}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Resp(text='{"orderId":"abc"}')
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post):
+            gate.wait_for_slot.return_value = 0.0
+            out = hl._signed_post(_creds(), "/v1/placeOrder", body, typed_payload=typed_payload, operation="new_order")
+        self.assertEqual(out, {"orderId": "abc"})
+        self.assertEqual(captured["url"], "http://test/v1/placeOrder")
+        self.assertNotIn("params", captured)
+        self.assertEqual(captured["headers"]["X-Timestamp"], "123456789")
+        self.assertEqual(json.loads(captured["data"]), body)
+
+    def test_failed_responses_preserve_http_status_and_log_safely(self):
+        hl = arcus()
+        records: List[str] = []
+
+        def fake_post(*args, **kwargs):
+            return Resp(status_code=401, text='{"error":"Invalid API key"}')
+
+        def fake_warning(msg, *args, **kwargs):
+            rendered = msg % args if args else str(msg)
+            records.append(rendered)
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post) as post, \
+             mock.patch.object(hl._HTTP_LOGGER, "warning", side_effect=fake_warning):
+            gate.wait_for_slot.return_value = 0.0
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401: Invalid API key"):
+                hl._signed_post(_creds(), "/v1/placeOrder", {"address": _creds()["wallet"]},
+                                typed_payload={"ad": _creds()["wallet"].lower(), "ai": 0, "ct": 123,
+                                               "g": 456, "m": 1, "op": hl._ARCUS_OP_PLACE,
+                                               "p": 1, "q": 1, "r": 0, "s": 0, "t": 0, "v": 1},
+                                operation="new_order")
+        self.assertEqual(post.call_count, 1)
+        joined = "\n".join(records)
+        self.assertIn("status=401", joined)
+        self.assertIn("endpoint=/v1/placeOrder", joined)
+        self.assertIn("account=amiroo", joined)
+        self.assertIn("account_index=0", joined)
+        self.assertIn("api_key_fp=", joined)
+        self.assertIn("wallet_fp=", joined)
+        self.assertIn("Invalid API key", joined)
+        self.assertNotIn(_creds()["api_signing_key"], joined)
+        self.assertNotIn(_creds()["private_key_hex"], joined)
+        self.assertNotIn("X-Signature", joined)
+        self.assertNotIn("signature", joined.lower())
+
+    def test_tpsl_failed_response_logs_safely_and_does_not_retry(self):
+        hl = arcus()
+        records: List[str] = []
+
+        def fake_post(*args, **kwargs):
+            return Resp(status_code=403, text='{"error":"Invalid API key"}')
+
+        def fake_warning(msg, *args, **kwargs):
+            records.append(msg % args if args else str(msg))
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post) as post, \
+             mock.patch.object(hl._HTTP_LOGGER, "warning", side_effect=fake_warning):
+            gate.wait_for_slot.return_value = 0.0
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403: Invalid API key"):
+                hl._arcus_batch_place_tpsl(
+                    _creds(), 1, "sell", "0.10000000", 10_000_000,
+                    [("TAKE_PROFIT", 700_000, "tp-client")],
+                )
+        self.assertEqual(post.call_count, 1)
+        joined = "\n".join(records)
+        self.assertIn("status=403", joined)
+        self.assertIn("endpoint=/v1/batchPlaceOrders", joined)
+        self.assertIn("operation=tpsl_batch", joined)
+        self.assertIn("Invalid API key", joined)
+        self.assertNotIn(_creds()["api_signing_key"], joined)
+        self.assertNotIn(_creds()["private_key_hex"], joined)
+        self.assertNotIn("X-Signature", joined)
+        self.assertNotIn("signature", joined.lower())
+
+
 class ArcusRateLimit429Tests(unittest.TestCase):
     """429 on order-creating ops is NOT blindly retried; Retry-After captured."""
 

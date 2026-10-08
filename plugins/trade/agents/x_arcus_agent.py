@@ -22,6 +22,7 @@ Optional fields supported for flexibility:
 from __future__ import annotations
 from plugins.trade.candles import handle_candles_operation, has_native_candles
 
+import hashlib
 import json
 import logging
 import os
@@ -63,6 +64,14 @@ _WALLET_PATTERN = re.compile(r"^(0x|0X)?[0-9a-fA-F]{40}$")
 # Safe HTTP diagnostics. NEVER log secrets, signatures, authorization headers,
 # or signed request material — only operation/endpoint/status/elapsed/wait.
 _HTTP_LOGGER = logging.getLogger("plugins.trade.agents.x_arcus_agent.http")
+_HTTP_LOGGER.addHandler(logging.NullHandler())
+
+
+def _safe_fingerprint(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _log_arcus_http(
@@ -92,6 +101,36 @@ def _log_arcus_http(
             attempt,
         )
     except Exception:  # noqa: BLE001 — logging must never break a trade.
+        pass
+
+
+def _log_arcus_http_failure(
+    *,
+    credentials: Dict[str, Any],
+    endpoint: str,
+    status: int,
+    error: str,
+    operation: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> None:
+    """Record a sanitized Arcus write failure diagnostic (no auth material)."""
+    try:
+        ts_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _HTTP_LOGGER.warning(
+            "arcus http failure ts_utc=%s operation=%s endpoint=%s status=%s "
+            "error=%s account=%s account_index=%s api_key_fp=%s wallet_fp=%s request_id=%s",
+            ts_utc,
+            operation or "-",
+            endpoint,
+            status,
+            sanitize_error_message(str(error or "")),
+            str(credentials.get("account") or ""),
+            int(credentials.get("account_index") or 0),
+            _safe_fingerprint(_api_key_for_signing(str(credentials.get("api_signing_key") or ""))),
+            _safe_fingerprint(str(credentials.get("wallet") or "").lower()),
+            str(request_id or "-"),
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never break a trade.
         pass
 
 _SIDE_TO_INT = {"buy": 0, "sell": 1}
@@ -359,8 +398,10 @@ def _format_arcus_error(status_code: int, payload: Any) -> str:
     code = payload.get("code") or payload.get("rejectionReason") or ""
     message = payload.get("error") or payload.get("message") or ""
     if code and message:
-        return f"{code}: {message}"
-    return str(code or message or f"HTTP {status_code}")
+        detail = f"{code}: {message}"
+    else:
+        detail = str(code or message or "").strip()
+    return f"HTTP {status_code}: {detail}" if detail else f"HTTP {status_code}"
 
 
 class _ArcusGetGate:
@@ -689,12 +730,30 @@ def _signed_post(
     except ValueError:
         payload_obj = {"raw": response.text}
     if response.status_code == 429:
+        error_text = _format_arcus_error(429, payload_obj)
+        _log_arcus_http_failure(
+            credentials=credentials,
+            endpoint=path,
+            status=429,
+            error=error_text,
+            operation=operation,
+            request_id=str(payload.get("clientId") or (typed_payload or {}).get("c") or ""),
+        )
         raise _ArcusRateLimitedError(
-            f"HTTP 429 on {path}: {_format_arcus_error(429, payload_obj)}",
+            f"HTTP 429 on {path}: {error_text}",
             retry_after=retry_after,
         )
     if response.status_code >= 400:
-        raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
+        error_text = _format_arcus_error(response.status_code, payload_obj)
+        _log_arcus_http_failure(
+            credentials=credentials,
+            endpoint=path,
+            status=response.status_code,
+            error=error_text,
+            operation=operation,
+            request_id=str(payload.get("clientId") or (typed_payload or {}).get("c") or ""),
+        )
+        raise RuntimeError(error_text)
     return payload_obj if isinstance(payload_obj, dict) else {"raw": response.text}
 
 
@@ -2401,18 +2460,35 @@ def _arcus_batch_place_tpsl(
     # are na | partialTpsl | positionTpsl | entryTpsl. For position-close
     # TP/SL we use positionTpsl — isPositionTPSL is implicitly true.
     body_envelope = {"grouping": "positionTpsl", "orders": body_orders}
+    t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}/v1/batchPlaceOrders",
+        params={"address": credentials["wallet"]},
         headers=headers,
         data=json.dumps(body_envelope, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
         timeout=API_TIMEOUT_SECONDS,
     )
+    elapsed = time.time() - t0
+    _log_arcus_http(method="POST", endpoint="/v1/batchPlaceOrders", status=response.status_code,
+                    elapsed_s=elapsed, gate_wait_s=0.0, operation="tpsl_batch")
     try:
         payload_obj = response.json()
     except ValueError:
         payload_obj = {"raw": response.text}
     if response.status_code >= 400:
-        raise RuntimeError(_format_arcus_error(response.status_code, payload_obj))
+        error_text = _format_arcus_error(response.status_code, payload_obj)
+        first_request_id = ""
+        if body_orders and isinstance(body_orders[0], dict):
+            first_request_id = str(body_orders[0].get("clientId") or "")
+        _log_arcus_http_failure(
+            credentials=credentials,
+            endpoint="/v1/batchPlaceOrders",
+            status=response.status_code,
+            error=error_text,
+            operation="tpsl_batch",
+            request_id=first_request_id,
+        )
+        raise RuntimeError(error_text)
     responses = payload_obj.get("responses") if isinstance(payload_obj, dict) else None
     return responses if isinstance(responses, list) else []
 
