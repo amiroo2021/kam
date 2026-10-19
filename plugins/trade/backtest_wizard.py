@@ -30,13 +30,52 @@ from goldenfibo.marketdata.aggtrade_cache import AggTradeCache  # noqa: E402
 from goldenfibo.marketdata.kline_cache import CachePolicy, KlineCache, fetch_range_cached  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
 
-_BACKTEST_CACHE = KlineCache(Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite"))
-_BACKTEST_AGGTRADE_CACHE = AggTradeCache(Path("/root/kam/GoldenFibo/data/aggtrades.sqlite"))
+_BACKTEST_CACHE: Optional[KlineCache] = None
+_BACKTEST_AGGTRADE_CACHE: Optional[AggTradeCache] = None
+_BACKTEST_CACHE_PATH = Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite")
+_BACKTEST_AGGTRADE_CACHE_PATH = Path("/root/kam/GoldenFibo/data/aggtrades.sqlite")
 _BACKTEST_TIMEFRAME = "1m"
 _BACKTEST_REFRESH_TAIL_MS = 0
+_BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS = 15
 INCOMPLETE_AGGTRADE_COVERAGE = "INCOMPLETE_AGGTRADE_COVERAGE"
 
 logger = logging.getLogger(__name__)
+
+
+class BacktestCacheUnavailable(RuntimeError):
+    """Backtest cache initialization failed without blocking Telegram routing."""
+
+
+def _initialize_backtest_caches() -> tuple[KlineCache, AggTradeCache]:
+    """Open SQLite caches only when a Backtest run actually needs them.
+
+    Call this from a worker thread: cache constructors may acquire SQLite locks
+    or perform schema compatibility work.
+    """
+    global _BACKTEST_CACHE, _BACKTEST_AGGTRADE_CACHE
+    if _BACKTEST_CACHE is None:
+        _BACKTEST_CACHE = KlineCache(_BACKTEST_CACHE_PATH)
+    if _BACKTEST_AGGTRADE_CACHE is None:
+        _BACKTEST_AGGTRADE_CACHE = AggTradeCache(_BACKTEST_AGGTRADE_CACHE_PATH)
+    return _BACKTEST_CACHE, _BACKTEST_AGGTRADE_CACHE
+
+
+async def initialize_backtest_caches_off_loop() -> tuple[KlineCache, AggTradeCache]:
+    """Initialize caches on a worker thread with a bounded Telegram-facing wait."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_initialize_backtest_caches),
+            timeout=_BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise BacktestCacheUnavailable(
+            "Backtest cache initialization timed out. Please try again shortly."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise BacktestCacheUnavailable(
+            f"Backtest cache is unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
 
 _SPOT = "https://api.binance.com"
 _FUTURES = "https://fapi.binance.com"
@@ -373,6 +412,7 @@ class BacktestWizard:
         return None
 
     def _run_backtest(self, st: State, *, on_progress=None) -> Screen:
+        cache, aggtrade_cache = _initialize_backtest_caches()
         start_dt = datetime(st.year or 2026, st.month or 1, st.day or 1, 0, 1, tzinfo=timezone.utc)
         sides = [Side.BUY, Side.SELL] if st.ladder == "both" else ([Side.BUY] if st.ladder == "buy" else [Side.SELL])
         total_sides = max(1, len(sides))
@@ -383,14 +423,16 @@ class BacktestWizard:
                     "pct": 0.0,
                     "bars_done": 0,
                     "bars_est": 1,
-                    "stats": {"path": str(_BACKTEST_CACHE.path), "bars_total": 0},
+                    "stats": {"path": str(cache.path), "bars_total": 0},
                     "detail": "Loading cached candles",
                 }
             )
-        candles = _fetch_klines(st.symbol, st.market, int(start_dt.timestamp() * 1000), on_progress=on_progress)
+        candles = _fetch_klines(
+            st.symbol, st.market, int(start_dt.timestamp() * 1000), cache=cache, on_progress=on_progress
+        )
         if not candles:
             return Screen("No Binance candles returned for that request.", [self._nav("symbol")], "error")
-        stats = _BACKTEST_CACHE.stats_for(st.symbol, _BACKTEST_TIMEFRAME, market="futures" if st.market == "futures" else "spot")
+        stats = cache.stats_for(st.symbol, _BACKTEST_TIMEFRAME, market="futures" if st.market == "futures" else "spot")
         if on_progress:
             on_progress(
                 {
@@ -418,7 +460,7 @@ class BacktestWizard:
                         "detail": f"Running {idx}/{total_sides} sides",
                     }
                 )
-            result = _summarize_side(candles, side, st.symbol, st.market, st.percentage)
+            result = _summarize_side(candles, side, st.symbol, st.market, st.percentage, aggtrade_cache=aggtrade_cache)
             parts.append(result["text"])
             attachments.append(result["svg"])
         self.reset(_DUMMY_KEY) if False else None
@@ -436,7 +478,7 @@ def _fetch_json(base: str, path: str, params: Dict[str, Any]):
         return json.loads(resp.read().decode())
 
 
-def _fetch_klines(symbol: str, market: str, start_ms: int, *, on_progress=None):
+def _fetch_klines(symbol: str, market: str, start_ms: int, *, cache: KlineCache, on_progress=None):
     end = int(datetime.now(timezone.utc).timestamp() * 1000)
     source_market = "futures" if market == "futures" else "spot"
     if on_progress:
@@ -445,7 +487,7 @@ def _fetch_klines(symbol: str, market: str, start_ms: int, *, on_progress=None):
                 "stage": "download",
                 "bars_done": 0,
                 "bars_est": max(1, (end - int(start_ms)) // 60_000),
-                "stats": {"path": str(_BACKTEST_CACHE.path), "bars_total": 0},
+                "stats": {"path": str(cache.path), "bars_total": 0},
                 "detail": "Loading cached candles",
             }
         )
@@ -455,7 +497,7 @@ def _fetch_klines(symbol: str, market: str, start_ms: int, *, on_progress=None):
         _BACKTEST_TIMEFRAME,
         int(start_ms),
         end,
-        cache=_BACKTEST_CACHE,
+        cache=cache,
         policy=CachePolicy.AUTO,
         refresh_tail_ms=_BACKTEST_REFRESH_TAIL_MS,
         base_url=base_url,
@@ -1131,7 +1173,17 @@ def _fmt(x: float) -> str:
     return f"{x:,.2f}"
 
 
-def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: float):
+def _summarize_side(
+    candles,
+    side: Side,
+    symbol: str,
+    market: str,
+    percentage: float,
+    *,
+    aggtrade_cache: Optional[AggTradeCache] = None,
+):
+    if aggtrade_cache is None:
+        _, aggtrade_cache = _initialize_backtest_caches()
     result = run_finite_backtest(
         candles,
         side=side,
@@ -1158,7 +1210,7 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     ladder_window = {"all_vwap": ladder_vwap}
     step_window = {"all_vwap": step_vwap}
     ladder_aggressor, step_aggressor, agg_meta = _aggtrade_aggressor_metrics_for_display(
-        _BACKTEST_AGGTRADE_CACHE,
+        aggtrade_cache,
         market,
         symbol,
         ladder_start_ts,
@@ -1170,7 +1222,7 @@ def _summarize_side(candles, side: Side, symbol: str, market: str, percentage: f
     if agg_meta.get("covered"):
         try:
             per_step_aggressor = _per_step_aggressor_table_from_cache(
-                _BACKTEST_AGGTRADE_CACHE,
+                aggtrade_cache,
                 market,
                 symbol,
                 result.engine.state,
@@ -1616,7 +1668,18 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
                         except Exception:
                             pass
                 asyncio.run_coroutine_threadsafe(_update(), loop)
-            screen = await asyncio.to_thread(_WIZARD._run_backtest, _WIZARD._state(key), on_progress=progress_cb)
+            try:
+                await initialize_backtest_caches_off_loop()
+            except BacktestCacheUnavailable as exc:
+                screen = Screen(
+                    str(exc),
+                    [[_button("Back", "restart")]],
+                    "cache_unavailable",
+                )
+            else:
+                screen = await asyncio.to_thread(
+                    _WIZARD._run_backtest, _WIZARD._state(key), on_progress=progress_cb
+                )
         else:
             screen=await asyncio.to_thread(_WIZARD.handle_callback,key,suffix)
         try:

@@ -12,7 +12,7 @@ States (encoded as strings, stored per chat_id):
 - ``"select_account"``  — user has picked an exchange; picks an account.
 - ``"action"``          — user has picked an account; picks an action.
 - ``"balance"``         — balance view; refresh returns to itself.
-- ``"summative_report"`` — cross-exchange balances + positions summary.
+- ``"summative_report"`` — multi-exchange open-position portfolio reports.
 - ``"positions_orders"`` — read-only positions & orders view.
 - ``"new_order"``        — new-order symbol chooser.
 - ``"ladder"``          — ladder flow root.
@@ -50,6 +50,8 @@ from .canonical import (
     PHASE1_IMPLEMENTED_ACTIONS,
     CanonicalResponse,
 )
+from . import portfolio_report as portfolio
+from . import summative_report_ui
 from .tradedesk import TradeDesk, get_tradedesk
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,12 @@ BUTTON_EXIT = ("\u2715 Exit", "exit")
 BUTTON_BACK = ("\u25c0\ufe0f Back", "back")
 BUTTON_REFRESH = ("\u21bb Refresh", "refresh")
 BUTTON_SUMMATIVE_REPORT = ("\U0001f4ca Summative Report", "summative_report")
+BUTTON_SR_POSITIONS = ("\U0001f4ca Positions by Symbol", "sr:p")
+BUTTON_SR_PNL_EX = ("\U0001f3e6 PnL by Exchange", "sr:e")
+BUTTON_SR_TOTAL_PNL = ("\U0001f4b0 Total Floating PnL", "sr:t")
+BUTTON_SR_EQUITY = ("\U0001f4bc Total Equity", "sr:q")
+BUTTON_SR_RISK = ("\u26a0\ufe0f Risk & Exposure", "sr:r")
+BUTTON_SR_FILTER = ("\U0001f50e Filter Exchange / Account", "sr:f")
 BUTTON_CONTINUE = ("Continue", "continue")
 BUTTON_SYMBOL_BTC = ("BTC", "symbol:BTC")
 BUTTON_SYMBOL_ETH = ("ETH", "symbol:ETH")
@@ -319,6 +327,8 @@ class WizardState:
     positions: List[Dict[str, Any]] = field(default_factory=list)
     position: Dict[str, Any] = field(default_factory=dict)
     position_action: Dict[str, Any] = field(default_factory=dict)
+    # Summative Report navigation context (indices into the cached snapshot).
+    report: Dict[str, Any] = field(default_factory=dict)
 
 
 class TradeWizard:
@@ -3106,7 +3116,7 @@ class TradeWizard:
 
     # -- summative report (all exchanges / accounts) --------------------
 
-    def _render_summative_report(
+    def _render_legacy_summative_report(
         self,
         chat_key: Tuple[Any, ...],
         refresh: bool,
@@ -3301,7 +3311,7 @@ class TradeWizard:
             state="summative_report",
         )
 
-    def _handle_summative_report(
+    def _handle_legacy_summative_report(
         self,
         chat_key: Tuple[Any, ...],
         suffix: str,
@@ -3314,6 +3324,31 @@ class TradeWizard:
             self.reset(chat_key)
             return Screen(text="Trade closed.", buttons=[], state="closed")
         return self._render_summative_report(chat_key, refresh=False)
+
+    def _render_summative_report(
+        self,
+        chat_key: Tuple[Any, ...],
+        refresh: bool,
+    ) -> Screen:
+        """Render the delegated read-only portfolio report menu."""
+        state = self._state_for(chat_key)
+        state.state = "summative_report"
+        state.exchange = None
+        state.account = None
+        suffix = "sr:refresh" if refresh else "summative_report"
+        view = summative_report_ui.handle(self._desk, state, suffix)
+        return Screen(text=view.text, buttons=view.buttons, state="summative_report")
+
+    def _handle_summative_report(
+        self,
+        chat_key: Tuple[Any, ...],
+        suffix: str,
+    ) -> Screen:
+        if suffix == "back":
+            return self._render_select_exchange(chat_key)
+        state = self._state_for(chat_key)
+        view = summative_report_ui.handle(self._desk, state, suffix)
+        return Screen(text=view.text, buttons=view.buttons, state="summative_report")
 
 
 # ---------------------------------------------------------------------------

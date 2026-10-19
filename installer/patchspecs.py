@@ -120,8 +120,20 @@ if data.startswith("fibolearn:"):
         return
 '''
 
-# --- Seam B: wizard free-text interception ---------------------------------
+# --- Seam B: free-text interception ----------------------------------------
+# Keep active trading sessions first: a /trade reply must never initialize the
+# backtest subsystem before the trade wizard has a chance to consume it.
 _TEXT_BLOCK = '''\
+try:
+    from plugins.trade.tradespot_wizard import handle_tradespot_text
+
+    if await handle_tradespot_text(self, msg):
+        return
+except Exception as exc:  # noqa: BLE001
+    logger.error(
+        "[%s] /tradespot text dispatch failed: %s",
+        self.name, exc, exc_info=True,
+    )
 try:
     from plugins.trade.wizard import handle_trade_text
 
@@ -133,13 +145,13 @@ except Exception as exc:  # noqa: BLE001
         self.name, exc, exc_info=True,
     )
 try:
-    from plugins.trade.tradespot_wizard import handle_tradespot_text
+    from plugins.trade.backtest_wizard import handle_backtest_text
 
-    if await handle_tradespot_text(self, msg):
+    if await handle_backtest_text(self, msg):
         return
 except Exception as exc:  # noqa: BLE001
     logger.error(
-        "[%s] /tradespot text dispatch failed: %s",
+        "[%s] /backtest text dispatch failed: %s",
         self.name, exc, exc_info=True,
     )
 '''

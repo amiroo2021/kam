@@ -52,7 +52,9 @@ class BacktestTelegramRoutingTests(unittest.TestCase):
     def test_backtest_callback_routes_to_callback_handler(self) -> None:
         adapter = SimpleNamespace(send_inline_keyboard=None, send=None, send_image_file=None, send_document=None)
         query = _DummyQuery()
-        with mock.patch.object(wizard._WIZARD, "_run_backtest", return_value=wizard.Screen("done", [], "done")) as run_bt:
+        with mock.patch.object(wizard, "initialize_backtest_caches_off_loop", new=mock.AsyncMock()), mock.patch.object(
+            wizard._WIZARD, "_run_backtest", return_value=wizard.Screen("done", [], "done")
+        ) as run_bt:
             asyncio.run(wizard.handle_backtest_callback(adapter, query, "backtest:run"))
         self.assertTrue(query.answered)
         self.assertTrue(run_bt.called)

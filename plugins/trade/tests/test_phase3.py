@@ -274,6 +274,20 @@ class TestPhase3NewOrderWizard(unittest.TestCase):
         self.assertIn("Status: success", result.text)
         self.assertIn("Verified: Yes", result.text)
 
+    def test_ladder_count_100_advances_without_submitting(self):
+        desk = StubDesk(self._ladder_success_response())
+        wizard, key, screen = self._open_ladder(desk)
+        self.assertIn("Select Distribution:", screen.text)
+        wizard.handle_callback(key, "distribution:half_gaussian")
+        wizard.handle_callback(key, "symbol:BTC")
+        screen = wizard.handle_callback(key, "side:buy")
+        self.assertIn("Enter Number of Orders:", screen.text)
+
+        screen = wizard.handle_text(key, "100")
+
+        self.assertIn("Enter Total Volume:", screen.text)
+        self.assertEqual([], desk.requests)
+
     def test_ladder_other_symbol_is_generic_and_canonical(self):
         desk = StubDesk(self._ladder_success_response())
         wizard, key, _screen = self._open_ladder(desk)
