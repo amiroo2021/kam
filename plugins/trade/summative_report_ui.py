@@ -6,18 +6,159 @@ TradeDesk and persists the report context; portfolio reads are delegated to
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from . import portfolio_report as portfolio
 
-_PAGE_SIZE = 8
+logger = logging.getLogger(__name__)
+
+_PAGE_SIZE = 6
+_NET_PAGE_SIZE = 6
 
 
 @dataclass(frozen=True)
 class ReportView:
     text: str
     buttons: List[List[Dict[str, str]]]
+
+
+# ---------------------------------------------------------------------------
+# Progress reporting
+#
+# The wizard is transport-agnostic; ``summative_report_ui`` is too.  Neither
+# module imports Telegram or any transport client.  Progress is reported by
+# pushing small payloads into ``state.report['progress']`` and emitting
+# :func:`summative_report_ui.progress_text` strings that the transport can
+# render via its existing message-edit helper.
+#
+# Three pieces:
+#
+# 1. ``ProgressSink`` — a callback interface.  Adapters (e.g. the Telegram
+#    adapter) install one in ``state.report['progress_sink']`` so the
+#    report layer can emit updates without knowing the transport.
+# 2. ``ProgressCollector`` — a default in-memory sink that captures every
+#    emitted frame; tests use this so progress is exercised end-to-end
+#    without standing up a Telegram adapter.
+# 3. ``push_progress`` / ``finalize_progress`` — the helpers called inside
+#    ``portfolio_report.collect_portfolio_snapshot``.  They push through the
+#    installed sink (if any) and always record the last frame on the state
+#    so the next view can render the latest status.
+# ---------------------------------------------------------------------------
+
+ProgressFrame = Dict[str, Any]
+
+
+class ProgressCollector:
+    """Default sink — records every progress frame in order.
+
+    Adapters that don't care about progress can simply do nothing; the
+    wizard still completes.  Tests assert on the captured frames.
+    """
+
+    def __init__(self) -> None:
+        self.frames: List[ProgressFrame] = []
+
+    def __call__(self, frame: ProgressFrame) -> None:
+        self.frames.append(dict(frame))
+
+
+def _update_progress(
+    state: Any,
+    *,
+    label: str,
+    done: int,
+    total: int,
+    current: Optional[str],
+) -> None:
+    state.report["progress_total"] = max(
+        int(state.report.get("progress_total") or 0), int(total)
+    )
+    push_progress(state, label=label, done=done, total=total, current=current)
+
+
+def install_progress_sink(state: Any, sink: Any) -> ProgressCollector:
+    """Install a progress sink on ``state.report`` for the next fetch.
+
+    Returns the collector that ends up recording all frames.  Pass
+    ``sink=None`` to install a fresh :class:`ProgressCollector` and let
+    the caller fetch its frames later.
+    """
+    if sink is None:
+        sink = ProgressCollector()
+    state.report["progress_sink"] = sink
+    state.report["progress_last"] = None
+    state.report.setdefault("progress_history", [])
+    return sink  # type: ignore[return-value]
+
+
+def push_progress(
+    state: Any,
+    *,
+    label: str,
+    done: int,
+    total: int,
+    current: Optional[str] = None,
+) -> Optional[ProgressFrame]:
+    """Push a progress frame through the installed sink (if any).
+
+    Always updates ``state.report['progress_last']`` so the next view
+    render can surface the latest status even if no sink was installed.
+    Returns the rendered frame (for adapters that want to render inline).
+    """
+    safe_total = max(0, int(total))
+    safe_done = max(0, int(done))
+    pct = 0.0 if safe_total <= 0 else min(100.0, (safe_done * 100.0) / safe_total)
+    frame: ProgressFrame = {
+        "label": label,
+        "pct": pct,
+        "done": safe_done,
+        "total": safe_total,
+        "current": current,
+        "text": progress_text(label, pct, done=safe_done, total=safe_total, current=current),
+    }
+    state.report["progress_last"] = frame
+    history = state.report.setdefault("progress_history", [])
+    history.append(frame)
+    sink = state.report.get("progress_sink")
+    if sink is not None:
+        try:
+            sink(frame)
+        except Exception:  # noqa: BLE001
+            # A buggy sink must never break a fetch.
+            logger.exception("summative progress sink raised")
+    return frame
+
+
+def finalize_progress(state: Any, *, label: str = "Fetch complete") -> ProgressFrame:
+    """Emit a final 100% progress frame and return it.
+
+    Uses the most recent emitted frame's ``done``/``total`` when available;
+    falls back to the ``total_targets`` hint when no frames were emitted
+    (e.g. an exchange with zero accounts).
+    """
+    last = state.report.get("progress_last") or {}
+    done = int(last.get("done") or 0)
+    total = int(last.get("total") or state.report.get("progress_total") or done)
+    if total <= 0:
+        total = max(total, done)
+    if total <= 0:
+        total = 1
+    frame = push_progress(state, label=label, done=total, total=total)
+    if frame is None:
+        frame = {
+            "label": label,
+            "pct": 100.0,
+            "done": total,
+            "total": total,
+            "text": progress_text(label, 100.0, done=total, total=total),
+        }
+    return frame
+
+
+def last_progress(state: Any) -> Optional[ProgressFrame]:
+    return state.report.get("progress_last")
 
 
 def _b(text: str, callback_data: str) -> Dict[str, str]:
@@ -27,9 +168,28 @@ def _b(text: str, callback_data: str) -> Dict[str, str]:
 def _report_snapshot(desk: Any, state: Any, *, refresh: bool = False) -> Any:
     snap = state.report.get("snapshot")
     if refresh or snap is None:
-        snap = portfolio.collect_portfolio_snapshot(desk)
+        # Install a default in-memory sink before the fetch so every
+        # exchange/account emits a frame the next view can render.  Callers
+        # (e.g. the Telegram adapter) can replace this with their own sink
+        # by writing ``state.report['progress_sink']`` immediately before
+        # invoking ``handle``.
+        if state.report.get("progress_sink") is None:
+            install_progress_sink(state, None)
+        progress_state = state
+        snap = portfolio.collect_portfolio_snapshot(
+            desk,
+            progress=lambda done, total, current=None: _update_progress(
+                progress_state,
+                label="Fetching positions",
+                done=done,
+                total=total,
+                current=current,
+            ),
+        )
         state.report["snapshot"] = snap
         state.report["page"] = 0
+        state.report["net_page"] = 0
+        finalize_progress(state, label="Fetch complete")
     return snap
 
 
@@ -45,6 +205,30 @@ def _freshness(snapshot: Any) -> str:
         f"Data fetched now · Positions: {snapshot.positions_accounts_ok}/"
         f"{snapshot.positions_accounts_seen} accounts{suffix}"
     )
+
+
+def progress_bar(pct: float, *, width: int = 10) -> str:
+    """Return a Unicode progress bar that fills ``0..100`` over ``width`` slots."""
+    safe_width = max(1, int(width))
+    clamped = max(0.0, min(100.0, float(pct)))
+    filled = int(round((clamped / 100.0) * safe_width))
+    filled = max(0, min(safe_width, filled))
+    return "[" + ("█" * filled) + ("░" * (safe_width - filled)) + "]"
+
+
+def progress_text(
+    label: str,
+    pct: float,
+    *,
+    done: int,
+    total: int,
+    current: Optional[str] = None,
+) -> str:
+    """Render a single-line progress message used for editMessageText updates."""
+    line = f"🔄 {label}…\n{progress_bar(pct)} {pct:5.1f}%   ({done}/{total})"
+    if current:
+        line += f"\nCurrent: {current}"
+    return line
 
 
 def _native_lines(lines: List[str], label: str, units: Dict[str, Any], *, signed: bool = False) -> None:
@@ -67,12 +251,72 @@ def _coverage_lines(lines: List[str], snapshot: Any) -> None:
         lines.append(f"• …and {len(snapshot.position_failures) - 6} more")
 
 
-def _footer(*, back: str = "sr:m", refresh: bool = True) -> List[List[Dict[str, str]]]:
+def _standard_nav(*, back: str = "sr:m", show_home: bool = True) -> List[Dict[str, str]]:
+    if show_home:
+        return [_b("◀ Back", back), _b("🏠 Home", "sr:h"), _b("🔄 Refresh", "sr:refresh")]
+    return [_b("◀ Back", back), _b("🔄 Refresh", "sr:refresh")]
+
+
+def _footer(
+    *,
+    back: str = "sr:m",
+    refresh: bool = True,
+    extra: Optional[List[List[Dict[str, str]]]] = None,
+) -> List[List[Dict[str, str]]]:
     rows: List[List[Dict[str, str]]] = []
+    if extra:
+        rows.extend(extra)
     if refresh:
-        rows.append([_b("↻ Refresh", "sr:refresh")])
-    rows.append([_b("◀️ Back", back), _b("✕ Exit", "exit")])
+        rows.append(_standard_nav(back=back))
+    else:
+        rows.append([_b("◀ Back", back), _b("🏠 Home", "sr:h")])
     return rows
+
+
+def _view_settings(state: Any) -> Dict[str, Any]:
+    settings = state.report.get("settings")
+    if not isinstance(settings, dict):
+        settings = {
+            "net_filter": "all",   # all | long | short
+            "net_sort": "gross",   # gross | net | pnl
+            "page_size": _NET_PAGE_SIZE,
+        }
+        state.report["settings"] = settings
+    return settings
+
+
+def _format_pnl_units(units: Dict[str, Any]) -> str:
+    if not units:
+        return "—"
+    pieces = [
+        f"{portfolio.format_money(amount, signed=True)} {unit}"
+        for unit, amount in sorted(units.items())
+    ]
+    return "; ".join(pieces)
+
+
+def _format_signed(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        q = portfolio._q2(value)
+    except Exception:  # noqa: BLE001
+        return str(value)
+    if q is None:
+        return str(value)
+    return f"{q:+.2f}" if q >= 0 else f"{q:.2f}"
+
+
+def _format_abs(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        q = portfolio._q2(abs(value))
+    except Exception:  # noqa: BLE001
+        return str(value)
+    if q is None:
+        return str(value)
+    return f"{q:.2f}"
 
 
 def _menu(desk: Any, state: Any, *, refresh: bool = False) -> ReportView:
@@ -84,24 +328,264 @@ def _menu(desk: Any, state: Any, *, refresh: bool = False) -> ReportView:
         selected = str(state.report["filter_exchange"])
         if state.report.get("filter_account"):
             selected += f" / {state.report['filter_account']}"
-    text = "\n".join([
+
+    equity = portfolio.total_equity(scope)
+    pnl = portfolio.total_floating_pnl(scope)
+    net_rows = portfolio.net_by_instrument(scope)
+    risk = portfolio.risk_and_exposure(scope)
+
+    net_rows_top = sorted(
+        net_rows,
+        key=lambda r: (-(r["gross"]), -(abs(r["net"])), r["instrument"]),
+    )[:4]
+
+    lines: List[str] = [
         "📊 Summative Report",
         "",
         _freshness(scope),
         f"Scope: {selected}",
+    ]
+
+    counts = (
+        f"Open Positions: {len(scope.positions)}"
+        f"   DEX: {len({a.exchange for a in scope.accounts})}"
+        f"   Accounts: {scope.positions_accounts_ok}/{scope.positions_accounts_seen}"
+    )
+    lines.append(counts)
+
+    lines += ["", "Equity (unconverted):"]
+    if equity["equity_units"]:
+        _native_lines(lines, "  Equity", equity["equity_units"], signed=False)
+    else:
+        lines.append("  Equity: unavailable")
+
+    lines += ["", "uPnL (unconverted):"]
+    if pnl["units"]:
+        _native_lines(lines, "  PnL", pnl["units"], signed=True)
+    else:
+        lines.append("  uPnL: unavailable")
+
+    if net_rows_top:
+        lines += ["", "Top instruments (size, not USD notional):"]
+        for row in net_rows_top:
+            pnl_text = _format_pnl_units(row["pnl_units"])
+            lines.append(
+                f"• {row['display_symbol']}: "
+                f"net {_format_signed(row['net'])} "
+                f"gross {_format_abs(row['gross'])} "
+                f"uPnL {pnl_text} "
+                f"({row['accounts']} acct)"
+            )
+    else:
+        lines += ["", "Top instruments: none"]
+
+    lines += ["", "Closest liquidation: unavailable (canonical contract lacks liquidation price)."]
+    if risk["notional_incomplete"]:
+        lines.append("USD notional: N/A (canonical contract lacks multiplier/inverse metadata).")
+    _coverage_lines(lines, scope)
+
+    buttons: List[List[Dict[str, str]]] = [
+        [_b("📈 Net Positions", "sr:n"), _b("🏛 By Exchange", "sr:e")],
+        [_b("📊 By Symbol", "sr:p"), _b("⚠️ Risks", "sr:r")],
+        [_b("⚡ Actions", "sr:a"), _b("🔍 Filter", "sr:f")],
+        [_b("🔄 Refresh", "sr:refresh"), _b("⚙️ Settings", "sr:s")],
+        [_b("◀ Back", "back"), _b("✕ Exit", "exit")],
+    ]
+    return ReportView("\n".join(lines), buttons)
+
+
+def _net_positions_view(desk: Any, state: Any, *, refresh: bool = False) -> ReportView:
+    snapshot = _scope(state, _report_snapshot(desk, state, refresh=refresh))
+    state.report["view"] = "net_positions"
+    settings = _view_settings(state)
+    rows = portfolio.net_by_instrument(snapshot)
+
+    filter_kind = settings.get("net_filter", "all")
+    if filter_kind == "long":
+        rows = [r for r in rows if r["net"] > 0]
+    elif filter_kind == "short":
+        rows = [r for r in rows if r["net"] < 0]
+
+    sort_kind = settings.get("net_sort", "gross")
+    if sort_kind == "gross":
+        rows.sort(key=lambda r: (-r["gross"], r["instrument"]))
+    elif sort_kind == "net":
+        rows.sort(key=lambda r: (abs(r["net"]), r["instrument"]))
+    elif sort_kind == "pnl":
+        def _pnl_key(r: Dict[str, Any]) -> Any:
+            values = list(r["pnl_units"].values())
+            return -max((abs(v) for v in values), default=portfolio.Decimal("0"))
+        rows.sort(key=_pnl_key)
+
+    state.report["net_rows"] = rows
+    page = max(0, int(state.report.get("net_page", 0)))
+    page_size = max(1, int(settings.get("page_size", _NET_PAGE_SIZE)))
+    page_count = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(page, page_count - 1)
+    state.report["net_page"] = page
+    begin = page * page_size
+    visible = rows[begin : begin + page_size]
+
+    lines = [
+        "📈 Net Positions",
         "",
-        "Open positions only. Read-only; no orders or account changes.",
-        "Choose a report:",
-    ])
-    return ReportView(text, [
-        [_b("📊 Positions by Symbol", "sr:p")],
-        [_b("🏦 PnL by Exchange", "sr:e")],
-        [_b("💰 Total Floating PnL", "sr:t")],
-        [_b("💼 Total Equity", "sr:q")],
-        [_b("⚠️ Risk & Exposure", "sr:r")],
-        [_b("🔎 Filter Exchange / Account", "sr:f")],
-        [_b("🔙 Back", "back"), _b("✕ Exit", "exit")],
-    ])
+        _freshness(snapshot),
+        f"Sort: {sort_kind}   Filter: {filter_kind}",
+        "size (qty), not USD notional — multiplier/inverse contract metadata is not available.",
+        "",
+    ]
+    if not visible:
+        lines.append("No open positions.")
+    for row in visible:
+        pnl_text = _format_pnl_units(row["pnl_units"])
+        lines.append(
+            f"{row['display_symbol']}    "
+            f"net {_format_signed(row['net'])}   "
+            f"gross {_format_abs(row['gross'])}   "
+            f"uPnL {pnl_text}   "
+            f"({row['accounts']} acct)"
+        )
+    _coverage_lines(lines, snapshot)
+
+    buttons: List[List[Dict[str, str]]] = [
+        [_b("Long only", "sr:long"), _b("Short only", "sr:short")],
+        [
+            _b("Sort Net", "sr:snet"),
+            _b("Sort Gross", "sr:sgross"),
+            _b("Sort PnL", "sr:spnl"),
+        ],
+    ]
+    for index, row in enumerate(visible, begin):
+        buttons.append([_b(f"{row['display_symbol']} details", f"sr:nd:{index}")])
+    if page_count > 1:
+        nav: List[Dict[str, str]] = []
+        if page > 0:
+            nav.append(_b("◀ Prev", "sr:np"))
+        nav.append(_b(f"{page + 1}/{page_count}", "sr:n"))
+        if page + 1 < page_count:
+            nav.append(_b("Next ▶", "sr:nn"))
+        buttons.append(nav)
+    buttons.append(_standard_nav(back="sr:m"))
+    return ReportView("\n".join(lines), buttons)
+
+
+def _net_position_detail(state: Any, index_text: str) -> ReportView:
+    rows = state.report.get("net_rows") or []
+    try:
+        row = rows[int(index_text)]
+    except (ValueError, IndexError, TypeError):
+        return _net_positions_view(None, state)
+    instrument = row["instrument"]
+    pnl_text = _format_pnl_units(row["pnl_units"])
+
+    lines = [
+        f"📈 {row['display_symbol']}",
+        "",
+        f"net   {_format_signed(row['net'])}",
+        f"gross {_format_abs(row['gross'])}   (size qty)",
+        f"uPnL  {pnl_text}   ({row['accounts']} acct)",
+        "",
+    ]
+
+    snapshot = state.report.get("snapshot")
+    contributors: List[Any] = []
+    if snapshot is not None:
+        scoped = _scope(state, snapshot)
+        for pos in scoped.positions:
+            if pos.instrument_key != instrument:
+                continue
+            contributors.append(pos)
+    if not contributors:
+        lines.append("No contributing positions cached.")
+
+    if contributors:
+        lines.append("Open positions:")
+        for pos in contributors[:12]:
+            pnl_str = (
+                f"{portfolio.format_money(pos.pnl, signed=True)} {pos.pnl_unit}"
+                if pos.pnl is not None
+                else "—"
+            )
+            size_str = format(pos.size, "f") if pos.size is not None else "—"
+            lines.append(
+                f"• {pos.exchange}/{pos.account_label}: {pos.symbol} {pos.side} "
+                f"size {size_str} · PnL {pnl_str}"
+            )
+        if len(contributors) > 12:
+            lines.append(f"• …and {len(contributors) - 12} more")
+
+    lines += [
+        "",
+        "Future action buttons (read-only stub):",
+    ]
+
+    buttons: List[List[Dict[str, str]]] = [
+        [
+            _b("Set TP", "sr:atp"),
+            _b("Set SL", "sr:asl"),
+        ],
+        [
+            _b("Close 50%", "sr:c50"),
+            _b("Close 100%", "sr:c100"),
+        ],
+    ]
+    buttons.append(_standard_nav(back="sr:n"))
+    return ReportView("\n".join(lines), buttons)
+
+
+def _actions_menu(desk: Any, state: Any) -> ReportView:
+    state.report["view"] = "actions"
+    snapshot = _scope(state, _report_snapshot(desk, state))
+    lines = [
+        "⚡ Actions",
+        "",
+        _freshness(snapshot),
+        "",
+        "Bulk future operations — read-only stubs.",
+        "These buttons do NOT submit, cancel, transfer, or modify accounts.",
+        "",
+        "When enabled, this menu will offer:",
+        "• Close all positions on a symbol across all exchanges",
+        "• Close all positions on an exchange",
+        "• Cancel all open orders on an exchange",
+        "",
+        "Every action requires an explicit confirmation step before submitting.",
+    ]
+    buttons: List[List[Dict[str, str]]] = [
+        [_b("Close symbol — choose", "sr:asym")],
+        [_b("Close exchange — choose", "sr:aex")],
+        [_b("Cancel all orders — confirm", "sr:acancel")],
+    ]
+    buttons.append(_standard_nav(back="sr:m"))
+    return ReportView("\n".join(lines), buttons)
+
+
+def _settings_menu(desk: Any, state: Any) -> ReportView:
+    state.report["view"] = "settings"
+    snapshot = _scope(state, _report_snapshot(desk, state))
+    settings = _view_settings(state)
+    lines = [
+        "⚙️ Settings",
+        "",
+        _freshness(snapshot),
+        "",
+        f"Default Net sort: {settings.get('net_sort', 'gross')}",
+        f"Default Net filter: {settings.get('net_filter', 'all')}",
+        f"Page size: {settings.get('page_size', _NET_PAGE_SIZE)}",
+        "",
+        "Settings are read-only here; persist them via the wizard config.",
+    ]
+    buttons: List[List[Dict[str, str]]] = [
+        [_b("Sort default: Gross", "sr:sgross")],
+        [_b("Sort default: Net", "sr:snet")],
+        [_b("Sort default: PnL", "sr:spnl")],
+    ]
+    buttons.append(_standard_nav(back="sr:m"))
+    return ReportView("\n".join(lines), buttons)
+
+
+def _home(desk: Any, state: Any) -> ReportView:
+    return _menu(desk, state, refresh=False)
 
 
 def _filter_exchanges(desk: Any, state: Any) -> ReportView:
@@ -112,7 +596,7 @@ def _filter_exchanges(desk: Any, state: Any) -> ReportView:
     buttons: List[List[Dict[str, str]]] = [[_b("All Exchanges", "sr:all")]]
     for index, exchange in enumerate(exchanges):
         buttons.append([_b(exchange, f"sr:fx:{index}")])
-    buttons += _footer(back="sr:m", refresh=False)
+    buttons.append(_standard_nav(back="sr:m", show_home=False))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -125,7 +609,7 @@ def _filter_accounts(desk: Any, state: Any) -> ReportView:
     buttons: List[List[Dict[str, str]]] = [[_b("All accounts", "sr:allx")]]
     for index, account in enumerate(accounts):
         buttons.append([_b(account.account_label, f"sr:fa:{index}")])
-    buttons += _footer(back="sr:f", refresh=False)
+    buttons.append(_standard_nav(back="sr:f", show_home=False))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -170,7 +654,7 @@ def _exchange_accounts(desk: Any, state: Any, exchange: str) -> ReportView:
         buttons.append([_b(account.account_label, f"sr:ea:{index}")])
     if not accounts:
         lines.append("No accounts available.")
-    buttons += _footer(back="sr:e")
+    buttons.append(_standard_nav(back="sr:e"))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -261,7 +745,6 @@ def _pnl_by_exchange(desk: Any, state: Any) -> ReportView:
     state.report["view"] = "exchange_pnl"
     rows = portfolio.pnl_by_exchange(snapshot)
     lines = ["🏦 PnL by Exchange", "", _freshness(snapshot), ""]
-    total = None
     if not rows:
         lines.append("No exchanges in the selected scope.")
     for row in rows:
@@ -275,11 +758,26 @@ def _pnl_by_exchange(desk: Any, state: Any) -> ReportView:
     lines += ["", "PORTFOLIO PnL (unconverted):"]
     _native_lines(lines, "  PnL", info["units"], signed=True)
     _coverage_lines(lines, snapshot)
-    buttons: List[List[Dict[str, str]]] = []
-    for index, row in enumerate(rows):
-        buttons.append([_b(f"{row['exchange']} accounts", f"sr:ex:{index}")])
-    buttons += _footer()
     state.report["exchange_rows"] = rows
+    buttons: List[List[Dict[str, str]]] = []
+    page = max(0, int(state.report.get("exchange_page", 0)))
+    page_size = _PAGE_SIZE
+    page_count = max(1, (len(rows) + page_size - 1) // page_size)
+    page = min(page, page_count - 1)
+    state.report["exchange_page"] = page
+    begin = page * page_size
+    visible = rows[begin : begin + page_size]
+    for index, row in enumerate(visible, begin):
+        buttons.append([_b(f"{row['exchange']} accounts", f"sr:ex:{index}")])
+    if page_count > 1:
+        nav: List[Dict[str, str]] = []
+        if page > 0:
+            nav.append(_b("◀ Prev", "sr:ep"))
+        nav.append(_b(f"{page + 1}/{page_count}", "sr:e"))
+        if page + 1 < page_count:
+            nav.append(_b("Next ▶", "sr:en"))
+        buttons.append(nav)
+    buttons.append(_standard_nav(back="sr:m"))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -289,16 +787,17 @@ def _positions(desk: Any, state: Any) -> ReportView:
     groups = portfolio.positions_by_symbol(snapshot)
     state.report["position_groups"] = groups
     page = max(0, int(state.report.get("page", 0)))
-    page_count = max(1, (len(groups) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page_size = _PAGE_SIZE
+    page_count = max(1, (len(groups) + page_size - 1) // page_size)
     page = min(page, page_count - 1)
     state.report["page"] = page
-    begin = page * _PAGE_SIZE
-    rows = groups[begin : begin + _PAGE_SIZE]
+    begin = page * page_size
+    rows = groups[begin : begin + page_size]
     lines = ["📊 Positions by Symbol", "", _freshness(snapshot)]
     if not rows:
         lines += ["", "No open positions."]
     for index, group in enumerate(rows, begin):
-        pnl = "; ".join(f"{portfolio.format_money(amount, signed=True)} {unit}" for unit, amount in sorted(group.units.items())) if group.pnl_any else "—"
+        pnl = _format_pnl_units(group.units) if group.pnl_any else "—"
         lines.append(
             f"{group.display_symbol} {group.side} | Volume: {format(group.volume, 'f')} | PnL: {pnl}"
         )
@@ -317,7 +816,7 @@ def _positions(desk: Any, state: Any) -> ReportView:
         if page + 1 < page_count:
             nav.append(_b("Next ▶", "sr:pn"))
         buttons.append(nav)
-    buttons += _footer()
+    buttons.append(_standard_nav(back="sr:m"))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -343,10 +842,42 @@ def _position_detail(state: Any, index_text: str) -> ReportView:
     return ReportView("\n".join(lines), _footer(back="sr:p"))
 
 
+def _set_settings(state: Any, *, sort: Optional[str] = None, filter_kind: Optional[str] = None) -> ReportView:
+    settings = _view_settings(state)
+    if sort is not None:
+        settings["net_sort"] = sort
+    if filter_kind is not None:
+        settings["net_filter"] = filter_kind
+    state.report["net_page"] = 0
+    return _net_positions_view(None, state)
+
+
+def _action_stub(state: Any, action: str) -> ReportView:
+    """Read-only stubs for the future Set TP / Set SL / Close 50% / Close 100% buttons."""
+    lines = [
+        f"🛑 {action}",
+        "",
+        "Read-only stub.",
+        "This action is not enabled yet — it would submit, cancel, or close positions.",
+        "When enabled, this screen will collect a confirm step before execution.",
+        "",
+        "No exchange writes were performed.",
+    ]
+    return ReportView("\n".join(lines), _standard_nav(back="sr:nd:0"))
+
+
 def handle(desk: Any, state: Any, suffix: str) -> ReportView:
     """Route a ``sr:`` callback.  Menu and position navigation are live."""
     if suffix in {"summative_report", "sr:m", "sr:refresh"}:
         return _menu(desk, state, refresh=suffix == "sr:refresh")
+    if suffix in {"sr:h", "sr:home"}:
+        return _home(desk, state)
+    if suffix == "sr:n":
+        return _net_positions_view(desk, state)
+    if suffix == "sr:a":
+        return _actions_menu(desk, state)
+    if suffix == "sr:s":
+        return _settings_menu(desk, state)
     if suffix == "sr:p":
         return _positions(desk, state)
     if suffix == "sr:e":
@@ -398,6 +929,46 @@ def handle(desk: Any, state: Any, suffix: str) -> ReportView:
     if suffix == "sr:pn":
         state.report["page"] = int(state.report.get("page", 0)) + 1
         return _positions(desk, state)
+    if suffix == "sr:ep":
+        state.report["exchange_page"] = max(0, int(state.report.get("exchange_page", 0)) - 1)
+        return _pnl_by_exchange(desk, state)
+    if suffix == "sr:en":
+        state.report["exchange_page"] = int(state.report.get("exchange_page", 0)) + 1
+        return _pnl_by_exchange(desk, state)
+    if suffix == "sr:np":
+        state.report["net_page"] = max(0, int(state.report.get("net_page", 0)) - 1)
+        return _net_positions_view(desk, state)
+    if suffix == "sr:nn":
+        state.report["net_page"] = int(state.report.get("net_page", 0)) + 1
+        return _net_positions_view(desk, state)
     if suffix.startswith("sr:d:"):
         return _position_detail(state, suffix.rsplit(":", 1)[-1])
+    if suffix.startswith("sr:nd:"):
+        return _net_position_detail(state, suffix.rsplit(":", 1)[-1])
+    if suffix == "sr:long":
+        return _set_settings(state, filter_kind="long")
+    if suffix == "sr:short":
+        return _set_settings(state, filter_kind="short")
+    if suffix == "sr:allf":
+        return _set_settings(state, filter_kind="all")
+    if suffix == "sr:snet":
+        return _set_settings(state, sort="net")
+    if suffix == "sr:sgross":
+        return _set_settings(state, sort="gross")
+    if suffix == "sr:spnl":
+        return _set_settings(state, sort="pnl")
+    if suffix == "sr:atp":
+        return _action_stub(state, "Set TP")
+    if suffix == "sr:asl":
+        return _action_stub(state, "Set SL")
+    if suffix == "sr:c50":
+        return _action_stub(state, "Close 50%")
+    if suffix == "sr:c100":
+        return _action_stub(state, "Close 100%")
+    if suffix == "sr:asym":
+        return _action_stub(state, "Close symbol — choose")
+    if suffix == "sr:aex":
+        return _action_stub(state, "Close exchange — choose")
+    if suffix == "sr:acancel":
+        return _action_stub(state, "Cancel all orders — confirm")
     return _menu(desk, state)

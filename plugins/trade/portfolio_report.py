@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -502,10 +502,17 @@ def collect_portfolio_snapshot(
     *,
     max_workers: int = _DEFAULT_MAX_WORKERS,
     exchanges: Optional[Sequence[str]] = None,
+    progress: Optional[Callable[[int, int, Optional[str]], None]] = None,
 ) -> PortfolioSnapshot:
     """Fetch open-position + equity snapshot across TradeDesk accounts.
 
     Strictly read-only: only ``balance`` and ``positions_orders``.
+
+    ``progress`` (optional) is invoked as ``progress(done, total, current)``
+    after each account snapshot completes.  ``done`` and ``total`` count
+    accounts; ``current`` is the ``exchange/account`` label of the account
+    that just finished.  The callback is allowed to raise — failures are
+    swallowed so a buggy transport sink cannot break a fetch.
     """
     started = time.time()
     errors: List[str] = []
@@ -542,6 +549,22 @@ def collect_portfolio_snapshot(
     snapshots: List[AccountSnapshot] = []
     workers = max(1, min(int(max_workers or _DEFAULT_MAX_WORKERS), max(1, len(targets))))
 
+    total_targets = len(targets)
+    done_targets = 0
+    if progress is not None:
+        try:
+            progress(0, total_targets, None)
+        except Exception:  # noqa: BLE001
+            logger.exception("portfolio snapshot progress(0) raised")
+
+    def _emit_progress(current_label: str) -> None:
+        if progress is None:
+            return
+        try:
+            progress(done_targets, total_targets, current_label)
+        except Exception:  # noqa: BLE001
+            logger.exception("portfolio snapshot progress(%d) raised", done_targets)
+
     if targets:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -570,6 +593,8 @@ def collect_portfolio_snapshot(
                             errors=[f"{ex}/{ac}: snapshot failed ({exc})"],
                         )
                     )
+                done_targets += 1
+                _emit_progress(f"{ex}/{ac}")
 
     # Stable order: exchange, account
     snapshots.sort(key=lambda a: (a.exchange.lower(), a.account.lower(), a.account_label.lower()))
@@ -600,6 +625,80 @@ def collect_portfolio_snapshot(
         incomplete=incomplete,
         max_workers=workers,
     )
+
+
+def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
+    """Aggregate open positions per instrument (combines BUY + SELL).
+
+    Returns a list of dicts in the shape::
+
+        {
+            "instrument": str,         # normalized instrument key
+            "display_symbol": str,      # first contributor's display symbol
+            "gross": Decimal,           # sum of |size| across both sides
+            "net": Decimal,            # signed net (BUY − SELL)
+            "long": Decimal,           # BUY absolute size
+            "short": Decimal,          # SELL absolute size
+            "pnl_units": Dict[str, Decimal],  # per-unit floating PnL
+            "accounts": int,           # unique exchange|account pairs
+        }
+
+    ``gross`` and ``net`` are derived from per-leg absolute/signed size,
+    never from ``size * price``: notional requires verified contract
+    multiplier/inverse metadata which CanonicalPosition does not supply.
+    """
+    buckets: Dict[str, Dict[str, Any]] = {}
+    accounts: Dict[str, set] = {}
+    for pos in snapshot.positions:
+        if pos.size is None:
+            continue
+        slot = buckets.setdefault(
+            pos.instrument_key,
+            {
+                "instrument": pos.instrument_key,
+                "display_symbol": pos.symbol or pos.instrument_key,
+                "gross": Decimal("0"),
+                "net": Decimal("0"),
+                "long": Decimal("0"),
+                "short": Decimal("0"),
+                "pnl_units": {},
+                "_count": 0,
+            },
+        )
+        slot["_count"] += 1
+        slot["display_symbol"] = pos.symbol or pos.instrument_key
+        size_abs = abs(pos.size)
+        slot["gross"] += size_abs
+        if pos.side == "BUY":
+            slot["long"] += size_abs
+            slot["net"] += pos.size
+        elif pos.side == "SELL":
+            slot["short"] += size_abs
+            slot["net"] -= size_abs
+        else:
+            # Unknown side; treat as long for size accounting, not for net.
+            slot["long"] += size_abs
+        if pos.pnl is not None:
+            unit = pos.pnl_unit or "?"
+            slot["pnl_units"][unit] = slot["pnl_units"].get(unit, Decimal("0")) + pos.pnl
+        accounts.setdefault(pos.instrument_key, set()).add(
+            f"{pos.exchange}|{pos.account}|"
+        )
+    rows: List[Dict[str, Any]] = []
+    for key, slot in buckets.items():
+        rows.append(
+            {
+                "instrument": slot["instrument"],
+                "display_symbol": slot["display_symbol"],
+                "gross": slot["gross"],
+                "net": slot["net"],
+                "long": slot["long"],
+                "short": slot["short"],
+                "pnl_units": slot["pnl_units"],
+                "accounts": len(accounts.get(key, set())),
+            }
+        )
+    return rows
 
 
 def positions_by_symbol(snapshot: PortfolioSnapshot) -> List[SymbolSideAggregate]:
@@ -876,6 +975,7 @@ __all__ = [
     "collect_portfolio_snapshot",
     "format_money",
     "list_exchanges",
+    "net_by_instrument",
     "normalize_instrument_key",
     "normalize_side",
     "pnl_by_exchange",

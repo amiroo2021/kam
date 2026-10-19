@@ -83,8 +83,8 @@ class TestPortfolioAggregation(unittest.TestCase):
         menu = wizard.handle_callback(key, "summative_report")
         labels = [item["text"] for row in menu.buttons for item in row]
         self.assertEqual(menu.state, "summative_report")
-        for expected in ("📊 Positions by Symbol", "🏦 PnL by Exchange", "💰 Total Floating PnL",
-                         "💼 Total Equity", "⚠️ Risk & Exposure", "🔎 Filter Exchange / Account"):
+        for expected in ("📈 Net Positions", "🏛 By Exchange", "📊 By Symbol",
+                         "⚠️ Risks", "⚡ Actions", "🔍 Filter"):
             self.assertIn(expected, labels)
         positions = wizard.handle_callback(key, "sr:p")
         self.assertIn("BTC BUY | Volume: 2.5", positions.text)

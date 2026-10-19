@@ -3329,12 +3329,21 @@ class TradeWizard:
         self,
         chat_key: Tuple[Any, ...],
         refresh: bool,
+        progress_sink: Optional[Any] = None,
     ) -> Screen:
-        """Render the delegated read-only portfolio report menu."""
+        """Render the delegated read-only portfolio report menu.
+
+        ``progress_sink`` may be passed by the caller (typically a
+        Telegram adapter) to stream progress frames while the snapshot
+        fetch runs.  The wizard stays transport-agnostic; the sink is the
+        only coupling.
+        """
         state = self._state_for(chat_key)
         state.state = "summative_report"
         state.exchange = None
         state.account = None
+        if progress_sink is not None:
+            state.report["progress_sink"] = progress_sink
         suffix = "sr:refresh" if refresh else "summative_report"
         view = summative_report_ui.handle(self._desk, state, suffix)
         return Screen(text=view.text, buttons=view.buttons, state="summative_report")
@@ -3428,6 +3437,38 @@ async def handle_trade_command(adapter: Any, msg: Any) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.error("trade wizard: /trade dispatch failed: %s", exc, exc_info=True)
         return False
+
+
+async def render_summative_with_progress(
+    adapter: Any,
+    query: Any,
+    chat_key: Tuple[Any, ...],
+    *,
+    refresh: bool = False,
+) -> Screen:
+    """Render the Summative Report while streaming progress to the chat.
+
+    The wizard installs a transport-agnostic progress sink before kicking
+    the snapshot fetch on a worker thread.  The sink (lazy-imported from
+    ``plugins.trade.summative_progress``) edits the same message in place
+    via ``query.edit_message_text``; the final view replaces the last
+    progress frame once the fetch completes.
+
+    Returns the wizard screen so the caller can render it normally.  The
+    function is read-only: it never invokes exchange writes.
+    """
+    from plugins.trade.summative_progress import TelegramProgressSink
+
+    state = _WIZARD._state_for(chat_key)
+    state.state = "summative_report"
+    state.exchange = None
+    state.account = None
+    sink = TelegramProgressSink(
+        query=query,
+        render=lambda frame: frame["text"],
+    )
+    state.report["progress_sink"] = sink
+    return await asyncio.to_thread(_WIZARD._render_summative_report, chat_key, refresh, sink)
 
 
 async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
