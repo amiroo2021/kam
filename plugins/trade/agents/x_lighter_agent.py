@@ -800,6 +800,8 @@ def capabilities() -> List[str]:
         # Public instrument resolve + Phase 2.4 catalog/price readers.
         "resolve_instrument", "list_instruments", "market_price",
         "get_tickers",
+        # Position management actions
+        "set_tp", "set_sl", "close_position",
     ]
 
 
