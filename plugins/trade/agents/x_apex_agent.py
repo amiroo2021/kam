@@ -3342,6 +3342,19 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
     position_side = _apex_position_side(position_row)
     position_size = _apex_position_size(position_row)
 
+    # Fallback to explicit size from the wizard request if the freshly
+    # fetched position reports zero size (common on short positions or
+    # certain Apex account_group views).
+    if position_size <= 0:
+        req_size = request.get("size")
+        if req_size:
+            try:
+                fallback = __import__("decimal").Decimal(str(req_size)).copy_abs()
+                if fallback > 0:
+                    position_size = fallback
+            except Exception:
+                pass
+
     # Negative or zero price → remove existing TP.
     if tp_price <= 0:
         cancelled = _apex_remove_existing_tpsl(
