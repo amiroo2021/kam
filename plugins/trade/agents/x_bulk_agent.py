@@ -184,6 +184,9 @@ def capabilities() -> list[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "set_tp",
+        "set_sl",
+        "close_position",
     ]
 
 
@@ -1590,6 +1593,77 @@ def _positions_orders(
     )
 
 
+
+def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Delegate set_tp / set_sl / close_position to the correct underlying agent."""
+    symbol = str(request.get("symbol") or "").strip().upper()
+    if not symbol:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+
+    row = _find_market(credentials, symbol)
+    if not row:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Symbol {symbol} is not configured for bulk account '{account}'.")
+
+    # Try multiple keys that might contain the underlying exchange
+    underlying = str(
+        row.get("exchange") or
+        row.get("underlying") or
+        row.get("venue") or
+        row.get("market") or ""
+    ).lower().strip()
+
+    if not underlying:
+        # Last resort: try to infer from other fields in the row
+        for key in ("exchange_name", "exchange_id", "type"):
+            val = str(row.get(key) or "").lower().strip()
+            if val:
+                underlying = val
+                break
+
+    if not underlying:
+        available_keys = list(row.keys())[:8]
+        return make_failure(
+            operation, name, account, "MISSING_UNDERLYING",
+            f"No underlying exchange configured for symbol '{symbol}' in bulk account '{account}'. "
+            f"Row keys: {available_keys}"
+        )
+
+    # Agent registry (extend as more exchanges are added)
+    agent_map = {
+        "hyperliquid": "x_hyperliquid_agent",
+        "apex": "x_apex_agent",
+        "phemex": "x_phemex_agent",
+        "hibachi": "x_hibachi_agent",
+        "edgex": "x_edgex_agent",
+        "mexc": "x_mexc_agent",
+        "perpl": "x_perpl_agent",
+        "lighter": "x_lighter_agent",
+        "nado": "x_nado_agent",
+        "ondoperps": "x_ondoperps_agent",
+        "arcus": "x_arcus_agent",
+        "pacifica": "x_pacifica_agent",
+        "qfex": "x_qfex_agent",
+        "raydium": "x_raydium_agent",
+        "aftermath": "x_aftermath_agent",
+        "vestmarkets": "x_vestmarkets_agent",
+    }
+
+    module_name = agent_map.get(underlying)
+    if not module_name:
+        return make_failure(operation, name, account, "UNSUPPORTED_UNDERLYING", f"Position management not supported for underlying exchange '{underlying}'.")
+
+    try:
+        agent = __import__(f"plugins.trade.agents.{module_name}", fromlist=[module_name])
+        # Some agents expose `execute`, some may need different entrypoint
+        if hasattr(agent, "execute"):
+            return agent.execute(dict(request))  # pass a copy
+        else:
+            return make_failure(operation, name, account, "AGENT_ERROR", f"Agent {module_name} has no execute() function.")
+    except Exception as exc:
+        logger.warning("Bulk position action delegation failed: %s", exc)
+        return make_failure(operation, name, account, "DELEGATION_FAILED", str(exc))
+
+
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
     operation = str(request.get("operation") or "").strip()
     account = str(request.get("account") or "").strip()
@@ -1625,6 +1699,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _ladder(credentials, account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(credentials, account, request)
+        if operation in ("set_tp", "set_sl", "close_position"):
+            return _bulk_position_action(credentials, account, operation, request)
         return make_failure(
             operation=operation,
             exchange=name,
