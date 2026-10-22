@@ -4389,7 +4389,18 @@ def _find_position_management_context(request: Dict[str, Any], *, include_active
     current_side = "long" if sign_value >= 0 else "short"
     closing_side = "sell" if current_side == "long" else "buy"
     size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
-    current_size = _quantize_down(abs(_decimal_or_none(current_raw.get("position")) or Decimal("0")), size_decimals)
+    raw_size = _decimal_or_none(current_raw.get("position")) or Decimal("0")
+    current_size = _quantize_down(abs(raw_size), size_decimals)
+    # Defensive fallback if size came back as 0 but request has it
+    if current_size <= 0:
+        req_size = request.get("size") or request.get("position_size")
+        if req_size:
+            try:
+                fb = _quantize_down(abs(Decimal(str(req_size))), size_decimals)
+                if fb > 0:
+                    current_size = fb
+            except Exception:
+                pass
     auth_token = str(fetched.get("auth_token") or "")
     active_orders = _fetch_active_orders(credentials, auth_token) if include_active_orders else []
     return fetched, credentials, target, market, active_orders, current_side, current_size, closing_side, auth_token
