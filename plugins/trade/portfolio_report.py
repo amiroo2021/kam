@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -68,6 +69,28 @@ def normalize_side(side: Any) -> str:
     return (text.upper() or "?")
 
 
+# EVM contract addresses: 0x + 40 hex chars (20 bytes) for ERC-20 tokens.
+# Some venues (Aftermath) quote perpetual markets by a 32-byte market id,
+# so accept 40 *or* 64 hex body chars.
+_CONTRACT_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+
+
+def is_opaque_exchange_identifier(value: Any) -> bool:
+    """True when an exchange instrument is an opaque id, not a ticker.
+
+    On-chain venues (Aftermath and similar wrappers) identify a market by its
+    contract address.  An address carries no base/quote/market-type
+    information, so it must never become a cross-exchange aggregation key
+    when a human-readable canonical symbol exists: doing so splits one
+    underlying asset into two visually identical rows.
+
+    It remains perfectly usable as a *within-venue* identity component for
+    position de-duplication.
+    """
+    text = str(value or "").strip()
+    return bool(_CONTRACT_ADDRESS_RE.match(text))
+
+
 def normalize_instrument_key(
     symbol: Any,
     exchange_instrument: Any = None,
@@ -75,44 +98,66 @@ def normalize_instrument_key(
     """Normalize venue-specific aliases into a stable aggregation key.
 
     Preference order:
-    1. Base extracted from exchange_instrument when present
-    2. Display symbol with common perp suffixes stripped
-    """
-    candidates: List[str] = []
-    ei = str(exchange_instrument or "").strip()
-    sym = str(symbol or "").strip()
-    if ei:
-        candidates.append(ei)
-    if sym:
-        candidates.append(sym)
+    1. Display symbol — authoritative for cross-exchange grouping.
+    2. ``exchange_instrument`` base token, but ONLY when it is a readable
+       ticker.  Contract addresses and other opaque ids are skipped; they
+       cannot establish instrument identity across venues.
 
-    for raw in candidates:
-        text = raw.strip()
-        if not text:
-            continue
-        # HIP-3 / namespaced forms: xyz:SP500 -> SP500; k:BTC -> BTC
-        if ":" in text:
-            text = text.rsplit(":", 1)[-1]
-        text = _PREFIX_STRIP_RE.sub("", text)
-        # Common quote pair forms: BTC-USD.P, BTCUSDT, ETH-USDC, PERP_ZEC_USDC
-        upper = text.upper()
-        for quote in ("USDT", "USDC", "USD", "USDG", "DAI", "FDUSD"):
-            if upper.endswith(quote) and len(upper) > len(quote):
-                upper = upper[: -len(quote)]
-                break
-        upper = _SYMBOL_STRIP_RE.sub("", upper)
-        upper = upper.replace("_", "-")
-        parts = [p for p in upper.split("-") if p and p not in {"PERP", "SWAP", "P"}]
-        if parts:
-            # Prefer first non-quote token as base.
-            base = parts[0]
-            base = _NON_ALNUM_RE.sub("", base)
-            if base:
-                return base
-        cleaned = _NON_ALNUM_RE.sub("", upper)
-        if cleaned:
-            return cleaned
-    return (sym or ei or "?").upper() or "?"
+    A contract address is never used as the aggregation key while a reliable
+    canonical symbol is available.  When neither side yields a usable base
+    token, the address is returned uppercased so it still forms a stable,
+    collision-free group rather than merging into an unrelated ticker.
+    """
+    sym = str(symbol or "").strip()
+    ei = str(exchange_instrument or "").strip()
+
+    if sym and not is_opaque_exchange_identifier(sym):
+        key = _base_token(sym)
+        if key:
+            return key
+    if ei and not is_opaque_exchange_identifier(ei):
+        key = _base_token(ei)
+        if key:
+            return key
+    if sym:
+        key = _base_token(sym)
+        if key:
+            return key
+    if ei:
+        # Opaque id with no usable symbol: keep it as its own group.
+        return ei.upper()
+    return "?"
+
+
+def _base_token(raw: str) -> Optional[str]:
+    """Reduce one raw venue string to its base asset token.
+
+    Returns ``None`` when the string carries no usable base token.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    # HIP-3 / namespaced forms: xyz:SP500 -> SP500; k:BTC -> BTC
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    text = _PREFIX_STRIP_RE.sub("", text)
+    # Common quote pair forms: BTC-USD.P, BTCUSDT, ETH-USDC, PERP_ZEC_USDC
+    upper = text.upper()
+    for quote in ("USDT", "USDC", "USD", "USDG", "DAI", "FDUSD"):
+        if upper.endswith(quote) and len(upper) > len(quote):
+            upper = upper[: -len(quote)]
+            break
+    upper = _SYMBOL_STRIP_RE.sub("", upper)
+    upper = upper.replace("_", "-")
+    parts = [p for p in upper.split("-") if p and p not in {"PERP", "SWAP", "P"}]
+    if parts:
+        # Prefer first non-quote token as base.
+        base = parts[0]
+        base = _NON_ALNUM_RE.sub("", base)
+        if base:
+            return base
+    cleaned = _NON_ALNUM_RE.sub("", upper)
+    return cleaned or None
 
 
 def _account_parts(entry: Any) -> Tuple[Optional[str], str]:
@@ -181,6 +226,21 @@ class OpenPositionRow:
     # infer notional from size×price until agents supply verified metadata.
     notional: Optional[Decimal] = None
     identity: str = ""
+    # === Provenance (additive, default None = unknown) =====================
+    # Populated ONLY from verified canonical/exchange metadata.  None means
+    # "the provider did not report it" and must never be read as a value,
+    # never inferred from the ticker, and never treated as proof of
+    # contract equivalence.
+    quantity_unit: Optional[str] = None      # e.g. "BTC" (base units)
+    market_type: Optional[str] = None        # "perp" | "spot" | ...
+    contract_multiplier: Optional[Decimal] = None  # verified size->base factor
+    contract_spec: Optional[str] = None      # venue contract specification id
+    # Original broker-native lot size, preserved whenever a conversion was
+    # applied so the raw exposure is never lost or silently overwritten.
+    raw_lots: Optional[Decimal] = None
+    broker_server: Optional[str] = None
+    broker_company: Optional[str] = None
+    calc_mode: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -200,6 +260,17 @@ class OpenPositionRow:
             "exchange_instrument": self.exchange_instrument,
             "notional": None if self.notional is None else format(self.notional, "f"),
             "identity": self.identity,
+            "quantity_unit": self.quantity_unit,
+            "market_type": self.market_type,
+            "contract_multiplier": (
+                None if self.contract_multiplier is None
+                else format(self.contract_multiplier, "f")
+            ),
+            "contract_spec": self.contract_spec,
+            "raw_lots": None if self.raw_lots is None else format(self.raw_lots, "f"),
+            "broker_server": self.broker_server,
+            "broker_company": self.broker_company,
+            "calc_mode": self.calc_mode,
         }
 
 
@@ -256,6 +327,146 @@ class AccountSnapshot:
         }
 
 
+_CONTRACT_SPEC_TTL_SECONDS = 900.0
+_CONTRACT_SPEC_LOCK = threading.Lock()
+_CONTRACT_SPEC_CACHE: Dict[Tuple[str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
+
+# MT5 calc modes we can interpret as a linear underlying-quantity contract.
+# SYMBOL_CALC_MODE_FOREX (0) and SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE (1) are
+# currency-margin instruments; SYMBOL_CALC_MODE_FUTURES (2) is exchange
+# style.  Calc mode 5 (SYMBOL_CALC_MODE_EXCH_FUTURES) is also linear.
+# Anything else (e.g. CFD/quanto/synthetic) stays unverified by design.
+_LINEAR_CALC_MODES = frozenset({0, 1, 2, 5})
+
+
+def _contract_spec_key(exchange: str, account: str, symbol: str) -> Tuple[str, str, str]:
+    return (str(exchange or "").strip().lower(),
+            str(account or "").strip().upper(),
+            str(symbol or "").strip().upper())
+
+
+def resolve_contract_spec(
+    desk: Any,
+    exchange: str,
+    account: str,
+    symbol: str,
+    *,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return broker contract metadata for one (exchange, account, symbol).
+
+    Read-only: issues a single ``symbol_info`` call through the existing
+    agent dispatch and caches the result briefly.  Returns ``None`` when the
+    venue has no contract specification concept or the lookup fails — never
+    a fabricated default.
+    """
+    key = _contract_spec_key(exchange, account, symbol)
+    if not key[1] or not key[2]:
+        return None
+    current = time.time() if now is None else now
+    with _CONTRACT_SPEC_LOCK:
+        cached = _CONTRACT_SPEC_CACHE.get(key)
+        if cached is not None and (current - cached[0]) < _CONTRACT_SPEC_TTL_SECONDS:
+            return cached[1]
+    try:
+        response = desk.execute(
+            {
+                "operation": "symbol_info",
+                "exchange": key[0],
+                "account": key[1],
+                "symbol": key[2],
+            }
+        )
+    except Exception:  # noqa: BLE001
+        response = None
+    spec: Optional[Dict[str, Any]] = None
+    if response is not None and getattr(response, "success", False):
+        data = getattr(response, "data", None) or {}
+        contract_size = _d(data.get("trade_contract_size"))
+        if contract_size is not None and contract_size > 0:
+            calc_mode = data.get("trade_calc_mode")
+            try:
+                calc_mode_int = int(calc_mode) if calc_mode is not None else None
+            except (TypeError, ValueError):
+                calc_mode_int = None
+            spec = {
+                "trade_contract_size": contract_size,
+                "trade_calc_mode": calc_mode_int,
+                "currency_base": data.get("currency_base"),
+                "currency_profit": data.get("currency_profit"),
+                "currency_margin": data.get("currency_margin"),
+                "volume_step": data.get("volume_step"),
+                "volume_min": data.get("volume_min"),
+                "volume_max": data.get("volume_max"),
+                "tick_size": data.get("tick_size"),
+                "server": data.get("server"),
+                "company": data.get("company"),
+                "broker": data.get("server"),
+            }
+    with _CONTRACT_SPEC_LOCK:
+        _CONTRACT_SPEC_CACHE[key] = (current, spec)
+    return spec
+
+
+def contract_spec_is_linear(spec: Optional[Dict[str, Any]]) -> bool:
+    """True only when the spec establishes a linear underlying quantity.
+
+    Requires a positive contract size AND a known calculation mode we can
+    interpret.  Unknown calc mode is treated as NOT linear: guessing here is
+    exactly what produced the original wrong aggregation.
+    """
+    if not spec:
+        return False
+    size = _d(spec.get("trade_contract_size"))
+    if size is None or size <= 0:
+        return False
+    mode = spec.get("trade_calc_mode")
+    if mode is None:
+        return False
+    return int(mode) in _LINEAR_CALC_MODES
+
+
+def underlying_quantity_from_lots(
+    lots: Optional[Decimal],
+    spec: Optional[Dict[str, Any]],
+) -> Optional[Decimal]:
+    """Convert MT5 lots to underlying units only for verified linear specs."""
+    if lots is None or not contract_spec_is_linear(spec):
+        return None
+    size = _d(spec.get("trade_contract_size"))
+    if size is None or size <= 0:
+        return None
+    return abs(lots) * size
+
+
+def is_account_eligible(account: AccountSnapshot) -> bool:
+    """Return True when an account is relevant enough to display.
+
+    Eligible means at least one of:
+      * a successfully retrieved, *meaningful* balance or equity, or
+      * one or more confirmed open positions.
+
+    Design rules (deliberate, do not "simplify" these away):
+
+    * A failed or unsupported response is never treated as zero.  The
+      ``balance_ok`` / ``positions_ok`` flags are set only from a successful
+      canonical response, so an error can never satisfy eligibility.
+    * A successful zero-balance/zero-equity response with no open positions
+      does NOT qualify — an empty account is not relevant.
+    * "Meaningful" means any non-zero successfully retrieved figure.  We do
+      not impose a dust threshold, because the reader decides what counts as
+      relevant and inventing one would silently hide real balances.
+    """
+    if account.positions_ok and account.positions:
+        # Confirmed open positions always qualify.
+        return True
+    if account.balance_ok:
+        for value in (account.equity, account.balance, account.available):
+            if value is not None and value != 0:
+                return True
+    return False
+
+
 @dataclass
 class SymbolSideAggregate:
     instrument_key: str
@@ -301,6 +512,34 @@ class PortfolioSnapshot:
     @property
     def position_failures(self) -> List[AccountSnapshot]:
         return [account for account in self.accounts if not account.positions_ok]
+
+    # ------------------------------------------------------------------
+    # Eligibility
+    #
+    # An account is *eligible for display* when it has at least one of:
+    #   * a successfully retrieved, meaningful balance or equity, or
+    #   * one or more confirmed open positions.
+    #
+    # A failed/unsupported response is NEVER read as zero: eligibility is
+    # gated on `balance_ok` / `positions_ok`, which are only set from a
+    # successful canonical response.  A successful zero-balance response
+    # with no open positions therefore does not qualify.
+    # ------------------------------------------------------------------
+
+    @property
+    def eligible_accounts(self) -> List[AccountSnapshot]:
+        """Accounts with a real balance/equity or >=1 confirmed position."""
+        return [a for a in self.accounts if is_account_eligible(a)]
+
+    @property
+    def eligible_exchanges(self) -> List[str]:
+        """Distinct exchanges holding at least one eligible account."""
+        return sorted({a.exchange for a in self.eligible_accounts})
+
+    @property
+    def position_bearing_accounts(self) -> List[AccountSnapshot]:
+        """Accounts with >=1 confirmed open position."""
+        return [a for a in self.accounts if a.positions_ok and a.positions]
 
     def filtered(
         self,
@@ -459,6 +698,30 @@ def _extract_account_snapshot(
             if pid in seen_pos:
                 continue
             seen_pos.add(pid)
+
+            # MetaTrader reports `size` in lots.  Only for a verified linear
+            # contract specification from THIS account do we also derive an
+            # underlying-asset quantity; otherwise the row keeps its native
+            # lot unit and stays in its own aggregation group.
+            spec = None
+            underlying = None
+            if str(exchange or "").strip().lower() == "metatrader":
+                spec = resolve_contract_spec(desk, exchange, account, symbol)
+                underlying = underlying_quantity_from_lots(abs(size), spec)
+
+            quantity_unit = None
+            contract_multiplier = None
+            # market_type stays None: the EA does not report it, and inferring
+            # "perp" from a USD suffix is a guess that would wrongly separate
+            # converted MT5 rows from token-denominated venues.  Verified
+            # absence is not evidence.
+            market_type = None
+            contract_spec = None
+            if underlying is not None and spec is not None:
+                quantity_unit = key
+                contract_multiplier = _d(spec.get("trade_contract_size"))
+                contract_spec = str(spec.get("server") or spec.get("broker") or "") or None
+
             row = OpenPositionRow(
                 exchange=exchange,
                 account=account,
@@ -466,7 +729,12 @@ def _extract_account_snapshot(
                 symbol=symbol,
                 instrument_key=key,
                 side=side,
-                size=abs(size),
+                size=(underlying if underlying is not None else abs(size)),
+                # raw_lots is the MT5 lot size.  Only set it for a
+                # lot-denominated venue: on token venues `size` is already the
+                # asset, and marking it as "lots" would both mislabel the row
+                # and wrongly split it from other token rows.
+                raw_lots=(abs(size) if spec is not None else None),
                 entry_price=entry,
                 mark=mark,
                 pnl=pnl,
@@ -476,6 +744,17 @@ def _extract_account_snapshot(
                 exchange_instrument=ei_s or None,
                 notional=None,
                 identity=pid,
+                # Provenance stays None unless the venue verified it.  The
+                # positions feed exposes no market_type / quantity_unit /
+                # multiplier, so these remain "unknown" for live positions and
+                # must never be inferred from the ticker.
+                quantity_unit=quantity_unit,
+                market_type=market_type,
+                contract_multiplier=contract_multiplier,
+                contract_spec=contract_spec,
+                broker_server=(str(spec.get("server")) if spec and spec.get("server") else None),
+                broker_company=(str(spec.get("company")) if spec and spec.get("company") else None),
+                calc_mode=(spec.get("trade_calc_mode") if spec else None),
             )
             positions.append(row)
             if pnl is not None:
@@ -627,6 +906,72 @@ def collect_portfolio_snapshot(
     )
 
 
+def positions_are_quantity_compatible(rows: List[OpenPositionRow]) -> bool:
+    """Return True when quantities from every row may be summed.
+
+    Conservative by construction: unknown provenance is NOT proof of
+    compatibility.  A row with unverified ``quantity_unit`` therefore blocks
+    merging against rows that *do* carry a verified unit, rather than
+    silently adding two different denominations.
+
+    Rules:
+      * quantity_unit must be known and equal on every row.
+      * market_type must be known and equal on every row (spot != perp).
+      * contract_multiplier must be known and equal on every row when any
+        row reports one.
+      * contract_spec must be equal on every row when any row reports one.
+
+    Every row carrying no provenance at all is treated as mutually
+    compatible, because with nothing to contradict it there is no evidence
+    of incompatibility — this keeps the common case (live positions, which
+    currently expose no metadata) aggregating as before rather than
+    fragmenting every symbol into one group per venue.
+    """
+    units = {r.quantity_unit for r in rows if r.quantity_unit is not None}
+    if len(units) > 1:
+        return False
+
+    market_types = {r.market_type for r in rows if r.market_type is not None}
+    if len(market_types) > 1:
+        return False
+
+    multipliers = {r.contract_multiplier for r in rows if r.contract_multiplier is not None}
+    if len(multipliers) > 1:
+        return False
+
+    specs = {r.contract_spec for r in rows if r.contract_spec is not None}
+    if len(specs) > 1:
+        return False
+
+    return True
+
+
+def _provenance_suffix(row: OpenPositionRow) -> str:
+    """Short human tag distinguishing an otherwise identical-looking group."""
+    bits: List[str] = []
+    market_type = _provenance(row, "market_type")
+    quantity_unit = _provenance(row, "quantity_unit")
+    multiplier = _provenance(row, "contract_multiplier")
+    spec = _provenance(row, "contract_spec")
+    if market_type:
+        bits.append(str(market_type))
+    if quantity_unit and str(quantity_unit).upper() != str(
+        getattr(row, "instrument_key", "") or ""
+    ).upper():
+        bits.append(str(quantity_unit))
+    if multiplier is not None:
+        bits.append(f"x{multiplier}")
+    if spec:
+        bits.append(str(spec))
+    if not bits:
+        unit = _provenance(row, "quantity_unit")
+        if unit is None and _provenance(row, "raw_lots") is not None:
+            bits.append("lots")
+    if not bits and is_opaque_exchange_identifier(getattr(row, "exchange_instrument", None)):
+        bits.append(str(row.exchange_instrument)[:8])
+    return "·" + "/".join(bits) if bits else ""
+
+
 def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
     """Aggregate open positions per instrument (combines BUY + SELL).
 
@@ -634,7 +979,7 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
 
         {
             "instrument": str,         # normalized instrument key
-            "display_symbol": str,      # first contributor's display symbol
+            "display_symbol": str,      # canonical symbol for the group
             "gross": Decimal,           # sum of |size| across both sides
             "net": Decimal,            # signed net (BUY − SELL)
             "long": Decimal,           # BUY absolute size
@@ -646,9 +991,22 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
     ``gross`` and ``net`` are derived from per-leg absolute/signed size,
     never from ``size * price``: notional requires verified contract
     multiplier/inverse metadata which CanonicalPosition does not supply.
+
+    Grouping is two-stage:
+
+    1. Bucket by normalized ``instrument_key``.  A contract address never
+       becomes the key while a canonical symbol exists, so one underlying
+       asset cannot split into visually identical rows.
+    2. Within a bucket, split further into *compatibility subgroups* using
+       verified provenance (quantity unit, market type, contract multiplier,
+       contract specification).  Quantities are summed only across rows the
+       provenance rules agree are summable.
+
+    Every emitted row gets a unique ``display_symbol``: when a bucket had to
+    be split, each subgroup is suffixed with its distinguishing provenance
+    so two rows can never render as indistinguishable labels.
     """
     buckets: Dict[str, Dict[str, Any]] = {}
-    accounts: Dict[str, set] = {}
     for pos in snapshot.positions:
         if pos.size is None:
             continue
@@ -663,42 +1021,147 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
                 "short": Decimal("0"),
                 "pnl_units": {},
                 "_count": 0,
+                "_symbols": {},
+                "_rows": [],
+                "_accounts": set(),
             },
         )
         slot["_count"] += 1
-        slot["display_symbol"] = pos.symbol or pos.instrument_key
-        size_abs = abs(pos.size)
-        slot["gross"] += size_abs
-        if pos.side == "BUY":
-            slot["long"] += size_abs
-            slot["net"] += pos.size
-        elif pos.side == "SELL":
-            slot["short"] += size_abs
-            slot["net"] -= size_abs
-        else:
-            # Unknown side; treat as long for size accounting, not for net.
-            slot["long"] += size_abs
-        if pos.pnl is not None:
-            unit = pos.pnl_unit or "?"
-            slot["pnl_units"][unit] = slot["pnl_units"].get(unit, Decimal("0")) + pos.pnl
-        accounts.setdefault(pos.instrument_key, set()).add(
-            f"{pos.exchange}|{pos.account}|"
-        )
+        # Deterministic display: the most common contributor symbol wins,
+        # not whichever row happened to be visited last.
+        symbol = pos.symbol or pos.instrument_key
+        slot["_symbols"][symbol] = slot["_symbols"].get(symbol, 0) + 1
+        slot["_rows"].append(pos)
+        slot["_accounts"].add(f"{pos.exchange}|{pos.account}|")
+
     rows: List[Dict[str, Any]] = []
     for key, slot in buckets.items():
-        rows.append(
-            {
-                "instrument": slot["instrument"],
-                "display_symbol": slot["display_symbol"],
-                "gross": slot["gross"],
-                "net": slot["net"],
-                "long": slot["long"],
-                "short": slot["short"],
-                "pnl_units": slot["pnl_units"],
-                "accounts": len(accounts.get(key, set())),
-            }
-        )
+        subgroups = _compatibility_subgroups(slot["_rows"])
+
+        # Most common contributor symbol, ties broken alphabetically so the
+        # label is deterministic across runs.
+        symbols: Dict[str, int] = slot["_symbols"]
+        canonical_symbol = sorted(symbols.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+        if len(subgroups) == 1:
+            groups = [subgroups[0]]
+            labels = [canonical_symbol]
+        else:
+            groups = subgroups
+            labels = [
+                f"{canonical_symbol}{_provenance_suffix(g[0][0])}"
+                for g in subgroups
+            ]
+
+        seen_labels: Dict[str, int] = {}
+        final_labels: List[str] = []
+        for label in labels:
+            seen_labels[label] = seen_labels.get(label, 0) + 1
+            if seen_labels[label] > 1:
+                final_labels.append(f"{label} #{seen_labels[label]}")
+            else:
+                final_labels.append(label)
+
+        for (group_rows, group_accounts), label in zip(groups, final_labels):
+            gross = Decimal("0")
+            net = Decimal("0")
+            long_amt = Decimal("0")
+            short_amt = Decimal("0")
+            pnl_units: Dict[str, Decimal] = {}
+            for pos in group_rows:
+                if pos.size is None:
+                    continue
+                size_abs = abs(pos.size)
+                gross += size_abs
+                if pos.side == "BUY":
+                    long_amt += size_abs
+                    net += pos.size
+                elif pos.side == "SELL":
+                    short_amt += size_abs
+                    net -= size_abs
+                else:
+                    # Unknown side; treat as long for size accounting, not net.
+                    long_amt += size_abs
+                if pos.pnl is not None:
+                    unit = pos.pnl_unit or "?"
+                    pnl_units[unit] = pnl_units.get(unit, Decimal("0")) + pos.pnl
+            rows.append(
+                {
+                    "instrument": slot["instrument"],
+                    "display_symbol": label,
+                    "gross": gross,
+                    "net": net,
+                    "long": long_amt,
+                    "short": short_amt,
+                    "pnl_units": pnl_units,
+                    "accounts": len(group_accounts),
+                }
+            )
     return rows
+
+
+def _provenance(row: Any, field: str) -> Any:
+    """Read an optional provenance field defensively.
+
+    Rows may be test stubs or duck-typed stand-ins that predate the
+    provenance fields; absence means "unknown", never a value.
+    """
+    return getattr(row, field, None)
+
+
+def _quantity_unit_signature(row: Any) -> Optional[str]:
+    """Grouping key for a row's quantity denomination.
+
+    Returns a verified underlying unit when the row declares one, a distinct
+    sentinel for rows whose native units could not be verified (never merged
+    with a token row), or ``None`` for a plain token-denominated position —
+    the overwhelmingly common case on perps venues, where the venue reports
+    the asset itself and no contract metadata exists or is needed.
+    """
+    unit = _provenance(row, "quantity_unit")
+    if unit:
+        return str(unit)
+    if _provenance(row, "raw_lots") is not None:
+        # Lot-denominated position with no verified contract specification.
+        # Distinct unit: it must never be summed with a token position.
+        return f"__unverified_lots__:{getattr(row, 'symbol', '') or '?'}"
+    # Plain token-denominated position.  Its unit IS the instrument key, so a
+    # converted MetaTrader row declaring quantity_unit="HYPE" and a perp venue
+    # row with no metadata both denote HYPE and belong in one group.
+    key = str(getattr(row, "instrument_key", "") or "")
+    return key or None
+
+
+def _compatibility_subgroups(
+    rows: List[OpenPositionRow],
+) -> List[Tuple[List[OpenPositionRow], set]]:
+    """Split rows into quantity-summable subgroups.
+
+    Rows are grouped by their verified quantity denomination.  Unverified
+    lot-denominated rows get a sentinel unit so they stay separate from
+    token rows instead of silently merging (or silently defaulting to 1).
+    """
+    groups: Dict[Tuple[Any, ...], List[OpenPositionRow]] = {}
+    order: List[Tuple[Any, ...]] = []
+    for pos in rows:
+        # Once a row carries a verified underlying quantity, its contract
+        # multiplier is the INPUT to that conversion, not a property of the
+        # resulting amount.  Two brokers using 100 and 10 per contract both
+        # yield plain ZEC, so they merge; the multiplier must not split them.
+        sig = (
+            _quantity_unit_signature(pos),
+            _provenance(pos, "market_type"),
+        )
+        if sig not in groups:
+            groups[sig] = []
+            order.append(sig)
+        groups[sig].append(pos)
+    out: List[Tuple[List[OpenPositionRow], set]] = []
+    for sig in order:
+        members = groups[sig]
+        accounts = {f"{p.exchange}|{p.account}|" for p in members}
+        out.append((members, accounts))
+    return out
 
 
 def positions_by_symbol(snapshot: PortfolioSnapshot) -> List[SymbolSideAggregate]:
@@ -942,11 +1405,21 @@ def risk_and_exposure(snapshot: PortfolioSnapshot) -> Dict[str, Any]:
 
 
 def list_exchanges(snapshot: PortfolioSnapshot) -> List[str]:
+    """Exchanges that hold at least one eligible account.
+
+    Falls back to every known exchange when nothing is eligible, so an
+    empty/unsupported snapshot still renders a usable (empty) view instead
+    of an error.
+    """
+    eligible = snapshot.eligible_exchanges
+    if eligible:
+        return eligible
     return sorted({a.exchange for a in snapshot.accounts})
 
 
 def accounts_for_exchange(snapshot: PortfolioSnapshot, exchange: str) -> List[AccountSnapshot]:
-    return [a for a in snapshot.accounts if a.exchange == exchange]
+    """Eligible accounts on one exchange."""
+    return [a for a in snapshot.accounts if a.exchange == exchange and is_account_eligible(a)]
 
 
 def format_money(value: Optional[Decimal], *, signed: bool = False) -> str:
@@ -974,10 +1447,13 @@ __all__ = [
     "accounts_for_exchange",
     "collect_portfolio_snapshot",
     "format_money",
+    "is_account_eligible",
+    "is_opaque_exchange_identifier",
     "list_exchanges",
     "net_by_instrument",
     "normalize_instrument_key",
     "normalize_side",
+    "positions_are_quantity_compatible",
     "pnl_by_exchange",
     "positions_by_symbol",
     "risk_and_exposure",

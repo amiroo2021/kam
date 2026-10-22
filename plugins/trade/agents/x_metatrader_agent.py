@@ -60,6 +60,19 @@ _MUTATING_OPS = frozenset(
     }
 )
 _READ_OPS = frozenset({"ping", "balance", "positions_orders"})
+# HubListener read actions that address a single instrument.  Forwarded with
+# the symbol so the EA can resolve broker-specific contract specifications.
+# `symbols` is listed for dispatch completeness but carries no symbol: the
+# forwarder only attaches a symbol when the caller supplied one.
+_SYMBOL_ACTIONS = frozenset({
+    "ticker", "candles", "symbols", "symbol_info", "symbol_tick",
+})
+# Read-only broker-side calculators.  Never place, modify or close anything.
+_CALC_ACTIONS = frozenset({"calc_profit", "calc_margin"})
+# Read actions with no symbol and no calculation arguments.
+_INFO_ACTIONS = frozenset({
+    "account_info", "positions_detail", "orders_detail", "health", "capabilities",
+})
 _TIMEOUT_SECONDS = 30
 METATRADER_MAGIC_NUMBER = 26092601
 _TICKERS_TTL_SECONDS = 15
@@ -123,6 +136,22 @@ def _positive_int(value: Any) -> Optional[int]:
         return None
 
 
+def _positive_decimal_or_none(value: Any) -> Optional[Decimal]:
+    """Parse a strictly positive finite decimal, else None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    return parsed
+
+
 def discover_accounts() -> Dict[str, int]:
     """Return {ALIAS: MetaTrader login} from MT_<ALIAS>_ACCOUNT variables."""
     env = _combined_env()
@@ -162,6 +191,15 @@ def capabilities() -> List[str]:
         "symbols",
         "ticker",
         "candles",
+        "symbol_info",
+        "symbol_tick",
+        "account_info",
+        "positions_detail",
+        "orders_detail",
+        "health",
+        "capabilities",
+        "calc_profit",
+        "calc_margin",
         "list_instruments",
         "resolve_instrument",
         "market_price",
@@ -731,11 +769,47 @@ def _execute_bridge_read_action(request: Mapping[str, Any], action: str) -> Cano
         "account": account_login,
         "action": action,
     }
-    if action in {"ticker", "candles"}:
+    if action in _CALC_ACTIONS:
         symbol = str(request.get("symbol") or "").strip()
         if not symbol:
             return _failure(action, alias_upper, "MISSING_SYMBOL", "Symbol is required.")
         payload["symbol"] = symbol
+    elif action in _SYMBOL_ACTIONS and action != "symbols":
+        symbol = str(request.get("symbol") or "").strip()
+        if not symbol:
+            return _failure(action, alias_upper, "MISSING_SYMBOL", "Symbol is required.")
+        payload["symbol"] = symbol
+    elif action == "symbols":
+        symbol = str(request.get("symbol") or "").strip()
+        if symbol:
+            payload["symbol"] = symbol
+    if action in _CALC_ACTIONS:
+        # HubListener build 2026-10-22.1 expects these exact argument names;
+        # it rejects direction/entry_price/current_price with INVALID_ARGUMENT.
+        side = str(request.get("side") or request.get("direction") or "").strip().upper()
+        if side not in {"BUY", "SELL"}:
+            return _failure(action, alias_upper, "INVALID_ARGUMENT",
+                            "side must be BUY or SELL for calculation actions.")
+        payload["side"] = side
+        volume = _positive_decimal_or_none(request.get("volume", request.get("volume_lots")))
+        if volume is None:
+            return _failure(action, alias_upper, "INVALID_ARGUMENT",
+                            "volume must be a positive number.")
+        payload["volume"] = float(volume)
+        if action == "calc_profit":
+            open_price = _positive_decimal_or_none(request.get("open_price"))
+            close_price = _positive_decimal_or_none(request.get("close_price"))
+            if open_price is None or close_price is None:
+                return _failure(action, alias_upper, "INVALID_ARGUMENT",
+                                "open_price and close_price must be positive numbers.")
+            payload["open_price"] = float(open_price)
+            payload["close_price"] = float(close_price)
+        else:  # calc_margin
+            price = _positive_decimal_or_none(request.get("price"))
+            if price is None:
+                return _failure(action, alias_upper, "INVALID_ARGUMENT",
+                                "price must be a positive number.")
+            payload["price"] = float(price)
     if action == "candles":
         timeframe = _metatrader_timeframe(request.get("timeframe", request.get("interval", "M1")))
         count_raw = request.get("count", request.get("limit", 10))
@@ -1446,7 +1520,7 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _execute_positions_orders(account, operation="positions_management")
     if operation == "new_order":
         return _execute_new_order(request)
-    if operation in {"symbols", "ticker", "candles"}:
+    if operation in _SYMBOL_ACTIONS or operation in _CALC_ACTIONS or operation in _INFO_ACTIONS:
         return _execute_bridge_read_action(request, operation)
     if operation == "list_instruments":
         return _execute_list_instruments(request)
