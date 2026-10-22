@@ -3471,6 +3471,441 @@ async def render_summative_with_progress(
     return await asyncio.to_thread(_WIZARD._render_summative_report, chat_key, refresh, sink)
 
 
+# Telegram constraints ------------------------------------------------------
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
+TELEGRAM_MAX_INLINE_CALLBACK_BYTES = 64
+_SUMMATIVE_SAFE_MESSAGE_CHARS = 3900
+_SUMMATIVE_SAFE_CALLBACK_BYTES = 56
+# Hard bound on the snapshot fetch.  A hung account, an unbounded HTTP call,
+# or a worker deadlock must never leave the chat on a permanent 100% frame.
+_SUMMATIVE_FETCH_TIMEOUT_SECONDS = float(__import__("os").environ.get(
+    "KAM_SUMMATIVE_FETCH_TIMEOUT_S",
+    "240",
+))
+
+
+def _validate_dashboard_for_telegram(text: str, buttons: Any) -> Tuple[str, List[List[Dict[str, str]]]]:
+    """Trim a dashboard to fit Telegram's message and callback limits.
+
+    Returns ``(text, buttons)``.  Both are guaranteed to fit; ``text`` is
+    truncated only when a safety margin is breached and a "…full report…" note
+    replaces the tail.
+    """
+    issues: List[str] = []
+
+    if isinstance(text, str) and len(text) > _SUMMATIVE_SAFE_MESSAGE_CHARS:
+        truncated = text[:_SUMMATIVE_SAFE_MESSAGE_CHARS - 80].rstrip()
+        truncated += "\n\n…dashboard truncated to fit Telegram. Open By Symbol for paging."
+        issues.append(f"text {len(text)} -> {len(truncated)}")
+        text = truncated
+
+    cleaned_rows: List[List[Dict[str, str]]] = []
+    if isinstance(buttons, list):
+        for row in buttons:
+            if not isinstance(row, list):
+                continue
+            cleaned_row: List[Dict[str, str]] = []
+            for btn in row:
+                if not isinstance(btn, dict):
+                    continue
+                label = str(btn.get("text", ""))[:32]
+                cb = str(btn.get("callback_data", ""))
+                # Telegram prefixes callback_data with "trade:" so the
+                # wire payload is len("trade:") + len(cb).
+                wire = f"trade:{cb}"
+                if len(wire.encode("utf-8")) > TELEGRAM_MAX_INLINE_CALLBACK_BYTES:
+                    issues.append(f"drop callback {cb!r}")
+                    continue
+                if not label or not cb:
+                    continue
+                cleaned_row.append({"text": label, "callback_data": cb})
+            if cleaned_row:
+                cleaned_rows.append(cleaned_row)
+    if issues:
+        logger.warning(
+            "summative.dashboard.truncated issues=%s", ",".join(issues)
+        )
+    return text, cleaned_rows
+
+
+def _safe_log_exception(stage: str, exc: BaseException, *, extra: Optional[Dict[str, Any]] = None) -> None:
+    """Structured diagnostic log without leaking credentials."""
+    safe_extra = {k: v for k, v in (extra or {}).items()
+                  if k in {"chat_key", "suffix", "stage", "elapsed_ms", "accounts_seen",
+                           "accounts_ok", "snapshot_ok", "text_len", "buttons_rows"}}
+    safe_extra["stage"] = stage
+    safe_extra["error_type"] = type(exc).__name__
+    safe_extra["error"] = str(exc)
+    logger.error("summative.dispatch %s", safe_extra, exc_info=False)
+
+
+async def _send_initial_progress_message(query: Any, *, chat_key: Tuple[Any, ...], suffix: str) -> bool:
+    """Edit the message in place with the initial 0%% progress frame.
+
+    Returns True on success, False if Telegram rejected the edit (the
+    message may have been replaced by something else).  Never silent:
+    failures are logged with the dispatch stage.
+    """
+    initial = (
+        "🔄 Fetching positions…\n"
+        "[░░░░░░░░░░] 0.0%   (0/?)"
+    )
+    try:
+        await query.edit_message_text(text=initial, reply_markup=None)
+        logger.warning(
+            "summative.dispatch stage=initial_message suffix=%s chat_key=%s",
+            suffix, chat_key,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _safe_log_exception(
+            "initial_message",
+            exc,
+            extra={"chat_key": chat_key, "suffix": suffix},
+        )
+        return False
+
+
+def _is_summative_entry(suffix: str) -> bool:
+    """Suffixes that open the snapshot-driven dashboard."""
+    return suffix in {"summative_report", "sr:refresh"}
+
+
+async def _safe_edit_dashboard(
+    query: Any,
+    text: str,
+    keyboard: Any,
+    *,
+    chat_key: Tuple[Any, ...],
+    suffix: str,
+    stage: str,
+) -> bool:
+    """Edit the message to the rendered dashboard.  Returns True on success."""
+    try:
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        logger.warning(
+            "summative.dispatch stage=%s suffix=%s chat_key=%s text_len=%d",
+            stage, suffix, chat_key, len(text or ""),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _safe_log_exception(
+            stage,
+            exc,
+            extra={
+                "chat_key": chat_key,
+                "suffix": suffix,
+                "text_len": len(text or ""),
+                "buttons_rows": len(keyboard.inline_keyboard) if keyboard is not None else 0,
+            },
+        )
+        return False
+
+
+async def _safe_send_fallback(
+    adapter: Any,
+    chat_id: Optional[str],
+    text: str,
+    *,
+    keyboard: Any,
+    metadata: Optional[Dict[str, Any]],
+    chat_key: Tuple[Any, ...],
+    suffix: str,
+) -> bool:
+    """Send a new message instead of editing.  Returns True on success."""
+    if not chat_id:
+        _safe_log_exception(
+            "fallback_send",
+            RuntimeError("no chat_id"),
+            extra={"chat_key": chat_key, "suffix": suffix},
+        )
+        return False
+    send = getattr(adapter, "send_inline_keyboard", None)
+    if callable(send):
+        try:
+            await send(
+                chat_id=chat_id,
+                text=text,
+                buttons=_keyboard_to_rows(keyboard) if keyboard is not None else [],
+                callback_prefix="trade",
+                metadata=metadata,
+            )
+            logger.warning(
+                "summative.dispatch stage=fallback_send_ok chat_key=%s suffix=%s",
+                chat_key, suffix,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _safe_log_exception(
+                "fallback_send",
+                exc,
+                extra={"chat_key": chat_key, "suffix": suffix},
+            )
+    fallback = getattr(adapter, "send", None)
+    if callable(fallback):
+        try:
+            await fallback(chat_id, text, metadata=metadata)
+            logger.warning(
+                "summative.dispatch stage=fallback_plain_ok chat_key=%s suffix=%s",
+                chat_key, suffix,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _safe_log_exception(
+                "fallback_plain",
+                exc,
+                extra={"chat_key": chat_key, "suffix": suffix},
+            )
+    return False
+
+
+def _keyboard_to_rows(keyboard: Any) -> List[List[Dict[str, str]]]:
+    if keyboard is None:
+        return []
+    rows: List[List[Dict[str, str]]] = []
+    inline_keyboard = getattr(keyboard, "inline_keyboard", None)
+    if isinstance(inline_keyboard, list):
+        for row in inline_keyboard:
+            converted: List[Dict[str, str]] = []
+            for btn in row:
+                text_attr = getattr(btn, "text", None)
+                cb_attr = getattr(btn, "callback_data", None)
+                if text_attr is None or cb_attr is None:
+                    continue
+                converted.append({"text": str(text_attr), "callback_data": str(cb_attr)})
+            if converted:
+                rows.append(converted)
+    return rows
+
+
+async def _send_user_facing_error(
+    adapter: Any,
+    query: Any,
+    *,
+    chat_key: Tuple[Any, ...],
+    suffix: str,
+) -> None:
+    """Final fallback: a short message with a Home button.
+
+    Guarantees the user is never stuck at 100% — they always see either
+    the dashboard or a recoverable error.
+    """
+    text = (
+        "⚠️ Could not update the Summative Report.\n"
+        "The fetch completed but Telegram rejected the message update.\n"
+        "Try /trade → Summative Report again, or Home to return."
+    )
+    try:
+        from plugins.platforms.telegram.adapter import (
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="trade:sr:refresh"),
+             InlineKeyboardButton("🏠 Home", callback_data="trade:sr:h")],
+            [InlineKeyboardButton("✕ Exit", callback_data="trade:exit")],
+        ])
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            query_message = getattr(query, "message", None)
+            chat_id = _chat_id_from_message(query_message)
+            metadata = _metadata_from_message(query_message)
+            await _safe_send_fallback(
+                adapter, chat_id, text,
+                keyboard=keyboard, metadata=metadata,
+                chat_key=chat_key, suffix=suffix,
+            )
+        logger.warning(
+            "summative.dispatch stage=user_error_shown chat_key=%s suffix=%s",
+            chat_key, suffix,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _safe_log_exception(
+            "user_error_shown",
+            exc,
+            extra={"chat_key": chat_key, "suffix": suffix},
+        )
+
+
+async def _dispatch_summative_progressively(
+    adapter: Any,
+    query: Any,
+    chat_key: Tuple[Any, ...],
+    suffix: str,
+) -> None:
+    """Handle the Summative Report entry via the streaming progress path.
+
+    Lifecycle (strict):
+        FETCHING  →  FINALIZING  →  COMPLETED
+        - FETCHING: progress sink emits edits; the user sees the bar advance.
+        - FINALIZING: sink stops accepting frames so no stale progress
+          edit can overwrite the dashboard render.
+        - COMPLETED: sink is dead; the dashboard is the canonical message.
+
+    A bounded timeout guards the snapshot fetch: if the snapshot never
+    completes (hung account, unbounded HTTP call, worker deadlock) the
+    dispatcher renders the dashboard from whatever partial data exists
+    rather than leaving the chat on a permanent 100% progress frame.
+    """
+    import asyncio as _asyncio
+    import time as _time
+    import uuid as _uuid
+
+    t0 = _time.monotonic()
+    req_id = _uuid.uuid4().hex[:12]
+
+    def _elapsed_ms() -> int:
+        return int((_time.monotonic() - t0) * 1000)
+
+    def _trace(stage: str, **fields: Any) -> None:
+        """WARNING-level so it reaches the journal (gateway logs at WARNING)."""
+        parts = " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.warning(
+            "summative.trace req=%s stage=%s elapsed_ms=%d %s",
+            req_id, stage, _elapsed_ms(), parts,
+        )
+
+    state_ref = _WIZARD._state_for(chat_key)
+    query_message = getattr(query, "message", None)
+    message_id = getattr(query_message, "message_id", None)
+    chat_id_val = None
+    chat_obj = getattr(query_message, "chat", None)
+    if chat_obj is not None:
+        chat_id_val = getattr(chat_obj, "id", None)
+
+    _trace(
+        "callback_received",
+        suffix=suffix,
+        chat=str(chat_key[0])[:24] if chat_key else "",
+        message_id=message_id,
+    )
+
+    refresh = suffix == "sr:refresh"
+    initial_ok = await _send_initial_progress_message(
+        query, chat_key=chat_key, suffix=suffix,
+    )
+    _trace("initial_message", ok=initial_ok)
+
+    # Unblock the sink so a timed-out fetch can still render.
+    timed_out = False
+    try:
+        screen = await _asyncio.wait_for(
+            render_summative_with_progress(
+                adapter, query, chat_key, refresh=refresh,
+            ),
+            timeout=_SUMMATIVE_FETCH_TIMEOUT_SECONDS,
+        )
+        _trace("snapshot_returned")
+    except _asyncio.TimeoutError:
+        timed_out = True
+        _trace("snapshot_timeout", limit_s=_SUMMATIVE_FETCH_TIMEOUT_SECONDS)
+        screen = _WIZARD._render_summative_report(
+            chat_key, refresh=False, progress_sink=None,
+        )
+        _trace("snapshot_recovered_from_partial", text_len=len(screen.text))
+    except Exception as exc:  # noqa: BLE001
+        _safe_log_exception(
+            "render_exception",
+            exc,
+            extra={
+                "chat_key": chat_key,
+                "suffix": suffix,
+                "elapsed_ms": _elapsed_ms(),
+            },
+        )
+        _trace("render_exception", error_type=type(exc).__name__)
+        await _send_user_facing_error(
+            adapter, query, chat_key=chat_key, suffix=suffix,
+        )
+        return
+
+    # Stop the sink now: any further frame that races in will be dropped.
+    try:
+        state = _WIZARD._state_for(chat_key)
+        summative_report_ui.begin_finalizing(state)
+        # Drain any in-flight scheduled edits by giving the loop one tick.
+        await _asyncio.sleep(0)
+        summative_report_ui.complete_progress(state)
+        sink_obj = state.report.get("progress_sink")
+        _trace(
+            "lifecycle_complete",
+            sink_lifecycle=getattr(sink_obj, "lifecycle", "n/a"),
+            sink_frames=len(getattr(sink_obj, "frames", []) or []),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _safe_log_exception(
+            "lifecycle_finalize",
+            exc,
+            extra={"chat_key": chat_key, "suffix": suffix},
+        )
+        _trace("lifecycle_exception", error_type=type(exc).__name__)
+
+    text, cleaned_rows = _validate_dashboard_for_telegram(screen.text, screen.buttons)
+
+    from plugins.platforms.telegram.adapter import (
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+    )
+    rows: List[List[Any]] = []
+    for row in cleaned_rows:
+        button_row: List[Any] = []
+        for btn in row:
+            label = str(btn.get("text", ""))
+            suffix_data = str(btn.get("callback_data", ""))
+            if not label or not suffix_data:
+                continue
+            button_row.append(
+                InlineKeyboardButton(label, callback_data=f"trade:{suffix_data}")
+            )
+        if button_row:
+            rows.append(button_row)
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
+
+    max_cb = max(
+        (len(f"trade:{b.get('callback_data', '')}".encode("utf-8"))
+         for row in cleaned_rows for b in row if isinstance(b, dict)),
+        default=0,
+    )
+    _trace(
+        "final_edit_start",
+        text_len=len(text),
+        rows=len(rows),
+        max_cb_bytes=max_cb,
+        message_id=message_id,
+        chat_id=chat_id_val,
+        timed_out=timed_out,
+    )
+
+    edit_ok = await _safe_edit_dashboard(
+        query, text, keyboard,
+        chat_key=chat_key, suffix=suffix, stage="final_edit",
+    )
+    _trace("final_edit_done", ok=edit_ok)
+    if not edit_ok:
+        query_message = getattr(query, "message", None)
+        chat_id = _chat_id_from_message(query_message)
+        metadata = _metadata_from_message(query_message)
+        _trace("fallback_send_start")
+        sent = await _safe_send_fallback(
+            adapter, chat_id, text,
+            keyboard=keyboard, metadata=metadata,
+            chat_key=chat_key, suffix=suffix,
+        )
+        _trace("fallback_send_done", ok=sent)
+        if not sent:
+            await _send_user_facing_error(
+                adapter, query, chat_key=chat_key, suffix=suffix,
+            )
+            _trace("user_error_shown")
+
+    logger.warning(
+        "summative.dispatch stage=completed chat_key=%s suffix=%s elapsed_ms=%d initial_ok=%s edit_ok=%s",
+        chat_key, suffix, int((_time.monotonic() - t0) * 1000),
+        initial_ok, edit_ok,
+    )
+
+
 async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
     """Handle a ``trade:`` prefixed callback query.
 
@@ -3505,6 +3940,13 @@ async def handle_trade_callback(adapter: Any, query: Any, data: str) -> None:
             await query.answer()
         except Exception:
             pass
+
+        # Summative Report entry → stream progress immediately instead of
+        # blocking on the full snapshot.  Every other suffix uses the
+        # standard sync path.
+        if _is_summative_entry(suffix):
+            await _dispatch_summative_progressively(adapter, query, chat_key, suffix)
+            return
 
         # ladder_confirm + confirm → show progress before the long write.
         if suffix == "confirm":

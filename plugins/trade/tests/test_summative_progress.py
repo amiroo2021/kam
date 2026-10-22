@@ -58,17 +58,19 @@ class _PositionStub:
         self.account = account
         self.symbol = symbol
         self.side = side
-        self.size = size
+        self.size = Decimal(str(size))
         self.entry_price = None
         self.mark = None
-        self.pnl = pnl
+        # Real snapshot stores pnl as Decimal; coerce here so totals work.
+        self.pnl = Decimal(str(pnl)) if pnl is not None else None
         self.pnl_unit = pnl_unit
-        self.native_pnl = pnl
+        self.native_pnl = self.pnl
         self.native_pnl_unit = pnl_unit
         self.exchange_instrument = symbol
         self.notional = None
         self.identity = f"{exchange}|{account}|{symbol}|{side}|{size}"
         self.instrument_key = symbol
+        self.account_label = account
         # Used by the dashboard formatter.
         self.to_dict = lambda: {
             "symbol": symbol, "side": side, "size": size,
@@ -264,6 +266,199 @@ class AwaitProgressTests(unittest.TestCase):
 
         seen["ready"] = True
         self.assertTrue(await_progress(predicate, timeout=0.2, poll_interval=0.01))
+
+
+def _flatten_buttons(buttons):
+    out = []
+    for row in buttons:
+        for btn in row:
+            if isinstance(btn, dict):
+                out.append(btn)
+    return out
+
+
+def _has_callback(buttons, suffix):
+    return any(
+        btn.get("callback_data") == suffix or btn.get("callback_data", "").startswith(suffix + ":")
+        for btn in _flatten_buttons(buttons)
+    )
+
+
+class ChecklistTests(unittest.TestCase):
+    """Final invariant checks against the checklist."""
+
+    def setUp(self) -> None:
+        from plugins.trade import portfolio_report as portfolio
+        self._original = portfolio._extract_account_snapshot
+        portfolio._extract_account_snapshot = lambda **kw: _AccountStub(kw["exchange"], kw["account"])
+        self.addCleanup(setattr, portfolio, "_extract_account_snapshot", self._original)
+
+        self._state = _make_state()
+        self._desk = _DeskStub({
+            "bulk": ["main"],
+            "metatrader": ["cents"],
+            "hyperliquid": ["flex"],
+        })
+
+    def _handle(self, suffix):
+        return handle(self._desk, self._state, suffix)
+
+    # Item 1 — Main Dashboard sections
+    def test_dashboard_has_all_sections(self) -> None:
+        view = self._handle("summative_report")
+        for needle in (
+            "Equity (unconverted):",
+            "uPnL (unconverted):",
+            "Open Positions:",
+            "Top instruments",
+            "Closest liquidation",
+            "Data fetched now",
+        ):
+            self.assertIn(needle, view.text)
+
+    def test_dashboard_top_instruments_have_net_and_gross(self) -> None:
+        positions = [
+            _PositionStub("bulk", "main", "BTC", side="BUY", size="0.5", pnl="100", pnl_unit="USDT"),
+        ]
+        from plugins.trade import portfolio_report as portfolio
+        original = portfolio._extract_account_snapshot
+
+        def extract(*, exchange, account, account_label, identity, desk):
+            return _AccountStub(exchange, account, positions=[
+                p for p in positions if p.exchange == exchange and p.account == account
+            ])
+        portfolio._extract_account_snapshot = extract
+        try:
+            view = self._handle("summative_report")
+        finally:
+            portfolio._extract_account_snapshot = original
+        self.assertIn("net", view.text)
+        self.assertIn("gross", view.text)
+        self.assertIn("size, not USD notional", view.text)
+
+    # Item 2 — Net Positions sort/filter/paginate
+    def test_net_positions_default_sort_gross(self) -> None:
+        view = self._handle("sr:n")
+        self.assertIn("📈 Net Positions", view.text)
+        self.assertIn("Sort: gross", view.text)
+        self.assertTrue(_has_callback(view.buttons, "sr:long"))
+        self.assertTrue(_has_callback(view.buttons, "sr:short"))
+        self.assertTrue(_has_callback(view.buttons, "sr:snet"))
+        self.assertTrue(_has_callback(view.buttons, "sr:sgross"))
+        self.assertTrue(_has_callback(view.buttons, "sr:spnl"))
+
+    # Item 3 — Detail view + read-only stubs
+    def test_detail_view_has_stub_buttons(self) -> None:
+        from plugins.trade import portfolio_report as portfolio
+        positions = [
+            _PositionStub("bulk", "main", "BTC", side="BUY", size="0.4", pnl="12", pnl_unit="USDT"),
+            _PositionStub("metatrader", "cents", "BTC", side="SELL", size="0.1", pnl="-3", pnl_unit="USC"),
+        ]
+        original = portfolio._extract_account_snapshot
+
+        def extract(*, exchange, account, account_label, identity, desk):
+            return _AccountStub(exchange, account, positions=[
+                p for p in positions if p.exchange == exchange and p.account == account
+            ])
+        portfolio._extract_account_snapshot = extract
+        try:
+            net_view = self._handle("sr:n")
+            detail_btn = next(
+                btn for btn in _flatten_buttons(net_view.buttons)
+                if btn.get("callback_data", "").startswith("sr:nd:")
+            )
+            detail_view = self._handle(detail_btn["callback_data"])
+        finally:
+            portfolio._extract_account_snapshot = original
+        self.assertIn("net", detail_view.text)
+        self.assertIn("gross", detail_view.text)
+        for suffix in ("sr:atp", "sr:asl", "sr:c50", "sr:c100"):
+            self.assertTrue(_has_callback(detail_view.buttons, suffix),
+                            f"missing stub {suffix}")
+
+    # Item 4 — Pagination present
+    def test_pagination_present(self) -> None:
+        # By Symbol page
+        view = self._handle("sr:p")
+        self.assertIn("📊 Positions by Symbol", view.text)
+        # By Exchange page
+        view = self._handle("sr:e")
+        self.assertIn("🏦 PnL by Exchange", view.text)
+
+    # Item 5 — Risks
+    def test_risks_view_present(self) -> None:
+        view = self._handle("sr:r")
+        self.assertIn("⚠️ Risk & Exposure", view.text)
+        self.assertIn("Liquidation prices: unavailable", view.text)
+
+    # Item 6 — Actions and Settings stubs
+    def test_actions_and_settings_stubs(self) -> None:
+        actions = self._handle("sr:a")
+        self.assertIn("Bulk future operations", actions.text)
+        settings = self._handle("sr:s")
+        self.assertIn("⚙️ Settings", settings.text)
+
+    # Item 7 — Standard footer (◀ Back, 🏠 Home, 🔄 Refresh) on every screen
+    def test_every_screen_has_home(self) -> None:
+        screens = {
+            "summative_report": "Main dashboard",
+            "sr:n": "Net Positions",
+            "sr:e": "By Exchange",
+            "sr:p": "By Symbol",
+            "sr:r": "Risks",
+            "sr:a": "Actions",
+            "sr:s": "Settings",
+            "sr:f": "Filter",
+            "sr:t": "Total PnL",
+            "sr:q": "Equity",
+        }
+        for suffix, label in screens.items():
+            view = self._handle(suffix)
+            with self.subTest(screen=label):
+                self.assertTrue(_has_callback(view.buttons, "sr:h"),
+                                f"{label}: missing Home")
+
+    # Item 8 — Progress sink is wired and non-fatal
+    def test_progress_sink_routes(self) -> None:
+        sink = ProgressCollector()
+        install_progress_sink(self._state, sink)
+        self._handle("sr:refresh")
+        self.assertGreater(len(sink.frames), 0)
+        # Any sink raising must not break the fetch.
+        def boom(_frame):
+            raise RuntimeError("sink failed")
+
+        install_progress_sink(self._state, boom)
+        view = self._handle("sr:refresh")
+        self.assertIn("Summative Report", view.text)
+
+    # Item 9 — No exchange writes reachable from any screen
+    def test_no_exchange_write_callbacks(self) -> None:
+        forbidden = {
+            "trade:submit", "trade:close", "trade:cancel", "trade:ladder_submit",
+            "trade:set_tp", "trade:set_sl",
+        }
+        screens = (
+            "summative_report", "sr:n", "sr:e", "sr:p", "sr:r",
+            "sr:a", "sr:s", "sr:f", "sr:t", "sr:q",
+        )
+        for suffix in screens:
+            view = self._handle(suffix)
+            for btn in _flatten_buttons(view.buttons):
+                cb = btn.get("callback_data", "") or ""
+                self.assertFalse(
+                    cb.startswith("trade:submit") or cb.startswith("trade:close")
+                    or cb.startswith("trade:cancel") or cb.startswith("trade:ladder_submit")
+                    or cb.startswith("trade:set_"),
+                    f"{suffix}: forbidden callback {cb}",
+                )
+
+    # Item 10 — Gross labeled as size, missing liquidation handled honestly
+    def test_honest_labels(self) -> None:
+        net = self._handle("sr:n")
+        self.assertIn("size (qty)", net.text)
+        risk = self._handle("sr:r")
+        self.assertIn("Liquidation prices: unavailable", risk.text)
 
 
 if __name__ == "__main__":

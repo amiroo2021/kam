@@ -131,6 +131,35 @@ def push_progress(
     return frame
 
 
+def begin_finalizing(state: Any) -> None:
+    """Flip the installed sink to FINALIZING.  No further edits go out.
+
+    Idempotent.  After this point the sink's ``__call__`` returns without
+    calling ``editMessageText`` so a delayed progress edit cannot overwrite
+    the dashboard render.
+    """
+    sink = state.report.get("progress_sink") if isinstance(state.report, dict) else None
+    begin = getattr(sink, "begin_finalizing", None)
+    if callable(begin):
+        try:
+            begin()
+        except Exception:  # noqa: BLE001
+            logger.exception("summative progress sink begin_finalizing raised")
+    state.report["progress_finalized"] = True
+
+
+def complete_progress(state: Any) -> None:
+    """Mark the installed sink COMPLETED.  Idempotent."""
+    sink = state.report.get("progress_sink") if isinstance(state.report, dict) else None
+    complete = getattr(sink, "complete", None)
+    if callable(complete):
+        try:
+            complete()
+        except Exception:  # noqa: BLE001
+            logger.exception("summative progress sink complete raised")
+    state.report["progress_completed"] = True
+
+
 def finalize_progress(state: Any, *, label: str = "Fetch complete") -> ProgressFrame:
     """Emit a final 100% progress frame and return it.
 
@@ -389,7 +418,7 @@ def _menu(desk: Any, state: Any, *, refresh: bool = False) -> ReportView:
         [_b("📊 By Symbol", "sr:p"), _b("⚠️ Risks", "sr:r")],
         [_b("⚡ Actions", "sr:a"), _b("🔍 Filter", "sr:f")],
         [_b("🔄 Refresh", "sr:refresh"), _b("⚙️ Settings", "sr:s")],
-        [_b("◀ Back", "back"), _b("✕ Exit", "exit")],
+        [_b("◀ Back", "back"), _b("🏠 Home", "sr:h"), _b("✕ Exit", "exit")],
     ]
     return ReportView("\n".join(lines), buttons)
 
@@ -596,7 +625,7 @@ def _filter_exchanges(desk: Any, state: Any) -> ReportView:
     buttons: List[List[Dict[str, str]]] = [[_b("All Exchanges", "sr:all")]]
     for index, exchange in enumerate(exchanges):
         buttons.append([_b(exchange, f"sr:fx:{index}")])
-    buttons.append(_standard_nav(back="sr:m", show_home=False))
+    buttons.append(_standard_nav(back="sr:m"))
     return ReportView("\n".join(lines), buttons)
 
 
@@ -609,7 +638,7 @@ def _filter_accounts(desk: Any, state: Any) -> ReportView:
     buttons: List[List[Dict[str, str]]] = [[_b("All accounts", "sr:allx")]]
     for index, account in enumerate(accounts):
         buttons.append([_b(account.account_label, f"sr:fa:{index}")])
-    buttons.append(_standard_nav(back="sr:f", show_home=False))
+    buttons.append(_standard_nav(back="sr:f"))
     return ReportView("\n".join(lines), buttons)
 
 
