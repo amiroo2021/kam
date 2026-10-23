@@ -449,16 +449,6 @@ class CanonicalLadderResult:
     # the sanitized backend message (no L1 address, no SDK internals).
     rate_limited: Optional[bool] = None
     exchange_reason: Optional[str] = None
-    # Per-child diagnostics captured by the Vest ladder for INVALID_NONCE /
-    # INVALID_LIMIT_PRICE debugging. SAFE fields only (no API key, no
-    # private key, no signature). Each entry has keys:
-    #   index, price, size, time_ms_generated, nonce_generated,
-    #   local_ms_before_sign, local_ms_after_sign,
-    #   local_ms_before_http, local_ms_after_http,
-    #   nonce_minus_time_ms, time_age_at_http_ms, nonce_age_at_http_ms,
-    #   wire_order_time, wire_order_nonce, wire_limit_price,
-    #   http_status, venue_code, venue_message, order_id.
-    child_diagnostics: Optional[list[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -485,8 +475,6 @@ class CanonicalLadderResult:
             data["rate_limited"] = self.rate_limited
         if self.exchange_reason is not None:
             data["exchange_reason"] = self.exchange_reason
-        if self.child_diagnostics is not None:
-            data["child_diagnostics"] = [dict(d) for d in self.child_diagnostics]
         return data
 
 
@@ -728,6 +716,7 @@ def make_failure(
     position_action: Optional[CanonicalPositionActionResult] = None,
     order_state: Optional[Dict[str, Any]] = None,
     exchange_reason: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
 ) -> CanonicalResponse:
     """Wrap an exchange-native failure in the canonical envelope.
 
@@ -756,6 +745,7 @@ def make_failure(
         cancel_group=cancel_group,
         position_action=position_action,
         order_state=order_state,
+        data=data,
         error=CanonicalError(
             code=code,
             message=sanitized_message,

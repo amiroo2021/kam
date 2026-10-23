@@ -149,22 +149,40 @@ class TestMainDashboard(unittest.TestCase):
     def test_menu_has_dashboard_sections(self) -> None:
         self.assertEqual(self.menu.state, "summative_report")
         self.assertIn("📊 Summative Report", self.menu.text)
-        self.assertIn("DEX:", self.menu.text)
+        self.assertIn("Open positions:", self.menu.text)
+        self.assertIn("Exchanges:", self.menu.text)
         self.assertIn("Accounts:", self.menu.text)
-        self.assertIn("Equity (unconverted)", self.menu.text)
-        self.assertIn("uPnL (unconverted)", self.menu.text)
+        self.assertIn("Equity", self.menu.text)
+        self.assertIn("uPnL", self.menu.text)
         self.assertIn("Top instruments", self.menu.text)
-        self.assertIn("Closest liquidation: unavailable", self.menu.text)
         labels = [item["text"] for row in self.menu.buttons for item in row]
         for expected in ("📈 Net Positions", "🏛 By Exchange", "📊 By Symbol",
                          "⚠️ Risks", "⚡ Actions", "🔍 Filter",
                          "🔄 Refresh", "⚙️ Settings", "◀ Back", "✕ Exit"):
             self.assertIn(expected, labels)
 
-    def test_top_instruments_show_net_and_gross(self) -> None:
-        self.assertIn("net", self.menu.text)
-        self.assertIn("gross", self.menu.text)
-        self.assertIn("acct)", self.menu.text)
+    def test_menu_omits_technical_coverage_spam(self) -> None:
+        # The dashboard must not carry technical explanations or the full
+        # excluded-account list; that lives in the detail/coverage screens.
+        for banned in (
+            "Closest liquidation",
+            "canonical contract lacks",
+            "USD notional: N/A",
+            "Excluded position accounts",
+            "coverage is PARTIAL",
+        ):
+            self.assertNotIn(banned, self.menu.text)
+
+    def test_top_instruments_show_buy_sell_and_vwap(self) -> None:
+        # Top instruments must show each side separately at its own VWAP,
+        # with the account count and net exposure still present.
+        self.assertIn("acct", self.menu.text)
+        self.assertIn("BUY", self.menu.text)
+        self.assertIn("SELL", self.menu.text)
+        # The per-instrument Net line was removed as redundant with the
+        # BUY/SELL rows; net still exists in the structured report data.
+        self.assertNotIn("  Net ", self.menu.text)
+        self.assertIn("@", self.menu.text)
 
     def test_fetch_status_line(self) -> None:
         self.assertIn("Data fetched now", self.menu.text)

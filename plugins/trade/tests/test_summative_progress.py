@@ -307,16 +307,23 @@ class ChecklistTests(unittest.TestCase):
     def test_dashboard_has_all_sections(self) -> None:
         view = self._handle("summative_report")
         for needle in (
-            "Equity (unconverted):",
-            "uPnL (unconverted):",
-            "Open Positions:",
+            "Equity",
+            "uPnL",
+            "Open positions:",
+            "Exchanges:",
+            "Accounts:",
             "Top instruments",
-            "Closest liquidation",
             "Data fetched now",
         ):
             self.assertIn(needle, view.text)
 
-    def test_dashboard_top_instruments_have_net_and_gross(self) -> None:
+    def test_dashboard_has_no_technical_spam(self) -> None:
+        view = self._handle("summative_report")
+        for banned in ("Closest liquidation", "canonical contract lacks",
+                       "Excluded position accounts", "(unconverted)"):
+            self.assertNotIn(banned, view.text)
+
+    def test_dashboard_top_instruments_show_buy_sell_vwap(self) -> None:
         positions = [
             _PositionStub("bulk", "main", "BTC", side="BUY", size="0.5", pnl="100", pnl_unit="USDT"),
         ]
@@ -332,9 +339,16 @@ class ChecklistTests(unittest.TestCase):
             view = self._handle("summative_report")
         finally:
             portfolio._extract_account_snapshot = original
-        self.assertIn("net", view.text)
+        self.assertIn("BUY/SELL @ VWAP · accounts", view.text)
+        self.assertIn("BUY", view.text)
+        self.assertNotIn("  Net ", view.text)
+        self.assertIn("acct", view.text)
+
+    def test_net_positions_view_still_shows_gross(self) -> None:
+        # The dashboard is net-size + account count only; gross stays on the
+        # dedicated Net Positions view.
+        view = self._handle("sr:n")
         self.assertIn("gross", view.text)
-        self.assertIn("size, not USD notional", view.text)
 
     # Item 2 — Net Positions sort/filter/paginate
     def test_net_positions_default_sort_gross(self) -> None:

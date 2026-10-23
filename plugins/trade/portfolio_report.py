@@ -296,6 +296,17 @@ class AccountSnapshot:
     balance_ok: bool = False
     positions_ok: bool = False
     positions_empty: bool = False
+    # True when the venue returned some positions but could not cover every
+    # sub-source it queried (e.g. one Hyperliquid perp dex failed).  Such an
+    # account is NOT full coverage: its totals are a floor, not a complete
+    # picture, and the report must say so rather than imply zero elsewhere.
+    positions_partial: bool = False
+    partial_detail: List[str] = field(default_factory=list)
+    # True when positions were fully read but the protective/open-order
+    # lookup failed.  Position coverage is UNAFFECTED; this is surfaced on its
+    # own so a missing TP/SL order is never confused with missing exposure.
+    orders_partial: bool = False
+    orders_partial_detail: List[str] = field(default_factory=list)
     native_monetary: Dict[str, Dict[str, Optional[Decimal]]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -320,6 +331,10 @@ class AccountSnapshot:
             "balance_ok": self.balance_ok,
             "positions_ok": self.positions_ok,
             "positions_empty": self.positions_empty,
+            "positions_partial": self.positions_partial,
+            "partial_detail": list(self.partial_detail),
+            "orders_partial": self.orders_partial,
+            "orders_partial_detail": list(self.orders_partial_detail),
             "native_monetary": {
                 metric: {unit: None if value is None else format(value, "f") for unit, value in units.items()}
                 for metric, units in self.native_monetary.items()
@@ -487,6 +502,32 @@ class SymbolSideAggregate:
 
 
 @dataclass
+class SideVwap:
+    """Quantity-weighted average entry price for one side of one group.
+
+    Built ONLY from normalized underlying quantities, so a MetaTrader lot is
+    never mixed with a token-denominated amount.  ``covered`` / ``total``
+    expose how many positions actually contributed, so an incomplete average
+    is reported as incomplete rather than silently looking authoritative.
+    """
+
+    quantity: Decimal = Decimal("0")
+    notional: Decimal = Decimal("0")
+    covered: int = 0
+    total: int = 0
+
+    @property
+    def vwap(self) -> Optional[Decimal]:
+        if self.quantity <= 0:
+            return None
+        return self.notional / self.quantity
+
+    @property
+    def complete(self) -> bool:
+        return self.total > 0 and self.covered == self.total
+
+
+@dataclass
 class PortfolioSnapshot:
     fetched_at: float
     accounts: List[AccountSnapshot] = field(default_factory=list)
@@ -506,8 +547,53 @@ class PortfolioSnapshot:
         return sum(1 for account in self.accounts if account.positions_ok)
 
     @property
+    def positions_accounts_partial(self) -> int:
+        """Accounts that answered but could not cover every sub-source."""
+        return sum(
+            1 for account in self.accounts
+            if account.positions_ok and getattr(account, "positions_partial", False)
+        )
+
+    @property
+    def positions_accounts_full(self) -> int:
+        """Accounts with a complete position read (partial or failed excluded)."""
+        return sum(
+            1 for account in self.accounts
+            if account.positions_ok and not getattr(account, "positions_partial", False)
+        )
+
+    @property
+    def positions_accounts_unavailable(self) -> int:
+        """Accounts whose positions could not be retrieved at all."""
+        return sum(1 for account in self.accounts if not account.positions_ok)
+
+    @property
+    def partial_accounts(self) -> List[AccountSnapshot]:
+        return [
+            account for account in self.accounts
+            if getattr(account, "positions_partial", False)
+        ]
+
+    @property
+    def orders_partial_accounts(self) -> List[AccountSnapshot]:
+        """Accounts whose protective/open-order read was incomplete.
+
+        Positions for these accounts are still fully known, so this is
+        reported separately and does NOT reduce position coverage.
+        """
+        return [
+            account for account in self.accounts
+            if getattr(account, "orders_partial", False)
+        ]
+
+    @property
     def positions_incomplete(self) -> bool:
-        return self.positions_accounts_ok < self.positions_accounts_seen
+        # Partial coverage counts as incomplete even when every account
+        # answered, because "answered" is not the same as "complete".
+        return (
+            self.positions_accounts_ok < self.positions_accounts_seen
+            or self.positions_accounts_partial > 0
+        )
 
     @property
     def position_failures(self) -> List[AccountSnapshot]:
@@ -570,7 +656,9 @@ class PortfolioSnapshot:
             errors=[e for e in self.errors if (not ex or e.startswith(ex))],
             accounts_seen=len(accounts),
             accounts_ok=sum(1 for a in accounts if a.balance_ok and a.positions_ok),
-            incomplete=any(not a.positions_ok for a in accounts) or bool(self.errors and accounts),
+            incomplete=any(not a.positions_ok for a in accounts)
+            or any(getattr(a, "positions_partial", False) for a in accounts)
+            or bool(self.errors and accounts),
             max_workers=self.max_workers,
         )
         if identities and any(not a.positions_ok for a in accounts):
@@ -677,6 +765,34 @@ def _extract_account_snapshot(
         snap.positions_ok = True
         raw_positions = list(getattr(pos_resp, "positions", None) or [])
         snap.positions_empty = len(raw_positions) == 0
+        # A venue may report success while having silently skipped a sub-source
+        # (Hyperliquid: one perp dex failing).  That is partial coverage, not a
+        # complete answer, so flag it instead of presenting a floor as a total.
+        resp_data = getattr(pos_resp, "data", None)
+        if isinstance(resp_data, dict) and resp_data.get("partial_coverage"):
+            failures = [
+                f for f in (resp_data.get("dex_failures") or [])
+                if isinstance(f, dict)
+            ]
+            # An orders-only failure still yields complete POSITIONS, so it is
+            # tracked separately and must not reduce position coverage.
+            orders_only = [f for f in failures if f.get("partial")]
+            pos_failures = [f for f in failures if not f.get("partial")]
+            queried = len(resp_data.get("dexes_queried") or [])
+            if pos_failures:
+                snap.positions_partial = True
+                cats = sorted({str(f.get("category") or "unknown") for f in pos_failures})
+                snap.partial_detail.append(
+                    f"{exchange}/{account}: {len(pos_failures)} of {queried} "
+                    f"perp DEXs unavailable ({', '.join(cats)})"
+                )
+            if orders_only:
+                snap.orders_partial = True
+                ocats = sorted({str(f.get("category") or "unknown") for f in orders_only})
+                snap.orders_partial_detail.append(
+                    f"{exchange}/{account}: open orders unavailable on "
+                    f"{len(orders_only)} of {queried} perp DEXs ({', '.join(ocats)})"
+                )
         seen_pos: set[str] = set()
         pnl_total = Decimal("0")
         pnl_any = False
@@ -972,6 +1088,38 @@ def _provenance_suffix(row: OpenPositionRow) -> str:
     return "·" + "/".join(bits) if bits else ""
 
 
+def _accumulate_vwap(acc: SideVwap, pos: OpenPositionRow) -> None:
+    """Add one position to a side's VWAP accumulator.
+
+    A position with a missing or non-positive quantity, or a missing /
+    non-positive entry price, is counted in ``total`` but contributes nothing
+    to the average.  That is what makes ``covered < total`` detectable, so
+    the UI can flag an incomplete VWAP instead of publishing a number that
+    silently excludes part of the exposure.
+    """
+    if pos.side != "BUY" and pos.side != "SELL":
+        return
+    acc.total += 1
+    # Coerce defensively: a row rebuilt from a serialized dict can carry
+    # strings for numeric fields, and comparing those numerically raises.
+    qty = _d(abs(pos.size)) if pos.size is not None else None
+    entry = _d(pos.entry_price)
+    if qty is None or qty <= 0 or entry is None or entry <= 0:
+        return
+    acc.quantity += qty
+    acc.notional += qty * entry
+    acc.covered += 1
+
+
+def _side_vwap_payload(acc: SideVwap) -> Dict[str, Any]:
+    return {
+        "vwap": acc.vwap,
+        "covered": acc.covered,
+        "total": acc.total,
+        "complete": acc.complete,
+    }
+
+
 def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
     """Aggregate open positions per instrument (combines BUY + SELL).
 
@@ -1068,17 +1216,24 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
             long_amt = Decimal("0")
             short_amt = Decimal("0")
             pnl_units: Dict[str, Decimal] = {}
+            buy_vwap = SideVwap()
+            sell_vwap = SideVwap()
             for pos in group_rows:
                 if pos.size is None:
                     continue
                 size_abs = abs(pos.size)
                 gross += size_abs
+                # VWAP is accumulated per side from normalized quantities only.
+                # `size` here is already the underlying quantity for converted
+                # MetaTrader rows, so lots never enter the average directly.
                 if pos.side == "BUY":
                     long_amt += size_abs
                     net += pos.size
+                    _accumulate_vwap(buy_vwap, pos)
                 elif pos.side == "SELL":
                     short_amt += size_abs
                     net -= size_abs
+                    _accumulate_vwap(sell_vwap, pos)
                 else:
                     # Unknown side; treat as long for size accounting, not net.
                     long_amt += size_abs
@@ -1093,6 +1248,8 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
                     "net": net,
                     "long": long_amt,
                     "short": short_amt,
+                    "buy_vwap": _side_vwap_payload(buy_vwap),
+                    "sell_vwap": _side_vwap_payload(sell_vwap),
                     "pnl_units": pnl_units,
                     "accounts": len(group_accounts),
                 }

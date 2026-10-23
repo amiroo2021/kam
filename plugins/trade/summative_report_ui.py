@@ -6,6 +6,8 @@ TradeDesk and persists the report context; portfolio reads are delegated to
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -260,12 +262,31 @@ def progress_text(
     return line
 
 
-def _native_lines(lines: List[str], label: str, units: Dict[str, Any], *, signed: bool = False) -> None:
+def _native_lines(
+    lines: List[str],
+    label: str,
+    units: Dict[str, Any],
+    *,
+    signed: bool = False,
+    suffix_unit: bool = False,
+) -> None:
+    """Render one metric per currency without ever combining currencies.
+
+    ``suffix_unit=True`` emits a single label followed by ``value unit`` per
+    line — used by the main dashboard, where repeating the label as both a
+    bracketed prefix and a suffix is redundant noise.  Detail views keep the
+    bracketed form because each line stands alone and must name its unit
+    unambiguously.
+    """
     if not units:
-        lines.append(f"{label}: unavailable")
+        lines.append(f"{label}: —")
         return
     for unit, amount in sorted(units.items()):
-        lines.append(f"{label} ({unit}): {portfolio.format_money(amount, signed=signed)} {unit}")
+        value = portfolio.format_money(amount, signed=signed)
+        if suffix_unit:
+            lines.append(f"{label} {value} {unit}")
+        else:
+            lines.append(f"{label} ({unit}): {value} {unit}")
 
 
 def _coverage_lines(lines: List[str], snapshot: Any) -> None:
@@ -324,6 +345,42 @@ def _format_pnl_units(units: Dict[str, Any]) -> str:
     return "; ".join(pieces)
 
 
+def _format_qty(value: Any) -> str:
+    """Compact quantity: thousands separators, adaptive decimal places.
+
+    Large amounts (thousands of tokens) read better with two decimals; small
+    amounts need more, and a quantity that is not a round number keeps enough
+    precision to be verifiable against the underlying positions.
+    """
+    if value is None:
+        return "—"
+    try:
+        d = Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return str(value)
+    d = d.copy_abs()
+    if d >= 1000:
+        return f"{d:,.2f}"
+    if d >= 1:
+        return f"{d:,.4f}".rstrip("0").rstrip(".") or "0"
+    return f"{d:,.8f}".rstrip("0").rstrip(".") or "0"
+
+
+def _format_price(value: Any) -> str:
+    """Average entry price, with enough precision for low-priced assets."""
+    if value is None:
+        return "n/a"
+    try:
+        d = Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return str(value)
+    if d >= 1000:
+        return f"{d:,.2f}"
+    if d >= 1:
+        return f"{d:,.4f}".rstrip("0").rstrip(".") or "0"
+    return f"{d:,.8f}".rstrip("0").rstrip(".") or "0"
+
+
 def _format_signed(value: Any) -> str:
     if value is None:
         return "—"
@@ -361,57 +418,98 @@ def _menu(desk: Any, state: Any, *, refresh: bool = False) -> ReportView:
     equity = portfolio.total_equity(scope)
     pnl = portfolio.total_floating_pnl(scope)
     net_rows = portfolio.net_by_instrument(scope)
-    risk = portfolio.risk_and_exposure(scope)
 
     net_rows_top = sorted(
         net_rows,
         key=lambda r: (-(r["gross"]), -(abs(r["net"])), r["instrument"]),
-    )[:4]
+    )[:5]
+
+    # Only accounts with a real balance/equity or >=1 confirmed position are
+    # counted; empty or failed accounts never inflate these numbers.
+    eligible = scope.eligible_accounts
+    eligible_dex = scope.eligible_exchanges
 
     lines: List[str] = [
         "📊 Summative Report",
         "",
         _freshness(scope),
-        f"Scope: {selected}",
     ]
 
-    counts = (
-        f"Open Positions: {len(scope.positions)}"
-        f"   DEX: {len({a.exchange for a in scope.accounts})}"
-        f"   Accounts: {scope.positions_accounts_ok}/{scope.positions_accounts_seen}"
+    lines.append(
+        f"Open positions: {len(scope.positions)}"
+        f"   Exchanges: {len(eligible_dex)}"
+        f"   Accounts: {len(eligible)}"
     )
-    lines.append(counts)
+    lines.append(f"Scope: {selected}")
 
-    lines += ["", "Equity (unconverted):"]
     if equity["equity_units"]:
-        _native_lines(lines, "  Equity", equity["equity_units"], signed=False)
+        _native_lines(lines, "Equity", equity["equity_units"], signed=False, suffix_unit=True)
     else:
-        lines.append("  Equity: unavailable")
+        lines.append("Equity: —")
 
-    lines += ["", "uPnL (unconverted):"]
     if pnl["units"]:
-        _native_lines(lines, "  PnL", pnl["units"], signed=True)
+        _native_lines(lines, "uPnL", pnl["units"], signed=True, suffix_unit=True)
     else:
-        lines.append("  uPnL: unavailable")
+        lines.append("uPnL: —")
 
     if net_rows_top:
-        lines += ["", "Top instruments (size, not USD notional):"]
+        lines += ["", "Top instruments (BUY/SELL @ VWAP · accounts):"]
         for row in net_rows_top:
-            pnl_text = _format_pnl_units(row["pnl_units"])
-            lines.append(
-                f"• {row['display_symbol']}: "
-                f"net {_format_signed(row['net'])} "
-                f"gross {_format_abs(row['gross'])} "
-                f"uPnL {pnl_text} "
-                f"({row['accounts']} acct)"
-            )
+            lines.append(f"• {row['display_symbol']} · {row['accounts']} acct")
+            for side, icon, amount in (
+                ("BUY", "🔵", row.get("long")),
+                ("SELL", "🔴", row.get("short")),
+            ):
+                if not amount:
+                    continue
+                block = row.get(f"{side.lower()}_vwap") or {}
+                vwap = block.get("vwap")
+                covered = block.get("covered") or 0
+                total = block.get("total") or 0
+                price = _format_price(vwap) if vwap is not None else "n/a"
+                note = "" if block.get("complete", True) else f" ⚠️{covered}/{total}"
+                lines.append(
+                    f"  {icon} {side} {_format_qty(amount)} @ {price}{note}"
+                )
     else:
-        lines += ["", "Top instruments: none"]
+        lines.append("")
+        lines.append("Top instruments: none")
 
-    lines += ["", "Closest liquidation: unavailable (canonical contract lacks liquidation price)."]
-    if risk["notional_incomplete"]:
-        lines.append("USD notional: N/A (canonical contract lacks multiplier/inverse metadata).")
-    _coverage_lines(lines, scope)
+    # Honest incompleteness notice: a 100% progress bar only means every
+    # account was *attempted*, not that every read succeeded.
+    if scope.positions_incomplete:
+        seen = scope.positions_accounts_seen
+        lines += [
+            "",
+            "⚠️ Position data incomplete",
+            f"   Accounts responded: {scope.positions_accounts_ok}/{seen}",
+            f"   Accounts fully covered: {scope.positions_accounts_full}/{seen}",
+            f"   Accounts unavailable: {scope.positions_accounts_unavailable}",
+        ]
+
+    # Partial coverage is not the same as "no positions": these accounts
+    # returned data but could not read every sub-source, so their totals are a
+    # floor.  Say so explicitly rather than letting a missing dex read as zero.
+    partials = scope.partial_accounts
+    if partials:
+        lines += ["", f"⚠️ Partial venue coverage ({len(partials)} account(s) — totals may be low):"]
+        for a in partials[:6]:
+            for detail in (getattr(a, "partial_detail", None) or ["partial coverage"]):
+                lines.append(f"   • {detail}")
+        if len(partials) > 6:
+            lines.append(f"   … and {len(partials) - 6} more")
+
+    # Open orders are a different question from positions: exposure is still
+    # known here, so this is reported on its own and never lowers the
+    # position-coverage numbers above.
+    orders_partial = scope.orders_partial_accounts
+    if orders_partial:
+        lines += ["", f"ℹ️ Open-order data incomplete ({len(orders_partial)} account(s) — positions unaffected):"]
+        for a in orders_partial[:6]:
+            for detail in (getattr(a, "orders_partial_detail", None) or ["open orders unavailable"]):
+                lines.append(f"   • {detail}")
+        if len(orders_partial) > 6:
+            lines.append(f"   … and {len(orders_partial) - 6} more")
 
     buttons: List[List[Dict[str, str]]] = [
         [_b("📈 Net Positions", "sr:n"), _b("🏛 By Exchange", "sr:e")],

@@ -2352,6 +2352,48 @@ def _discover_perp_dex_names() -> List[str]:
     return names
 
 
+def _extract_asset_positions(payload: Any) -> List[Any]:
+    """Pull ``assetPositions`` out of a clearinghouseState payload.
+
+    Returns an empty list only when the key is absent or not a list; a
+    missing/malformed payload is reported by the caller as a dex failure, not
+    as an account with no positions.
+    """
+    if isinstance(payload, dict):
+        raw = payload.get("assetPositions")
+        if isinstance(raw, list):
+            return list(raw)
+    return []
+
+
+def _classify_dex_error(exc: BaseException) -> str:
+    """Bucket a transport/parse failure into a stable, non-secret category."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "429" in text or "too many requests" in text or "rate limit" in text:
+        return "rate_limited"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        return "network"
+    return "unknown"
+
+
+def _dex_failure(dex: str, exc: BaseException, *, partial: bool = False) -> Dict[str, Any]:
+    """Build sanitized per-dex failure metadata.
+
+    Contains only the dex identifier and an error category plus a sanitized
+    message.  Wallet addresses and secrets are never included.
+    """
+    return {
+        "dex": dex or "",
+        "category": _classify_dex_error(exc),
+        "message": sanitize_error_message(str(exc)),
+        "partial": partial,
+    }
+
+
 def _execute_positions_orders(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     alias = _normalize_account_alias(account)
     if not alias:
@@ -2383,6 +2425,7 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
         aggregated_positions: Dict[str, Any] = {"assetPositions": []}
         aggregated_orders: List[Dict[str, Any]] = []
         price_decimals_by_symbol: Dict[str, int] = {}
+        dex_failures: List[Dict[str, Any]] = []
 
         # Prefer price precision from the process-lifetime candidates cache so we
         # do not re-hit metaAndAssetCtxs once per dex on every positions poll.
@@ -2409,25 +2452,34 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
         except Exception:  # noqa: BLE001
             pass
 
-        def _load_dex(dex: str) -> Tuple[List[Any], List[Dict[str, Any]], Dict[str, int]]:
+        def _load_dex(dex: str) -> Tuple[List[Any], List[Dict[str, Any]], Dict[str, int], Optional[Dict[str, Any]]]:
             positions_part: List[Any] = []
             orders_part: List[Dict[str, Any]] = []
             decimals_part: Dict[str, int] = {}
             try:
                 positions_raw = _fetch_clearinghouse_state(wallet, dex)
+            except Exception as exc:  # noqa: BLE001
+                # A failed dex is NOT an empty dex.  Returning bare empty lists
+                # here would let a transient timeout/429 be reported as a
+                # successful fetch with zero exposure, which the report would
+                # render as "no positions" instead of "unavailable".
+                return positions_part, orders_part, decimals_part, _dex_failure(dex, exc)
+            try:
                 open_orders = _fetch_open_orders_for_dex(wallet, dex)
-            except Exception:  # noqa: BLE001
-                return positions_part, orders_part, decimals_part
-            dex_positions = positions_raw.get("assetPositions")
-            if isinstance(dex_positions, list):
-                positions_part = list(dex_positions)
+            except Exception as exc:  # noqa: BLE001
+                # Positions are the primary payload; keep them when only the
+                # protective-order lookup fails, but flag partial coverage.
+                positions_part = _extract_asset_positions(positions_raw)
+                return positions_part, [], decimals_part, _dex_failure(dex, exc, partial=True)
+            dex_positions = _extract_asset_positions(positions_raw)
+            positions_part = dex_positions
             orders_part = list(open_orders)
             if not price_decimals_by_symbol:
                 try:
                     decimals_part = _price_decimal_map_for_dex(dex)
                 except Exception:  # noqa: BLE001
                     decimals_part = {}
-            return positions_part, orders_part, decimals_part
+            return positions_part, orders_part, decimals_part, None
 
         if dex_names:
             # Parallelize multi-dex clearinghouse + open-order fanout (HIP-3).
@@ -2437,7 +2489,9 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(_load_dex, dex): dex for dex in dex_names}
                 for fut in as_completed(futures):
-                    positions_part, orders_part, decimals_part = fut.result()
+                    positions_part, orders_part, decimals_part, failure = fut.result()
+                    if failure is not None:
+                        dex_failures.append(failure)
                     aggregated_positions["assetPositions"].extend(positions_part)
                     aggregated_orders.extend(orders_part)
                     for sym, prec in decimals_part.items():
@@ -2449,6 +2503,25 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
             account=account,
             code="POSITIONS_ORDERS_UNAVAILABLE",
             message=sanitize_error_message(str(exc)),
+        )
+
+    # If every queried dex failed to yield POSITIONS, the account's exposure
+    # is UNKNOWN, not empty.  Reporting success would render missing exposure
+    # as zero.  A dex whose positions arrived but whose open-order lookup
+    # failed is a partial read, not a total failure, so it does not trip this.
+    total_failures = [f for f in dex_failures if not f.get("partial")]
+    if dex_names and len(total_failures) == len(dex_names):
+        cats = sorted({str(f.get("category") or "unknown") for f in dex_failures})
+        return make_failure(
+            operation="positions_orders",
+            exchange=name,
+            account=account,
+            code="POSITIONS_ORDERS_UNAVAILABLE",
+            message=(
+                f"All {len(dex_names)} perp dex(es) unavailable "
+                f"({', '.join(cats)}); position exposure is unknown, not zero."
+            ),
+            data={"partial_coverage": False, "dex_failures": dex_failures},
         )
 
     protection_orders_by_symbol: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
@@ -2470,6 +2543,16 @@ def _execute_positions_orders(account: str, request: Dict[str, Any]) -> Canonica
         positions=positions,
         open_order_count=len(aggregated_orders),
         order_groups=order_groups,
+        data=(
+            {
+                "partial_coverage": True,
+                "dexes_queried": list(dex_names),
+                "dexes_failed": len(dex_failures),
+                "dex_failures": dex_failures,
+            }
+            if dex_failures
+            else None
+        ),
     )
 
 
