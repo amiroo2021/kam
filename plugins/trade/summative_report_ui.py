@@ -9,6 +9,8 @@ from __future__ import annotations
 from decimal import Decimal
 
 import logging
+import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -196,27 +198,133 @@ def _b(text: str, callback_data: str) -> Dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
+class _InFlightFetch:
+    """One shared snapshot fetch that concurrent refreshes can wait on."""
+
+    __slots__ = ("event", "snapshot", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.snapshot: Any = None
+        self.error: Optional[BaseException] = None
+
+    def resolve(self, snapshot: Any) -> None:
+        self.snapshot = snapshot
+        self.event.set()
+
+    def reject(self, error: BaseException) -> None:
+        self.error = error
+        self.event.set()
+
+    def wait(self, timeout: Optional[float] = None) -> Any:
+        if not self.event.wait(timeout):
+            raise TimeoutError("Timed out waiting for an in-progress report refresh.")
+        if self.error is not None:
+            raise self.error
+        return self.snapshot
+
+
+# Keyed by a weak reference to the TradeDesk so entries disappear with the desk
+# instead of pinning it forever.  ``id()`` alone is unsafe: CPython reuses ids
+# once an object is freed, which could hand one desk another desk's in-flight
+# fetch.  The referent identity check below makes a stale id collision
+# impossible rather than merely unlikely.
+_REFRESH_LOCK = threading.Lock()
+_INFLIGHT: "weakref.WeakKeyDictionary[Any, _InFlightFetch]" = weakref.WeakKeyDictionary()
+
+
+def _in_flight_for(desk: Any) -> Optional[_InFlightFetch]:
+    try:
+        return _INFLIGHT.get(desk)
+    except TypeError:
+        # Not weak-referenceable; fall back to no coordination rather than
+        # keying on something that can collide.
+        return None
+
+
+def _shared_snapshot(desk: Any, produce: Any) -> Any:
+    """Return the snapshot for ``desk``, sharing one fetch across callers.
+
+    The first caller runs ``produce``; concurrent callers block on the shared
+    event and receive that same result — or that same exception.  The registry
+    lock is only ever held for dict access, never across the network call.
+    """
+    existing = _in_flight_for(desk)
+    if existing is not None:
+        return existing.wait()
+
+    entry = _InFlightFetch()
+    try:
+        with _REFRESH_LOCK:
+            # Re-check under the lock: another thread may have registered
+            # between our lookup and here.  Losing that race is correct and
+            # cheaper than duplicating the whole fan-out.
+            if desk in _INFLIGHT:
+                leader = _INFLIGHT[desk]
+            else:
+                _INFLIGHT[desk] = entry
+                leader = entry
+    except TypeError:
+        leader = entry  # uncoordinated, but still correct
+
+    if leader is not entry:
+        return leader.wait()
+
+    try:
+        snapshot = produce()
+    except BaseException as exc:  # noqa: BLE001
+        entry.reject(exc)
+        raise
+    else:
+        entry.resolve(snapshot)
+        return snapshot
+    finally:
+        # Remove the in-flight entry whatever happened, so a later refresh
+        # starts fresh instead of replaying a completed or failed result.
+        # Cleanup must never mask the real outcome: if the registry cannot be
+        # updated, the caller's snapshot (or the original error) still wins,
+        # otherwise an internal bookkeeping fault would discard a good fetch.
+        try:
+            with _REFRESH_LOCK:
+                if _INFLIGHT.get(desk) is entry:
+                    del _INFLIGHT[desk]
+        except Exception:  # noqa: BLE001
+            try:
+                with _REFRESH_LOCK:
+                    _INFLIGHT.pop(desk, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _report_snapshot(desk: Any, state: Any, *, refresh: bool = False) -> Any:
     snap = state.report.get("snapshot")
     if refresh or snap is None:
         # Install a default in-memory sink before the fetch so every
         # exchange/account emits a frame the next view can render.  Callers
-        # (e.g. the Telegram adapter) can replace this with their own sink
+        # (e.g. the Telegram adapter) can replace this with its own sink
         # by writing ``state.report['progress_sink']`` immediately before
         # invoking ``handle``.
         if state.report.get("progress_sink") is None:
             install_progress_sink(state, None)
-        progress_state = state
-        snap = portfolio.collect_portfolio_snapshot(
-            desk,
-            progress=lambda done, total, current=None: _update_progress(
-                progress_state,
-                label="Fetching positions",
-                done=done,
-                total=total,
-                current=current,
-            ),
-        )
+
+        def _produce() -> Any:
+            progress_state = state
+            return portfolio.collect_portfolio_snapshot(
+                desk,
+                progress=lambda done, total, current=None: _update_progress(
+                    progress_state,
+                    label="Fetching positions",
+                    done=done,
+                    total=total,
+                    current=current,
+                ),
+            )
+
+        # Concurrent refreshes share one fan-out.  Each caller still owns its
+        # own `state`, so progress frames and page state stay per-user; only
+        # the read-only snapshot object is shared, and `filtered()` returns a
+        # new snapshot rather than mutating it.
+        snap = _shared_snapshot(desk, _produce)
         state.report["snapshot"] = snap
         state.report["page"] = 0
         state.report["net_page"] = 0
