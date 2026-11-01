@@ -26,8 +26,6 @@ from plugins.trade.agents.x_mt5linux_agent import (
     convert_user_quantity,
     execute,
     infer_unit_label,
-    _contract_cache_get,
-    _contract_cache_put,
     _symbol_info_remote,
 )
 
@@ -178,13 +176,15 @@ class CacheIsolationTests(unittest.TestCase):
         clear_contract_spec_cache()
 
     def test_cache_key_includes_login_server_symbol(self) -> None:
-        _contract_cache_put(1, "ServerA", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "a"})
-        _contract_cache_put(2, "ServerA", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "b"})
-        _contract_cache_put(1, "ServerB", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "c"})
-        self.assertEqual(_contract_cache_get(1, "ServerA", "HYPEUSD")["v"], "a")
-        self.assertEqual(_contract_cache_get(2, "ServerA", "HYPEUSD")["v"], "b")
-        self.assertEqual(_contract_cache_get(1, "ServerB", "HYPEUSD")["v"], "c")
-        self.assertIsNone(_contract_cache_get(9, "ServerA", "HYPEUSD"))
+        from plugins.trade.agents import x_mt5linux_agent as m
+
+        m._contract_cache_put(1, "ServerA", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "a"})
+        m._contract_cache_put(2, "ServerA", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "b"})
+        m._contract_cache_put(1, "ServerB", "HYPEUSD", {"native_symbol": "HYPEUSD", "v": "c"})
+        self.assertEqual(m._contract_cache_get(1, "ServerA", "HYPEUSD")["v"], "a")
+        self.assertEqual(m._contract_cache_get(2, "ServerA", "HYPEUSD")["v"], "b")
+        self.assertEqual(m._contract_cache_get(1, "ServerB", "HYPEUSD")["v"], "c")
+        self.assertIsNone(m._contract_cache_get(9, "ServerA", "HYPEUSD"))
 
 
 class InvalidMetadataTests(unittest.TestCase):
@@ -369,8 +369,8 @@ class GetContractSpecExecuteTests(unittest.TestCase):
 
             self.assertEqual(resp.data["spec"]["trade_contract_size"], _qty_fmt(Decimal(str(contract))))
         # Normalize check
-        self.assertEqual(_contract_cache_get(1, "A", "ETHUSD")["spec"]["trade_contract_size"], "1")
-        self.assertEqual(_contract_cache_get(2, "B", "ETHUSD")["spec"]["trade_contract_size"], "100")
+        self.assertEqual(m._contract_cache_get(1, "A", "ETHUSD")["spec"]["trade_contract_size"], "1")
+        self.assertEqual(m._contract_cache_get(2, "B", "ETHUSD")["spec"]["trade_contract_size"], "100")
 
 
 class WizardUsesGetContractSpec(unittest.TestCase):
