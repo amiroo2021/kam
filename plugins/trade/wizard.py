@@ -1656,73 +1656,82 @@ class TradeWizard:
         return str(ex).strip().lower() == "mt5linux"
 
     def _fetch_mt5_contract_spec(self, exchange: str, account: str, symbol: str):
-        """Live broker contract specs for mt5linux (read-only)."""
-        from plugins.trade.agents.x_mt5linux_agent import ContractSpec, build_quantity_plan
+        """Live broker contract specs via agent get_contract_spec (New Order + Ladder).
+
+        Returns (spec, plan, diagnostic_message). diagnostic is set on failure.
+        """
+        from decimal import Decimal
+
+        from plugins.trade.agents.x_mt5linux_agent import (
+            ContractSpec,
+            QuantityPlan,
+            build_quantity_plan,
+        )
 
         if str(exchange or "").strip().lower() != "mt5linux":
-            return None, None
+            return None, None, "not mt5linux"
         sym = str(symbol or "").strip()
         if not sym or not account:
-            return None, None
-        info: dict = {}
-        # Prefer resolve_instrument / market_price payload (already switches account under lock).
-        for operation in ("resolve_instrument", "market_price", "ticker"):
-            try:
-                response = self._desk.execute(
-                    {
-                        "operation": operation,
-                        "exchange": exchange,
-                        "account": account,
-                        "symbol": sym,
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("mt5 contract_spec %s failed: %s", operation, exc)
-                continue
-            data = getattr(response, "data", None)
-            if isinstance(data, dict):
-                raw_info = data.get("info") if isinstance(data.get("info"), dict) else {}
-                merged = dict(raw_info)
-                for key in (
-                    "contract_size",
-                    "trade_contract_size",
-                    "volume_min",
-                    "volume_max",
-                    "volume_step",
-                    "minimum_size",
-                    "size_increment",
-                    "description",
-                    "path",
-                    "trade_calc_mode",
-                    "digits",
-                    "currency_base",
-                    "currency_profit",
-                ):
-                    if key in data and data.get(key) is not None and key not in merged:
-                        merged[key] = data.get(key)
-                # Canonical instrument fields
-                inst = getattr(response, "instrument", None) or getattr(response, "market_price", None)
-                if inst is not None:
-                    for src, dst in (
-                        ("minimum_size", "volume_min"),
-                        ("size_increment", "volume_step"),
-                        ("price_increment", "point"),
-                    ):
-                        val = inst.get(src) if isinstance(inst, dict) else getattr(inst, src, None)
-                        if val is not None and dst not in merged:
-                            merged[dst] = val
-                if merged.get("trade_contract_size") is None and merged.get("contract_size") is not None:
-                    merged["trade_contract_size"] = merged.get("contract_size")
-                if merged:
-                    info = merged
-                    if response.success or info.get("trade_contract_size") or info.get("contract_size"):
-                        break
-        if not info:
-            return None, None
-        spec = ContractSpec.from_mapping(sym, info)
+            return None, None, "missing account or symbol"
+        try:
+            response = self._desk.execute(
+                {
+                    "operation": "get_contract_spec",
+                    "exchange": exchange,
+                    "account": account,
+                    "symbol": sym,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mt5 get_contract_spec failed: %s", exc)
+            return None, None, f"get_contract_spec transport error: {type(exc).__name__}: {exc}"
+        if not getattr(response, "success", False):
+            err = getattr(response, "error", None)
+            msg = getattr(err, "message", None) or getattr(err, "code", None) or "contract spec request failed"
+            return None, None, str(msg)
+        data = getattr(response, "data", None)
+        if not isinstance(data, dict):
+            return None, None, "get_contract_spec returned no data"
+        # Rebuild typed objects from agent public payload (single source of truth).
+        spec_raw = data.get("spec") if isinstance(data.get("spec"), dict) else {}
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        merged = dict(info)
+        merged.update({k: v for k, v in spec_raw.items() if v is not None})
+        if merged.get("trade_contract_size") is None and data.get("trade_contract_size") is not None:
+            merged["trade_contract_size"] = data.get("trade_contract_size")
+        native = str(data.get("native_symbol") or merged.get("symbol") or sym)
+        login = data.get("login")
+        server = str(data.get("server") or "")
+        spec = ContractSpec.from_mapping(native, merged, login=login if login is not None else None, server=server)
         if spec is None:
-            return None, None
-        return spec, build_quantity_plan(spec)
+            return None, None, (
+                f"Invalid contract metadata for {native!r}: "
+                f"trade_contract_size={merged.get('trade_contract_size')!r}"
+            )
+        plan_raw = data.get("plan") if isinstance(data.get("plan"), dict) else None
+        if plan_raw:
+            def _d(key, default="0"):
+                try:
+                    return Decimal(str(plan_raw.get(key) if plan_raw.get(key) is not None else default))
+                except Exception:
+                    return Decimal(str(default))
+            mode = str(plan_raw.get("mode") or "lots")
+            plan = QuantityPlan(
+                mode=mode,
+                unit_label=str(plan_raw.get("unit_label") or "lot"),
+                contract_size=_d("contract_size", format(spec.contract_size, "f")),
+                volume_min_lots=_d("volume_min_lots", format(spec.volume_min, "f")),
+                volume_max_lots=_d("volume_max_lots", format(spec.volume_max, "f")),
+                volume_step_lots=_d("volume_step_lots", format(spec.volume_step, "f")),
+                min_underlying=_d("min_underlying") if plan_raw.get("min_underlying") is not None else None,
+                step_underlying=_d("step_underlying") if plan_raw.get("step_underlying") is not None else None,
+                max_underlying=_d("max_underlying") if plan_raw.get("max_underlying") is not None else None,
+                native_symbol=native,
+                diagnostic=str(plan_raw.get("diagnostic") or "") or "",
+            )
+        else:
+            plan = build_quantity_plan(spec)
+        return spec, plan, None
 
     def _mt5_volume_plan_for_state(self, state: WizardState, *, ladder: bool = False):
         symbol = ""
@@ -1730,7 +1739,18 @@ class TradeWizard:
             symbol = str(state.ladder.get("symbol") or state.symbol or "").strip()
         else:
             symbol = str(state.order.get("symbol") or state.symbol or "").strip()
-        return self._fetch_mt5_contract_spec(state.exchange or "", state.account or "", symbol)
+        spec, plan, diagnostic = self._fetch_mt5_contract_spec(
+            state.exchange or "", state.account or "", symbol
+        )
+        # Stash diagnostic on state for the quantity prompt.
+        bucket = state.ladder if ladder else state.order
+        if diagnostic:
+            bucket["contract_spec_error"] = diagnostic
+        else:
+            bucket.pop("contract_spec_error", None)
+        if plan is not None:
+            bucket["native_symbol"] = plan.native_symbol or symbol
+        return spec, plan
 
     def _format_order_volume_line(self, state: WizardState) -> str:
         if state.order.get("volume_display"):
@@ -1794,7 +1814,8 @@ class TradeWizard:
             else:
                 state.order["qty_mode"] = "lots"
                 prompt = "Enter Volume (MT5 lots):"
-                extra = "(Contract specs unavailable — enter broker lots.)\n\n"
+                why = state.order.get("contract_spec_error") or "contract specifications could not be loaded"
+                extra = f"(Contract specs unavailable — enter broker lots.)\nReason: {why}\n\n"
         return Screen(
             text=header + extra + prompt,
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
@@ -2175,20 +2196,17 @@ class TradeWizard:
                 state.ladder["volume_min_lots"] = format(plan.volume_min_lots, "f")
                 state.ladder["volume_step_lots"] = format(plan.volume_step_lots, "f")
                 state.ladder["volume_max_lots"] = format(plan.volume_max_lots, "f")
-                if plan.mode == "underlying":
-                    prompt = f"Enter Total Volume ({plan.unit_label} tokens):" if plan.unit_label.isalpha() and len(plan.unit_label) <= 6 and not plan.unit_label.endswith(" oz") else f"Enter Total Volume ({plan.unit_label}):"
-                    if plan.unit_label.endswith(" oz") or plan.unit_label.upper() in {"EUR", "GBP", "AUD", "CAD", "CHF", "NZD", "JPY", "USD"}:
-                        prompt = f"Enter Total Volume ({plan.unit_label}):"
-                    elif plan.unit_label.isalpha() and len(plan.unit_label) <= 6:
-                        prompt = f"Enter Total Volume ({plan.unit_label} tokens):"
-                    else:
-                        prompt = f"Enter Total Volume ({plan.unit_label}):"
+                # Reuse the same unit semantics as New Order (plan.prompt_label → Total Volume).
+                base_prompt = plan.prompt_label
+                if base_prompt.startswith("Enter Volume"):
+                    prompt = "Enter Total " + base_prompt[len("Enter "):]
                 else:
-                    prompt = "Enter Total Volume (MT5 lots):"
+                    prompt = base_prompt
                 extra = "\n".join(plan.help_lines()) + "\n\n"
             else:
                 prompt = "Enter Total Volume (MT5 lots):"
-                extra = "(Contract specs unavailable — enter broker lots.)\n\n"
+                why = state.ladder.get("contract_spec_error") or "contract specifications could not be loaded"
+                extra = f"(Contract specs unavailable — enter broker lots.)\nReason: {why}\n\n"
         return Screen(
             text=f"Ladder\n\n{extra}{prompt}",
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],

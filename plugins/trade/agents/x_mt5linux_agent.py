@@ -96,6 +96,7 @@ _READ_OPS = frozenset(
         "market_price",
         "candles",
         "get_tickers",
+        "get_contract_spec",
     }
 )
 _WRITE_OPS = frozenset(
@@ -393,6 +394,7 @@ def capabilities() -> List[str]:
         "market_price",
         "candles",
         "get_tickers",
+        "get_contract_spec",
         "new_order",
         "modify_order",
         "cancel_order",
@@ -1080,6 +1082,8 @@ def _info(i):
         'volume_min': float(getattr(i, 'volume_min', 0) or 0),
         'volume_max': float(getattr(i, 'volume_max', 0) or 0),
         'volume_step': float(getattr(i, 'volume_step', 0) or 0),
+        'volume_limit': float(getattr(i, 'volume_limit', 0) or 0),
+        'currency_margin': str(getattr(i, 'currency_margin', '') or ''),
         'trade_contract_size': float(getattr(i, 'trade_contract_size', 0) or 0),
         'description': str(getattr(i, 'description', '') or ''),
         'path': str(getattr(i, 'path', '') or ''),
@@ -2089,6 +2093,152 @@ def _execute_position_action(request: Mapping[str, Any], operation: str) -> Cano
     return _run_op(operation, account, run)
 
 
+
+def _resolve_native_symbol(client: Any, requested: str) -> Tuple[str, Optional[str]]:
+    """Return (native_symbol, diagnostic). Uses exact info first, then catalog prefix/contains."""
+    req = _normalize_symbol(requested)
+    if not req:
+        return "", "empty symbol"
+    payload = _symbol_info_remote(client, req)
+    info = (payload or {}).get("info") if isinstance(payload, dict) else None
+    if isinstance(info, dict) and info.get("name"):
+        return str(info["name"]), None
+    # Fallback: scan symbols with query=req (full catalog filter)
+    code = f"""
+import MetaTrader5 as m
+q = {req!r}
+hits = []
+for s in (m.symbols_get() or ()):
+    name = str(s.name)
+    up = name.upper().replace('.','').replace('-','').replace('_','')
+    if up == q or name.upper() == q or up.startswith(q) or q in up:
+        hits.append(name)
+        if len(hits) >= 30:
+            break
+resolve_hits = hits
+"""
+    try:
+        _remote_execute(client, code)
+        hits = _remote_eval(client, "resolve_hits")
+    except Exception as exc:  # noqa: BLE001
+        return req, f"symbol_info miss and catalog scan failed: {type(exc).__name__}"
+    if not isinstance(hits, list) or not hits:
+        return req, f"symbol {req!r} not found on this account/server"
+    # Prefer exact, then prefix, then USD quote
+    ups = [(str(h), str(h).upper().replace('.','')) for h in hits]
+    for h, u in ups:
+        if u == req or str(h).upper() == req:
+            return h, None
+    for h, u in ups:
+        if u.startswith(req) and u.endswith("USD"):
+            return h, None
+    for h, u in ups:
+        if u.startswith(req):
+            return h, None
+    return str(hits[0]), f"fuzzy match {hits[0]!r} for requested {req!r}"
+
+
+def _execute_get_contract_spec(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Universal live contract-spec discovery for any MT5Linux account/symbol."""
+    operation = "get_contract_spec"
+    requested = str(request.get("symbol") or request.get("query") or "").strip()
+    if not requested:
+        return _failure(operation, account, "MISSING_SYMBOL", "symbol is required")
+    force_refresh = bool(request.get("force_refresh") or request.get("refresh"))
+
+    def run(client, snap, alias, login, server):
+        ai = snap.get("account") or {}
+        # Identity already verified by _with_account; re-check.
+        if int(ai.get("login") or 0) != int(login) or str(ai.get("server") or "") != str(server):
+            return _failure(operation, alias, "ACCOUNT_MISMATCH", "Account changed under lock.")
+
+        native, resolve_diag = _resolve_native_symbol(client, requested)
+        cache_key_sym = native or requested
+        if not force_refresh:
+            cached = _contract_cache_get(int(login), str(server), cache_key_sym)
+            if cached:
+                data = _augment_account_data(snap)
+                data.update(cached)
+                data["cache_hit"] = True
+                return make_success(operation=operation, exchange=name, account=alias, data=data)
+
+        payload = _symbol_info_remote(client, native or requested)
+        if not isinstance(payload, dict) or not payload.get("info"):
+            # One more select+retry via normalize
+            payload = _symbol_info_remote(client, requested)
+        info = (payload or {}).get("info") if isinstance(payload, dict) else None
+        if not isinstance(info, dict):
+            reason = resolve_diag or f"symbol_info({requested!r}) returned no info"
+            return _failure(
+                operation,
+                alias,
+                "CONTRACT_SPEC_UNAVAILABLE",
+                (
+                    f"Could not load contract specifications for {requested!r} on "
+                    f"{login}@{server}. {reason}. "
+                    f"Check the broker-native symbol name and Market Watch availability."
+                ),
+            )
+
+        # Ensure volume_limit present if broker exposes it (already in _symbol_info_remote if we add it)
+        spec = ContractSpec.from_mapping(str(info.get("name") or native or requested), info, login=int(login), server=str(server))
+        if spec is None:
+            return _failure(
+                operation,
+                alias,
+                "CONTRACT_SPEC_INVALID",
+                (
+                    f"Symbol {info.get('name')!r} on {login}@{server} has invalid trade_contract_size="
+                    f"{info.get('trade_contract_size')!r} (must be > 0). "
+                    f"volume_min={info.get('volume_min')!r} volume_step={info.get('volume_step')!r}."
+                ),
+            )
+        plan = build_quantity_plan(spec)
+        tick = (payload or {}).get("tick") if isinstance(payload, dict) else {}
+        public = {
+            "requested_symbol": requested,
+            "native_symbol": spec.symbol,
+            "resolve_diagnostic": resolve_diag,
+            "spec": spec.to_public_dict(),
+            "plan": plan.to_public_dict(),
+            "info": info,
+            "tick": tick,
+            "contract_size": _qty_fmt(spec.contract_size),
+            "trade_contract_size": _qty_fmt(spec.contract_size),
+            "volume_min": _qty_fmt(spec.volume_min),
+            "volume_max": _qty_fmt(spec.volume_max),
+            "volume_step": _qty_fmt(spec.volume_step),
+            "volume_limit": _qty_fmt(spec.volume_limit) if spec.volume_limit is not None else None,
+            "login": int(login),
+            "server": str(server),
+            "cache_hit": False,
+        }
+        _contract_cache_put(int(login), str(server), spec.symbol, public)
+        data = _augment_account_data(snap)
+        data.update(public)
+        instrument = CanonicalInstrument(
+            requested_symbol=requested,
+            symbol=spec.symbol,
+            display_name=spec.symbol,
+            native_symbol=spec.symbol,
+            display_symbol=spec.symbol,
+            price_increment=_decimal_text(info.get("trade_tick_size") or info.get("point")),
+            size_increment=format(spec.volume_step, "f"),
+            minimum_size=format(spec.volume_min, "f"),
+        )
+        return make_success(
+            operation=operation,
+            exchange=name,
+            account=alias,
+            instrument=instrument,
+            data=data,
+        )
+
+    return _run_op(operation, account, run)
+
+
+
+
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     if not isinstance(request, Mapping):
         return _failure("", "", "INVALID_REQUEST", "Request must be a dict.")
@@ -2116,6 +2266,8 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _execute_candles(account, request)
     if operation == "get_tickers":
         return _execute_get_tickers(account, request)
+    if operation == "get_contract_spec":
+        return _execute_get_contract_spec(account, request)
     if operation == "new_order":
         return _execute_new_order(request)
     if operation == "modify_order":
@@ -2181,26 +2333,35 @@ _QUOTE_SUFFIXES = (
 )
 
 
+
 @dataclass(frozen=True)
 class ContractSpec:
+    """Live broker contract specification (never hardcoded per broker/instrument)."""
+
     symbol: str
     contract_size: Decimal
     volume_min: Decimal
     volume_max: Decimal
     volume_step: Decimal
+    volume_limit: Optional[Decimal] = None
     currency_base: str = ""
     currency_profit: str = ""
+    currency_margin: str = ""
     description: str = ""
     path: str = ""
     trade_calc_mode: Optional[int] = None
+    trade_mode: Optional[int] = None
     digits: Optional[int] = None
+    login: Optional[int] = None
+    server: str = ""
 
     @classmethod
-    def from_mapping(cls, symbol: str, info: Mapping[str, Any]) -> Optional["ContractSpec"]:
+    def from_mapping(cls, symbol: str, info: Mapping[str, Any], *, login: Optional[int] = None, server: str = "") -> Optional["ContractSpec"]:
         contract = _qty_dec(info.get("trade_contract_size") if "trade_contract_size" in info else info.get("contract_size"))
         vmin = _qty_dec(info.get("volume_min") if "volume_min" in info else info.get("minimum_size"))
         vmax = _qty_dec(info.get("volume_max") if "volume_max" in info else info.get("maximum_size"))
         vstep = _qty_dec(info.get("volume_step") if "volume_step" in info else info.get("size_increment"))
+        vlimit = _qty_dec(info.get("volume_limit"))
         if contract is None or contract <= 0:
             return None
         if vmin is None or vmin <= 0:
@@ -2209,11 +2370,19 @@ class ContractSpec:
             vstep = vmin
         if vmax is None or vmax <= 0:
             vmax = Decimal("100")
+        # volume_limit 0 often means "no extra limit" on MT5
+        if vlimit is not None and vlimit <= 0:
+            vlimit = None
         tcm = info.get("trade_calc_mode")
         try:
             tcm_i = int(tcm) if tcm is not None else None
         except (TypeError, ValueError):
             tcm_i = None
+        tm = info.get("trade_mode")
+        try:
+            tm_i = int(tm) if tm is not None else None
+        except (TypeError, ValueError):
+            tm_i = None
         dig = info.get("digits")
         try:
             dig_i = int(dig) if dig is not None else None
@@ -2225,17 +2394,48 @@ class ContractSpec:
             volume_min=vmin,
             volume_max=vmax,
             volume_step=vstep,
+            volume_limit=vlimit,
             currency_base=str(info.get("currency_base") or "").strip(),
             currency_profit=str(info.get("currency_profit") or "").strip(),
+            currency_margin=str(info.get("currency_margin") or "").strip(),
             description=str(info.get("description") or "").strip(),
             path=str(info.get("path") or "").strip(),
             trade_calc_mode=tcm_i,
+            trade_mode=tm_i,
             digits=dig_i,
+            login=int(login) if login is not None else None,
+            server=str(server or ""),
         )
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "trade_contract_size": _qty_fmt(self.contract_size),
+            "contract_size": _qty_fmt(self.contract_size),
+            "volume_min": _qty_fmt(self.volume_min),
+            "volume_max": _qty_fmt(self.volume_max),
+            "volume_step": _qty_fmt(self.volume_step),
+            "volume_limit": _qty_fmt(self.volume_limit) if self.volume_limit is not None else None,
+            "currency_base": self.currency_base,
+            "currency_profit": self.currency_profit,
+            "currency_margin": self.currency_margin,
+            "description": self.description,
+            "path": self.path,
+            "trade_calc_mode": self.trade_calc_mode,
+            "trade_mode": self.trade_mode,
+            "digits": self.digits,
+            "login": self.login,
+            "server": self.server,
+        }
 
 
 def _symbol_base_guess(symbol: str) -> str:
-    up = str(symbol or "").strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+    """Strip common quote suffixes; broker-agnostic (no instrument allowlists)."""
+    up = str(symbol or "").strip().upper()
+    # Drop broker suffix after '.', e.g. USOUSD.pc → USOUSD then strip USD
+    if "." in up:
+        up = up.split(".", 1)[0]
+    up = up.replace("/", "").replace("-", "").replace(" ", "").replace("_", "")
     if not up:
         return ""
     if up.startswith("XAU"):
@@ -2248,95 +2448,70 @@ def _symbol_base_guess(symbol: str) -> str:
     return up
 
 
-def infer_unit_label(spec: ContractSpec) -> Tuple[str, str]:
-    """Return (unit_label, mode) where mode is 'underlying' or 'lots'.
+def _path_tokens(path: str) -> str:
+    return (path or "").upper().replace("\\", "/").replace("-", " ").replace("_", " ")
 
-    Crypto CFD paths / familiar crypto tickers → base asset tokens.
-    Forex (calc mode 0 or known FX pairs) → base currency units.
-    Metals XAU/XAG → troy oz label.
-    Otherwise → broker lots (do not invent a token name).
+
+def infer_unit_label(spec: ContractSpec) -> Tuple[str, str]:
+    """Return (unit_label, mode) with mode in {'underlying','lots'}.
+
+    Broker-independent heuristics from live metadata only — never a fixed coin list.
+    Ambiguous metadata → lots mode (show contract size, do not invent a unit).
     """
-    path_u = (spec.path or "").upper().replace("\\", "/")
+    path_u = _path_tokens(spec.path)
     sym_u = (spec.symbol or "").upper()
     base_guess = _symbol_base_guess(spec.symbol)
     desc_u = (spec.description or "").upper()
+    cbase = (spec.currency_base or "").upper()
 
-    is_crypto = (
-        "CRYPTO" in path_u
-        or base_guess
-        in {
-            "BTC",
-            "ETH",
-            "SOL",
-            "HYPE",
-            "ZEC",
-            "XRP",
-            "ADA",
-            "DOGE",
-            "LTC",
-            "BNB",
-            "DOT",
-            "AVAX",
-            "LINK",
-            "MATIC",
-            "UNI",
-            "ATOM",
-            "NEAR",
-            "APT",
-            "ARB",
-            "OP",
-            "SUI",
-            "TIA",
-            "INJ",
-            "FIL",
-            "AAVE",
-            "MKR",
-            "CRV",
-            "PEPE",
-            "WIF",
-            "BONK",
-            "SHIB",
-            "TRX",
-            "TON",
-            "VET",
-            "THT",
-            "BCH",
-            "ETC",
-            "XLM",
-            "ALGO",
-            "ICP",
-            "FTM",
-            "SAND",
-            "MANA",
-            "AXS",
-            "GALA",
-            "IMX",
-            "RENDER",
-            "FET",
-            "TAO",
-        }
-        or any(tok in desc_u for tok in ("BITCOIN", "ETHEREUM", "SOLANA", "CRYPTO"))
-    )
-    if is_crypto and base_guess:
-        return base_guess, "underlying"
-
-    if base_guess in {"XAU", "XAG"} or "XAU" in sym_u or "XAG" in sym_u or "GOLD" in desc_u or "SILVER" in desc_u:
-        # Contract size is ounces (or grams on some brokers) — still a real underlying unit.
-        metal = "XAU" if ("XAU" in sym_u or "GOLD" in desc_u) else "XAG"
+    # Metals
+    if (
+        base_guess in {"XAU", "XAG"}
+        or "XAU" in sym_u
+        or "XAG" in sym_u
+        or "GOLD" in path_u
+        or "SILVER" in path_u
+        or "GOLD" in desc_u
+        or "SILVER" in desc_u
+    ):
+        metal = "XAU" if ("XAU" in sym_u or "GOLD" in path_u or "GOLD" in desc_u) else "XAG"
         return f"{metal} oz", "underlying"
 
-    # Forex: calc mode 0 (Forex) or EURUSD-style with currency_base matching left side.
+    # Forex
     if spec.trade_calc_mode == 0 or (
-        spec.currency_base
+        cbase
         and base_guess
-        and spec.currency_base.upper() == base_guess
+        and cbase == base_guess
         and len(base_guess) == 3
         and base_guess.isalpha()
     ):
-        unit = (spec.currency_base or base_guess).upper()
+        unit = cbase or base_guess
         if unit:
             return unit, "underlying"
 
+    # Crypto category from path/description (any ticker — no allowlist)
+    is_crypto_path = any(tok in path_u for tok in ("CRYPTO", "COIN", "DIGITAL"))
+    is_crypto_desc = any(tok in desc_u for tok in ("CRYPTO", "COIN", "TOKEN", "BITCOIN", "ETHEREUM"))
+    if (is_crypto_path or is_crypto_desc) and base_guess and base_guess.isalnum() and 2 <= len(base_guess) <= 12:
+        return base_guess, "underlying"
+
+    # Equities / stocks
+    if any(tok in path_u for tok in ("EQUITY", "STOCK", "SHARE", "SHARES")) and base_guess:
+        return f"{base_guess} shares", "underlying"
+
+    # Indices — multipliers and tick values vary by broker; never invent a unit label.
+    if any(tok in path_u for tok in ("INDEX", "INDICES", "INDICE")):
+        return "lot", "lots"
+
+    # Energy / commodities without clear unit
+    if any(tok in path_u for tok in ("OIL", "ENERGY", "GAS", "COMMODIT")):
+        # Only claim barrels if description/path says so
+        if "BARREL" in desc_u or "BBL" in desc_u:
+            return "bbl", "underlying"
+        return "lot", "lots"
+
+    # Generic CFD with a clean base ticker and non-USD currency_base mismatch is weak —
+    # if base_guess looks like an asset code and contract_size is a round lot multiplier, still lots.
     return "lot", "lots"
 
 
@@ -2351,21 +2526,27 @@ class QuantityPlan:
     min_underlying: Optional[Decimal]
     step_underlying: Optional[Decimal]
     max_underlying: Optional[Decimal]
+    native_symbol: str = ""
+    diagnostic: str = ""
 
     @property
     def prompt_label(self) -> str:
         if self.mode == "underlying":
-            # "SOL" → "SOL tokens"; "EUR" stays "EUR"; "XAU oz" stays.
             unit = self.unit_label
-            if unit.endswith(" oz") or unit.upper() in {"EUR", "GBP", "AUD", "CAD", "CHF", "NZD", "JPY", "USD"}:
+            if unit.endswith(" oz") or unit.endswith(" shares") or unit.endswith(" pts") or unit.endswith(" bbl"):
                 return f"Enter Volume ({unit}):"
-            if len(unit) <= 6 and unit.isalpha():
-                return f"Enter Volume ({unit} tokens):"
+            if unit.upper() in {"EUR", "GBP", "AUD", "CAD", "CHF", "NZD", "JPY", "USD"}:
+                return f"Enter Volume ({unit}):"
+            if len(unit) <= 12 and unit.replace(" ", "").isalnum():
+                # crypto-style tickers
+                if " " not in unit and unit.isalpha():
+                    return f"Enter Volume ({unit} tokens):"
+                return f"Enter Volume ({unit}):"
             return f"Enter Volume ({unit}):"
         return "Enter Volume (MT5 lots):"
 
-    def help_lines(self) -> list[str]:
-        lines: list[str] = []
+    def help_lines(self) -> list:
+        lines: list = []
         if self.mode == "underlying" and self.min_underlying is not None and self.step_underlying is not None:
             lines.append(
                 f"Minimum: {_qty_fmt(self.min_underlying)} {self.unit_label} = {_qty_fmt(self.volume_min_lots)} MT5 lots"
@@ -2385,11 +2566,37 @@ class QuantityPlan:
             lines.append(f"Increment: {_qty_fmt(self.volume_step_lots)} lots")
             lines.append(f"Contract size: {_qty_fmt(self.contract_size)} (broker units per lot)")
             lines.append(f"Maximum: {_qty_fmt(self.volume_max_lots)} lots")
+            if self.diagnostic:
+                lines.append(f"Note: {self.diagnostic}")
         return lines
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "unit_label": self.unit_label,
+            "contract_size": _qty_fmt(self.contract_size),
+            "volume_min_lots": _qty_fmt(self.volume_min_lots),
+            "volume_max_lots": _qty_fmt(self.volume_max_lots),
+            "volume_step_lots": _qty_fmt(self.volume_step_lots),
+            "min_underlying": _qty_fmt(self.min_underlying) if self.min_underlying is not None else None,
+            "step_underlying": _qty_fmt(self.step_underlying) if self.step_underlying is not None else None,
+            "max_underlying": _qty_fmt(self.max_underlying) if self.max_underlying is not None else None,
+            "native_symbol": self.native_symbol,
+            "prompt_label": self.prompt_label,
+            "help_lines": self.help_lines(),
+            "diagnostic": self.diagnostic or None,
+        }
 
 
 def build_quantity_plan(spec: ContractSpec) -> QuantityPlan:
     unit, mode = infer_unit_label(spec)
+    diag = ""
+    if mode == "lots":
+        diag = (
+            f"Underlying unit ambiguous for {spec.symbol} "
+            f"(path={spec.path!r}, calc_mode={spec.trade_calc_mode}); using MT5 lots. "
+            f"Contract size={_qty_fmt(spec.contract_size)} broker units/lot."
+        )
     if mode == "underlying":
         return QuantityPlan(
             mode=mode,
@@ -2401,6 +2608,8 @@ def build_quantity_plan(spec: ContractSpec) -> QuantityPlan:
             min_underlying=spec.volume_min * spec.contract_size,
             step_underlying=spec.volume_step * spec.contract_size,
             max_underlying=spec.volume_max * spec.contract_size,
+            native_symbol=spec.symbol,
+            diagnostic="",
         )
     return QuantityPlan(
         mode="lots",
@@ -2412,7 +2621,37 @@ def build_quantity_plan(spec: ContractSpec) -> QuantityPlan:
         min_underlying=None,
         step_underlying=None,
         max_underlying=None,
+        native_symbol=spec.symbol,
+        diagnostic=diag,
     )
+
+
+# Account-scoped contract-spec cache: (login, server, native_symbol) -> (monotonic_ts, payload_dict)
+_CONTRACT_SPEC_CACHE: Dict[Tuple[int, str, str], Tuple[float, Dict[str, Any]]] = {}
+_CONTRACT_SPEC_CACHE_TTL_S = 120.0
+
+
+def _contract_cache_get(login: int, server: str, symbol: str) -> Optional[Dict[str, Any]]:
+    key = (int(login), str(server), str(symbol).upper())
+    hit = _CONTRACT_SPEC_CACHE.get(key)
+    if not hit:
+        return None
+    ts, payload = hit
+    if time.monotonic() - ts > _CONTRACT_SPEC_CACHE_TTL_S:
+        _CONTRACT_SPEC_CACHE.pop(key, None)
+        return None
+    return dict(payload)
+
+
+def _contract_cache_put(login: int, server: str, symbol: str, payload: Mapping[str, Any]) -> None:
+    key = (int(login), str(server), str(symbol).upper())
+    _CONTRACT_SPEC_CACHE[key] = (time.monotonic(), dict(payload))
+
+
+def clear_contract_spec_cache() -> None:
+    """Test helper / forced refresh."""
+    _CONTRACT_SPEC_CACHE.clear()
+
 
 
 def lots_to_underlying(lots: Decimal, contract_size: Decimal) -> Decimal:
