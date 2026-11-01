@@ -748,6 +748,58 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
         assert resp.error is not None
         self.assertNotEqual(resp.error.code, "READ_ONLY")
 
+    def test_trade_expert_false_blocks_writes(self) -> None:
+        from plugins.trade.agents import x_mt5linux_agent as m
+
+        self._basic_accounts()
+        snap = {
+            "account": {
+                "login": 5701520,
+                "server": "PoTrade-MT5",
+                "currency": "USD",
+                "balance": 1,
+                "trade_expert": False,
+                "trade_allowed": True,
+            },
+            "terminal": {"connected": True, "trade_allowed": True, "tradeapi_disabled": False},
+        }
+
+        def _side(account, fn):
+            return fn(object(), snap, "PO5701520", 5701520, "PoTrade-MT5")
+
+        with mock.patch.object(m, "_with_account") as wa:
+            wa.side_effect = _side
+            resp = m.execute(
+                {
+                    "operation": "new_order",
+                    "account": "PO5701520",
+                    "symbol": "SOLUSD",
+                    "side": "sell",
+                    "volume": "0.01",
+                    "price": "50",
+                    "order_type": "limit",
+                }
+            )
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "BROKER_AUTOTRADING_DISABLED")
+        self.assertIn("trade_expert=False", resp.error.message)
+        with mock.patch.object(m._orders, "order_send_pending") as send:
+            with mock.patch.object(m, "_with_account") as wa2:
+                wa2.side_effect = _side
+                m.execute(
+                    {
+                        "operation": "new_order",
+                        "account": "PO5701520",
+                        "symbol": "SOLUSD",
+                        "side": "sell",
+                        "volume": "0.01",
+                        "price": "50",
+                        "order_type": "limit",
+                    }
+                )
+            send.assert_not_called()
+
 
 class PortfolioUscTests(unittest.TestCase):
     def test_portfolio_normalizes_mt5linux_usc(self) -> None:

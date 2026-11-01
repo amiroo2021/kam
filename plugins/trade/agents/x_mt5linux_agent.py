@@ -548,6 +548,9 @@ def _ai(a):
         'margin_level': float(a.margin_level) if a.margin_level is not None else None,
         'leverage': int(a.leverage),
         'trade_mode': int(a.trade_mode),
+        'trade_allowed': bool(getattr(a, 'trade_allowed', True)),
+        'trade_expert': bool(getattr(a, 'trade_expert', True)),
+        'limit_orders': int(getattr(a, 'limit_orders', 0) or 0),
     }
 
 def _ti(t):
@@ -1475,6 +1478,72 @@ def restore_account(alias: str) -> CanonicalResponse:
     return _execute_ping(alias)
 
 
+def _automated_trading_block(snap: Mapping[str, Any], operation: str, alias: str) -> Optional[CanonicalResponse]:
+    """Refuse writes when the broker disables automated/EA/API trading on this account.
+
+    Does not bypass broker policy. Read-only ops must not call this.
+    Local terminal Algo Trading can still be on; account.trade_expert is the
+    server-side gate (PoTrade 5701520 returns trade_expert=False → MT5 10026).
+    """
+    ai = snap.get("account") or {}
+    ti = snap.get("terminal") or {}
+    login = ai.get("login")
+    server = ai.get("server")
+    trade_expert = ai.get("trade_expert")
+    trade_allowed_acc = ai.get("trade_allowed")
+    trade_allowed_term = ti.get("trade_allowed")
+    tradeapi_disabled = ti.get("tradeapi_disabled")
+
+    # Explicit False only — missing keys stay permissive for older snapshots.
+    if trade_expert is False:
+        return _failure(
+            operation,
+            alias,
+            "BROKER_AUTOTRADING_DISABLED",
+            (
+                f"Broker has disabled automated trading for account {login}@{server} "
+                f"(account.trade_expert=False). Manual UI orders may still work; "
+                f"Hermes/API/EA place, modify, cancel, and close are blocked until the "
+                f"broker enables Expert Advisors / algorithmic trading on this account. "
+                f"Retcode 10026 (AutoTrading disabled by server) is expected. "
+                f"Read-only balance/positions/quotes remain available."
+            ),
+            exchange_reason="10026",
+        )
+    if trade_allowed_acc is False:
+        return _failure(
+            operation,
+            alias,
+            "ACCOUNT_TRADE_DISABLED",
+            (
+                f"Account {login}@{server} has trade_allowed=False. "
+                f"Trading is disabled for this account; contact the broker."
+            ),
+        )
+    if tradeapi_disabled is True:
+        return _failure(
+            operation,
+            alias,
+            "TERMINAL_TRADEAPI_DISABLED",
+            (
+                "Terminal reports tradeapi_disabled=True (external Python/API trading "
+                "disabled in Experts settings). Enable algorithmic trading / uncheck "
+                "Disable algorithmic trading via external Python API, then retry."
+            ),
+        )
+    if trade_allowed_term is False:
+        return _failure(
+            operation,
+            alias,
+            "TERMINAL_TRADE_DISABLED",
+            (
+                "Terminal reports trade_allowed=False (Algo Trading off in the MT5 UI). "
+                "Turn on AutoTrading in the toolbar, then retry."
+            ),
+        )
+    return None
+
+
 def _side_norm(value: Any) -> Optional[str]:
     text = str(value or "").strip().lower()
     if text in {"buy", "long"}:
@@ -1528,9 +1597,12 @@ def _execute_new_order(request: Mapping[str, Any]) -> CanonicalResponse:
     if order_type == "stop":
         order_type = "buy_stop" if side == "buy" else "sell_stop"
     request_id = _orders._coerce_request_id(request.get("request_id") or request.get("client_order_id"))
-    comment = _orders._short_comment(request_id)
+    order_comment = _orders._short_comment(request_id)
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         # Verify account still matches
         ai = (snap.get("account") or {})
         if int(ai.get("login") or 0) != int(login) or str(ai.get("server") or "") != str(server):
@@ -1544,7 +1616,7 @@ def _execute_new_order(request: Mapping[str, Any]) -> CanonicalResponse:
             price=price,
             sl=sl,
             tp=tp,
-            comment=comment,
+            comment=order_comment,
         )
         if result.get("ambiguous"):
             return _failure(operation, alias, "AMBIGUOUS_EXECUTION", "Order outcome unknown; reconcile before retry.")
@@ -1556,11 +1628,25 @@ def _execute_new_order(request: Mapping[str, Any]) -> CanonicalResponse:
                 result["reconcile"] = recon
         if not result.get("ok"):
             code = str(result.get("error") or "ORDER_REJECTED")
+            fail_comment = str(result.get("comment") or code)
+            ret = result.get("retcode")
+            try:
+                ret_i = int(ret) if ret is not None else None
+            except (TypeError, ValueError):
+                ret_i = None
+            # Never bypass; clarify broker-side autotrading block if server still rejects.
+            if ret_i == 10026 or "autotrading disabled by server" in fail_comment.lower():
+                code = "BROKER_AUTOTRADING_DISABLED"
+                fail_comment = (
+                    f"MT5 retcode 10026 (AutoTrading disabled by server) for {login}@{server}. "
+                    f"Broker must enable algorithmic/EA trading on this account. "
+                    f"Hermes does not bypass this restriction. Detail: {fail_comment}"
+                )
             return _failure(
                 operation,
                 alias,
                 code,
-                sanitize_error_message(str(result.get("comment") or code)),
+                sanitize_error_message(fail_comment),
                 exchange_reason=str(result.get("retcode")),
             )
         order = CanonicalOrderResult(
@@ -1609,6 +1695,9 @@ def _execute_modify_order(request: Mapping[str, Any]) -> CanonicalResponse:
         )
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         result = _orders.order_modify_pending(client, ticket=ticket, price=price, sl=sl_d, tp=tp_d)
         if result.get("ambiguous"):
             return _failure(operation, alias, "AMBIGUOUS_EXECUTION", "Modify outcome unknown; reconcile before retry.")
@@ -1640,6 +1729,9 @@ def _execute_cancel_order(request: Mapping[str, Any]) -> CanonicalResponse:
         return _failure(operation, account, "INVALID_ORDER_TICKET", "order_ticket must be a positive integer.")
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         result = _orders.order_cancel(client, ticket=ticket)
         if result.get("ambiguous"):
             return _failure(operation, alias, "AMBIGUOUS_EXECUTION", "Cancel outcome unknown; reconcile before retry.")
@@ -1670,6 +1762,9 @@ def _execute_cancel_orders(request: Mapping[str, Any]) -> CanonicalResponse:
     ladder_id = str(request.get("ladder_id") or "").strip()
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         orders = _orders.list_account_orders(client, symbol=symbol)
         matched = []
         for o in orders:
@@ -1769,6 +1864,9 @@ def _execute_ladder(request: Mapping[str, Any]) -> CanonicalResponse:
     ladder_id = str(request.get("ladder_id") or request_id)
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         # Freeze account identity for the whole ladder
         locked_login, locked_server = int(login), str(server)
         meta = _orders.remote_symbol_trade_meta(client, symbol)
@@ -1912,6 +2010,9 @@ def _execute_position_action(request: Mapping[str, Any], operation: str) -> Cano
     side = _side_norm(request.get("side"))
 
     def run(client, snap, alias, login, server):
+        blocked = _automated_trading_block(snap, operation, alias)
+        if blocked is not None:
+            return blocked
         nonlocal ticket
         if ticket <= 0:
             # resolve single ticket by symbol+side if exactly one match
