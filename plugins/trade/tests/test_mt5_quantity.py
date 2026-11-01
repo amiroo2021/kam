@@ -5,7 +5,7 @@ import unittest
 from decimal import Decimal
 from unittest import mock
 
-from plugins.trade.mt5_quantity import (
+from plugins.trade.agents.x_mt5linux_agent import (
     ContractSpec,
     build_quantity_plan,
     convert_user_quantity,

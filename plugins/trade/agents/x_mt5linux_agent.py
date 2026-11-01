@@ -33,8 +33,11 @@ import re
 import sys
 import threading
 import time
+import uuid
+import json
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
@@ -55,7 +58,6 @@ from ..canonical import (
     sanitize_error_message,
 )
 from ..ladder_math import build_ladder_children
-from . import _mt5linux_orders as _orders
 
 logger = logging.getLogger(__name__)
 
@@ -1051,6 +1053,8 @@ def _symbol_info_remote(client: Any, symbol: str) -> Optional[Dict[str, Any]]:
     code = f"""
 import MetaTrader5 as m
 import time
+import uuid
+import json
 sym = {symbol!r}
 m.symbol_select(sym, True)
 info = m.symbol_info(sym)
@@ -2129,3 +2133,976 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     if operation in _READ_OPS:
         return _failure(operation, account, "NOT_IMPLEMENTED", f"MT5Linux read operation {operation!r} is not implemented.")
     return _failure(operation, account, "NOT_IMPLEMENTED", f"MT5Linux does not implement {operation!r}.")
+
+
+# ---------------------------------------------------------------------------
+# Quantity conversion (formerly mt5_quantity.py) — underlying units ↔ lots
+# ---------------------------------------------------------------------------
+
+
+
+def _qty_dec(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, Decimal):
+            d = value
+        elif isinstance(value, float):
+            d = Decimal(str(value))
+        else:
+            text = str(value).strip().replace(",", "")
+            if not text:
+                return None
+            d = Decimal(text)
+        if not d.is_finite():
+            return None
+        return d
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _qty_fmt(d: Decimal) -> str:
+    text = format(d.normalize(), "f") if d != 0 else "0"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+# Quote suffixes stripped when deriving a crypto base ticker from the symbol name.
+_QUOTE_SUFFIXES = (
+    "USDT",
+    "USDC",
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY",
+    "AUD",
+    "CAD",
+    "CHF",
+    "NZD",
+)
+
+
+@dataclass(frozen=True)
+class ContractSpec:
+    symbol: str
+    contract_size: Decimal
+    volume_min: Decimal
+    volume_max: Decimal
+    volume_step: Decimal
+    currency_base: str = ""
+    currency_profit: str = ""
+    description: str = ""
+    path: str = ""
+    trade_calc_mode: Optional[int] = None
+    digits: Optional[int] = None
+
+    @classmethod
+    def from_mapping(cls, symbol: str, info: Mapping[str, Any]) -> Optional["ContractSpec"]:
+        contract = _qty_dec(info.get("trade_contract_size") if "trade_contract_size" in info else info.get("contract_size"))
+        vmin = _qty_dec(info.get("volume_min") if "volume_min" in info else info.get("minimum_size"))
+        vmax = _qty_dec(info.get("volume_max") if "volume_max" in info else info.get("maximum_size"))
+        vstep = _qty_dec(info.get("volume_step") if "volume_step" in info else info.get("size_increment"))
+        if contract is None or contract <= 0:
+            return None
+        if vmin is None or vmin <= 0:
+            vmin = Decimal("0.01")
+        if vstep is None or vstep <= 0:
+            vstep = vmin
+        if vmax is None or vmax <= 0:
+            vmax = Decimal("100")
+        tcm = info.get("trade_calc_mode")
+        try:
+            tcm_i = int(tcm) if tcm is not None else None
+        except (TypeError, ValueError):
+            tcm_i = None
+        dig = info.get("digits")
+        try:
+            dig_i = int(dig) if dig is not None else None
+        except (TypeError, ValueError):
+            dig_i = None
+        return cls(
+            symbol=str(info.get("name") or symbol or "").strip() or str(symbol),
+            contract_size=contract,
+            volume_min=vmin,
+            volume_max=vmax,
+            volume_step=vstep,
+            currency_base=str(info.get("currency_base") or "").strip(),
+            currency_profit=str(info.get("currency_profit") or "").strip(),
+            description=str(info.get("description") or "").strip(),
+            path=str(info.get("path") or "").strip(),
+            trade_calc_mode=tcm_i,
+            digits=dig_i,
+        )
+
+
+def _symbol_base_guess(symbol: str) -> str:
+    up = str(symbol or "").strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+    if not up:
+        return ""
+    if up.startswith("XAU"):
+        return "XAU"
+    if up.startswith("XAG"):
+        return "XAG"
+    for suf in _QUOTE_SUFFIXES:
+        if up.endswith(suf) and len(up) > len(suf):
+            return up[: -len(suf)]
+    return up
+
+
+def infer_unit_label(spec: ContractSpec) -> Tuple[str, str]:
+    """Return (unit_label, mode) where mode is 'underlying' or 'lots'.
+
+    Crypto CFD paths / familiar crypto tickers → base asset tokens.
+    Forex (calc mode 0 or known FX pairs) → base currency units.
+    Metals XAU/XAG → troy oz label.
+    Otherwise → broker lots (do not invent a token name).
+    """
+    path_u = (spec.path or "").upper().replace("\\", "/")
+    sym_u = (spec.symbol or "").upper()
+    base_guess = _symbol_base_guess(spec.symbol)
+    desc_u = (spec.description or "").upper()
+
+    is_crypto = (
+        "CRYPTO" in path_u
+        or base_guess
+        in {
+            "BTC",
+            "ETH",
+            "SOL",
+            "HYPE",
+            "ZEC",
+            "XRP",
+            "ADA",
+            "DOGE",
+            "LTC",
+            "BNB",
+            "DOT",
+            "AVAX",
+            "LINK",
+            "MATIC",
+            "UNI",
+            "ATOM",
+            "NEAR",
+            "APT",
+            "ARB",
+            "OP",
+            "SUI",
+            "TIA",
+            "INJ",
+            "FIL",
+            "AAVE",
+            "MKR",
+            "CRV",
+            "PEPE",
+            "WIF",
+            "BONK",
+            "SHIB",
+            "TRX",
+            "TON",
+            "VET",
+            "THT",
+            "BCH",
+            "ETC",
+            "XLM",
+            "ALGO",
+            "ICP",
+            "FTM",
+            "SAND",
+            "MANA",
+            "AXS",
+            "GALA",
+            "IMX",
+            "RENDER",
+            "FET",
+            "TAO",
+        }
+        or any(tok in desc_u for tok in ("BITCOIN", "ETHEREUM", "SOLANA", "CRYPTO"))
+    )
+    if is_crypto and base_guess:
+        return base_guess, "underlying"
+
+    if base_guess in {"XAU", "XAG"} or "XAU" in sym_u or "XAG" in sym_u or "GOLD" in desc_u or "SILVER" in desc_u:
+        # Contract size is ounces (or grams on some brokers) — still a real underlying unit.
+        metal = "XAU" if ("XAU" in sym_u or "GOLD" in desc_u) else "XAG"
+        return f"{metal} oz", "underlying"
+
+    # Forex: calc mode 0 (Forex) or EURUSD-style with currency_base matching left side.
+    if spec.trade_calc_mode == 0 or (
+        spec.currency_base
+        and base_guess
+        and spec.currency_base.upper() == base_guess
+        and len(base_guess) == 3
+        and base_guess.isalpha()
+    ):
+        unit = (spec.currency_base or base_guess).upper()
+        if unit:
+            return unit, "underlying"
+
+    return "lot", "lots"
+
+
+@dataclass(frozen=True)
+class QuantityPlan:
+    mode: str  # underlying | lots
+    unit_label: str
+    contract_size: Decimal
+    volume_min_lots: Decimal
+    volume_max_lots: Decimal
+    volume_step_lots: Decimal
+    min_underlying: Optional[Decimal]
+    step_underlying: Optional[Decimal]
+    max_underlying: Optional[Decimal]
+
+    @property
+    def prompt_label(self) -> str:
+        if self.mode == "underlying":
+            # "SOL" → "SOL tokens"; "EUR" stays "EUR"; "XAU oz" stays.
+            unit = self.unit_label
+            if unit.endswith(" oz") or unit.upper() in {"EUR", "GBP", "AUD", "CAD", "CHF", "NZD", "JPY", "USD"}:
+                return f"Enter Volume ({unit}):"
+            if len(unit) <= 6 and unit.isalpha():
+                return f"Enter Volume ({unit} tokens):"
+            return f"Enter Volume ({unit}):"
+        return "Enter Volume (MT5 lots):"
+
+    def help_lines(self) -> list[str]:
+        lines: list[str] = []
+        if self.mode == "underlying" and self.min_underlying is not None and self.step_underlying is not None:
+            lines.append(
+                f"Minimum: {_qty_fmt(self.min_underlying)} {self.unit_label} = {_qty_fmt(self.volume_min_lots)} MT5 lots"
+            )
+            lines.append(
+                f"Increment: {_qty_fmt(self.step_underlying)} {self.unit_label} = {_qty_fmt(self.volume_step_lots)} MT5 lots"
+            )
+            lines.append(
+                f"Contract size: {_qty_fmt(self.contract_size)} {self.unit_label} per lot"
+            )
+            if self.max_underlying is not None:
+                lines.append(
+                    f"Maximum: {_qty_fmt(self.max_underlying)} {self.unit_label} = {_qty_fmt(self.volume_max_lots)} MT5 lots"
+                )
+        else:
+            lines.append(f"Minimum: {_qty_fmt(self.volume_min_lots)} lots")
+            lines.append(f"Increment: {_qty_fmt(self.volume_step_lots)} lots")
+            lines.append(f"Contract size: {_qty_fmt(self.contract_size)} (broker units per lot)")
+            lines.append(f"Maximum: {_qty_fmt(self.volume_max_lots)} lots")
+        return lines
+
+
+def build_quantity_plan(spec: ContractSpec) -> QuantityPlan:
+    unit, mode = infer_unit_label(spec)
+    if mode == "underlying":
+        return QuantityPlan(
+            mode=mode,
+            unit_label=unit,
+            contract_size=spec.contract_size,
+            volume_min_lots=spec.volume_min,
+            volume_max_lots=spec.volume_max,
+            volume_step_lots=spec.volume_step,
+            min_underlying=spec.volume_min * spec.contract_size,
+            step_underlying=spec.volume_step * spec.contract_size,
+            max_underlying=spec.volume_max * spec.contract_size,
+        )
+    return QuantityPlan(
+        mode="lots",
+        unit_label="lot",
+        contract_size=spec.contract_size,
+        volume_min_lots=spec.volume_min,
+        volume_max_lots=spec.volume_max,
+        volume_step_lots=spec.volume_step,
+        min_underlying=None,
+        step_underlying=None,
+        max_underlying=None,
+    )
+
+
+def lots_to_underlying(lots: Decimal, contract_size: Decimal) -> Decimal:
+    return lots * contract_size
+
+
+def underlying_to_lots(underlying: Decimal, contract_size: Decimal) -> Decimal:
+    if contract_size <= 0:
+        raise ValueError("contract_size must be positive")
+    return underlying / contract_size
+
+
+def _quantize_to_step(lots: Decimal, step: Decimal, *, rounding=ROUND_HALF_UP) -> Decimal:
+    if step <= 0:
+        return lots
+    units = (lots / step).to_integral_value(rounding=rounding)
+    return units * step
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    ok: bool
+    lots: Optional[Decimal]
+    underlying: Optional[Decimal]
+    mode: str
+    unit_label: str
+    message: str = ""
+    nearest_lots: Optional[Decimal] = None
+    nearest_underlying: Optional[Decimal] = None
+
+
+def convert_user_quantity(user_value: Any, plan: QuantityPlan) -> ConversionResult:
+    """Convert a user-entered quantity into broker lots.
+
+    Never silently changes exposure: if the exact lot size is off-step or out of
+    range, ok=False and nearest valid quantities are suggested.
+    """
+    raw = _qty_dec(user_value)
+    if raw is None or raw <= 0:
+        return ConversionResult(
+            ok=False,
+            lots=None,
+            underlying=None,
+            mode=plan.mode,
+            unit_label=plan.unit_label,
+            message="Please enter a positive numeric value.",
+        )
+
+    if plan.mode == "underlying":
+        underlying = raw
+        lots = underlying_to_lots(underlying, plan.contract_size)
+        display_underlying = underlying
+    else:
+        lots = raw
+        underlying = lots_to_underlying(lots, plan.contract_size) if plan.contract_size > 0 else None
+        display_underlying = underlying
+
+    # Exact step check (no silent rounding).
+    step = plan.volume_step_lots
+    if step > 0:
+        ratio = lots / step
+        if ratio != ratio.to_integral_value(rounding=ROUND_DOWN):
+            down = _quantize_to_step(lots, step, rounding=ROUND_DOWN)
+            up = down + step
+            # clamp suggestions into [min,max]
+            cands = []
+            for cand in (down, up):
+                if cand < plan.volume_min_lots or cand > plan.volume_max_lots:
+                    continue
+                if cand <= 0:
+                    continue
+                cands.append(cand)
+            msg = (
+                f"{_qty_fmt(raw)} {plan.unit_label} is not a valid broker increment "
+                f"(step {_qty_fmt(plan.step_underlying or step)} {plan.unit_label})."
+            )
+            if cands:
+                parts = []
+                for c in cands:
+                    u = lots_to_underlying(c, plan.contract_size) if plan.mode == "underlying" else c
+                    if plan.mode == "underlying":
+                        parts.append(f"{_qty_fmt(u)} {plan.unit_label} ({_qty_fmt(c)} lots)")
+                    else:
+                        parts.append(f"{_qty_fmt(c)} lots")
+                msg += " Closest valid: " + " or ".join(parts) + "."
+            nearest = cands[0] if cands else None
+            return ConversionResult(
+                ok=False,
+                lots=None,
+                underlying=display_underlying,
+                mode=plan.mode,
+                unit_label=plan.unit_label,
+                message=msg,
+                nearest_lots=nearest,
+                nearest_underlying=(
+                    lots_to_underlying(nearest, plan.contract_size) if nearest is not None else None
+                ),
+            )
+
+    if lots < plan.volume_min_lots:
+        return ConversionResult(
+            ok=False,
+            lots=None,
+            underlying=display_underlying,
+            mode=plan.mode,
+            unit_label=plan.unit_label,
+            message=(
+                f"Below minimum: need at least {_qty_fmt(plan.min_underlying or plan.volume_min_lots)} "
+                f"{plan.unit_label if plan.mode == 'underlying' else 'lots'} "
+                f"({_qty_fmt(plan.volume_min_lots)} MT5 lots)."
+            ),
+            nearest_lots=plan.volume_min_lots,
+            nearest_underlying=plan.min_underlying,
+        )
+    if lots > plan.volume_max_lots:
+        return ConversionResult(
+            ok=False,
+            lots=None,
+            underlying=display_underlying,
+            mode=plan.mode,
+            unit_label=plan.unit_label,
+            message=(
+                f"Above maximum: at most {_qty_fmt(plan.max_underlying or plan.volume_max_lots)} "
+                f"{plan.unit_label if plan.mode == 'underlying' else 'lots'} "
+                f"({_qty_fmt(plan.volume_max_lots)} MT5 lots)."
+            ),
+            nearest_lots=plan.volume_max_lots,
+            nearest_underlying=plan.max_underlying,
+        )
+
+    return ConversionResult(
+        ok=True,
+        lots=lots,
+        underlying=display_underlying if plan.mode == "underlying" else underlying,
+        mode=plan.mode,
+        unit_label=plan.unit_label,
+        message="",
+    )
+
+
+def format_volume_confirm(result: ConversionResult, plan: QuantityPlan) -> list[str]:
+    if not result.ok or result.lots is None:
+        return []
+    lines = []
+    if plan.mode == "underlying" and result.underlying is not None:
+        lines.append(f"Volume: {_qty_fmt(result.underlying)} {plan.unit_label}")
+        lines.append(f"MT5 volume: {_qty_fmt(result.lots)} lot" + ("s" if result.lots != 1 else ""))
+    else:
+        lines.append(f"Volume: {_qty_fmt(result.lots)} MT5 lots")
+        if result.underlying is not None and plan.contract_size > 0:
+            lines.append(f"Contract exposure: {_qty_fmt(result.underlying)} (×{_qty_fmt(plan.contract_size)} per lot)")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Write-path helpers (formerly _mt5linux_orders.py) — order_send / ladders
+# ---------------------------------------------------------------------------
+
+
+
+# Match MetaTrader agent magic for cross-tool visibility where useful.
+MT5LINUX_MAGIC = 26092601
+
+# MT5 enums (mirror MetaTrader5 package constants)
+ORDER_TYPE_BUY = 0
+ORDER_TYPE_SELL = 1
+ORDER_TYPE_BUY_LIMIT = 2
+ORDER_TYPE_SELL_LIMIT = 3
+ORDER_TYPE_BUY_STOP = 4
+ORDER_TYPE_SELL_STOP = 5
+
+TRADE_ACTION_DEAL = 1
+TRADE_ACTION_PENDING = 5
+TRADE_ACTION_SLTP = 6
+TRADE_ACTION_MODIFY = 7
+TRADE_ACTION_REMOVE = 8
+
+ORDER_TIME_GTC = 0
+ORDER_FILLING_FOK = 0
+ORDER_FILLING_IOC = 1
+ORDER_FILLING_RETURN = 2
+
+# Trade retcodes considered success
+_RETCODE_DONE = {10008, 10009}  # PLACED, DONE
+_RETCODE_DONE_PARTIAL = {10010}  # DONE_PARTIAL
+
+
+def _orders_hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+
+def ladder_store_dir() -> Path:
+    d = _hermes_home() / "mt5linux" / "ladders"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ord_dec(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float):
+            d = Decimal(str(value))
+        elif isinstance(value, Decimal):
+            d = value
+        else:
+            d = Decimal(str(value).strip().replace(",", ""))
+        if not d.is_finite():
+            return None
+        return d
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _ord_dec_text(value: Any) -> str:
+    d = _ord_dec(value)
+    if d is None:
+        return "0"
+    return format(d, "f")
+
+
+def _json_num(value: Decimal) -> float | int:
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
+def _short_comment(request_id: str) -> str:
+    return "XL:" + str(request_id).replace("-", "")[:12]
+
+
+def _coerce_request_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 8:
+        return text
+    return str(uuid.uuid4())
+
+
+def remote_symbol_trade_meta(client: Any, symbol: str) -> Dict[str, Any]:
+    """Fetch trade constraints for symbol (must run under lock)."""
+    code = f"""
+import MetaTrader5 as m
+sym = {symbol!r}
+info = m.symbol_info(sym)
+if info is None:
+    m.symbol_select(sym, True)
+    info = m.symbol_info(sym)
+tick = m.symbol_info_tick(sym)
+meta = None
+if info is not None:
+    filling = int(getattr(info, 'filling_mode', 0) or 0)
+    # Prefer RETURN, then IOC, then FOK based on symbol flags (bitmask).
+    # SYMBOL_FILLING_FOK=1, IOC=2, RETURN=4 in many builds — try RETURN first.
+    fill_mode = 2  # ORDER_FILLING_RETURN default try
+    if filling & 4:
+        fill_mode = 2
+    elif filling & 2:
+        fill_mode = 1
+    elif filling & 1:
+        fill_mode = 0
+    meta = {{
+        'name': str(info.name),
+        'digits': int(info.digits),
+        'point': float(info.point),
+        'trade_tick_size': float(getattr(info, 'trade_tick_size', 0) or info.point or 0),
+        'volume_min': float(getattr(info, 'volume_min', 0) or 0),
+        'volume_max': float(getattr(info, 'volume_max', 0) or 0),
+        'volume_step': float(getattr(info, 'volume_step', 0) or 0),
+        'trade_stops_level': int(getattr(info, 'trade_stops_level', 0) or 0),
+        'trade_freeze_level': int(getattr(info, 'trade_freeze_level', 0) or 0),
+        'trade_contract_size': float(getattr(info, 'trade_contract_size', 0) or 0),
+        'filling_mode_flags': filling,
+        'filling_mode': fill_mode,
+        'trade_mode': int(getattr(info, 'trade_mode', 0) or 0),
+        'bid': float(tick.bid) if tick is not None else None,
+        'ask': float(tick.ask) if tick is not None else None,
+    }}
+trade_meta = meta
+"""
+    client.execute(code)
+    meta = client.eval("trade_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _normalize_volume(volume: Decimal, meta: Mapping[str, Any]) -> Decimal:
+    step = _ord_dec(meta.get("volume_step")) or Decimal("0.01")
+    vmin = _ord_dec(meta.get("volume_min")) or step
+    vmax = _ord_dec(meta.get("volume_max")) or Decimal("1000")
+    if step <= 0:
+        step = Decimal("0.01")
+    units = (volume / step).to_integral_value(rounding=ROUND_DOWN)
+    out = units * step
+    if out < vmin:
+        out = vmin
+    if out > vmax:
+        out = vmax
+    return out
+
+
+def _normalize_price(price: Decimal, meta: Mapping[str, Any]) -> Decimal:
+    tick = _ord_dec(meta.get("trade_tick_size")) or _ord_dec(meta.get("point")) or Decimal("0.01")
+    if tick <= 0:
+        return price
+    units = (price / tick).to_integral_value(rounding=ROUND_DOWN)
+    # half-up via +0.5 tick when remainder large — keep ROUND_DOWN then optional adjust
+    rem = price - units * tick
+    if rem >= tick / 2:
+        units += 1
+    return units * tick
+
+
+def _map_order_type(side: str, order_type: str) -> Optional[int]:
+    side_u = side.upper()
+    ot = order_type.upper().replace("-", "_").replace(" ", "_")
+    if ot in {"LIMIT", "BUY_LIMIT", "SELL_LIMIT"}:
+        if side_u == "BUY":
+            return ORDER_TYPE_BUY_LIMIT
+        if side_u == "SELL":
+            return ORDER_TYPE_SELL_LIMIT
+    if ot in {"STOP", "BUY_STOP", "SELL_STOP"}:
+        if side_u == "BUY":
+            return ORDER_TYPE_BUY_STOP
+        if side_u == "SELL":
+            return ORDER_TYPE_SELL_STOP
+    if ot in {"BUY_LIMIT"}:
+        return ORDER_TYPE_BUY_LIMIT
+    if ot in {"SELL_LIMIT"}:
+        return ORDER_TYPE_SELL_LIMIT
+    if ot in {"BUY_STOP"}:
+        return ORDER_TYPE_BUY_STOP
+    if ot in {"SELL_STOP"}:
+        return ORDER_TYPE_SELL_STOP
+    return None
+
+
+def order_send_pending(
+    client: Any,
+    *,
+    symbol: str,
+    side: str,
+    order_type: str,
+    volume: Decimal,
+    price: Decimal,
+    sl: Optional[Decimal] = None,
+    tp: Optional[Decimal] = None,
+    comment: str = "",
+    magic: int = MT5LINUX_MAGIC,
+    expiration: int = 0,
+) -> Dict[str, Any]:
+    """Place a pending LIMIT/STOP order. Returns result dict (never raises on broker reject)."""
+    meta = remote_symbol_trade_meta(client, symbol)
+    if not meta:
+        return {"ok": False, "retcode": -1, "comment": "symbol not found", "error": "INSTRUMENT_NOT_FOUND"}
+    otype = _map_order_type(side, order_type)
+    if otype is None:
+        return {"ok": False, "retcode": -1, "error": "UNSUPPORTED_ORDER_TYPE", "comment": f"bad type {order_type}"}
+    vol = _normalize_volume(volume, meta)
+    px = _normalize_price(price, meta)
+    sl_v = float(_normalize_price(sl, meta)) if sl is not None and sl > 0 else 0.0
+    tp_v = float(_normalize_price(tp, meta)) if tp is not None and tp > 0 else 0.0
+    fill = int(meta.get("filling_mode") or ORDER_FILLING_RETURN)
+    code = f"""
+import MetaTrader5 as m
+req = {{
+    'action': {TRADE_ACTION_PENDING},
+    'symbol': {str(meta.get('name') or symbol)!r},
+    'volume': {float(vol)},
+    'type': {int(otype)},
+    'price': {float(px)},
+    'sl': {sl_v},
+    'tp': {tp_v},
+    'deviation': 20,
+    'magic': {int(magic)},
+    'comment': {str(comment)[:31]!r},
+    'type_time': {ORDER_TIME_GTC},
+    'type_filling': {fill},
+}}
+if {int(expiration)} > 0:
+    req['type_time'] = m.ORDER_TIME_SPECIFIED if hasattr(m, 'ORDER_TIME_SPECIFIED') else 1
+    req['expiration'] = {int(expiration)}
+result = m.order_send(req)
+out = None
+if result is None:
+    out = {{'ok': False, 'retcode': -1, 'comment': str(m.last_error()), 'order': 0, 'deal': 0, 'request': req}}
+else:
+    out = {{
+        'ok': bool(result.retcode in (m.TRADE_RETCODE_DONE, m.TRADE_RETCODE_PLACED, 10008, 10009, 10010)),
+        'retcode': int(result.retcode),
+        'comment': str(result.comment),
+        'order': int(result.order),
+        'deal': int(getattr(result, 'deal', 0) or 0),
+        'volume': float(getattr(result, 'volume', 0) or 0),
+        'price': float(getattr(result, 'price', 0) or 0),
+        'request_id': int(getattr(result, 'request_id', 0) or 0),
+        'retcode_external': int(getattr(result, 'retcode_external', 0) or 0),
+    }}
+order_send_out = out
+"""
+    try:
+        client.execute(code)
+        out = client.eval("order_send_out")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "retcode": -2,
+            "error": "AMBIGUOUS_EXECUTION",
+            "comment": f"order_send transport error: {type(exc).__name__}",
+            "ambiguous": True,
+        }
+    if not isinstance(out, dict):
+        return {"ok": False, "retcode": -1, "error": "MALFORMED_RESULT", "comment": "bad remote result"}
+    out.setdefault("symbol", meta.get("name") or symbol)
+    out.setdefault("side", side.upper())
+    out.setdefault("order_type", order_type.upper())
+    out.setdefault("requested_volume", float(volume))
+    out.setdefault("submitted_volume", float(vol))
+    out.setdefault("requested_price", float(price))
+    out.setdefault("submitted_price", float(px))
+    out.setdefault("magic", magic)
+    out.setdefault("comment_sent", comment[:31])
+    return out
+
+
+def order_modify_pending(
+    client: Any,
+    *,
+    ticket: int,
+    price: Optional[Decimal] = None,
+    sl: Optional[Decimal] = None,
+    tp: Optional[Decimal] = None,
+    volume: Optional[Decimal] = None,
+) -> Dict[str, Any]:
+    if volume is not None:
+        return {
+            "ok": False,
+            "retcode": -1,
+            "error": "UNSUPPORTED_PARAMETER",
+            "comment": "Pending order volume modification is not supported via MT5 trade modify; cancel and replace.",
+        }
+    code = f"""
+import MetaTrader5 as m
+ticket = {int(ticket)}
+orders = m.orders_get(ticket=ticket)
+if not orders:
+    order_mod_out = {{'ok': False, 'retcode': -1, 'error': 'ORDER_NOT_FOUND', 'comment': 'pending order not found'}}
+else:
+    o = orders[0]
+    info = m.symbol_info(o.symbol)
+    price = {float(price) if price is not None else 'None'}
+    sl = {float(sl) if sl is not None else 'None'}
+    tp = {float(tp) if tp is not None else 'None'}
+    req = {{
+        'action': {TRADE_ACTION_MODIFY},
+        'order': ticket,
+        'symbol': str(o.symbol),
+        'volume': float(o.volume_current),
+        'price': float(o.price_open) if price is None else float(price),
+        'sl': float(o.sl) if sl is None else float(sl),
+        'tp': float(o.tp) if tp is None else float(tp),
+        'type_time': int(o.type_time),
+        'type_filling': int(getattr(o, 'type_filling', 0) or 0),
+        'magic': int(o.magic),
+        'comment': str(o.comment)[:31],
+    }}
+    if int(o.time_expiration or 0) > 0:
+        req['expiration'] = int(o.time_expiration)
+    result = m.order_send(req)
+    if result is None:
+        order_mod_out = {{'ok': False, 'retcode': -1, 'comment': str(m.last_error())}}
+    else:
+        order_mod_out = {{
+            'ok': bool(result.retcode in (m.TRADE_RETCODE_DONE, m.TRADE_RETCODE_PLACED, 10008, 10009)),
+            'retcode': int(result.retcode),
+            'comment': str(result.comment),
+            'order': int(result.order or ticket),
+        }}
+"""
+    try:
+        client.execute(code)
+        out = client.eval("order_mod_out")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "retcode": -2, "error": "AMBIGUOUS_EXECUTION", "ambiguous": True, "comment": type(exc).__name__}
+    return out if isinstance(out, dict) else {"ok": False, "error": "MALFORMED_RESULT"}
+
+
+def order_cancel(client: Any, *, ticket: int) -> Dict[str, Any]:
+    code = f"""
+import MetaTrader5 as m
+ticket = {int(ticket)}
+req = {{'action': {TRADE_ACTION_REMOVE}, 'order': ticket}}
+result = m.order_send(req)
+if result is None:
+    order_cancel_out = {{'ok': False, 'retcode': -1, 'comment': str(m.last_error()), 'order': ticket}}
+else:
+    order_cancel_out = {{
+        'ok': bool(result.retcode in (m.TRADE_RETCODE_DONE, m.TRADE_RETCODE_PLACED, 10008, 10009)),
+        'retcode': int(result.retcode),
+        'comment': str(result.comment),
+        'order': int(result.order or ticket),
+    }}
+"""
+    try:
+        client.execute(code)
+        out = client.eval("order_cancel_out")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "retcode": -2, "error": "AMBIGUOUS_EXECUTION", "ambiguous": True, "comment": type(exc).__name__}
+    return out if isinstance(out, dict) else {"ok": False, "error": "MALFORMED_RESULT"}
+
+
+def position_set_sltp(client: Any, *, ticket: int, sl: Optional[Decimal], tp: Optional[Decimal]) -> Dict[str, Any]:
+    code = f"""
+import MetaTrader5 as m
+ticket = {int(ticket)}
+positions = m.positions_get(ticket=ticket)
+if not positions:
+    pos_sltp_out = {{'ok': False, 'retcode': -1, 'error': 'POSITION_NOT_FOUND', 'comment': 'position not found'}}
+else:
+    p = positions[0]
+    sl = {float(sl) if sl is not None else 'None'}
+    tp = {float(tp) if tp is not None else 'None'}
+    req = {{
+        'action': {TRADE_ACTION_SLTP},
+        'position': ticket,
+        'symbol': str(p.symbol),
+        'sl': float(p.sl) if sl is None else float(sl),
+        'tp': float(p.tp) if tp is None else float(tp),
+        'magic': int(p.magic),
+    }}
+    result = m.order_send(req)
+    if result is None:
+        pos_sltp_out = {{'ok': False, 'retcode': -1, 'comment': str(m.last_error())}}
+    else:
+        pos_sltp_out = {{
+            'ok': bool(result.retcode in (m.TRADE_RETCODE_DONE, m.TRADE_RETCODE_PLACED, 10008, 10009)),
+            'retcode': int(result.retcode),
+            'comment': str(result.comment),
+            'position': ticket,
+            'symbol': str(p.symbol),
+            'side': 'BUY' if int(p.type)==0 else 'SELL',
+            'sl': req['sl'],
+            'tp': req['tp'],
+        }}
+"""
+    try:
+        client.execute(code)
+        out = client.eval("pos_sltp_out")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "retcode": -2, "error": "AMBIGUOUS_EXECUTION", "ambiguous": True, "comment": type(exc).__name__}
+    return out if isinstance(out, dict) else {"ok": False, "error": "MALFORMED_RESULT"}
+
+
+def position_close(client: Any, *, ticket: int, volume: Optional[Decimal] = None) -> Dict[str, Any]:
+    """Full or partial close by ticket (hedging-safe)."""
+    vol_expr = "None" if volume is None else str(float(volume))
+    code = f"""
+import MetaTrader5 as m
+ticket = {int(ticket)}
+positions = m.positions_get(ticket=ticket)
+if not positions:
+    pos_close_out = {{'ok': False, 'retcode': -1, 'error': 'POSITION_NOT_FOUND', 'comment': 'position not found'}}
+else:
+    p = positions[0]
+    vol = {vol_expr}
+    if vol is None or vol <= 0 or vol >= float(p.volume):
+        close_vol = float(p.volume)
+    else:
+        close_vol = float(vol)
+    # opposite deal
+    otype = m.ORDER_TYPE_SELL if int(p.type)==0 else m.ORDER_TYPE_BUY
+    info = m.symbol_info(p.symbol)
+    tick = m.symbol_info_tick(p.symbol)
+    price = float(tick.bid if int(p.type)==0 else tick.ask) if tick is not None else 0.0
+    filling = int(getattr(info, 'filling_mode', 0) or 0) if info is not None else 0
+    fill_mode = 2 if filling & 4 else (1 if filling & 2 else 0)
+    req = {{
+        'action': {TRADE_ACTION_DEAL},
+        'position': ticket,
+        'symbol': str(p.symbol),
+        'volume': close_vol,
+        'type': otype,
+        'price': price,
+        'deviation': 30,
+        'magic': int(p.magic),
+        'comment': 'XL:close',
+        'type_time': m.ORDER_TIME_GTC,
+        'type_filling': fill_mode,
+    }}
+    result = m.order_send(req)
+    if result is None:
+        pos_close_out = {{'ok': False, 'retcode': -1, 'comment': str(m.last_error()), 'ambiguous': False}}
+    else:
+        pos_close_out = {{
+            'ok': bool(result.retcode in (m.TRADE_RETCODE_DONE, m.TRADE_RETCODE_PLACED, 10008, 10009, 10010)),
+            'retcode': int(result.retcode),
+            'comment': str(result.comment),
+            'deal': int(getattr(result, 'deal', 0) or 0),
+            'order': int(getattr(result, 'order', 0) or 0),
+            'position': ticket,
+            'symbol': str(p.symbol),
+            'closed_volume': close_vol,
+            'side': 'BUY' if int(p.type)==0 else 'SELL',
+        }}
+"""
+    try:
+        client.execute(code)
+        out = client.eval("pos_close_out")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "retcode": -2, "error": "AMBIGUOUS_EXECUTION", "ambiguous": True, "comment": type(exc).__name__}
+    return out if isinstance(out, dict) else {"ok": False, "error": "MALFORMED_RESULT"}
+
+
+def reconcile_order(client: Any, ticket: int) -> Optional[Dict[str, Any]]:
+    code = f"""
+import MetaTrader5 as m
+ticket = {int(ticket)}
+orders = m.orders_get(ticket=ticket)
+if orders:
+    o = orders[0]
+    recon = {{'present': True, 'ticket': int(o.ticket), 'symbol': str(o.symbol), 'type': int(o.type),
+              'volume': float(o.volume_current), 'price': float(o.price_open), 'sl': float(o.sl), 'tp': float(o.tp)}}
+else:
+    recon = {{'present': False, 'ticket': ticket}}
+"""
+    try:
+        client.execute(code)
+        out = client.eval("recon")
+        return out if isinstance(out, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def save_ladder_record(record: Mapping[str, Any]) -> Path:
+    ladder_id = str(record.get("ladder_id") or uuid.uuid4())
+    path = ladder_store_dir() / f"{ladder_id}.json"
+    payload = dict(record)
+    payload["ladder_id"] = ladder_id
+    payload["updated_at"] = time.time()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_ladder_record(ladder_id: str) -> Optional[Dict[str, Any]]:
+    path = ladder_store_dir() / f"{ladder_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def list_account_orders(client: Any, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    code = f"""
+import MetaTrader5 as m
+sym = {symbol!r}
+if sym:
+    rows = m.orders_get(symbol=sym) or ()
+else:
+    rows = m.orders_get() or ()
+ord_list = []
+for o in rows:
+    ord_list.append({{
+        'ticket': int(o.ticket), 'symbol': str(o.symbol), 'type': int(o.type),
+        'volume_current': float(o.volume_current), 'price_open': float(o.price_open),
+        'sl': float(o.sl), 'tp': float(o.tp), 'magic': int(o.magic), 'comment': str(o.comment),
+    }})
+"""
+    client.execute(code)
+    out = client.eval("ord_list")
+    return list(out) if isinstance(out, list) else []
+
+
+class _OrdersNS:
+    """Delegates to module globals so mock.patch on this module's functions works."""
+
+    _ALIASES = {
+        "_dec_text": "_ord_dec_text",
+        "_dec": "_ord_dec",
+    }
+
+    def __getattr__(self, name: str):
+        key = self._ALIASES.get(name, name)
+        try:
+            return globals()[key]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+_orders = _OrdersNS()
+

@@ -388,7 +388,7 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
 
     def test_new_order_limit_success_mocked(self) -> None:
         from plugins.trade.agents import x_mt5linux_agent as m
-        from plugins.trade.agents import _mt5linux_orders as orders
+        from plugins.trade.agents import x_mt5linux_agent as orders
 
         snap = {
             "account": {
@@ -442,7 +442,7 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
 
     def test_ladder_uniform_mocked(self) -> None:
         from plugins.trade.agents import x_mt5linux_agent as m
-        from plugins.trade.agents import _mt5linux_orders as orders
+        from plugins.trade.agents import x_mt5linux_agent as orders
 
         snap = {
             "account": {
@@ -515,7 +515,7 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
 
     def test_cancel_orders_group_mocked(self) -> None:
         from plugins.trade.agents import x_mt5linux_agent as m
-        from plugins.trade.agents import _mt5linux_orders as orders
+        from plugins.trade.agents import x_mt5linux_agent as orders
 
         snap = {
             "account": {
@@ -596,7 +596,7 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
 
     def test_set_tp_by_ticket_mocked(self) -> None:
         from plugins.trade.agents import x_mt5linux_agent as m
-        from plugins.trade.agents import _mt5linux_orders as orders
+        from plugins.trade.agents import x_mt5linux_agent as orders
 
         snap = {
             "account": {
@@ -641,9 +641,12 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
         self.assertEqual(resp.position_action.operation, "set_tp")
 
     def test_orders_module_no_password_literal(self) -> None:
-        src = (_REPO_ROOT / "plugins" / "trade" / "agents" / "_mt5linux_orders.py").read_text(encoding="utf-8")
-        self.assertNotRegex(src, r"(?i)password")
-        self.assertNotRegex(src, r"(?i)passwd")
+        src = (_REPO_ROOT / "plugins" / "trade" / "agents" / "x_mt5linux_agent.py").read_text(encoding="utf-8")
+        # Write-path helpers must not accept password kwargs.
+        self.assertNotRegex(src, r"def order_send_pending\([\s\S]*?password")
+        self.assertNotRegex(src, r"def order_cancel\([\s\S]*?password")
+        # order_send remote payloads must not embed password fields.
+        self.assertNotRegex(src, r"order_send\([^)]*password")
 
     def test_market_price_rejects_zero_quote(self) -> None:
         """Regression: unselected ETHUSD must not surface price 0."""

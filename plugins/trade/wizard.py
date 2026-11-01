@@ -1657,7 +1657,7 @@ class TradeWizard:
 
     def _fetch_mt5_contract_spec(self, exchange: str, account: str, symbol: str):
         """Live broker contract specs for mt5linux (read-only)."""
-        from plugins.trade.mt5_quantity import ContractSpec, build_quantity_plan
+        from plugins.trade.agents.x_mt5linux_agent import ContractSpec, build_quantity_plan
 
         if str(exchange or "").strip().lower() != "mt5linux":
             return None, None
@@ -1912,7 +1912,7 @@ class TradeWizard:
             return self._render_new_order_text_error(field, "Please enter a positive numeric value.")
         if state.state == "awaiting_volume":
             if self._is_mt5linux(state):
-                from plugins.trade.mt5_quantity import convert_user_quantity
+                from plugins.trade.agents.x_mt5linux_agent import convert_user_quantity
 
                 spec, plan = self._mt5_volume_plan_for_state(state, ladder=False)
                 if plan is None:
@@ -2279,7 +2279,7 @@ class TradeWizard:
             return self._render_ladder_total_volume(chat_key)
         if state.state == "awaiting_ladder_total_volume":
             if self._is_mt5linux(state):
-                from plugins.trade.mt5_quantity import convert_user_quantity
+                from plugins.trade.agents.x_mt5linux_agent import convert_user_quantity
 
                 spec, plan = self._mt5_volume_plan_for_state(state, ladder=True)
                 if plan is not None:
