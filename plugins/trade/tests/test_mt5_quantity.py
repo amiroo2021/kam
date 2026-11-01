@@ -130,6 +130,34 @@ class Mt5QuantityMathTests(unittest.TestCase):
         self.assertEqual(r.lots, Decimal("0.5"))
 
 
+
+    def test_hypeusd_puprime_plan(self) -> None:
+        plan = build_quantity_plan(
+            _spec(
+                symbol="HYPEUSD",
+                contract_size=Decimal("100"),
+                path=r"Cryptos\HYPEUSD",
+                description="Hyperliquid coin",
+            )
+        )
+        self.assertEqual(plan.mode, "underlying")
+        self.assertEqual(plan.unit_label, "HYPE")
+        self.assertEqual(plan.min_underlying, Decimal("1.00"))
+        self.assertIn("HYPE tokens", plan.prompt_label)
+
+    def test_remote_symbol_info_code_has_no_uuid_import(self) -> None:
+        from pathlib import Path as P
+        import re
+        src = (P(__file__).resolve().parents[1] / "agents" / "x_mt5linux_agent.py").read_text(encoding="utf-8")
+        # Extract _symbol_info_remote f-string body
+        m = re.search(r"def _symbol_info_remote[\s\S]*?code = f\"\"\"([\s\S]*?)\"\"\"", src)
+        self.assertIsNotNone(m)
+        body = m.group(1)
+        self.assertNotIn("import uuid", body)
+        self.assertNotIn("import json", body)
+        self.assertIn("trade_contract_size", body)
+
+
 class WizardMt5VolumeTests(unittest.TestCase):
     def test_new_order_volume_screen_and_convert(self) -> None:
         from plugins.trade.wizard import TradeWizard, WizardState

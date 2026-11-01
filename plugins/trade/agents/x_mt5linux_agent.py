@@ -1053,8 +1053,6 @@ def _symbol_info_remote(client: Any, symbol: str) -> Optional[Dict[str, Any]]:
     code = f"""
 import MetaTrader5 as m
 import time
-import uuid
-import json
 sym = {symbol!r}
 m.symbol_select(sym, True)
 info = m.symbol_info(sym)
