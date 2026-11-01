@@ -93,15 +93,33 @@ def symbol_search_hints(requested: str) -> List[str]:
     return out
 
 
-def list_instruments(desk: Any, exchange: str, account: str) -> List[Dict[str, Any]]:
+def list_instruments(
+    desk: Any,
+    exchange: str,
+    account: str,
+    *,
+    query: Optional[str] = None,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """Fetch venue instruments for ``account`` (never cross-account).
+
+    When ``query`` is set it is forwarded so brokers with large catalogs
+    (e.g. PUPrime 1400+ symbols) still return SOLUSD for \"SOL\" instead of
+    only the first N alphabetical rows.
+    """
+    req: Dict[str, Any] = {
+        "operation": "list_instruments",
+        "exchange": exchange,
+        "account": account,
+        "limit": int(limit) if limit else 500,
+    }
+    q = str(query or "").strip()
+    if q:
+        req["query"] = q
+        # Query path: enough room for prefix/substring variants.
+        req["limit"] = max(int(limit or 0), 300)
     try:
-        response = desk.execute(
-            {
-                "operation": "list_instruments",
-                "exchange": exchange,
-                "account": account,
-            }
-        )
+        response = desk.execute(req)
     except Exception as exc:  # noqa: BLE001
         logger.warning("list_instruments failed: %s", exc)
         return []
@@ -113,7 +131,25 @@ def list_instruments(desk: Any, exchange: str, account: str) -> List[Dict[str, A
     records = data.get("instruments")
     if not isinstance(records, list):
         return []
-    return [item for item in records if isinstance(item, dict)]
+    out: List[Dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        # Normalize symbol field for rankers (agents may only set native_symbol).
+        sym = str(
+            item.get("symbol")
+            or item.get("native_symbol")
+            or item.get("display_symbol")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not sym:
+            continue
+        row = dict(item)
+        row["symbol"] = sym
+        row.setdefault("native_symbol", sym)
+        out.append(row)
+    return out
 
 
 def market_price_text(desk: Any, exchange: str, account: str, symbol: str) -> Optional[str]:
@@ -169,6 +205,128 @@ def market_price_text(desk: Any, exchange: str, account: str, symbol: str) -> Op
 def rank_catalog_candidates(catalog: List[Dict[str, Any]], requested: str) -> List[Dict[str, Any]]:
     if not catalog:
         return []
+    req = str(requested or "").strip().upper()
+    hints = symbol_search_hints(req)
+    hint_set = {h.upper() for h in hints}
+
+    def _local_rank() -> List[Dict[str, Any]]:
+        scored: List[Tuple[int, float, str, Dict[str, Any]]] = []
+        for raw in catalog:
+            if not isinstance(raw, dict):
+                continue
+            sym = candidate_symbol(raw)
+            if not sym:
+                continue
+            up = sym.upper()
+            compact = up.replace(".", "").replace("-", "").replace("_", "").replace(" ", "")
+            base = str(raw.get("base") or "").strip().upper()
+            display = str(raw.get("display_name") or raw.get("displayName") or "").strip().upper()
+            desc = str(
+                raw.get("description") or raw.get("long_name") or raw.get("longName") or ""
+            ).strip().upper()
+            path = str(raw.get("path") or "").strip().upper()
+            tokens = set(_tokenize_instrument(up))
+            if base:
+                tokens.update(_tokenize_instrument(base))
+            if display:
+                tokens.update(_tokenize_instrument(display))
+            if desc:
+                tokens.update(_tokenize_instrument(desc))
+
+            score = 0
+            # Priority: exact > prefix > token/concept > substring.
+            if up == req or compact == req:
+                score += 200
+            elif up.startswith(req) or compact.startswith(req):
+                score += 150
+                # Bare base query (SOL) → prefer USD/USDT quotes over SOLJPY etc.
+                rest = up[len(req):] if up.startswith(req) else compact[len(req):]
+                if rest in {"USD", "USDT", "USDC", "UST"}:
+                    score += 40
+                elif rest in {"EUR", "GBP", "JPY", "AUD", "CAD", "CHF"}:
+                    score += 5
+            elif any(up.startswith(h) or compact.startswith(h) for h in hint_set if len(h) >= 3):
+                score += 130
+            if base and base == req:
+                score += 80
+            # Concept / token hits (SOL → SOLUSD via SOLANA group).
+            if req in tokens or any(h in tokens for h in hint_set if len(h) >= 3):
+                score += 100
+            overlap = tokens & hint_set
+            if overlap:
+                score += 40
+            blob = " ".join(x for x in (up, base, display, desc, path) if x)
+            for h in sorted(hint_set, key=len, reverse=True):
+                if len(h) >= 3 and h in blob:
+                    # Prefer real crypto path matches over accidental substrings.
+                    if h == req and up.startswith(h):
+                        score += 50
+                    elif h == req:
+                        score += 30
+                    else:
+                        score += 15
+                    break
+            # Penalize very short symbols that only fuzzy-match a longer query (SO vs SOL).
+            if len(up) < len(req) and not req.startswith(up):
+                score -= 40
+            if len(up) <= 2 and len(req) >= 3:
+                score -= 30
+            # Accidental substring: USOUSD contains neither SOL as prefix — mild score only via fuzzy.
+            best_ratio = 0.0
+            for cand_txt in (up, base, display, *tokens):
+                if not cand_txt:
+                    continue
+                r = SequenceMatcher(None, req, cand_txt).ratio()
+                if r > best_ratio:
+                    best_ratio = r
+                for h in hint_set:
+                    if h == req:
+                        continue
+                    r2 = SequenceMatcher(None, h, cand_txt).ratio()
+                    if r2 > best_ratio:
+                        best_ratio = r2
+            if best_ratio >= 0.9:
+                score += 40
+            elif best_ratio >= 0.75:
+                score += 25
+            elif best_ratio >= 0.55:
+                score += 10
+            elif best_ratio >= 0.4:
+                score += 3
+
+            if score <= 0:
+                continue
+            entry = {
+                "symbol": sym,
+                "display_name": str(raw.get("display_name") or raw.get("displayName") or "").strip(),
+                "score": score,
+                "fuzzy": round(best_ratio, 3),
+            }
+            if raw.get("price") is not None:
+                entry["price"] = str(raw.get("price"))
+            scored.append((score, best_ratio, up, entry))
+
+        scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        if not scored:
+            return []
+        best = scored[0][0]
+        # Keep strong matches; always retain exact/prefix tier if present.
+        floor = max(80, int(best * 0.5)) if best >= 100 else (40 if best >= 40 else max(15, int(best * 0.5)))
+        keep = [t for t in scored if t[0] >= floor]
+        if not keep:
+            keep = scored[: min(3, len(scored))]
+        return [t[3] for t in keep]
+
+    # Prefer local exact/prefix ranking for short ticker queries. Fibo ranker
+    # historically elevated SO / USOUSD.pc over SOLUSD for "SOL".
+    local = _local_rank()
+    if local:
+        top = int(local[0].get("score") or 0)
+        if top >= 100 or any(
+            str(e.get("symbol") or "").upper().startswith(req) for e in local if req
+        ):
+            return local
+
     try:
         from plugins.trade.fibo.candidates import rank_candidates
 
@@ -192,6 +350,16 @@ def rank_catalog_candidates(catalog: List[Dict[str, Any]], requested: str) -> Li
                 )
             out.append(entry)
         if out:
+            # Merge: if local found a prefix match missing from fibo top, prepend it.
+            if local:
+                seen = {str(e.get("symbol") or "").upper() for e in out}
+                for e in local:
+                    su = str(e.get("symbol") or "").upper()
+                    if su and su not in seen and (
+                        su == req or (req and su.startswith(req)) or int(e.get("score") or 0) >= 130
+                    ):
+                        out.insert(0, e)
+                        seen.add(su)
             best = max(int(e.get("score") or 0) for e in out)
             floor = 40 if best >= 40 else max(15, int(best * 0.5))
             strong = [e for e in out if int(e.get("score") or 0) >= floor]
@@ -199,94 +367,7 @@ def rank_catalog_candidates(catalog: List[Dict[str, Any]], requested: str) -> Li
     except Exception as exc:  # noqa: BLE001
         logger.warning("rank_candidates fallback: %s", exc)
 
-    req = str(requested or "").strip().upper()
-    hints = symbol_search_hints(req)
-    hint_set = {h.upper() for h in hints}
-    scored: List[Tuple[int, float, str, Dict[str, Any]]] = []
-
-    for raw in catalog:
-        if not isinstance(raw, dict):
-            continue
-        sym = candidate_symbol(raw)
-        if not sym:
-            continue
-        up = sym.upper()
-        base = str(raw.get("base") or "").strip().upper()
-        display = str(raw.get("display_name") or raw.get("displayName") or "").strip().upper()
-        desc = str(
-            raw.get("description") or raw.get("long_name") or raw.get("longName") or ""
-        ).strip().upper()
-        tokens = set(_tokenize_instrument(up))
-        if base:
-            tokens.update(_tokenize_instrument(base))
-        if display:
-            tokens.update(_tokenize_instrument(display))
-        if desc:
-            tokens.update(_tokenize_instrument(desc))
-
-        score = 0
-        if up == req:
-            score += 100
-        if base and base == req:
-            score += 80
-        overlap = tokens & hint_set
-        if overlap:
-            score += 90 if any(t == req or t in hint_set for t in overlap) else 60
-            if any(len(t) >= 3 and t in tokens for t in hint_set):
-                score += 10
-        blob = " ".join(x for x in (up, base, display, desc) if x)
-        for h in hint_set:
-            if len(h) >= 2 and h in blob:
-                score += 25
-                break
-        best_ratio = 0.0
-        for cand_txt in (up, base, display, *tokens):
-            if not cand_txt:
-                continue
-            r = SequenceMatcher(None, req, cand_txt).ratio()
-            if r > best_ratio:
-                best_ratio = r
-            for h in hint_set:
-                if h == req:
-                    continue
-                r2 = SequenceMatcher(None, h, cand_txt).ratio()
-                if r2 > best_ratio:
-                    best_ratio = r2
-        if best_ratio >= 0.75:
-            score += 40
-        elif best_ratio >= 0.55:
-            score += 20
-        elif best_ratio >= 0.4:
-            score += 8
-
-        entry = {
-            "symbol": sym,
-            "display_name": str(raw.get("display_name") or raw.get("displayName") or "").strip(),
-            "score": score,
-            "fuzzy": round(best_ratio, 3),
-        }
-        if raw.get("price") is not None:
-            entry["price"] = str(raw.get("price"))
-        scored.append((score, best_ratio, up, entry))
-
-    positive = [t for t in scored if t[0] > 0]
-    positive.sort(key=lambda t: (-t[0], -t[1], t[2]))
-    if positive:
-        best = positive[0][0]
-        floor = 40 if best >= 40 else max(15, int(best * 0.5))
-        keep = [t for t in positive if t[0] >= floor or (t[0] >= 25 and t[1] >= 0.7)]
-        if not keep:
-            keep = positive[: min(3, len(positive))]
-        return [t[3] for t in keep]
-
-    fuzzy = [t for t in scored if t[1] >= 0.45]
-    fuzzy.sort(key=lambda t: (-t[1], t[2]))
-    out_fuzzy: List[Dict[str, Any]] = []
-    for _score, ratio, _up, entry in fuzzy[:INSTRUMENT_PICK_MAX_TELEGRAM]:
-        row = dict(entry)
-        row["score"] = max(1, int(ratio * 100))
-        out_fuzzy.append(row)
-    return out_fuzzy
+    return local
 
 
 def enrich_candidate_prices(
@@ -380,7 +461,7 @@ def build_priced_candidates(
         _push(sym, score=900, **extra)
 
     if "list_instruments" in caps:
-        catalog = list_instruments(desk, exchange, account)
+        catalog = list_instruments(desk, exchange, account, query=requested)
         for ranked in rank_catalog_candidates(catalog, requested):
             _push(
                 str(ranked.get("symbol") or "").strip(),

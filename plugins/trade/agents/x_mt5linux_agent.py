@@ -1166,30 +1166,71 @@ def _execute_symbols_or_list(account: str, operation: str, request: Mapping[str,
             limit_i = int(limit) if limit is not None else 500
         except (TypeError, ValueError):
             limit_i = 500
+        # Query searches need headroom for ranking; uncapped scans still stop at 5000.
+        if str(request.get("query") or request.get("symbol") or "").strip():
+            limit_i = max(limit_i, 200)
         limit_i = max(1, min(limit_i, 5000))
         query = _normalize_symbol(str(request.get("query") or request.get("symbol") or ""))
+        # Scan the full broker catalog when filtering. Early-break on the raw
+        # symbols_get() order previously dropped SOLUSD (alphabetically late on
+        # PUPrime ~1400 symbols) while SO / USOUSD.pc still matched substring rankers.
         code = f"""
 import MetaTrader5 as m
 syms = m.symbols_get() or ()
-rows = []
 q = {query!r}
+rows = []
 for s in syms:
     name = str(s.name)
-    if q and q not in name.upper():
-        continue
+    up = name.upper()
+    if q:
+        if q not in up and not up.startswith(q):
+            # also allow base-before-separator matches (SOLUSD, SOL.USD, SOL-USD)
+            compact = up.replace('.', '').replace('-', '').replace('_', '').replace(' ', '')
+            if q not in compact and not compact.startswith(q):
+                continue
     rows.append({{
         'name': name,
         'path': str(getattr(s, 'path', '') or ''),
         'visible': bool(getattr(s, 'visible', False)),
+        'select': bool(getattr(s, 'select', False)),
         'digits': int(getattr(s, 'digits', 0) or 0),
         'point': float(getattr(s, 'point', 0) or 0),
         'trade_contract_size': float(getattr(s, 'trade_contract_size', 0) or 0),
         'volume_min': float(getattr(s, 'volume_min', 0) or 0),
+        'volume_max': float(getattr(s, 'volume_max', 0) or 0),
         'volume_step': float(getattr(s, 'volume_step', 0) or 0),
+        'trade_mode': int(getattr(s, 'trade_mode', 0) or 0),
+        'description': str(getattr(s, 'description', '') or ''),
+        'currency_base': str(getattr(s, 'currency_base', '') or ''),
     }})
-    if len(rows) >= {limit_i}:
-        break
-symbols_payload = {{'count': len(rows), 'symbols': rows, 'total_available': int(m.symbols_total() or 0)}}
+# Rank: exact > prefix > substring; never invent symbols.
+# Prefer USD/USDT quotes when query is a bare base (SOL → SOLUSD before SOLJPY).
+_QUOTE_PREF = ("USDT", "USDC", "USD", "UST")
+def _rank_key(row):
+    up = str(row.get('name') or '').upper()
+    compact = up.replace('.', '').replace('-', '').replace('_', '').replace(' ', '')
+    if not q:
+        return (2, up)
+    if up == q or compact == q:
+        return (0, 0, 0, up)
+    if up.startswith(q) or compact.startswith(q):
+        rest = up[len(q):] if up.startswith(q) else compact[len(q):]
+        qboost = 0
+        for i, suf in enumerate(_QUOTE_PREF):
+            if rest == suf:
+                qboost = i  # lower is better
+                break
+        else:
+            qboost = 50 + len(rest)
+        return (0, 1, qboost, up)
+    pos = up.find(q) if q in up else compact.find(q)
+    return (0, 2, pos if pos >= 0 else 999, len(up), up)
+if q:
+    rows.sort(key=_rank_key)
+else:
+    rows.sort(key=lambda r: str(r.get('name') or '').upper())
+rows = rows[:{limit_i}]
+symbols_payload = {{'count': len(rows), 'symbols': rows, 'total_available': int(m.symbols_total() or 0), 'query': q}}
 """
         _remote_execute(client, code)
         payload = _remote_eval(client, "symbols_payload")
@@ -1200,6 +1241,8 @@ symbols_payload = {{'count': len(rows), 'symbols': rows, 'total_available': int(
             if not isinstance(row, dict):
                 continue
             sym = str(row.get("name") or "")
+            if not sym:
+                continue
             instruments.append(
                 CanonicalInstrument(
                     requested_symbol=sym,
@@ -1212,6 +1255,12 @@ symbols_payload = {{'count': len(rows), 'symbols': rows, 'total_available': int(
                     minimum_size=_decimal_text(row.get("volume_min")),
                 ).to_dict()
             )
+            # Keep path/description on the instrument dict for rankers (to_dict may drop extras —
+            # also stash on a parallel list field).
+            instruments[-1]["path"] = row.get("path")
+            instruments[-1]["description"] = row.get("description")
+            instruments[-1]["visible"] = row.get("visible")
+            instruments[-1]["select"] = row.get("select")
         data["instruments"] = instruments
         return make_success(operation=operation, exchange=name, account=alias, data=data)
 
