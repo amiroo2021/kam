@@ -254,5 +254,55 @@ class InstallerFlagTests(unittest.TestCase):
         self.assertEqual(inst._mt5linux_argv(ns), ["--mt5linux"])
 
 
+
+
+class EntrypointSharedVncTests(unittest.TestCase):
+    def test_entrypoint_enables_x11vnc_shared(self) -> None:
+        """Fresh installs must start x11vnc with -shared by default."""
+        import mt5linux_provision as p
+
+        asset = p.ENTRYPOINT_ASSET
+        self.assertTrue(asset.is_file(), msg=f"missing {asset}")
+        text = asset.read_text(encoding="utf-8")
+        # Canonical argv fragments required by product policy.
+        self.assertIn("-display :0", text)
+        self.assertIn("-forever", text)
+        self.assertIn("-shared", text)
+        self.assertIn("-rfbport", text)
+        # Both password and nopw branches must include -shared.
+        shared_lines = [ln for ln in text.splitlines() if "x11vnc" in ln and "-shared" in ln]
+        self.assertGreaterEqual(len(shared_lines), 2, msg=text)
+        self.assertTrue(any("-nopw" in ln for ln in shared_lines))
+        self.assertTrue(any("-passwd" in ln for ln in shared_lines))
+        # Must rewrite vnc.sh rather than relying on the stock image.
+        self.assertIn("cat >/app/src/vnc.sh", text)
+        # Every x11vnc invocation line includes -shared (no non-shared startup path).
+        bare = [
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip().startswith("x11vnc ") or ln.strip().startswith("x11vnc\t")
+        ]
+        self.assertTrue(bare)
+        for ln in bare:
+            self.assertIn("-shared", ln, msg=ln)
+            self.assertIn("-display :0", ln)
+            self.assertIn("-forever", ln)
+            self.assertIn("-rfbport", ln)
+
+    def test_ensure_entrypoint_copies_shared_flags(self) -> None:
+        import mt5linux_provision as p
+
+        home = Path(tempfile.mkdtemp(prefix="mt5linux_ep_"))
+        dest = p.ensure_entrypoint_on_host(home, dry_run=False)
+        self.assertTrue(dest.is_file())
+        text = dest.read_text(encoding="utf-8")
+        self.assertIn("x11vnc -display :0 -forever -shared -rfbport", text)
+        # Idempotent refresh
+        dest.write_text("# stale\n", encoding="utf-8")
+        dest2 = p.ensure_entrypoint_on_host(home, dry_run=False)
+        self.assertEqual(dest2, dest)
+        self.assertIn("-shared", dest.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
