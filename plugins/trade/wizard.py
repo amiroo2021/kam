@@ -1649,21 +1649,154 @@ class TradeWizard:
             rendered = rendered.rstrip("0").rstrip(".")
         return rendered or "0"
 
+
+    def _is_mt5linux(self, state: Optional[WizardState] = None) -> bool:
+        st = state or None
+        ex = (st.exchange if st is not None else None) or ""
+        return str(ex).strip().lower() == "mt5linux"
+
+    def _fetch_mt5_contract_spec(self, exchange: str, account: str, symbol: str):
+        """Live broker contract specs for mt5linux (read-only)."""
+        from plugins.trade.mt5_quantity import ContractSpec, build_quantity_plan
+
+        if str(exchange or "").strip().lower() != "mt5linux":
+            return None, None
+        sym = str(symbol or "").strip()
+        if not sym or not account:
+            return None, None
+        info: dict = {}
+        # Prefer resolve_instrument / market_price payload (already switches account under lock).
+        for operation in ("resolve_instrument", "market_price", "ticker"):
+            try:
+                response = self._desk.execute(
+                    {
+                        "operation": operation,
+                        "exchange": exchange,
+                        "account": account,
+                        "symbol": sym,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("mt5 contract_spec %s failed: %s", operation, exc)
+                continue
+            data = getattr(response, "data", None)
+            if isinstance(data, dict):
+                raw_info = data.get("info") if isinstance(data.get("info"), dict) else {}
+                merged = dict(raw_info)
+                for key in (
+                    "contract_size",
+                    "trade_contract_size",
+                    "volume_min",
+                    "volume_max",
+                    "volume_step",
+                    "minimum_size",
+                    "size_increment",
+                    "description",
+                    "path",
+                    "trade_calc_mode",
+                    "digits",
+                    "currency_base",
+                    "currency_profit",
+                ):
+                    if key in data and data.get(key) is not None and key not in merged:
+                        merged[key] = data.get(key)
+                # Canonical instrument fields
+                inst = getattr(response, "instrument", None) or getattr(response, "market_price", None)
+                if inst is not None:
+                    for src, dst in (
+                        ("minimum_size", "volume_min"),
+                        ("size_increment", "volume_step"),
+                        ("price_increment", "point"),
+                    ):
+                        val = inst.get(src) if isinstance(inst, dict) else getattr(inst, src, None)
+                        if val is not None and dst not in merged:
+                            merged[dst] = val
+                if merged.get("trade_contract_size") is None and merged.get("contract_size") is not None:
+                    merged["trade_contract_size"] = merged.get("contract_size")
+                if merged:
+                    info = merged
+                    if response.success or info.get("trade_contract_size") or info.get("contract_size"):
+                        break
+        if not info:
+            return None, None
+        spec = ContractSpec.from_mapping(sym, info)
+        if spec is None:
+            return None, None
+        return spec, build_quantity_plan(spec)
+
+    def _mt5_volume_plan_for_state(self, state: WizardState, *, ladder: bool = False):
+        symbol = ""
+        if ladder:
+            symbol = str(state.ladder.get("symbol") or state.symbol or "").strip()
+        else:
+            symbol = str(state.order.get("symbol") or state.symbol or "").strip()
+        return self._fetch_mt5_contract_spec(state.exchange or "", state.account or "", symbol)
+
+    def _format_order_volume_line(self, state: WizardState) -> str:
+        if state.order.get("volume_display"):
+            return f"Volume: {state.order.get('volume_display')}"
+        vol = _comma_format(state.order.get("volume") or "")
+        if state.order.get("volume_lots") and state.order.get("qty_mode") == "underlying":
+            return (
+                f"Volume: {_comma_format(state.order.get('volume_underlying') or state.order.get('volume') or '')} "
+                f"{state.order.get('qty_unit') or ''}".rstrip()
+                + f" ({_comma_format(state.order.get('volume_lots'))} lots)"
+            )
+        return f"Volume: {vol}"
+
+    def _format_order_volume_confirm_lines(self, state: WizardState) -> list:
+        lines = []
+        if state.order.get("qty_mode") == "underlying" and state.order.get("volume_lots"):
+            unit = state.order.get("qty_unit") or ""
+            und = state.order.get("volume_underlying") or state.order.get("volume") or ""
+            lots = state.order.get("volume_lots")
+            lines.append(f"Volume: {_comma_format(und)} {unit}".rstrip())
+            lines.append(f"MT5 volume: {_comma_format(lots)} lot" + ("s" if str(lots) not in {"1", "1.0", "1.00"} else ""))
+        elif state.order.get("volume_lots"):
+            lines.append(f"Volume: {_comma_format(state.order.get('volume_lots'))} MT5 lots")
+            if state.order.get("volume_underlying"):
+                lines.append(
+                    f"Contract exposure: {_comma_format(state.order.get('volume_underlying'))}"
+                )
+        else:
+            lines.append(f"Volume: {_comma_format(state.order.get('volume') or '')}")
+        return lines
+
+
     def _render_new_order_volume(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
         state.state = "awaiting_volume"
         symbol = str(state.order.get("symbol") or state.symbol or "").strip()
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
+        ex = state.exchange or ""
+        ex_label = ex[:1].upper() + ex[1:] if ex else ex
+        header = (
+            "New Order\n\n"
+            f"Exchange: {ex_label}\n"
+            f"Account: {state.account}\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side_label}\n\n"
+        )
+        prompt = "Enter Volume:"
+        extra = ""
+        if self._is_mt5linux(state):
+            spec, plan = self._mt5_volume_plan_for_state(state, ladder=False)
+            if plan is not None:
+                state.order["qty_mode"] = plan.mode
+                state.order["qty_unit"] = plan.unit_label
+                state.order["contract_size"] = format(plan.contract_size, "f")
+                state.order["volume_min_lots"] = format(plan.volume_min_lots, "f")
+                state.order["volume_step_lots"] = format(plan.volume_step_lots, "f")
+                state.order["volume_max_lots"] = format(plan.volume_max_lots, "f")
+                prompt = plan.prompt_label
+                extra = "\n".join(plan.help_lines()) + "\n\n"
+            else:
+                state.order["qty_mode"] = "lots"
+                prompt = "Enter Volume (MT5 lots):"
+                extra = "(Contract specs unavailable — enter broker lots.)\n\n"
         return Screen(
-            text=(
-                "New Order\n\n"
-                f"Exchange: {state.exchange[:1].upper() + state.exchange[1:] if state.exchange else state.exchange}\n"
-                f"Account: {state.account}\n"
-                f"Symbol: {symbol}\n"
-                f"Side: {side_label}\n\n"
-                "Enter Volume:"
-            ),
+            text=header + extra + prompt,
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
             state="awaiting_volume",
         )
@@ -1674,7 +1807,7 @@ class TradeWizard:
         symbol = str(state.order.get("symbol") or state.symbol or "").strip()
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
-        volume = _comma_format(state.order.get("volume") or "")
+        volume_line = self._format_order_volume_line(state)
         return Screen(
             text=(
                 "New Order\n\n"
@@ -1682,7 +1815,7 @@ class TradeWizard:
                 f"Account: {state.account}\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {side_label}\n"
-                f"Volume: {volume}\n\n"
+                f"{volume_line}\n\n"
                 "Enter Price:"
             ),
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
@@ -1694,7 +1827,6 @@ class TradeWizard:
         symbol = str(state.order.get("symbol") or state.symbol or "").strip()
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
-        volume = _comma_format(state.order.get("volume") or "")
         price = _comma_format(state.order.get("price") or "")
         lines = [
             "⚠️ Confirm New Order",
@@ -1704,9 +1836,9 @@ class TradeWizard:
             "",
             f"Symbol: {symbol}",
             f"Side: {side_label}",
-            f"Volume: {volume}",
-            f"Price: {price}",
         ]
+        lines.extend(self._format_order_volume_confirm_lines(state))
+        lines.append(f"Price: {price}")
         state.state = "new_order_confirm"
         return Screen(
             text="\n".join(lines).rstrip(),
@@ -1779,6 +1911,34 @@ class TradeWizard:
             field = "volume" if state.state == "awaiting_volume" else "price"
             return self._render_new_order_text_error(field, "Please enter a positive numeric value.")
         if state.state == "awaiting_volume":
+            if self._is_mt5linux(state):
+                from plugins.trade.mt5_quantity import convert_user_quantity
+
+                spec, plan = self._mt5_volume_plan_for_state(state, ladder=False)
+                if plan is None:
+                    state.order["volume"] = value
+                    state.order["volume_lots"] = value
+                    state.order["qty_mode"] = "lots"
+                    return self._render_new_order_price(chat_key)
+                result = convert_user_quantity(value, plan)
+                if not result.ok:
+                    return self._render_new_order_text_error("volume", result.message)
+                # Native lots for the adapter; keep underlying for display.
+                state.order["volume"] = format(result.lots, "f")
+                state.order["volume_lots"] = format(result.lots, "f")
+                if result.underlying is not None:
+                    state.order["volume_underlying"] = format(result.underlying, "f")
+                state.order["qty_mode"] = plan.mode
+                state.order["qty_unit"] = plan.unit_label
+                state.order["contract_size"] = format(plan.contract_size, "f")
+                if plan.mode == "underlying" and result.underlying is not None:
+                    state.order["volume_display"] = (
+                        f"{_comma_format(format(result.underlying, 'f'))} {plan.unit_label} "
+                        f"({_comma_format(format(result.lots, 'f'))} lots)"
+                    )
+                else:
+                    state.order["volume_display"] = f"{_comma_format(format(result.lots, 'f'))} lots"
+                return self._render_new_order_price(chat_key)
             state.order["volume"] = value
             return self._render_new_order_price(chat_key)
         if state.state == "awaiting_price":
@@ -1815,6 +1975,7 @@ class TradeWizard:
             return Screen(text="Trade closed.", buttons=[], state="closed")
         if suffix != "confirm":
             return self._render_new_order_confirm(chat_key)
+        volume_native = state.order.get("volume_lots") or state.order.get("volume") or ""
         request = {
             "operation": "new_order",
             "exchange": state.exchange or "",
@@ -1822,9 +1983,14 @@ class TradeWizard:
             "symbol": state.order.get("symbol") or state.symbol or "",
             "side": state.order.get("side") or "",
             "order_type": "limit",
-            "volume": state.order.get("volume") or "",
+            "volume": volume_native,
             "price": state.order.get("price") or "",
         }
+        if state.order.get("volume_underlying"):
+            request["volume_underlying"] = state.order.get("volume_underlying")
+            request["volume_unit"] = state.order.get("qty_unit") or ""
+            request["contract_size"] = state.order.get("contract_size") or ""
+            request["quantity_mode"] = "lots"  # adapter receives broker lots
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_new_order_result(chat_key, response)
 
@@ -1998,8 +2164,33 @@ class TradeWizard:
         state = self._state_for(chat_key)
         state.state = "awaiting_ladder_total_volume"
         state.flow = "ladder"
+        prompt = "Enter Total Volume:"
+        extra = ""
+        if self._is_mt5linux(state):
+            spec, plan = self._mt5_volume_plan_for_state(state, ladder=True)
+            if plan is not None:
+                state.ladder["qty_mode"] = plan.mode
+                state.ladder["qty_unit"] = plan.unit_label
+                state.ladder["contract_size"] = format(plan.contract_size, "f")
+                state.ladder["volume_min_lots"] = format(plan.volume_min_lots, "f")
+                state.ladder["volume_step_lots"] = format(plan.volume_step_lots, "f")
+                state.ladder["volume_max_lots"] = format(plan.volume_max_lots, "f")
+                if plan.mode == "underlying":
+                    prompt = f"Enter Total Volume ({plan.unit_label} tokens):" if plan.unit_label.isalpha() and len(plan.unit_label) <= 6 and not plan.unit_label.endswith(" oz") else f"Enter Total Volume ({plan.unit_label}):"
+                    if plan.unit_label.endswith(" oz") or plan.unit_label.upper() in {"EUR", "GBP", "AUD", "CAD", "CHF", "NZD", "JPY", "USD"}:
+                        prompt = f"Enter Total Volume ({plan.unit_label}):"
+                    elif plan.unit_label.isalpha() and len(plan.unit_label) <= 6:
+                        prompt = f"Enter Total Volume ({plan.unit_label} tokens):"
+                    else:
+                        prompt = f"Enter Total Volume ({plan.unit_label}):"
+                else:
+                    prompt = "Enter Total Volume (MT5 lots):"
+                extra = "\n".join(plan.help_lines()) + "\n\n"
+            else:
+                prompt = "Enter Total Volume (MT5 lots):"
+                extra = "(Contract specs unavailable — enter broker lots.)\n\n"
         return Screen(
-            text="Ladder\n\nEnter Total Volume:",
+            text=f"Ladder\n\n{extra}{prompt}",
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
             state="awaiting_ladder_total_volume",
         )
@@ -2044,13 +2235,24 @@ class TradeWizard:
             f"Side: {side_label}",
             f"Distribution: {'Half Gaussian' if distribution == 'half_gaussian' else 'Uniform' if distribution == 'uniform' else distribution}",
             f"Orders: {requested_count}",
-            f"Total Volume: {_comma_format(total_volume)}",
-            f"Start Price: {_comma_format(start_price)}",
-            f"End Price: {_comma_format(end_price)}",
-            "",
-            "Smallest size near Start",
-            "Largest size near End",
         ]
+        if ladder.get("qty_mode") == "underlying" and ladder.get("total_volume_lots"):
+            unit = ladder.get("qty_unit") or ""
+            und = ladder.get("total_volume_underlying") or ""
+            lots = ladder.get("total_volume_lots") or total_volume
+            lines.append(f"Total Volume: {_comma_format(und)} {unit}".rstrip())
+            lines.append(f"MT5 total volume: {_comma_format(lots)} lots")
+        else:
+            lines.append(f"Total Volume: {_comma_format(total_volume)}")
+        lines.extend(
+            [
+                f"Start Price: {_comma_format(start_price)}",
+                f"End Price: {_comma_format(end_price)}",
+                "",
+                "Smallest size near Start",
+                "Largest size near End",
+            ]
+        )
         state.state = "ladder_confirm"
         return Screen(
             text="\n".join(lines).rstrip(),
@@ -2076,6 +2278,24 @@ class TradeWizard:
             state.ladder["order_count"] = str(count)
             return self._render_ladder_total_volume(chat_key)
         if state.state == "awaiting_ladder_total_volume":
+            if self._is_mt5linux(state):
+                from plugins.trade.mt5_quantity import convert_user_quantity
+
+                spec, plan = self._mt5_volume_plan_for_state(state, ladder=True)
+                if plan is not None:
+                    result = convert_user_quantity(value, plan)
+                    if not result.ok:
+                        return self._render_ladder_text_error(chat_key, state.state, result.message)
+                    # Ladder math + agent expect broker lots.
+                    state.ladder["total_volume"] = format(result.lots, "f")
+                    state.ladder["total_volume_lots"] = format(result.lots, "f")
+                    if result.underlying is not None:
+                        state.ladder["total_volume_underlying"] = format(result.underlying, "f")
+                    state.ladder["qty_mode"] = plan.mode
+                    state.ladder["qty_unit"] = plan.unit_label
+                    state.ladder["contract_size"] = format(plan.contract_size, "f")
+                    state.ladder["volume_step_lots"] = format(plan.volume_step_lots, "f")
+                    return self._render_ladder_start_price(chat_key)
             state.ladder["total_volume"] = value
             return self._render_ladder_start_price(chat_key)
         if state.state == "awaiting_ladder_start_price":
@@ -2152,6 +2372,7 @@ class TradeWizard:
         if suffix != "confirm":
             return self._render_ladder_confirm(chat_key)
         state = self._state_for(chat_key)
+        total_native = state.ladder.get("total_volume_lots") or state.ladder.get("total_volume") or ""
         request = {
             "operation": "ladder",
             "exchange": state.exchange or "",
@@ -2160,10 +2381,16 @@ class TradeWizard:
             "side": state.ladder.get("side") or "",
             "distribution": state.ladder.get("distribution") or "",
             "order_count": state.ladder.get("order_count") or "",
-            "total_volume": state.ladder.get("total_volume") or "",
+            "total_volume": total_native,
             "start_price": state.ladder.get("start_price") or "",
             "end_price": state.ladder.get("end_price") or "",
         }
+        if state.ladder.get("volume_step_lots"):
+            request["size_increment"] = state.ladder.get("volume_step_lots")
+        if state.ladder.get("total_volume_underlying"):
+            request["total_volume_underlying"] = state.ladder.get("total_volume_underlying")
+            request["volume_unit"] = state.ladder.get("qty_unit") or ""
+            request["contract_size"] = state.ladder.get("contract_size") or ""
         response: CanonicalResponse = self._desk.execute(request)
         state.state = "ladder_result"
         lines = ["Ladder"]
