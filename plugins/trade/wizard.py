@@ -810,7 +810,7 @@ class TradeWizard:
                 dec = Decimal(text)
             except Exception:  # noqa: BLE001
                 continue
-            if dec.is_finite():
+            if dec.is_finite() and dec > 0:
                 return format(dec.normalize(), "f")
         return None
 

@@ -645,6 +645,109 @@ class ExecuteMockTests(_MT5LinuxEnvMixin, unittest.TestCase):
         self.assertNotRegex(src, r"(?i)password")
         self.assertNotRegex(src, r"(?i)passwd")
 
+    def test_market_price_rejects_zero_quote(self) -> None:
+        """Regression: unselected ETHUSD must not surface price 0."""
+        from plugins.trade.agents import x_mt5linux_agent as m
+
+        self._basic_accounts()
+        fake_payload = {
+            "info": {
+                "name": "ETHUSD",
+                "point": 0.01,
+                "trade_tick_size": 0.01,
+                "volume_min": 0.01,
+                "volume_step": 0.01,
+                "trade_contract_size": 1.0,
+                "digits": 2,
+                "bid": 0.0,
+                "ask": 0.0,
+                "last": 0.0,
+            },
+            "tick": {"bid": 0.0, "ask": 0.0, "last": 0.0, "time": 0, "rate_close": None},
+        }
+        with mock.patch.object(m, "_with_account") as wa:
+            def _side(account, fn):
+                snap = {
+                    "account": {
+                        "login": 7486706,
+                        "server": "LiteFinance-MT5-Live",
+                        "currency": "USD",
+                        "balance": 1,
+                    },
+                    "terminal": {"connected": True},
+                }
+                return fn(object(), snap, "LITE7486706", 7486706, "LiteFinance-MT5-Live")
+
+            wa.side_effect = _side
+            with mock.patch.object(m, "_symbol_info_remote", return_value=fake_payload):
+                resp = m.execute(
+                    {"operation": "market_price", "account": "LITE7486706", "symbol": "ETHUSD"}
+                )
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertEqual(resp.error.code, "QUOTE_UNAVAILABLE")
+
+    def test_market_price_uses_bid_when_last_zero(self) -> None:
+        from plugins.trade.agents import x_mt5linux_agent as m
+
+        self._basic_accounts()
+        fake_payload = {
+            "info": {
+                "name": "ETHUSD",
+                "point": 0.01,
+                "trade_tick_size": 0.01,
+                "volume_min": 0.01,
+                "volume_step": 0.01,
+                "trade_contract_size": 1.0,
+                "digits": 2,
+                "bid": 2270.41,
+                "ask": 2270.59,
+                "last": 0.0,
+            },
+            "tick": {"bid": 2270.41, "ask": 2270.59, "last": 0.0, "time": 1, "rate_close": None},
+        }
+        with mock.patch.object(m, "_with_account") as wa:
+            def _side(account, fn):
+                snap = {
+                    "account": {
+                        "login": 7486706,
+                        "server": "LiteFinance-MT5-Live",
+                        "currency": "USD",
+                        "balance": 1,
+                    },
+                    "terminal": {"connected": True},
+                }
+                return fn(object(), snap, "LITE7486706", 7486706, "LiteFinance-MT5-Live")
+
+            wa.side_effect = _side
+            with mock.patch.object(m, "_symbol_info_remote", return_value=fake_payload):
+                resp = m.execute(
+                    {"operation": "market_price", "account": "LITE7486706", "symbol": "ETHUSD"}
+                )
+        self.assertTrue(resp.success)
+        assert resp.market_price is not None
+        self.assertEqual(resp.market_price.price, "2270.41")
+        self.assertNotEqual(resp.market_price.price, "0")
+
+    def test_new_order_not_read_only(self) -> None:
+        from plugins.trade.agents import x_mt5linux_agent as m
+
+        self.assertIn("new_order", m.capabilities())
+        self._basic_accounts()
+        resp = m.execute(
+            {
+                "operation": "new_order",
+                "account": "LITE7486706",
+                "symbol": "ETHUSD",
+                "side": "sell",
+                "price": "2600",
+                "order_type": "limit",
+            }
+        )
+        self.assertFalse(resp.success)
+        assert resp.error is not None
+        self.assertNotEqual(resp.error.code, "READ_ONLY")
+
 
 class PortfolioUscTests(unittest.TestCase):
     def test_portfolio_normalizes_mt5linux_usc(self) -> None:

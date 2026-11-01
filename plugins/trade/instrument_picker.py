@@ -159,7 +159,9 @@ def market_price_text(desk: Any, exchange: str, account: str, symbol: str) -> Op
             dec = Decimal(text)
         except Exception:  # noqa: BLE001
             continue
-        if dec.is_finite():
+        # Reject zero/negative — agents that coerce missing quotes to "0"
+        # must not paint the picker as "ETHUSD · 0".
+        if dec.is_finite() and dec > 0:
             return format(dec.normalize(), "f")
     return None
 

@@ -1039,11 +1039,25 @@ def _normalize_symbol(raw: str) -> str:
 
 
 def _symbol_info_remote(client: Any, symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch symbol + tick as plain dicts (never return MT5 namedtuples over RPyC).
+
+    Always ``symbol_select`` first — many brokers keep symbols unselected until
+    MarketWatch activation; ticks are then zero/empty even when ``symbol_info``
+    succeeds. Prefer live bid/ask; fall back to last M1 close when tick is stale.
+    """
     code = f"""
 import MetaTrader5 as m
+import time
 sym = {symbol!r}
+m.symbol_select(sym, True)
 info = m.symbol_info(sym)
-tick = m.symbol_info_tick(sym)
+tick = None
+for _ in range(8):
+    tick = m.symbol_info_tick(sym)
+    if tick is not None and (float(getattr(tick, 'bid', 0) or 0) > 0 or float(getattr(tick, 'ask', 0) or 0) > 0 or float(getattr(tick, 'last', 0) or 0) > 0):
+        break
+    time.sleep(0.15)
+    info = m.symbol_info(sym) or info
 def _info(i):
     if i is None:
         return None
@@ -1064,29 +1078,82 @@ def _info(i):
         'trade_contract_size': float(getattr(i, 'trade_contract_size', 0) or 0),
         'visible': bool(getattr(i, 'visible', False)),
         'select': bool(getattr(i, 'select', False)),
+        'bid': float(getattr(i, 'bid', 0) or 0),
+        'ask': float(getattr(i, 'ask', 0) or 0),
+        'last': float(getattr(i, 'last', 0) or 0),
+        'time': int(getattr(i, 'time', 0) or 0),
+        'trade_mode': int(getattr(i, 'trade_mode', 0) or 0),
     }}
-def _tick(t):
-    if t is None:
-        return None
+def _tick(t, i):
+    bid = ask = last = 0.0
+    t_time = t_msc = 0
+    vol = 0.0
+    if t is not None:
+        bid = float(getattr(t, 'bid', 0) or 0)
+        ask = float(getattr(t, 'ask', 0) or 0)
+        last = float(getattr(t, 'last', 0) or 0)
+        t_time = int(getattr(t, 'time', 0) or 0)
+        t_msc = int(getattr(t, 'time_msc', 0) or 0)
+        vol = float(getattr(t, 'volume', 0) or 0)
+    if i is not None:
+        if bid <= 0:
+            bid = float(getattr(i, 'bid', 0) or 0)
+        if ask <= 0:
+            ask = float(getattr(i, 'ask', 0) or 0)
+        if last <= 0:
+            last = float(getattr(i, 'last', 0) or 0)
+        if t_time <= 0:
+            t_time = int(getattr(i, 'time', 0) or 0)
+    rate_close = None
+    if bid <= 0 and ask <= 0 and last <= 0:
+        rates = m.copy_rates_from_pos(sym, m.TIMEFRAME_M1, 0, 1)
+        if rates is not None and len(rates) > 0:
+            rate_close = float(rates[0]['close'])
+            last = rate_close
+            t_time = int(rates[0]['time'])
     return {{
-        'bid': float(t.bid),
-        'ask': float(t.ask),
-        'last': float(t.last),
-        'volume': int(getattr(t, 'volume', 0) or 0),
-        'time': int(getattr(t, 'time', 0) or 0),
-        'time_msc': int(getattr(t, 'time_msc', 0) or 0),
+        'bid': bid,
+        'ask': ask,
+        'last': last,
+        'volume': vol,
+        'time': t_time,
+        'time_msc': t_msc,
+        'rate_close': rate_close,
     }}
-if info is None:
-    m.symbol_select(sym, True)
-    info = m.symbol_info(sym)
-    tick = m.symbol_info_tick(sym)
-sym_payload = {{'info': _info(info), 'tick': _tick(tick), 'last_error': tuple(m.last_error()) if m.last_error() is not None else None}}
+err = m.last_error()
+sym_payload = {{
+    'info': _info(info),
+    'tick': _tick(tick, info),
+    'last_error': [int(err[0]), str(err[1])] if err is not None else None,
+}}
 """
     _remote_execute(client, code)
     payload = _remote_eval(client, "sym_payload")
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _positive_price(*candidates: Any) -> Optional[str]:
+    """First finite price strictly greater than zero, as a plain decimal string."""
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            if isinstance(value, float):
+                dec = Decimal(str(value))
+            elif isinstance(value, Decimal):
+                dec = value
+            else:
+                text = str(value).strip().replace(",", "")
+                if not text:
+                    continue
+                dec = Decimal(text)
+            if dec.is_finite() and dec > 0:
+                return format(dec, "f")
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+    return None
 
 
 def _execute_symbols_or_list(account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
@@ -1156,16 +1223,18 @@ def _execute_ticker_or_price(account: str, operation: str, request: Mapping[str,
     def run(client, snap, alias, login, server):
         payload = _symbol_info_remote(client, symbol)
         info = (payload or {}).get("info")
-        tick = (payload or {}).get("tick")
+        tick = (payload or {}).get("tick") or {}
         if not info:
             return _failure(operation, alias, "INSTRUMENT_NOT_FOUND", f"Symbol {symbol!r} not found on this account/server.")
         native = str(info.get("name") or symbol)
-        bid = (tick or {}).get("bid")
-        ask = (tick or {}).get("ask")
-        last = (tick or {}).get("last")
-        price = last or bid or ask
-        price_s = _decimal_text(price)
-        mark_s = _decimal_text(bid if bid is not None else price)
+        bid = tick.get("bid")
+        ask = tick.get("ask")
+        last = tick.get("last")
+        rate_close = tick.get("rate_close")
+        # CFDs often report last=0 while bid/ask are live — never prefer a zero last.
+        price_s = _positive_price(bid, ask, last, rate_close, info.get("bid"), info.get("ask"), info.get("last"))
+        mark_s = _positive_price(bid, ask, last, rate_close, info.get("bid"), info.get("ask"))
+        last_s = _positive_price(last, rate_close)
         meta = {
             "price_increment": _decimal_text(info.get("trade_tick_size") or info.get("point")),
             "size_increment": _decimal_text(info.get("volume_step")),
@@ -1175,29 +1244,41 @@ def _execute_ticker_or_price(account: str, operation: str, request: Mapping[str,
             "bid": bid,
             "ask": ask,
             "last": last,
-            "tick_time": (tick or {}).get("time"),
-            "tick_time_msc": (tick or {}).get("time_msc"),
+            "rate_close": rate_close,
+            "tick_time": tick.get("time"),
+            "tick_time_msc": tick.get("time_msc"),
+            "quote_available": price_s is not None,
         }
         data = _augment_account_data(snap)
         data.update({"symbol": native, "info": info, "tick": tick, **meta})
-        if operation in {"market_price", "ticker", "resolve_instrument"}:
-            instrument = CanonicalInstrument(
-                requested_symbol=symbol,
-                symbol=native,
-                display_name=native,
-                native_symbol=native,
-                display_symbol=native,
-                price_increment=meta["price_increment"],
-                size_increment=meta["size_increment"],
-                minimum_size=meta["minimum_size"],
+        if price_s is not None:
+            data["price"] = price_s
+            data["mark_price"] = mark_s or price_s
+        instrument = CanonicalInstrument(
+            requested_symbol=symbol,
+            symbol=native,
+            display_name=native,
+            native_symbol=native,
+            display_symbol=native,
+            price_increment=meta["price_increment"],
+            size_increment=meta["size_increment"],
+            minimum_size=meta["minimum_size"],
+        )
+        if operation == "resolve_instrument":
+            return make_success(
+                operation=operation,
+                exchange=name,
+                account=alias,
+                instrument=instrument,
+                data=data,
             )
-            if operation == "resolve_instrument":
-                return make_success(
-                    operation=operation,
-                    exchange=name,
-                    account=alias,
-                    instrument=instrument,
-                    data=data,
+        if operation in {"market_price", "ticker"}:
+            if price_s is None:
+                return _failure(
+                    operation,
+                    alias,
+                    "QUOTE_UNAVAILABLE",
+                    f"No live bid/ask/last for {native!r} on this account (symbol present but quote is zero/stale).",
                 )
             market_price = CanonicalMarketPrice(
                 requested_symbol=symbol,
@@ -1207,8 +1288,8 @@ def _execute_ticker_or_price(account: str, operation: str, request: Mapping[str,
                 display_symbol=native,
                 display_name=native,
                 price=price_s,
-                mark_price=mark_s,
-                last_external_price=_decimal_text(last) if last is not None else price_s,
+                mark_price=mark_s or price_s,
+                last_external_price=last_s or price_s,
                 price_increment=meta["price_increment"],
                 size_increment=meta["size_increment"],
                 minimum_size=meta["minimum_size"],
@@ -1300,14 +1381,16 @@ def _execute_get_tickers(account: str, request: Mapping[str, Any]) -> CanonicalR
             bid = tick.get("bid")
             ask = tick.get("ask")
             last = tick.get("last")
-            price = last or bid or ask
+            rate_close = tick.get("rate_close")
+            price_s = _positive_price(bid, ask, last, rate_close, info.get("bid"), info.get("ask"), info.get("last"))
             rows.append(
                 {
                     "symbol": native,
                     "bid": bid,
                     "ask": ask,
                     "last": last,
-                    "price": price,
+                    "price": price_s,  # None when unavailable — never "0"
+                    "quote_available": price_s is not None,
                     "time": tick.get("time"),
                     "time_msc": tick.get("time_msc"),
                 }
