@@ -123,6 +123,29 @@ def run(
         print(f"    [{mark}] {name} - {detail}")
         if not passed:
             ok = False
+
+    # Optional MT5Linux (auto if accounts configured).
+    print("==> verify mt5linux (optional)")
+    try:
+        from mt5linux_provision import verify_mt5linux
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [FAIL] mt5linux_provision import: {exc}")
+        ok = False
+    else:
+        force = None
+        if "--mt5linux" in list(argv or []):
+            force = True
+        if "--no-mt5linux" in list(argv or []):
+            force = False
+        mt5_ok, messages = verify_mt5linux(
+            hermes_root=hermes_root,
+            hermes_home=hermes_home,
+            force=force,
+        )
+        for msg in messages:
+            print(f"    {msg}")
+        if not mt5_ok:
+            ok = False
     return ok
 
 

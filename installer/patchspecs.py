@@ -238,7 +238,7 @@ _TRADESPOT_COMMAND_BLOCK = """
 """
 
 # --- Seam C: /trade slash command -----------------------------------------
-_COMMAND_BLOCK = '''\\
+_COMMAND_BLOCK = '''\
 # Match exactly: ``/trade``, ``/trade@botname``, or
 # ``/trade<space>...`` -- but NOT ``/trader`` or ``/trades``.
 raw_text = (msg.text or "").strip()
@@ -262,7 +262,7 @@ if first_token:
         try:
             from plugins.trade.tradespot_wizard import handle_tradespot_command
 
-            handled = await _tradespot_cmd(self, msg)
+            handled = await handle_tradespot_command(self, msg)
             if handled:
                 return
         except Exception as exc:  # noqa: BLE001

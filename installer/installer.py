@@ -69,6 +69,8 @@ RECOGNIZED_FLAGS = {
     "--systemd-dir",
     "--no-restart", "--skip-deps", "--purge-state",
     "--action",
+    # Optional MT5Linux Docker provision (trade capability)
+    "--mt5linux", "--no-mt5linux", "--mt5linux-purge-volume",
 }
 
 
@@ -128,6 +130,13 @@ def _parse_args(argv: List[str], action: str) -> argparse.Namespace:
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--skip-deps", action="store_true")
     parser.add_argument("--purge-state", action="store_true")
+    parser.add_argument("--mt5linux", action="store_true", help="Accepted for compatibility; MT5Linux is default-on with --trade")
+    parser.add_argument("--no-mt5linux", action="store_true", help="Opt out of MT5Linux Docker provision")
+    parser.add_argument(
+        "--mt5linux-purge-volume",
+        action="store_true",
+        help="Uninstall only: also delete the mt5-wine Docker volume",
+    )
     parser.add_argument("--action", default=action)
     return parser.parse_args(argv)
 
@@ -152,9 +161,29 @@ def _print_usage(action: str) -> None:
     print("  --no-restart         install but don't start/restart services")
     print("  --skip-deps          skip pip dependency install")
     print("  --purge-state        uninstall: also remove capability-owned state")
+    print("  --mt5linux           (compat) MT5Linux is default-on with --trade")
+    print("  --no-mt5linux        opt out of MT5Linux Docker provision")
+    print("  --mt5linux-purge-volume  uninstall: also delete mt5-wine volume (default: keep)")
     print("  --help, -h           show this help and exit 0 (zero mutation)")
     print()
+    print("MT5Linux (default with --trade):")
+    print("  Provisions Docker (if needed), mt5 container, Wine volume, RPyC, Python client.")
+    print("  Credentials optional at install time: mt5linux_<ALIAS>_{ACCOUNT,PASSWORD,SERVER} in .env.")
+    print("  Docker never receives broker passwords. Opt out with --no-mt5linux.")
+    print("  Existing healthy 'mt5' containers are reused; Wine volume survives uninstall by default.")
+    print()
     print("Exit codes: 0=ok, 2=usage error, 1=action error.")
+
+
+def _mt5linux_argv(args: argparse.Namespace) -> List[str]:
+    out: List[str] = []
+    if getattr(args, "mt5linux", False):
+        out.append("--mt5linux")
+    if getattr(args, "no_mt5linux", False):
+        out.append("--no-mt5linux")
+    if getattr(args, "mt5linux_purge_volume", False):
+        out.append("--mt5linux-purge-volume")
+    return out
 
 
 def _resolve_capabilities(args: argparse.Namespace) -> List[str]:
@@ -260,10 +289,20 @@ def cmd_install(args: argparse.Namespace) -> int:
     # string means "skip systemd unit installation" (used by
     # tests that don't want a real /etc/systemd/system write).
     shared_record["systemd_dir"] = str(systemd_dir)
+    # MT5Linux force flags for the trade capability installer.
+    if getattr(args, "mt5linux", False) and getattr(args, "no_mt5linux", False):
+        print("ERROR: --mt5linux and --no-mt5linux are mutually exclusive", file=sys.stderr)
+        return 2
+    if getattr(args, "mt5linux", False):
+        shared_record["mt5linux_force"] = True
+    elif getattr(args, "no_mt5linux", False):
+        shared_record["mt5linux_force"] = False
+    # Build argv fragment so capability modules that inspect argv still see flags.
+    cap_argv = _mt5linux_argv(args)
     for cap in caps:
         if cap == "trade":
             res = run_trade(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
+                argv=cap_argv, hermes_root=hermes_root, hermes_home=hermes_home,
                 shared=shared_record, dry_run=dry_run,
             )
         elif cap == "fibo":
@@ -380,7 +419,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for cap in caps:
         if cap == "trade":
             ok = verify_trade(
-                argv=[],
+                argv=_mt5linux_argv(args),
                 hermes_root=hermes_root,
                 hermes_home=hermes_home,
                 systemd_dir=systemd_dir,
@@ -444,7 +483,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     for cap in reversed(caps):
         if cap == "trade":
             res = uninstall_trade(
-                argv=[],
+                argv=_mt5linux_argv(args),
                 hermes_root=hermes_root,
                 hermes_home=hermes_home,
                 dry_run=dry_run,

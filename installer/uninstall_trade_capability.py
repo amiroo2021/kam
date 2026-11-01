@@ -87,6 +87,25 @@ def run(
     record["trade_web_unit"] = uninstall_trade_web_unit(
         systemd_dir=sd, dry_run=dry_run, manage_webui=False,
     )
+
+    # Optional MT5Linux teardown: remove container + client state; preserve Wine volume.
+    purge_volume = "--mt5linux-purge-volume" in list(argv or [])
+    skip_mt5 = "--no-mt5linux" in list(argv or [])
+    if not skip_mt5:
+        try:
+            from mt5linux_provision import uninstall_mt5linux
+        except Exception as exc:  # noqa: BLE001
+            record["mt5linux"] = {"ok": False, "error": f"import failed: {exc}"}
+        else:
+            record["mt5linux"] = uninstall_mt5linux(
+                hermes_home=hermes_home,
+                dry_run=dry_run,
+                remove_container=True,
+                purge_volume=purge_volume,
+            )
+    else:
+        record["mt5linux"] = {"action": "skipped", "reason": "--no-mt5linux"}
+
     return record
 
 

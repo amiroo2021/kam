@@ -132,6 +132,39 @@ def run(
     else:
         record["trade_web_unit"] = {"action": "skipped", "reason": "empty systemd_dir"}
 
+    # Optional MT5Linux Docker + client provision (default-on with /trade;
+    # never embeds broker credentials in container env). Opt out with --no-mt5linux.
+    try:
+        from mt5linux_provision import install_mt5linux
+    except Exception as exc:  # noqa: BLE001
+        record["mt5linux"] = {"ok": False, "error": f"import failed: {exc}"}
+        record["ok"] = False
+    else:
+        force = shared.get("mt5linux_force", None)
+        if force is None and "--mt5linux" in list(argv or []):
+            force = True
+        if force is None and "--no-mt5linux" in list(argv or []):
+            force = False
+        mt5_record = install_mt5linux(
+            hermes_root=hermes_root,
+            hermes_home=hermes_home,
+            dry_run=dry_run,
+            force=force,
+            allow_restart_unhealthy=bool(shared.get("mt5linux_allow_restart_unhealthy")),
+            skip_account_verify=bool(shared.get("mt5linux_skip_account_verify")),
+        )
+        record["mt5linux"] = mt5_record
+        if mt5_record.get("enabled") and not mt5_record.get("ok", False):
+            record["ok"] = False
+        elif mt5_record.get("manual_login_required"):
+            record.setdefault("warnings", []).append(
+                "mt5linux: infrastructure installed; broker login via noVNC still needed for live accounts"
+            )
+        if mt5_record.get("enabled") and mt5_record.get("accounts_configured_count", 0) == 0:
+            record.setdefault("warnings", []).append(
+                "mt5linux: no mt5linux_* credentials in .env yet (empty account list is OK)"
+            )
+
     return record
 
 

@@ -195,7 +195,9 @@ def _monetary_normalization(exchange: str, unit: Optional[str]) -> Tuple[str, De
     Every other unit remains distinct.
     """
     source = str(unit or "?").strip() or "?"
-    if str(exchange).strip().lower() == "metatrader" and source.upper() == "USC":
+    ex = str(exchange).strip().lower()
+    # USC is a cents denomination on some MetaTrader/MT5Linux brokers (e.g. PUPrime).
+    if ex in {"metatrader", "mt5linux"} and source.upper() == "USC":
         return "USD", Decimal("0.01")
     return source, Decimal("1")
 
