@@ -296,6 +296,45 @@ class Hip3RoutingTests(unittest.TestCase):
         self.assertTrue(response.success, f"new_order failed: {response.error}")
         self.assertEqual(captured.get("coin"), "xyz:SP500")
 
+    def test_ladder_prefixed_gold_uses_route_symbol(self):
+        hl = _hl_module()
+        gold = _candidate("xyz", "xyz:GOLD", size_increment="0.01")
+        captured: Dict[str, Any] = {}
+
+        class _FakeExchange:
+            def bulk_orders(self, order_requests, *a, **k):
+                coins = [request["coin"] for request in order_requests]
+                captured.setdefault("coins", []).extend(coins)
+                for coin in coins:
+                    if coin != "xyz:GOLD":
+                        raise KeyError(coin)
+                statuses = [
+                    {"resting": {"oid": 1000 + index}}
+                    for index in range(len(order_requests))
+                ]
+                return {"status": "ok", "response": {"data": {"statuses": statuses}}}
+
+        fake = _FakeExchange()
+        with mock.patch.object(hl, "_normalize_account_alias", return_value="FLEX"), \
+             mock.patch.object(hl, "_fetch_perp_market_candidates", lambda: [gold]), \
+             mock.patch.object(hl, "_resolve_instrument_candidate",
+                               lambda requested, candidates: (candidates[0], "")), \
+             mock.patch.object(hl, "_build_exchange_client",
+                               lambda account: (fake, "0x4FE260D11bf48BA3a94459771259c910a398ac59", "secret")), \
+             mock.patch.object(hl, "_verify_ladder_submission",
+                               lambda wallet, candidate, side, requests, records:
+                               (True, len(requests), [record["oid"] for record in records])):
+            response = hl.execute({
+                "operation": "ladder", "exchange": "hyperliquid", "account": "FLEX",
+                "symbol": "xyz:GOLD", "side": "sell", "distribution": "half_gaussian",
+                "order_count": "30", "total_volume": "200",
+                "start_price": "4000", "end_price": "4200",
+            })
+
+        self.assertTrue(response.success, f"ladder failed: {response.error}")
+        self.assertEqual(len(captured.get("coins", [])), 30)
+        self.assertEqual(set(captured["coins"]), {"xyz:GOLD"})
+
     def test_close_position_uses_route_symbol(self):
         hl = _hl_module()
         captured = {}

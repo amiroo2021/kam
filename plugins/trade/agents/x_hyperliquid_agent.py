@@ -1704,7 +1704,7 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
 
     try:
         order_requests, submitted_volume = _build_ladder_order_requests(
-            symbol=str(candidate.get("public_symbol") or requested_symbol),
+            symbol=str(candidate.get("route_symbol") or candidate.get("public_symbol") or requested_symbol),
             side=requested_side,
             distribution=distribution,
             order_count=order_count,
