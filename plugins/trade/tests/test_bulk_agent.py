@@ -15,6 +15,10 @@ bulk = importlib.import_module("plugins.trade.agents.x_bulk_agent")
 
 
 class TestBulkAgent(unittest.TestCase):
+    def setUp(self) -> None:
+        with bulk._close_guard_lock:
+            bulk._close_guard.clear()
+
     def test_discovers_complete_env_pairs_only(self) -> None:
         env = {
             "BULK_MAIN_ACCOUNT": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7",
@@ -139,15 +143,260 @@ class TestBulkAgent(unittest.TestCase):
         self.assertIn("positions_management", bulk.capabilities())
         self.assertNotIn("set_tp", bulk.capabilities())
         self.assertNotIn("set_sl", bulk.capabilities())
-        self.assertNotIn("close_position", bulk.capabilities())
+        self.assertIn("close_position", bulk.capabilities())
 
-        # Unsupported mutations stay NOT_IMPLEMENTED (not shown by wizard when caps known).
-        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds):
-            for op in ("set_tp", "set_sl", "close_position"):
+        # TP/SL remain NOT_IMPLEMENTED and must not enter the write path.
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_submit_order") as submit:
+            for op in ("set_tp", "set_sl"):
                 bad = bulk.execute({"operation": op, "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "long", "price": "1"})
                 self.assertFalse(bad.success)
                 self.assertEqual(bad.error.code, "NOT_IMPLEMENTED")
                 self.assertNotIn("read-only adapter", bad.error.message)
+        submit.assert_not_called()
+
+    def test_close_position_uses_bulk_native_reduce_only_market_order_for_short(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3}
+        live = {"positions": [{"symbol": "BTC-USD", "size": -0.125, "iso": False}], "openOrders": []}
+        flat = {"positions": [], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[live, flat]) as read, \
+             mock.patch.object(bulk, "_submit_order", return_value={"status": "ok", "response": {"data": {"statuses": [{"filled": {}}]}}}) as submit:
+            resp = bulk.execute({"operation": "close_position", "exchange": "bulk", "account": "main", "symbol": "BTC"})
+        self.assertTrue(resp.success)
+        self.assertEqual(read.call_count, 2)
+        payload_action = submit.call_args.args[1][0]["m"]
+        self.assertEqual(payload_action, {"c": "BTC-USD", "b": True, "sz": 0.125, "r": True, "i": False})
+        self.assertEqual(resp.data["close_status"], "fully_closed")
+
+    def test_close_position_uses_sell_for_long_and_preserves_account(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "ETH-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        live = {"positions": [{"symbol": "ETH-USD", "size": 1.25, "iso": False}], "openOrders": []}
+        flat = {"positions": [], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[live, flat]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"filled": {"oid": "order-1"}}]}}}) as submit:
+            result = bulk.execute({"operation": "close_position", "account": "main", "symbol": "ETH"})
+        self.assertTrue(result.success)
+        action = submit.call_args.args[1][0]["m"]
+        self.assertEqual(action, {"c": "ETH-USD", "b": False, "sz": 1.25, "r": True, "i": False})
+        self.assertIs(submit.call_args.args[0], creds)
+        self.assertEqual(result.data["close_status"], "fully_closed")
+
+    def test_close_position_uses_verified_isolated_lane_flag(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3}
+        pos = {"symbol": "BTC-USD", "size": -0.125, "iso": True, "isoPubkey": "isolated-pubkey"}
+        flat = {"positions": [], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[{"positions": [pos], "openOrders": []}, flat]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"filled": {"oid": "filled-isolated"}}]}}}) as submit:
+            result = bulk.execute({"operation": "close_position", "account": "main", "symbol": "BTC"})
+        self.assertTrue(result.success)
+        self.assertTrue(submit.call_args.args[1][0]["m"]["i"])
+        self.assertEqual(submit.call_args.args[0]["account_pubkey"], creds["account_pubkey"])
+
+    def test_close_position_missing_or_invalid_size_fails_before_write(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        cases = [({"positions": [], "openOrders": []}, "POSITION_NOT_FOUND"),
+                 ({"positions": [{"symbol": "BTC-USD", "size": 0.123, "iso": False}], "openOrders": []}, "POSITION_SIZE_INVALID")]
+        for account_snapshot, code in cases:
+            with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+                 mock.patch.object(bulk, "_find_market", return_value=market), \
+                 mock.patch.object(bulk, "_live_account", return_value=account_snapshot), \
+                 mock.patch.object(bulk, "_submit_order") as submit:
+                result = bulk.execute({"operation": "close_position", "account": "main", "symbol": "BTC"})
+            self.assertFalse(result.success)
+            self.assertEqual(result.error.code, code)
+            submit.assert_not_called()
+
+    def test_close_position_partial_fill_blocks_duplicate_submission(self) -> None:
+        creds = {"account": "dupecheck", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3}
+        before = {"positions": [{"symbol": "BTC-USD", "size": 1, "iso": False}], "openOrders": []}
+        after = {"positions": [{"symbol": "BTC-USD", "size": 0.4, "iso": False}], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[before, after, after]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"partiallyFilled": {"oid": "partial-1"}}]}}}) as submit:
+            first = bulk.execute({"operation": "close_position", "account": "dupecheck", "symbol": "BTC"})
+            second = bulk.execute({"operation": "close_position", "account": "dupecheck", "symbol": "BTC"})
+        self.assertFalse(first.success)
+        self.assertEqual(first.data["close_status"], "partially_filled")
+        self.assertEqual(second.error.code, "CLOSE_OUTCOME_UNKNOWN")
+        self.assertEqual(submit.call_count, 1)
+
+    def test_close_position_uncertain_submission_is_verified_and_never_retried(self) -> None:
+        creds = {"account": "uncertain", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3}
+        live = {"positions": [{"symbol": "BTC-USD", "size": -0.2, "iso": False}], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[live, live, live]), \
+             mock.patch.object(bulk, "_submit_order", side_effect=TimeoutError("timed out")) as submit:
+            first = bulk.execute({"operation": "close_position", "account": "uncertain", "symbol": "BTC"})
+            second = bulk.execute({"operation": "close_position", "account": "uncertain", "symbol": "BTC"})
+        self.assertEqual(first.error.code, "CLOSE_OUTCOME_UNKNOWN")
+        self.assertEqual(second.error.code, "CLOSE_OUTCOME_UNKNOWN")
+        self.assertEqual(submit.call_count, 1)
+
+    def test_close_position_reports_accepted_open_order_without_success(self) -> None:
+        creds = {"account": "accepted", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        before = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}], "openOrders": []}
+        after = {"positions": before["positions"], "openOrders": [{"symbol": "BTC-USD", "orderId": "pending-close", "size": -0.5, "reduceOnly": True, "iso": False}]}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[before, after]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"status": "ok"}):
+            result = bulk.execute({"operation": "close_position", "account": "accepted", "symbol": "BTC"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error.code, "CLOSE_ACCEPTED")
+        self.assertEqual(result.data["close_status"], "pending")
+
+    def test_close_position_reports_rejected_order(self) -> None:
+        creds = {"account": "rejected", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        live = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}], "openOrders": []}
+        rejected = {"response": {"data": {"statuses": [{"rejectedRiskLimit": {"reason": "risk"}}]}}}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[live, live]), \
+             mock.patch.object(bulk, "_submit_order", return_value=rejected):
+            result = bulk.execute({"operation": "close_position", "account": "rejected", "symbol": "BTC"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error.code, "CLOSE_REJECTED")
+        self.assertEqual(result.data["close_status"], "rejected")
+
+    def test_position_action_status_classifies_documented_bulk_order_statuses(self) -> None:
+        cases = {
+            "filled": "filled",
+            "partiallyFilled": "partially_filled",
+            "working": "pending",
+            "resting": "pending",
+            "triggered": "pending",
+            "cancelledIoc": "cancelled",
+            "cancelledRiskLimit": "cancelled",
+            "cancelledSelfCrossing": "cancelled",
+            "cancelledReduceOnly": "cancelled",
+            "cancelled": "cancelled",
+            "siblingCancelled": "cancelled",
+            "triggerFailed": "cancelled",
+            "rejectedCrossing": "rejected",
+            "rejectedDuplicate": "rejected",
+            "rejectedRiskLimit": "rejected",
+            "rejectedInvalid": "rejected",
+            "cancelOneRejected": "rejected",
+            "cancelAllRejected": "rejected",
+            "error": "rejected",
+            "deposit": "unknown",
+            "depositFailed": "unknown",
+            "agentWallet": "unknown",
+            "agentWalletFailed": "unknown",
+            "transfer": "unknown",
+            "transferFailed": "unknown",
+            "createSubAccount": "unknown",
+            "createSubAccountFailed": "unknown",
+            "removeSubAccount": "unknown",
+            "removeSubAccountFailed": "unknown",
+            "renameSubAccount": "unknown",
+            "renameSubAccountFailed": "unknown",
+        }
+        for native_status, expected in cases.items():
+            with self.subTest(status=native_status):
+                payload = {"status": "ok", "response": {"data": {"statuses": [{native_status: {"oid": "order-1"}}]}}}
+                parsed = bulk._position_action_status(payload)
+                self.assertEqual(parsed["classification"], expected)
+                self.assertIn(native_status, parsed["statuses"])
+        self.assertEqual(bulk._position_action_status({"status": "ok"})["classification"], "unknown")
+        self.assertEqual(bulk._position_action_status({"statuses": [{"filled": {}}, {"rejectedDuplicate": {}}]})["classification"], "unknown")
+
+    def test_close_verification_requires_valid_account_identity_and_positions(self) -> None:
+        creds = {"account": "snapshot", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        good = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}], "openOrders": []}
+        for bad_snapshot in ({}, {"positions": None}, {"account": "wrong-account", "positions": []}):
+            with bulk._close_guard_lock:
+                bulk._close_guard.clear()
+            with self.subTest(snapshot=bad_snapshot), \
+                 mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+                 mock.patch.object(bulk, "_find_market", return_value=market), \
+                 mock.patch.object(bulk, "_live_account", return_value=bad_snapshot), \
+                 mock.patch.object(bulk, "_submit_order") as submit:
+                result = bulk.execute({"operation": "close_position", "account": "snapshot", "symbol": "BTC"})
+                self.assertFalse(result.success)
+                self.assertIn(result.error.code, {"ACCOUNT_SNAPSHOT_INVALID", "ACCOUNT_IDENTITY_INVALID"})
+                submit.assert_not_called()
+
+        for failed_refresh in ({}, {"positions": None}, {"account": "wrong-account", "positions": []}):
+            with bulk._close_guard_lock:
+                bulk._close_guard.clear()
+            with self.subTest(post_submit=failed_refresh), \
+                 mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+                 mock.patch.object(bulk, "_find_market", return_value=market), \
+                 mock.patch.object(bulk, "_live_account", side_effect=[good, failed_refresh]), \
+                 mock.patch.object(bulk, "_submit_order", return_value={"status": "ok"}):
+                result = bulk.execute({"operation": "close_position", "account": "snapshot", "symbol": "BTC"})
+                self.assertFalse(result.success)
+                self.assertEqual(result.error.code, "CLOSE_VERIFICATION_UNAVAILABLE")
+                self.assertNotEqual(result.data.get("close_status"), "fully_closed")
+
+    def test_close_unknown_status_never_succeeds_even_if_snapshot_is_flat(self) -> None:
+        creds = {"account": "ambiguous", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        before = {"positions": [{"symbol": "BTC-USD", "size": -0.5, "iso": False}], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[before, {"positions": [], "openOrders": []}]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"status": "ok"}):
+            result = bulk.execute({"operation": "close_position", "account": "ambiguous", "symbol": "BTC"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.data["close_status"], "unknown")
+
+    def test_partial_close_reports_signed_remaining_size_and_does_not_retry(self) -> None:
+        creds = {"account": "partial-signed", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        before = {"positions": [{"symbol": "BTC-USD", "size": -1.0, "iso": False}], "openOrders": []}
+        after = {"positions": [{"symbol": "BTC-USD", "size": -0.37, "iso": False}], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[before, after]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"partiallyFilled": {"oid": "partial-2"}}]}}}) as submit:
+            result = bulk.execute({"operation": "close_position", "account": "partial-signed", "symbol": "BTC"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.data["close_status"], "partially_filled")
+        self.assertEqual(result.data["remaining_signed_size"], "-0.37")
+        submit.assert_called_once()
+
+    def test_post_submit_refresh_timeout_never_reports_closed(self) -> None:
+        creds = {"account": "refresh-timeout", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "redacted", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        before = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}], "openOrders": []}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[before, TimeoutError("read timeout")]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"filled": {"oid": "filled-1"}}]}}}) as submit:
+            result = bulk.execute({"operation": "close_position", "account": "refresh-timeout", "symbol": "BTC"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error.code, "CLOSE_VERIFICATION_UNAVAILABLE")
+        self.assertNotEqual(result.data.get("close_status"), "fully_closed")
+        submit.assert_called_once()
+
+    def test_close_position_returns_not_implemented_for_tp_sl(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_submit_order") as submit:
+            for operation in ("set_tp", "set_sl"):
+                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC"})
+                self.assertFalse(resp.success)
+                self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+        submit.assert_not_called()
 
     def test_positions_management_attaches_tp_sl_from_open_orders(self) -> None:
         creds = {

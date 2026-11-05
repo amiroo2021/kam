@@ -7,11 +7,11 @@ Credentials (``.env`` / environment):
   Optional: ``BULK_<ALIAS>_BASE_URL``  default https://mainnet-api1.bulk.trade/api/v1
 
 Reads use unsigned POST /account {type: fullAccount, user}.
-Writes use signed POST /order (new_order, ladder, cancel_order_group).
+Writes use signed POST /order (new_order, ladder, cancel_order_group, close_position).
 
 Wizard Positions Management lists via operation ``positions_management``,
 which is an alias of the same fullAccount snapshot as ``positions_orders``.
-``set_tp`` / ``set_sl`` / ``close_position`` are not advertised until implemented.
+Bulk-native ``close_position`` is supported; ``set_tp`` / ``set_sl`` are not.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import struct
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -184,8 +185,6 @@ def capabilities() -> list[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
-        "set_tp",
-        "set_sl",
         "close_position",
     ]
 
@@ -1594,74 +1593,222 @@ def _positions_orders(
 
 
 
-def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
-    """Delegate set_tp / set_sl / close_position to the correct underlying agent."""
-    symbol = str(request.get("symbol") or "").strip().upper()
-    if not symbol:
-        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+_close_guard_lock = threading.Lock()
+_close_guard: set[tuple[str, str, bool]] = set()
 
-    row = _find_market(credentials, symbol)
-    if not row:
-        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Symbol {symbol} is not configured for bulk account '{account}'.")
 
-    # Try multiple keys that might contain the underlying exchange
-    underlying = str(
-        row.get("exchange") or
-        row.get("underlying") or
-        row.get("venue") or
-        row.get("market") or ""
-    ).lower().strip()
+def _position_rows(full_account: Mapping[str, Any], symbol: str) -> list[Dict[str, Any]]:
+    rows = full_account.get("positions")
+    if not isinstance(rows, list):
+        raise ValueError("Bulk fullAccount positions must be an array")
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError("Bulk fullAccount contains a malformed position row")
+    return [
+        row for row in rows
+        if str(row.get("symbol") or "").strip().upper() == symbol.upper()
+        and _decimal(row.get("size")) != 0
+    ]
 
-    if not underlying:
-        # Last resort: try to infer from other fields in the row
-        for key in ("exchange_name", "exchange_id", "type"):
-            val = str(row.get(key) or "").lower().strip()
-            if val:
-                underlying = val
-                break
 
-    if not underlying:
-        available_keys = list(row.keys())[:8]
-        return make_failure(
-            operation, name, account, "MISSING_UNDERLYING",
-            f"No underlying exchange configured for symbol '{symbol}' in bulk account '{account}'. "
-            f"Row keys: {available_keys}"
-        )
+def _validate_close_snapshot(credentials: Mapping[str, str], account: str, snapshot: Any) -> Mapping[str, Any]:
+    """Validate the account-bound fullAccount snapshot used by close verification."""
+    expected_alias = str(credentials.get("account") or "").strip().casefold()
+    if expected_alias and expected_alias != str(account or "").strip().casefold():
+        raise ValueError("Bulk credentials do not match the requested account alias")
+    account_pubkey = str(credentials.get("account_pubkey") or "").strip()
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", account_pubkey):
+        raise ValueError("Bulk query account identity is missing or malformed")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("Bulk fullAccount response is not an object")
+    for identity_key in ("user", "account", "account_pubkey", "pubkey"):
+        echoed_identity = snapshot.get(identity_key)
+        if echoed_identity is not None and str(echoed_identity).strip() != account_pubkey:
+            raise PermissionError("Bulk fullAccount identity does not match the requested account")
+    positions = snapshot.get("positions")
+    if not isinstance(positions, list):
+        raise ValueError("Bulk fullAccount response omitted its positions array")
+    for row in positions:
+        if not isinstance(row, Mapping) or not str(row.get("symbol") or "").strip():
+            raise ValueError("Bulk fullAccount contains a malformed position row")
+        try:
+            position_size = Decimal(str(row.get("size")))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError("Bulk fullAccount contains an invalid position size") from exc
+        if not position_size.is_finite():
+            raise ValueError("Bulk fullAccount contains a non-finite position size")
+    return snapshot
 
-    # Agent registry (extend as more exchanges are added)
-    agent_map = {
-        "hyperliquid": "x_hyperliquid_agent",
-        "apex": "x_apex_agent",
-        "phemex": "x_phemex_agent",
-        "hibachi": "x_hibachi_agent",
-        "edgex": "x_edgex_agent",
-        "mexc": "x_mexc_agent",
-        "perpl": "x_perpl_agent",
-        "lighter": "x_lighter_agent",
-        "nado": "x_nado_agent",
-        "ondoperps": "x_ondoperps_agent",
-        "arcus": "x_arcus_agent",
-        "pacifica": "x_pacifica_agent",
-        "qfex": "x_qfex_agent",
-        "raydium": "x_raydium_agent",
-        "aftermath": "x_aftermath_agent",
-        "vestmarkets": "x_vestmarkets_agent",
+
+def _position_action_status(payload: Any) -> Dict[str, Any]:
+    """Parse Bulk's tagged order statuses without treating transaction acceptance as a fill."""
+    status_classes = {
+        "filled": "filled",
+        "partiallyFilled": "partially_filled",
+        "working": "pending",
+        "resting": "pending",
+        "triggered": "pending",
+        "cancelledIoc": "cancelled",
+        "cancelledRiskLimit": "cancelled",
+        "cancelledSelfCrossing": "cancelled",
+        "cancelledReduceOnly": "cancelled",
+        "cancelled": "cancelled",
+        "siblingCancelled": "cancelled",
+        "triggerFailed": "cancelled",
+        "rejectedCrossing": "rejected",
+        "rejectedDuplicate": "rejected",
+        "rejectedRiskLimit": "rejected",
+        "rejectedInvalid": "rejected",
+        "cancelOneRejected": "rejected",
+        "cancelAllRejected": "rejected",
+        "error": "rejected",
+        # Recognize the remaining documented transaction status tags, but
+        # never interpret non-order actions as a close fill or rejection.
+        "deposit": "unknown",
+        "depositFailed": "unknown",
+        "agentWallet": "unknown",
+        "agentWalletFailed": "unknown",
+        "transfer": "unknown",
+        "transferFailed": "unknown",
+        "createSubAccount": "unknown",
+        "createSubAccountFailed": "unknown",
+        "removeSubAccount": "unknown",
+        "removeSubAccountFailed": "unknown",
+        "renameSubAccount": "unknown",
+        "renameSubAccountFailed": "unknown",
     }
+    statuses: list[str] = []
+    ids = [str(x) for x in _bulk_order_ids_from_payload(payload)]
 
-    module_name = agent_map.get(underlying)
-    if not module_name:
-        return make_failure(operation, name, account, "UNSUPPORTED_UNDERLYING", f"Position management not supported for underlying exchange '{underlying}'.")
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key in value:
+                if key in status_classes:
+                    statuses.append(key)
+            for child in value.values():
+                if isinstance(child, (Mapping, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    unique = list(dict.fromkeys(statuses))
+    classification = status_classes[unique[0]] if len(unique) == 1 else "unknown"
+    return {"classification": classification, "statuses": unique, "order_ids": ids}
+
+
+def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
+    lane_rows = [row for row in rows if row.get("iso") is isolated]
+    if len(lane_rows) > 1:
+        raise ValueError("Multiple Bulk position rows match the target market and lane")
+    return _decimal(lane_rows[0].get("size")) if lane_rows else Decimal("0")
+
+
+def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Close a Bulk position natively; TP/SL remain intentionally unsupported."""
+    if operation != "close_position":
+        return make_failure(operation, name, account, "NOT_IMPLEMENTED", f"Bulk {operation} is not implemented.")
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+    try:
+        market = _find_market(credentials, requested)
+    except Exception:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Bulk market {requested!r} was not found.")
+    symbol = str(market.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", "Bulk market row has no symbol.")
 
     try:
-        agent = __import__(f"plugins.trade.agents.{module_name}", fromlist=[module_name])
-        # Some agents expose `execute`, some may need different entrypoint
-        if hasattr(agent, "execute"):
-            return agent.execute(dict(request))  # pass a copy
-        else:
-            return make_failure(operation, name, account, "AGENT_ERROR", f"Agent {module_name} has no execute() function.")
-    except Exception as exc:
-        logger.warning("Bulk position action delegation failed: %s", exc)
-        return make_failure(operation, name, account, "DELEGATION_FAILED", str(exc))
+        before_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+    except PermissionError as exc:
+        return make_failure(operation, name, account, "ACCOUNT_IDENTITY_INVALID", sanitize_error_message(str(exc)))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "ACCOUNT_SNAPSHOT_INVALID", sanitize_error_message(str(exc)))
+    positions = _position_rows(before_account, symbol)
+    if not positions:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if len(positions) != 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_POSITION", f"Multiple open Bulk rows match {symbol}; refusing to choose a lane.")
+    position = positions[0]
+    size = _decimal(position.get("size"))
+    if size == 0:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if not isinstance(position.get("iso"), bool):
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk position snapshot omitted its base/isolated routing flag.")
+    isolated = position["iso"]
+    if isolated and not str(position.get("isoPubkey") or "").strip():
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk isolated position omitted isoPubkey; refusing to route a close.")
+
+    increment = _decimal(market.get("sizeIncrement", market.get("lotSize")), "0")
+    precision_raw = market.get("sizeDecimals")
+    if increment <= 0 or precision_raw is None:
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_MISSING", "Bulk market omitted valid size increment/precision metadata.")
+    try:
+        precision = int(precision_raw)
+    except (ValueError, TypeError):
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_INVALID", "Bulk market sizeDecimals is invalid.")
+    abs_size = abs(size)
+    precision_step = Decimal(1).scaleb(-precision)
+    if precision < 0 or abs_size % increment != 0 or abs_size % precision_step != 0:
+        return make_failure(operation, name, account, "POSITION_SIZE_INVALID", "Live Bulk position size does not conform to market increment/precision.")
+
+    close_side = "buy" if size < 0 else "sell"
+    guard_key = (str(credentials.get("account_pubkey") or ""), symbol.upper(), isolated)
+    with _close_guard_lock:
+        if guard_key in _close_guard:
+            return make_failure(operation, name, account, "CLOSE_OUTCOME_UNKNOWN", "A prior Bulk close for this account/market/lane is unresolved; reconcile state before another submission.", data={"close_status": "unknown", "retry_safe": False})
+        pending = [o for o in _orders_for(before_account, symbol, close_side)
+                   if bool(o.get("reduceOnly")) and bool(o.get("iso", False)) == isolated]
+        if pending:
+            return make_failure(operation, name, account, "CLOSE_IN_PROGRESS", "A matching Bulk reduce-only order is already open; refusing a duplicate close.", data={"close_status": "pending", "retry_safe": False})
+        _close_guard.add(guard_key)
+
+    # Bulk requires r=true for reduce-only and i routes base vs isolated margin.
+    action = {"m": {"c": symbol, "b": close_side == "buy", "sz": float(abs_size), "r": True, "i": isolated}}
+    try:
+        response = _submit_order(credentials, [action])
+    except Exception as exc:  # noqa: BLE001 - submission may have reached Bulk
+        try:
+            after = _validate_close_snapshot(credentials, account, _live_account(credentials))
+            remaining = _lane_position_size(_position_rows(after, symbol), isolated)
+        except Exception:
+            remaining = size
+        signed_remaining = _plain_decimal(remaining)
+        if remaining * size > 0 and abs(remaining) < abs(size):
+            return make_failure(operation, name, account, "CLOSE_PARTIALLY_FILLED", "Bulk submission outcome is uncertain; the live position was reduced. No automatic retry was made.", data={"close_status": "partially_filled", "verified": True, "requested_size": _plain_decimal(abs_size), "remaining_size": _plain_decimal(abs(remaining)), "remaining_signed_size": signed_remaining, "retry_safe": False, "error_type": type(exc).__name__})
+        return make_failure(operation, name, account, "CLOSE_OUTCOME_UNKNOWN", "Bulk submission outcome is uncertain. No automatic retry was made.", data={"close_status": "unknown", "verified": False, "requested_size": _plain_decimal(abs_size), "remaining_signed_size": signed_remaining, "remaining_size": _plain_decimal(abs(remaining)), "retry_safe": False, "error_type": type(exc).__name__})
+
+    parsed = _position_action_status(response)
+    classification = parsed["classification"]
+    try:
+        after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+        after_rows = _position_rows(after_account, symbol)
+        after_size = _lane_position_size(after_rows, isolated)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "CLOSE_VERIFICATION_UNAVAILABLE", "Bulk returned a response but a valid, account-bound positions snapshot could not verify the result; no retry was made.", data={"close_status": "unknown", "verified": False, "retry_safe": False, "order_ids": parsed["order_ids"], "bulk_status": classification, "verification_error": sanitize_error_message(str(exc))})
+
+    common = {"verified": True, "requested_size": _plain_decimal(abs_size), "remaining_size": _plain_decimal(abs(after_size)), "remaining_signed_size": _plain_decimal(after_size), "order_ids": parsed["order_ids"], "bulk_status": classification, "native_statuses": parsed["statuses"], "retry_safe": False}
+    if classification == "rejected":
+        with _close_guard_lock:
+            _close_guard.discard(guard_key)
+        return make_failure(operation, name, account, "CLOSE_REJECTED", "Bulk rejected the reduce-only close order.", data={**common, "close_status": "rejected"})
+    reduced = after_size * size > 0 and abs(after_size) < abs(size)
+    if reduced:
+        return make_failure(operation, name, account, "CLOSE_PARTIALLY_FILLED", "Bulk close reduced but did not flatten the position; no automatic retry was made.", data={**common, "close_status": "partially_filled"})
+    if classification == "filled" and after_size == 0:
+        with _close_guard_lock:
+            _close_guard.discard(guard_key)
+        return make_success(operation, name, account, data={**common, "close_status": "fully_closed"})
+    if classification == "cancelled":
+        with _close_guard_lock:
+            _close_guard.discard(guard_key)
+        return make_failure(operation, name, account, "CLOSE_CANCELLED", "Bulk cancelled the close order; the position is not confirmed closed.", data={**common, "close_status": "cancelled"})
+    after_close_orders = [o for o in _orders_for(after_account, symbol, close_side)
+                          if bool(o.get("reduceOnly")) and bool(o.get("iso", False)) == isolated]
+    if (classification == "pending" or (classification == "unknown" and _payload_ok(response))) and after_close_orders:
+        return make_failure(operation, name, account, "CLOSE_ACCEPTED", "Bulk accepted a pending reduce-only close order; the position is not confirmed closed.", data={**common, "close_status": "pending", "open_order_ids": [str(o.get("orderId") or o.get("oid") or "") for o in after_close_orders]})
+    return make_failure(operation, name, account, "CLOSE_OUTCOME_UNKNOWN", "Bulk response and verified position state do not establish a completed close; no automatic retry was made.", data={**common, "close_status": "unknown"})
 
 
 def execute(request: Dict[str, Any]) -> CanonicalResponse:
