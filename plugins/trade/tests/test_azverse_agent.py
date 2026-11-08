@@ -54,7 +54,7 @@ class AzverseAgentTests(unittest.TestCase):
         with mock.patch.object(azverse, "_combined_azverse_env", return_value=combined):
             self.assertEqual(azverse._discover_credential_map()["main"], {"key": "env-key", "secret": "env-secret"})
 
-    def test_capabilities_include_new_order_and_cancel_without_ladder(self) -> None:
+    def test_capabilities_include_position_actions(self) -> None:
         caps = azverse.capabilities()
         self.assertEqual(
             caps,
@@ -68,10 +68,21 @@ class AzverseAgentTests(unittest.TestCase):
                 "list_instruments",
                 "resolve_instrument",
                 "market_price",
+                "ladder",
+                "close_position",
+                "set_tp",
+                "set_sl",
             ],
         )
-        for forbidden in ("ladder", "close_position", "set_tp", "set_sl"):
-            self.assertNotIn(forbidden, caps)
+
+    def test_unadvertised_mutations_are_not_implemented_without_http(self) -> None:
+        with mock.patch.object(azverse, "_signed_get") as signed:
+            for operation in ("transfer", "withdraw"):
+                with self.subTest(operation=operation):
+                    response = azverse.execute({"operation": operation, "exchange": "azverse", "account": "amiroo"})
+                    self.assertFalse(response.success)
+                    self.assertEqual(response.error.code, "NOT_IMPLEMENTED")
+        signed.assert_not_called()
 
     def test_balance_maps_live_futures_fields(self) -> None:
         payload = [
@@ -164,6 +175,8 @@ class AzverseAgentTests(unittest.TestCase):
         def fake_get(_creds, path, query=None):
             if path == azverse.POSITIONS_PATH:
                 return positions
+            if path == azverse.PROFIT_LIST_PATH:
+                return {"page": 1, "ps": 100, "total": 0, "items": []}
             if path == azverse.ORDERS_PATH:
                 return orders
             raise AssertionError(path)
@@ -190,6 +203,131 @@ class AzverseAgentTests(unittest.TestCase):
         self.assertEqual(group.total_size, "2.5")
         self.assertEqual(group.vwap, "1204")
         self.assertEqual(group.order_ids, ["o1", "o2"])
+
+    def test_positions_orders_overlays_tp_sl_from_profit_list_when_position_fields_are_empty(self) -> None:
+        positions = [
+            {
+                "symbol": "zec_usdt",
+                "positionSide": "SHORT",
+                "positionSize": "50",
+                "entryPrice": "1240.16",
+                "markPrice": "1256",
+                "profitId": None,
+                "triggerProfitPrice": None,
+                "triggerStopPrice": None,
+            }
+        ]
+        profits = {
+            "page": 1,
+            "ps": 100,
+            "total": 2,
+            "items": [
+                {
+                    "profitId": "p-tp",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": "1000",
+                    "triggerStopPrice": None,
+                    "origQty": "50",
+                },
+                {
+                    "profitId": "p-sl",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": None,
+                    "triggerStopPrice": "1400",
+                    "origQty": "50",
+                },
+            ],
+        }
+        orders = {"page": 1, "ps": 100, "total": 0, "items": []}
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return positions
+            if path == azverse.PROFIT_LIST_PATH:
+                self.assertEqual(query.get("symbol"), "zec_usdt")
+                self.assertEqual(query.get("state"), "UNFINISHED")
+                return profits
+            if path == azverse.ORDERS_PATH:
+                return orders
+            raise AssertionError(path)
+
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ):
+            response = azverse.execute({"operation": "positions_orders", "exchange": "azverse", "account": "amiroo"})
+
+        self.assertTrue(response.success, response)
+        position = response.positions[0]
+        self.assertIsNone(positions[0]["triggerProfitPrice"])
+        self.assertEqual(position.tp, "1000")
+        self.assertEqual(position.sl, "1400")
+        self.assertEqual(position.tp_count, 1)
+        self.assertEqual(position.sl_count, 1)
+
+    def test_positions_orders_shows_multiple_profit_rows_on_same_side(self) -> None:
+        positions = [
+            {
+                "symbol": "zec_usdt",
+                "positionSide": "SHORT",
+                "positionSize": "50",
+                "entryPrice": "1240.16",
+                "markPrice": "1256",
+                "profitId": None,
+                "triggerProfitPrice": None,
+                "triggerStopPrice": None,
+            }
+        ]
+        profits = {
+            "page": 1,
+            "ps": 100,
+            "total": 2,
+            "items": [
+                {
+                    "profitId": "p1",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": "1000",
+                    "triggerStopPrice": "1400",
+                    "origQty": "50",
+                },
+                {
+                    "profitId": "p2",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": "1000",
+                    "triggerStopPrice": "1400",
+                    "origQty": "50",
+                },
+            ],
+        }
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return positions
+            if path == azverse.PROFIT_LIST_PATH:
+                return profits
+            if path == azverse.ORDERS_PATH:
+                return {"page": 1, "ps": 100, "total": 0, "items": []}
+            raise AssertionError(path)
+
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ):
+            response = azverse.execute({"operation": "positions_orders", "exchange": "azverse", "account": "amiroo"})
+
+        position = response.positions[0]
+        self.assertEqual(position.tp, "1000")
+        self.assertEqual(position.sl, "1400")
+        self.assertEqual(position.tp_count, 2)
+        self.assertEqual(position.sl_count, 2)
 
     def test_positions_management_is_positions_only_and_does_not_fetch_orders(self) -> None:
         positions = [{"symbol": "btc_usdt", "positionSide": "LONG", "positionSize": "0", "entryPrice": "0", "markPrice": "0"}]
@@ -307,16 +445,6 @@ class AzverseAgentTests(unittest.TestCase):
         self.assertIsNone(response.open_order_count)
         self.assertNotIn(creds["api_key"], response.error.message)
         self.assertNotIn(creds["secret"], response.error.message)
-
-    def test_unadvertised_mutations_are_not_implemented_without_http(self) -> None:
-        with mock.patch.object(azverse, "_signed_get") as signed:
-            for operation in ("ladder", "close_position", "set_tp", "set_sl"):
-                with self.subTest(operation=operation):
-                    response = azverse.execute({"operation": operation, "exchange": "azverse", "account": "amiroo"})
-                    self.assertFalse(response.success)
-                    self.assertEqual(response.error.code, "NOT_IMPLEMENTED")
-        signed.assert_not_called()
-
 
     class _ExplodingErrorBody:
         def __init__(self, message: str) -> None:
@@ -704,6 +832,480 @@ class AzverseAgentTests(unittest.TestCase):
         self.assertTrue(response.cancel_group.verified)
         self.assertEqual(calls, [{"method": "POST", "path": azverse.ORDER_CANCEL_PATH, "body": {"orderId": "cancel-buy"}}])
         self.assertNotIn("/order/cancel-all", [item["path"] for item in calls])
+
+    def test_cancel_treats_unfinished_row_with_canceled_state_as_gone(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        open_before = {
+            "items": [
+                {
+                    "orderId": "689531369764414528",
+                    "symbol": "sol_usdt",
+                    "orderSide": "SELL",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "80",
+                    "state": "UNFINISHED",
+                }
+            ],
+            "total": 1,
+        }
+        open_after = {
+            "items": [
+                {
+                    **open_before["items"][0],
+                    "state": "CANCELED",
+                }
+            ],
+            "total": 1,
+        }
+        gets = {"n": 0}
+
+        def fake_get(_creds, path, query=None):
+            gets["n"] += 1
+            return open_before if gets["n"] == 1 else open_after
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", return_value={"orderId": "689531369764414528"}):
+            response = azverse.execute(
+                {
+                    "operation": "cancel_order_group",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "SOL",
+                    "side": "sell",
+                    "order_type": "LIMIT",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.cancel_group.cancelled_order_count, 1)
+        self.assertTrue(response.cancel_group.verified)
+        self.assertEqual(response.cancel_group.remaining_target_count, 0)
+
+    def test_cancel_ack_with_still_open_list_is_unknown_not_zero_partial(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        open_orders = {
+            "items": [
+                {
+                    "orderId": "689531369764414528",
+                    "symbol": "sol_usdt",
+                    "orderSide": "SELL",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "80",
+                    "state": "UNFINISHED",
+                }
+            ],
+            "total": 1,
+        }
+        posts = []
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            posts.append(path)
+            return {"orderId": body["orderId"]}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", return_value=open_orders
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request), mock.patch.object(azverse.time, "sleep"):
+            response = azverse.execute(
+                {
+                    "operation": "cancel_order_group",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "SOL",
+                    "side": "sell",
+                    "order_type": "LIMIT",
+                }
+            )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "CANCEL_STATUS_UNKNOWN")
+        self.assertNotEqual(response.error.code, "PARTIAL_CANCEL")
+        self.assertIn("Do not retry", response.error.message)
+        self.assertEqual(posts, [azverse.ORDER_CANCEL_PATH])
+
+    def _btc_catalog(self):
+        return [
+            {
+                "symbol": "btc_usdt",
+                "baseCoin": "btc",
+                "quoteCoin": "usdt",
+                "tradeSwitch": True,
+                "isOpenApi": True,
+                "contractType": "PERPETUAL",
+                "pricePrecision": 1,
+                "quantityPrecision": 3,
+                "minQty": "0.001",
+                "minNotional": "0.5",
+                "minStepPrice": "0.1",
+            }
+        ]
+
+    def test_ladder_dry_run_builds_uniform_children_without_post(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        posted = []
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=self._btc_catalog()
+        ), mock.patch.object(azverse, "_signed_request", side_effect=lambda *a, **k: posted.append((a, k)) or {}):
+            response = azverse.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "distribution": "uniform",
+                    "order_count": "3",
+                    "total_volume": "0.03",
+                    "start_price": "100",
+                    "end_price": "90",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.ladder.status, "dry_run")
+        self.assertFalse(response.ladder.verified)
+        self.assertEqual(response.ladder.requested_order_count, 3)
+        self.assertEqual(response.ladder.submitted_order_count, 3)
+        self.assertEqual(response.ladder.side, "buy")
+        self.assertEqual(response.ladder.distribution, "uniform")
+        children = response.data["children"]
+        self.assertEqual([c["price"] for c in children], ["100", "95", "90"])
+        self.assertEqual([c["origQty"] for c in children], ["0.01", "0.01", "0.01"])
+        self.assertEqual(posted, [])
+
+    def test_ladder_rejects_invalid_inputs_without_post(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        posted = []
+        cases = [
+            {"side": "hold", "code": "INVALID_SIDE"},
+            {"order_count": "0", "code": "INVALID_ORDER_COUNT"},
+            {"total_volume": "0", "code": "INVALID_VOLUME"},
+            {"end_price": "110", "code": "INVALID_LADDER_DIRECTION"},
+            {"distribution": "random", "code": "INVALID_DISTRIBUTION"},
+        ]
+        base = {
+            "operation": "ladder",
+            "exchange": "azverse",
+            "account": "amiroo",
+            "symbol": "BTC",
+            "side": "buy",
+            "distribution": "uniform",
+            "order_count": "3",
+            "total_volume": "0.03",
+            "start_price": "100",
+            "end_price": "90",
+        }
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=self._btc_catalog()
+        ), mock.patch.object(azverse, "_signed_request", side_effect=lambda *a, **k: posted.append((a, k)) or {}):
+            for case in cases:
+                payload = dict(base)
+                payload.update({k: v for k, v in case.items() if k != "code"})
+                with self.subTest(case=case):
+                    response = azverse.execute(payload)
+                    self.assertFalse(response.success)
+                    self.assertEqual(response.error.code, case["code"])
+        self.assertEqual(posted, [])
+
+    def test_ladder_live_posts_limit_children_only(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"method": method, "path": path, "body": body})
+            return {"orderId": f"id-{len(calls)}"}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=self._btc_catalog()
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "sell",
+                    "distribution": "uniform",
+                    "order_count": "2",
+                    "total_volume": "0.02",
+                    "start_price": "90",
+                    "end_price": "100",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.ladder.submitted_order_count, 2)
+        self.assertEqual(response.ladder.child_order_ids, ["id-1", "id-2"])
+        self.assertEqual([item["path"] for item in calls], [azverse.ORDER_CREATE_PATH, azverse.ORDER_CREATE_PATH])
+        self.assertEqual(calls[0]["body"]["symbol"], "btc_usdt")
+        self.assertEqual(calls[0]["body"]["orderType"], "LIMIT")
+        self.assertEqual(calls[0]["body"]["orderSide"], "SELL")
+        self.assertEqual(calls[0]["body"]["positionSide"], "SHORT")
+        self.assertNotIn("/order/cancel-all", [item["path"] for item in calls])
+
+    def test_ladder_timeout_after_ack_is_unknown_and_does_not_retry(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append(path)
+            if len(calls) == 1:
+                return {"orderId": "ok-1"}
+            raise RuntimeError("AZverse request failed: timed out")
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=self._btc_catalog()
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {
+                    "operation": "ladder",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "distribution": "uniform",
+                    "order_count": "2",
+                    "total_volume": "0.02",
+                    "start_price": "100",
+                    "end_price": "90",
+                }
+            )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "ORDER_STATUS_UNKNOWN")
+        self.assertEqual(calls, [azverse.ORDER_CREATE_PATH, azverse.ORDER_CREATE_PATH])
+        self.assertEqual(response.ladder.submitted_order_count, 1)
+        self.assertIn("Do not retry", response.error.message)
+
+    def _short_zec_position(self, **overrides):
+        row = {
+            "symbol": "zec_usdt",
+            "positionSide": "SHORT",
+            "positionSize": "50",
+            "entryPrice": "1240.16",
+            "markPrice": "1256",
+            "profitId": None,
+            "triggerProfitPrice": None,
+            "triggerStopPrice": None,
+        }
+        row.update(overrides)
+        return row
+
+    def test_close_position_dry_run_does_not_post(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        posted = []
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", return_value=[self._short_zec_position()]
+        ), mock.patch.object(azverse, "_signed_request", side_effect=lambda *a, **k: posted.append((a, k)) or {}):
+            response = azverse.execute(
+                {"operation": "close_position", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.position_action.status, "dry_run")
+        self.assertFalse(response.position_action.verified)
+        self.assertEqual(posted, [])
+
+    def test_close_position_live_posts_reduce_only_market_not_close_all(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+        gets = {"n": 0}
+
+        def fake_get(_creds, path, query=None):
+            gets["n"] += 1
+            if gets["n"] == 1:
+                return [self._short_zec_position()]
+            return []
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"method": method, "path": path, "body": body})
+            return {"orderId": "close-1"}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {"operation": "close_position", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(calls[0]["path"], azverse.ORDER_CREATE_PATH)
+        self.assertEqual(calls[0]["body"]["orderType"], "MARKET")
+        self.assertEqual(calls[0]["body"]["orderSide"], "BUY")
+        self.assertEqual(calls[0]["body"]["positionSide"], "SHORT")
+        self.assertEqual(calls[0]["body"]["origQty"], "50")
+        self.assertTrue(calls[0]["body"]["reduceOnly"])
+        self.assertNotIn("/position/close-all", [item["path"] for item in calls])
+        self.assertNotIn("/cancel-all", [item["path"] for item in calls])
+
+    def test_set_tp_live_creates_profit_entrust_and_zero_cancels_id(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                if any(item["path"] == azverse.PROFIT_CANCEL_PATH for item in calls):
+                    return {"items": [], "total": 0}
+                if any(item["path"] == azverse.PROFIT_CREATE_PATH for item in calls):
+                    return {
+                        "items": [
+                            {
+                                "profitId": "p1",
+                                "symbol": "zec_usdt",
+                                "positionSide": "SHORT",
+                                "state": "NOT_TRIGGERED",
+                                "triggerProfitPrice": "1100",
+                                "triggerStopPrice": None,
+                                "origQty": "50",
+                            }
+                        ],
+                        "total": 1,
+                    }
+                return {"items": [], "total": 0}
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"path": path, "body": body})
+            if path == azverse.PROFIT_CREATE_PATH:
+                return {"profitId": "p1"}
+            if path == azverse.PROFIT_CANCEL_PATH:
+                return {"profitId": body["profitId"]}
+            raise AssertionError(path)
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            created = azverse.execute(
+                {"operation": "set_tp", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "1100"}
+            )
+            removed = azverse.execute(
+                {"operation": "set_tp", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "0"}
+            )
+        self.assertTrue(created.success, created)
+        self.assertEqual(created.position_action.price, "1100")
+        self.assertFalse(created.position_action.removed)
+        self.assertEqual(calls[0]["path"], azverse.PROFIT_CREATE_PATH)
+        self.assertEqual(calls[0]["body"]["triggerProfitPrice"], "1100")
+        self.assertNotIn("triggerStopPrice", calls[0]["body"])
+        self.assertTrue(removed.success, removed)
+        self.assertTrue(removed.position_action.removed)
+        self.assertEqual(calls[1]["path"], azverse.PROFIT_CANCEL_PATH)
+        self.assertEqual(calls[1]["body"], {"profitId": "p1"})
+        self.assertNotIn("cancel-all-profit-stop", [item["path"] for item in calls])
+
+    def test_set_sl_updates_existing_profit_id_without_cancel_all(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                if calls:
+                    return {
+                        "items": [
+                            {
+                                "profitId": "p1",
+                                "symbol": "zec_usdt",
+                                "positionSide": "SHORT",
+                                "state": "NOT_TRIGGERED",
+                                "triggerProfitPrice": "1100",
+                                "triggerStopPrice": "1300",
+                                "origQty": "50",
+                            }
+                        ],
+                        "total": 1,
+                    }
+                return {
+                    "items": [
+                        {
+                            "profitId": "p1",
+                            "symbol": "zec_usdt",
+                            "positionSide": "SHORT",
+                            "state": "NOT_TRIGGERED",
+                            "triggerProfitPrice": "1100",
+                            "triggerStopPrice": None,
+                            "origQty": "50",
+                        }
+                    ],
+                    "total": 1,
+                }
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"path": path, "body": body})
+            return {"profitId": "p1"}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {"operation": "set_sl", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "1300"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(calls[0]["path"], azverse.PROFIT_UPDATE_PATH)
+        self.assertEqual(calls[0]["body"]["profitId"], "p1")
+        self.assertEqual(calls[0]["body"]["triggerStopPrice"], "1300")
+        self.assertEqual(calls[0]["body"]["triggerProfitPrice"], "1100")
+        self.assertNotIn("cancel-all", "".join(item["path"] for item in calls))
+
+    def test_set_tp_verifies_against_profit_list_when_position_fields_are_empty(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        posted = {"n": 0}
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                if posted["n"]:
+                    return {
+                        "items": [
+                            {
+                                "profitId": "689539800181236800",
+                                "symbol": "zec_usdt",
+                                "positionSide": "SHORT",
+                                "state": "NOT_TRIGGERED",
+                                "triggerProfitPrice": "1000",
+                                "origQty": "50",
+                            }
+                        ],
+                        "total": 1,
+                    }
+                return {"items": [], "total": 0}
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            posted["n"] += 1
+            return {"profitId": "689539800181236800"}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {"operation": "set_tp", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "1000"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(response.position_action.price, "1000")
+
+    def test_set_tp_ack_without_profit_list_row_is_unknown_not_verification_failed(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            return {"items": [], "total": 0}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", return_value={"profitId": "p1"}), mock.patch.object(azverse.time, "sleep"):
+            response = azverse.execute(
+                {"operation": "set_tp", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "1000"}
+            )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "PROTECTION_STATUS_UNKNOWN")
+        self.assertNotEqual(response.error.code, "VERIFICATION_FAILED")
+        self.assertIn("Do not retry", response.error.message)
 
     def test_signed_post_includes_json_body_in_hmac_and_rejects_redirects(self) -> None:
         creds = {"account": "amiroo", "api_key": "app-key", "secret": "super-secret", "api_base": azverse.DEFAULT_API_BASE}

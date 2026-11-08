@@ -6,10 +6,10 @@ Credentials are discovered from ``AZVERSE_<ALIAS>_API_KEY``/``_KEY`` and
 module and are redacted from all errors.
 
 Read operations: balance, positions/orders, instrument catalog, and
-market price. Writes are limited to limit ``new_order`` and per-order
-``cancel_order_group``. Live POSTs require ``AZVERSE_WRITE_ENABLED=1``
-and ``AZVERSE_DRY_RUN=0``; otherwise Confirm is dry-run only. Ladder,
-TP/SL, and close-position are not implemented.
+market price. Writes are limited to limit ``new_order``, per-order ``cancel_order_group``,
+and limit ``ladder``, plus position close/TP/SL. Live POSTs require ``AZVERSE_WRITE_ENABLED=1``
+and ``AZVERSE_DRY_RUN=0``; otherwise Confirm is dry-run only. Close-all
+and cancel-all endpoints are never used.
 """
 
 from __future__ import annotations
@@ -17,24 +17,28 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..canonical import (
     CanonicalCancelGroupResult,
     CanonicalInstrument,
+    CanonicalLadderResult,
     CanonicalMarketPrice,
     CanonicalOrderGroup,
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     make_failure,
     make_success,
     normalize_balance,
@@ -50,10 +54,22 @@ POSITIONS_PATH = "/az/future/user/v1/position/list"
 ORDERS_PATH = "/az/future/trade/v1/order/list"
 ORDER_CREATE_PATH = "/az/future/trade/v1/order/create"
 ORDER_CANCEL_PATH = "/az/future/trade/v1/order/cancel"
+PROFIT_CREATE_PATH = "/az/future/trade/v1/entrust/create-profit"
+PROFIT_UPDATE_PATH = "/az/future/trade/v1/entrust/update-profit-stop"
+PROFIT_CANCEL_PATH = "/az/future/trade/v1/entrust/cancel-profit-stop"
+PROFIT_LIST_PATH = "/az/future/trade/v1/entrust/profit-list"
 SYMBOLS_PATH = "/az/future/market/v3/public/symbol/list"
 TICKER_PATH = "/az/future/market/v1/public/q/ticker"
 MARK_PATH = "/az/future/market/v1/public/q/symbol-mark-price"
-_ALLOWED_POST_PATHS = frozenset({ORDER_CREATE_PATH, ORDER_CANCEL_PATH})
+_ALLOWED_POST_PATHS = frozenset(
+    {
+        ORDER_CREATE_PATH,
+        ORDER_CANCEL_PATH,
+        PROFIT_CREATE_PATH,
+        PROFIT_UPDATE_PATH,
+        PROFIT_CANCEL_PATH,
+    }
+)
 _USER_AGENT = "Hermes-KAM-AZverseAgent/1.0"
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _KEY_SUFFIXES = ("API_KEY", "KEY")
@@ -154,6 +170,10 @@ def capabilities() -> List[str]:
         "list_instruments",
         "resolve_instrument",
         "market_price",
+        "ladder",
+        "close_position",
+        "set_tp",
+        "set_sl",
     ]
 
 
@@ -565,6 +585,48 @@ def _normalize_positions(payload: Any) -> List[CanonicalPosition]:
     return positions
 
 
+def _protection_display(prices: List[Decimal]) -> Tuple[Optional[str], Optional[int]]:
+    if not prices:
+        return None, None
+    unique: List[Decimal] = []
+    seen = set()
+    for price in prices:
+        if price not in seen:
+            seen.add(price)
+            unique.append(price)
+    return ", ".join(_format_decimal(price) for price in unique), len(prices)
+
+
+def _overlay_protections_from_profits(
+    positions: List[CanonicalPosition],
+    credentials: Mapping[str, str],
+) -> List[CanonicalPosition]:
+    if not positions:
+        return positions
+    natives: List[str] = []
+    seen = set()
+    for position in positions:
+        native = str(position.exchange_instrument or "").strip() or position.symbol
+        key = native.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        natives.append(native)
+    profits_by_native: Dict[str, List[Mapping[str, Any]]] = {}
+    for native in natives:
+        profits_by_native[native.lower()] = _fetch_open_profits(credentials, native)
+    overlaid: List[CanonicalPosition] = []
+    for position in positions:
+        native = str(position.exchange_instrument or "").strip() or position.symbol
+        matches = _profits_for_position(profits_by_native.get(native.lower(), []), native, position.side)
+        tp_prices = [price for price in (_protection_price(row, "tp") for row in matches) if price is not None]
+        sl_prices = [price for price in (_protection_price(row, "sl") for row in matches) if price is not None]
+        tp_text, tp_count = _protection_display(tp_prices)
+        sl_text, sl_count = _protection_display(sl_prices)
+        overlaid.append(replace(position, tp=tp_text, sl=sl_text, tp_count=tp_count, sl_count=sl_count))
+    return overlaid
+
+
 def _order_items(payload: Any) -> Tuple[List[Mapping[str, Any]], int]:
     if isinstance(payload, list):
         raise ValueError("AZverse order response must use an object envelope.")
@@ -758,7 +820,10 @@ def _handle_positions(account: str, operation: str, include_orders: bool):
     if credentials is None:
         return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
     try:
-        positions = _normalize_positions(_signed_get(credentials, POSITIONS_PATH))
+        positions = _overlay_protections_from_profits(
+            _normalize_positions(_signed_get(credentials, POSITIONS_PATH)),
+            credentials,
+        )
         if not include_orders:
             return make_success(operation, name, credentials["account"], positions=positions)
         order_rows = _fetch_open_orders(credentials)
@@ -1088,6 +1153,49 @@ def _order_matches_cancel(row: Mapping[str, Any], symbol: str, side: str, order_
     return display_type.upper() == order_type.upper()
 
 
+_OPEN_ORDER_STATES = frozenset({
+    "",
+    "NEW",
+    "UNFINISHED",
+    "PARTIALLY_FILLED",
+    "PARTIAL",
+    "LIVE",
+    "OPEN",
+    "PENDING",
+})
+_TERMINAL_ORDER_STATES = frozenset({
+    "CANCELED",
+    "CANCELLED",
+    "FILLED",
+    "REJECTED",
+    "EXPIRED",
+    "FAILED",
+    "COMPLETED",
+})
+
+
+def _order_state(row: Mapping[str, Any]) -> str:
+    return str(_order_value(row, "state", "status", "orderStatus") or "").strip().upper()
+
+
+def _is_open_order_row(row: Mapping[str, Any]) -> bool:
+    return _order_state(row) not in _TERMINAL_ORDER_STATES
+
+
+def _matching_open_ids(rows: List[Mapping[str, Any]], symbol: str, side: str, order_type: str) -> List[str]:
+    ids: List[str] = []
+    for row in rows:
+        if not _order_matches_cancel(row, symbol, side, order_type):
+            continue
+        if not _is_open_order_row(row):
+            continue
+        order_id = _order_value(row, "orderId", "id", "entrustId")
+        if order_id in (None, ""):
+            raise ValueError("AZverse open order omitted orderId.")
+        ids.append(str(order_id))
+    return ids
+
+
 def _handle_cancel_order_group(account: str, request: Mapping[str, Any]):
     operation = "cancel_order_group"
     credentials = _lookup_credentials(account)
@@ -1100,13 +1208,7 @@ def _handle_cancel_order_group(account: str, request: Mapping[str, Any]):
         return make_failure(operation, name, account, "INVALID_REQUEST", "Symbol and buy/sell side are required.")
     try:
         rows = _fetch_open_orders(credentials)
-        targets = [row for row in rows if _order_matches_cancel(row, symbol, side, order_type)]
-        target_ids = []
-        for row in targets:
-            order_id = _order_value(row, "orderId", "id", "entrustId")
-            if order_id in (None, ""):
-                raise ValueError("AZverse open order omitted orderId.")
-            target_ids.append(str(order_id))
+        target_ids = _matching_open_ids(rows, symbol, side, order_type)
         if _is_dry_run(request):
             return make_failure(
                 operation,
@@ -1116,36 +1218,45 @@ def _handle_cancel_order_group(account: str, request: Mapping[str, Any]):
                 f"AZverse writes are dry-run; {len(target_ids)} matching order(s) were not cancelled.",
             )
         batches: List[Dict[str, Any]] = []
-        cancelled: List[str] = []
         for order_id in target_ids:
             _signed_request(credentials, "POST", ORDER_CANCEL_PATH, body={"orderId": order_id})
             batches.append({"order_id": order_id, "ok": True, "status": "CANCELLED"})
-            cancelled.append(order_id)
-        remaining_rows = _fetch_open_orders(credentials)
-        remaining_ids = {
-            str(_order_value(row, "orderId", "id", "entrustId"))
-            for row in remaining_rows
-            if _order_matches_cancel(row, symbol, side, order_type)
-        }
+        remaining_ids = set(_matching_open_ids(_fetch_open_orders(credentials), symbol, side, order_type))
         still_open = [order_id for order_id in target_ids if order_id in remaining_ids]
+        retries = 0
+        while still_open and retries < 3:
+            time.sleep(0.4)
+            remaining_ids = set(_matching_open_ids(_fetch_open_orders(credentials), symbol, side, order_type))
+            still_open = [order_id for order_id in target_ids if order_id in remaining_ids]
+            retries += 1
         verified = not still_open
+        cancelled_count = len(target_ids) - len(still_open)
         result = CanonicalCancelGroupResult(
             symbol=_short_symbol(symbol) if "_" in symbol else symbol,
             side=side,
             targeted_order_count=len(target_ids),
-            cancelled_order_count=len(target_ids) - len(still_open),
-            confirmed_absent_count=len(target_ids) - len(still_open),
+            cancelled_order_count=cancelled_count,
+            confirmed_absent_count=cancelled_count,
             remaining_target_count=len(still_open),
             verified=verified,
             partial=not verified,
-            status="success" if verified else "partial",
+            status="success" if verified else "unknown" if still_open and cancelled_count == 0 else "partial",
             batch_count=len(batches),
             batches=batches,
             requested_cancel_count=len(target_ids),
-            verified_cancel_count=len(target_ids) - len(still_open),
+            verified_cancel_count=cancelled_count,
         )
         if verified:
             return make_success(operation, name, credentials["account"], cancel_group=result)
+        if cancelled_count == 0:
+            return make_failure(
+                operation,
+                name,
+                credentials["account"],
+                "CANCEL_STATUS_UNKNOWN",
+                "AZverse accepted the cancel, but the open-order list still showed it. Do not retry until Positions & Orders is reconciled.",
+                cancel_group=result,
+            )
         return make_failure(
             operation,
             name,
@@ -1156,6 +1267,528 @@ def _handle_cancel_order_group(account: str, request: Mapping[str, Any]):
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation, name, account, "AZVERSE_CANCEL_ERROR", _redact(exc, credentials))
+
+
+def _quantize_floor(value: Decimal, increment: Optional[Decimal]) -> Decimal:
+    if increment is None or increment <= 0:
+        return value
+    steps = (value / increment).to_integral_value(rounding=ROUND_DOWN)
+    return steps * increment
+
+
+def _increment_from_instrument(data: Mapping[str, Any], key: str) -> Optional[Decimal]:
+    raw = data.get(key)
+    if raw in (None, ""):
+        return None
+    parsed = _optional_decimal(raw)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _ladder_distribution_weights(order_count: int, distribution: str) -> List[Decimal]:
+    if order_count <= 0:
+        return []
+    distribution_key = str(distribution or "").strip().lower()
+    if distribution_key == "uniform":
+        return [Decimal("1")] * order_count
+    if distribution_key != "half_gaussian":
+        raise ValueError("INVALID_DISTRIBUTION")
+    if order_count == 1:
+        return [Decimal("1")]
+    weights: List[Decimal] = []
+    span = Decimal(order_count - 1)
+    for index in range(order_count):
+        z = Decimal("3") * (span - Decimal(index)) / span
+        weights.append(Decimal(str(math.exp(-(float(z) ** 2) / 2.0))))
+    return weights
+
+
+def _build_ladder_children(
+    *,
+    native: str,
+    side: str,
+    distribution: str,
+    order_count: int,
+    total_volume: Decimal,
+    start_price: Decimal,
+    end_price: Decimal,
+    instrument: Mapping[str, Any],
+) -> List[Dict[str, str]]:
+    weights = _ladder_distribution_weights(order_count, distribution)
+    weights_total = sum(weights) or Decimal("1")
+    price_step = (end_price - start_price) / Decimal(max(order_count - 1, 1))
+    tick = _increment_from_instrument(instrument, "price_increment")
+    lot = _increment_from_instrument(instrument, "size_increment")
+    min_size = _increment_from_instrument(instrument, "minimum_size") or Decimal("0")
+    min_notional = _increment_from_instrument(instrument, "minimum_notional") or Decimal("0")
+    children: List[Dict[str, str]] = []
+    allocated = Decimal("0")
+    for index in range(order_count):
+        if index == order_count - 1:
+            size = total_volume - allocated
+        else:
+            size = _quantize_floor(total_volume * weights[index] / weights_total, lot)
+            allocated += size
+        price = _quantize_floor(start_price + price_step * Decimal(index), tick)
+        if size <= 0 or price <= 0:
+            raise ValueError("NO_VALID_CHILDREN")
+        if min_size > 0 and size < min_size:
+            raise ValueError("CHILD_BELOW_MIN_SIZE")
+        if min_notional > 0 and (price * size) < min_notional:
+            raise ValueError("CHILD_BELOW_MIN_NOTIONAL")
+        children.append(
+            {
+                "symbol": native,
+                "orderSide": "BUY" if side == "buy" else "SELL",
+                "orderType": "LIMIT",
+                "origQty": _format_decimal(size),
+                "positionSide": "LONG" if side == "buy" else "SHORT",
+                "price": _format_decimal(price),
+                "timeInForce": "GTC",
+            }
+        )
+    return children
+
+
+def _handle_ladder(account: str, request: Mapping[str, Any]):
+    operation = "ladder"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    side = str(request.get("side") or "").strip().lower()
+    distribution = str(request.get("distribution") or "").strip().lower()
+    if not requested_symbol:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required.")
+    if side not in {"buy", "sell"}:
+        return make_failure(operation, name, account, "INVALID_SIDE", "Side must be buy or sell.")
+    if distribution not in {"uniform", "half_gaussian"}:
+        return make_failure(operation, name, account, "INVALID_DISTRIBUTION", "Distribution must be uniform or half_gaussian.")
+    try:
+        order_count = int(str(request.get("order_count") or "").strip())
+    except (TypeError, ValueError):
+        order_count = 0
+    if order_count <= 0:
+        return make_failure(operation, name, account, "INVALID_ORDER_COUNT", "Order count must be positive.")
+    try:
+        total_volume = _positive_decimal(request.get("total_volume"), "volume")
+    except Exception:  # noqa: BLE001
+        return make_failure(operation, name, account, "INVALID_VOLUME", "Total volume must be positive.")
+    try:
+        start_price = _positive_decimal(request.get("start_price"), "start_price")
+        end_price = _positive_decimal(request.get("end_price"), "end_price")
+        row = _find_symbol_row(requested_symbol)
+        native = str(row.get("symbol") or "").strip()
+        instrument = _instrument_dict(row)
+        if side == "buy" and end_price >= start_price:
+            return make_failure(operation, name, account, "INVALID_LADDER_DIRECTION", "BUY ladders require end price below start price.")
+        if side == "sell" and end_price <= start_price:
+            return make_failure(operation, name, account, "INVALID_LADDER_DIRECTION", "SELL ladders require end price above start price.")
+        children = _build_ladder_children(
+            native=native,
+            side=side,
+            distribution=distribution,
+            order_count=order_count,
+            total_volume=total_volume,
+            start_price=start_price,
+            end_price=end_price,
+            instrument=instrument,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        if code in {"INVALID_DISTRIBUTION", "NO_VALID_CHILDREN", "CHILD_BELOW_MIN_SIZE", "CHILD_BELOW_MIN_NOTIONAL"}:
+            return make_failure(operation, name, account, code, _redact(exc, credentials))
+        return make_failure(operation, name, account, "INVALID_REQUEST", _redact(exc, credentials))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "INVALID_REQUEST", _redact(exc, credentials))
+    submitted_volume = sum((Decimal(child["origQty"]) for child in children), Decimal("0"))
+    display = _short_symbol(native)
+    batches: List[Dict[str, Any]] = []
+    child_ids: List[str] = []
+    accepted = 0
+    if _is_dry_run(request):
+        result = CanonicalLadderResult(
+            symbol=display,
+            side=side,
+            distribution=distribution,
+            requested_order_count=order_count,
+            submitted_order_count=len(children),
+            requested_volume=_format_decimal(total_volume),
+            submitted_volume=_format_decimal(submitted_volume),
+            batch_count=0,
+            verified=False,
+            partial=False,
+            status="dry_run",
+            accepted_child_count=0,
+            child_order_ids=None,
+            batches=None,
+        )
+        return make_success(operation, name, credentials["account"], ladder=result, data={"dry_run": True, "children": children, "native_symbol": native})
+    unknown = False
+    unknown_message = ""
+    for index, child in enumerate(children):
+        try:
+            payload = _signed_request(credentials, "POST", ORDER_CREATE_PATH, body=child)
+            order_id = _order_id_from_payload(payload)
+            if not order_id:
+                unknown = True
+                unknown_message = "AZverse create response omitted orderId."
+                batches.append({"index": index, "ok": False, "status": "UNKNOWN", "path": ORDER_CREATE_PATH})
+                break
+            accepted += 1
+            child_ids.append(order_id)
+            batches.append({"index": index, "ok": True, "status": "ACCEPTED", "order_id": order_id, "path": ORDER_CREATE_PATH})
+        except Exception as exc:  # noqa: BLE001
+            message = _redact(exc, credentials)
+            if accepted > 0:
+                unknown = True
+                unknown_message = message
+                batches.append({"index": index, "ok": False, "status": "UNKNOWN", "path": ORDER_CREATE_PATH})
+                break
+            return make_failure(operation, name, account, "AZVERSE_ORDER_ERROR", message)
+    result = CanonicalLadderResult(
+        symbol=display,
+        side=side,
+        distribution=distribution,
+        requested_order_count=order_count,
+        submitted_order_count=accepted,
+        requested_volume=_format_decimal(total_volume),
+        submitted_volume=_format_decimal(sum((Decimal(children[i]["origQty"]) for i in range(accepted)), Decimal("0"))) if accepted else "0",
+        batch_count=len(batches),
+        verified=accepted == order_count and not unknown,
+        partial=accepted not in {0, order_count},
+        status="unknown" if unknown else ("success" if accepted == order_count else "failed"),
+        accepted_child_count=accepted,
+        child_order_ids=child_ids or None,
+        batches=batches or None,
+    )
+    if unknown:
+        return make_failure(
+            operation,
+            name,
+            credentials["account"],
+            "ORDER_STATUS_UNKNOWN",
+            "One or more ladder orders may already have been submitted. Do not retry this ladder until open orders are reconciled.",
+            ladder=result,
+        )
+    if accepted == order_count:
+        return make_success(operation, name, credentials["account"], ladder=result, data={"children": children, "requested": order_count, "succeeded": accepted, "failed": 0})
+    return make_failure(operation, name, credentials["account"], "AZVERSE_ORDER_ERROR", "AZverse ladder submission failed.", ladder=result)
+
+
+def _request_position_side(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"buy", "long", "b"}:
+        return "long"
+    if text in {"sell", "short", "s"}:
+        return "short"
+    raise ValueError("INVALID_SIDE")
+
+
+def _position_matches(row: Mapping[str, Any], symbol: str, side: str) -> bool:
+    native = str(row.get("symbol") or "").strip()
+    if not native:
+        return False
+    if _short_symbol(native).lower() != symbol.lower() and native.lower() != symbol.lower():
+        return False
+    raw = str(row.get("positionSide") or row.get("side") or "").strip().lower()
+    if raw in {"short", "sell"}:
+        row_side = "short"
+    elif raw in {"long", "buy"}:
+        row_side = "long"
+    else:
+        return False
+    return row_side == side
+
+
+def _find_position_row(credentials: Mapping[str, str], symbol: str, side: str) -> Mapping[str, Any]:
+    rows = _signed_get(credentials, POSITIONS_PATH)
+    if not isinstance(rows, list):
+        raise ValueError("AZverse position response is not a list.")
+    matches = [row for row in rows if isinstance(row, Mapping) and _position_matches(row, symbol, side)]
+    open_matches = []
+    for row in matches:
+        size = abs(_required_first_decimal(row, "positionSize", "quantity"))
+        if size > 0:
+            open_matches.append(row)
+    if not open_matches:
+        raise ValueError("POSITION_NOT_FOUND")
+    if len(open_matches) > 1:
+        raise ValueError("POSITION_AMBIGUOUS")
+    return open_matches[0]
+
+
+def _profit_id(row: Mapping[str, Any]) -> Optional[str]:
+    value = row.get("profitId")
+    if value in (None, "", 0, "0"):
+        return None
+    return str(value)
+
+
+def _profit_items(payload: Any) -> List[Mapping[str, Any]]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("AZverse profit-list response is not an object.")
+    rows = payload.get("items")
+    if rows is None:
+        rows = payload.get("list")
+    if rows is None:
+        raise ValueError("AZverse profit-list omitted items.")
+    if not isinstance(rows, list):
+        raise ValueError("AZverse profit-list items are not a list.")
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise ValueError("AZverse profit-list contained a malformed row.")
+    return list(rows)
+
+
+def _fetch_open_profits(credentials: Mapping[str, str], native: str) -> List[Mapping[str, Any]]:
+    payload = _signed_get(
+        credentials,
+        PROFIT_LIST_PATH,
+        {"symbol": native, "state": "UNFINISHED", "page": 1, "size": 100},
+    )
+    open_rows: List[Mapping[str, Any]] = []
+    for row in _profit_items(payload):
+        state = str(row.get("state") or "").strip().upper()
+        if state in _TERMINAL_ORDER_STATES:
+            continue
+        open_rows.append(row)
+    return open_rows
+
+
+def _profits_for_position(rows: List[Mapping[str, Any]], native: str, side: str) -> List[Mapping[str, Any]]:
+    wanted = "LONG" if side == "long" else "SHORT"
+    matches: List[Mapping[str, Any]] = []
+    for row in rows:
+        row_native = str(row.get("symbol") or "").strip()
+        if row_native.lower() != native.lower() and _short_symbol(row_native).lower() != _short_symbol(native).lower():
+            continue
+        row_side = str(row.get("positionSide") or "").strip().upper()
+        if row_side != wanted:
+            continue
+        matches.append(row)
+    return matches
+
+
+def _protection_price(row: Mapping[str, Any], kind: str) -> Optional[Decimal]:
+    key = "triggerProfitPrice" if kind == "tp" else "triggerStopPrice"
+    value = _optional_decimal(row.get(key))
+    if value is not None and value <= 0:
+        return None
+    return value
+
+
+def _protection_verified(rows: List[Mapping[str, Any]], kind: str, price: Decimal, removing: bool) -> bool:
+    actuals = [_protection_price(row, kind) for row in rows]
+    if removing:
+        return all(value is None for value in actuals)
+    return any(value is not None and value == price for value in actuals)
+
+
+def _handle_close_position(account: str, request: Mapping[str, Any]):
+    operation = "close_position"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    symbol = str(request.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required.")
+    try:
+        side = _request_position_side(request.get("side"))
+        row = _find_position_row(credentials, symbol, side)
+        native = str(row.get("symbol") or "").strip()
+        size = abs(_required_first_decimal(row, "positionSize", "quantity"))
+    except ValueError as exc:
+        code = str(exc)
+        if code in {"INVALID_SIDE", "POSITION_NOT_FOUND", "POSITION_AMBIGUOUS"}:
+            return make_failure(operation, name, account, code, _redact(exc, credentials))
+        return make_failure(operation, name, account, "INVALID_REQUEST", _redact(exc, credentials))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_POSITIONS_ORDERS_ERROR", _redact(exc, credentials))
+    display = _short_symbol(native)
+    body = {
+        "symbol": native,
+        "orderSide": "SELL" if side == "long" else "BUY",
+        "orderType": "MARKET",
+        "origQty": _format_decimal(size),
+        "positionSide": "LONG" if side == "long" else "SHORT",
+        "reduceOnly": True,
+    }
+    action = CanonicalPositionActionResult(
+        operation=operation,
+        symbol=display,
+        verified=False,
+        status="dry_run",
+        current_side=side,
+        current_size=_format_decimal(size),
+        message="Close preview; no order was submitted.",
+    )
+    if _is_dry_run(request):
+        return make_success(operation, name, credentials["account"], position_action=action, data={"dry_run": True, "native_symbol": native})
+    try:
+        payload = _signed_request(credentials, "POST", ORDER_CREATE_PATH, body=body)
+        order_id = _order_id_from_payload(payload)
+        remaining = _signed_get(credentials, POSITIONS_PATH)
+        still = [
+            item
+            for item in remaining
+            if isinstance(item, Mapping) and _position_matches(item, symbol, side) and abs(_required_first_decimal(item, "positionSize", "quantity")) > 0
+        ] if isinstance(remaining, list) else [True]
+        verified = not still
+        result = CanonicalPositionActionResult(
+            operation=operation,
+            symbol=display,
+            verified=verified,
+            status="success" if verified else "unknown",
+            exchange_order_id=order_id,
+            current_side=None if verified else side,
+            current_size="0" if verified else _format_decimal(size),
+            message="Position closed." if verified else "Close submitted; reconcile Positions & Orders. Do not retry.",
+        )
+        if verified:
+            return make_success(operation, name, credentials["account"], position_action=result)
+        return make_failure(
+            operation,
+            name,
+            credentials["account"],
+            "ORDER_STATUS_UNKNOWN",
+            "Close was submitted but the position still appears open. Do not retry until Positions & Orders is reconciled.",
+            position_action=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_ORDER_ERROR", _redact(exc, credentials))
+
+
+def _handle_set_protection(account: str, request: Mapping[str, Any], kind: str):
+    operation = "set_tp" if kind == "tp" else "set_sl"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    symbol = str(request.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required.")
+    raw_price = request.get("price")
+    try:
+        side = _request_position_side(request.get("side"))
+        if str(raw_price).strip() == "0":
+            price = Decimal("0")
+        else:
+            price = _positive_decimal(raw_price, "price")
+        row = _find_position_row(credentials, symbol, side)
+        native = str(row.get("symbol") or "").strip()
+        size = abs(_required_first_decimal(row, "positionSize", "quantity"))
+        profits = _profits_for_position(_fetch_open_profits(credentials, native), native, side)
+        existing = profits[0] if profits else None
+        existing_id = _profit_id(existing) if existing is not None else _profit_id(row)
+        existing_tp = _protection_price(existing, "tp") if existing is not None else _optional_decimal(row.get("triggerProfitPrice"))
+        existing_sl = _protection_price(existing, "sl") if existing is not None else _optional_decimal(row.get("triggerStopPrice"))
+    except ValueError as exc:
+        code = str(exc)
+        if code in {"INVALID_SIDE", "POSITION_NOT_FOUND", "POSITION_AMBIGUOUS"}:
+            return make_failure(operation, name, account, code, _redact(exc, credentials))
+        return make_failure(operation, name, account, "INVALID_REQUEST", _redact(exc, credentials))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_POSITIONS_ORDERS_ERROR", _redact(exc, credentials))
+    display = _short_symbol(native)
+    current = existing_tp if kind == "tp" else existing_sl
+    other = existing_sl if kind == "tp" else existing_tp
+    removing = price == 0
+    if removing and current is None:
+        return make_success(
+            operation,
+            name,
+            credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation=operation,
+                symbol=display,
+                verified=True,
+                removed=False,
+                current_side=side,
+                current_size=_format_decimal(size),
+                message="No Take Profit was set." if kind == "tp" else "No Stop Loss was set.",
+            ),
+        )
+    if _is_dry_run(request):
+        return make_success(
+            operation,
+            name,
+            credentials["account"],
+            position_action=CanonicalPositionActionResult(
+                operation=operation,
+                symbol=display,
+                verified=False,
+                price=None if removing else _format_decimal(price),
+                removed=removing,
+                status="dry_run",
+                current_side=side,
+                current_size=_format_decimal(size),
+                message="Protection preview; no order was submitted.",
+            ),
+            data={"dry_run": True},
+        )
+    try:
+        if removing and existing_id and other is None:
+            _signed_request(credentials, "POST", PROFIT_CANCEL_PATH, body={"profitId": existing_id})
+        elif existing_id:
+            body: Dict[str, Any] = {"profitId": existing_id}
+            if kind == "tp":
+                if not removing:
+                    body["triggerProfitPrice"] = _format_decimal(price)
+                if other is not None:
+                    body["triggerStopPrice"] = _format_decimal(other)
+            else:
+                if not removing:
+                    body["triggerStopPrice"] = _format_decimal(price)
+                if other is not None:
+                    body["triggerProfitPrice"] = _format_decimal(other)
+            _signed_request(credentials, "POST", PROFIT_UPDATE_PATH, body=body)
+        else:
+            body = {
+                "symbol": native,
+                "positionSide": "LONG" if side == "long" else "SHORT",
+                "origQty": _format_decimal(size),
+                "triggerPriceType": "MARK_PRICE",
+            }
+            if kind == "tp":
+                body["triggerProfitPrice"] = _format_decimal(price)
+                if existing_sl is not None:
+                    body["triggerStopPrice"] = _format_decimal(existing_sl)
+            else:
+                body["triggerStopPrice"] = _format_decimal(price)
+                if existing_tp is not None:
+                    body["triggerProfitPrice"] = _format_decimal(existing_tp)
+            _signed_request(credentials, "POST", PROFIT_CREATE_PATH, body=body)
+        refreshed = _profits_for_position(_fetch_open_profits(credentials, native), native, side)
+        verified = _protection_verified(refreshed, kind, price, removing)
+        retries = 0
+        while not verified and retries < 3:
+            time.sleep(0.4)
+            refreshed = _profits_for_position(_fetch_open_profits(credentials, native), native, side)
+            verified = _protection_verified(refreshed, kind, price, removing)
+            retries += 1
+        result = CanonicalPositionActionResult(
+            operation=operation,
+            symbol=display,
+            verified=verified,
+            price=None if removing else _format_decimal(price),
+            removed=removing,
+            status="success" if verified else "unknown",
+            current_side=side,
+            current_size=_format_decimal(size),
+            message=("Take Profit removed." if removing else "Take Profit updated.") if kind == "tp" else ("Stop Loss removed." if removing else "Stop Loss updated."),
+        )
+        if verified:
+            return make_success(operation, name, credentials["account"], position_action=result)
+        return make_failure(
+            operation,
+            name,
+            credentials["account"],
+            "PROTECTION_STATUS_UNKNOWN",
+            "AZverse accepted the protection change, but the profit-list did not yet show it. Do not retry until Positions & Orders is reconciled.",
+            position_action=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_ORDER_ERROR", _redact(exc, credentials))
 
 
 def execute(request: Mapping[str, Any]):
@@ -1177,6 +1810,14 @@ def execute(request: Mapping[str, Any]):
         return _handle_new_order(account, request)
     if operation in {"cancel_orders", "cancel_order_group"}:
         return _handle_cancel_order_group(account, request)
+    if operation == "ladder":
+        return _handle_ladder(account, request)
+    if operation == "close_position":
+        return _handle_close_position(account, request)
+    if operation == "set_tp":
+        return _handle_set_protection(account, request, "tp")
+    if operation == "set_sl":
+        return _handle_set_protection(account, request, "sl")
     return make_failure(
         operation or "unknown",
         name,
