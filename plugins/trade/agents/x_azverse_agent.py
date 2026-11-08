@@ -1578,8 +1578,24 @@ def _protection_price(row: Mapping[str, Any], kind: str) -> Optional[Decimal]:
     return value
 
 
-def _protection_verified(rows: List[Mapping[str, Any]], kind: str, price: Decimal, removing: bool) -> bool:
-    actuals = [_protection_price(row, kind) for row in rows]
+def _protection_verified(
+    rows: List[Mapping[str, Any]],
+    kind: str,
+    price: Decimal,
+    removing: bool,
+    ignored_ids: Optional[set] = None,
+    cleared_ids: Optional[set] = None,
+) -> bool:
+    ignored_ids = ignored_ids or set()
+    cleared_ids = cleared_ids or set()
+    actuals: List[Optional[Decimal]] = []
+    for row in rows:
+        profit_id = _profit_id(row)
+        if profit_id is not None and profit_id in ignored_ids:
+            continue
+        if removing and profit_id is not None and profit_id in cleared_ids:
+            continue
+        actuals.append(_protection_price(row, kind))
     if removing:
         return all(value is None for value in actuals)
     return any(value is not None and value == price for value in actuals)
@@ -1682,6 +1698,7 @@ def _handle_set_protection(account: str, request: Mapping[str, Any], kind: str):
         existing_id = _profit_id(existing) if existing is not None else _profit_id(row)
         existing_tp = _protection_price(existing, "tp") if existing is not None else _optional_decimal(row.get("triggerProfitPrice"))
         existing_sl = _protection_price(existing, "sl") if existing is not None else _optional_decimal(row.get("triggerStopPrice"))
+        kind_rows = [item for item in profits if _protection_price(item, kind) is not None]
     except ValueError as exc:
         code = str(exc)
         if code in {"INVALID_SIDE", "POSITION_NOT_FOUND", "POSITION_AMBIGUOUS"}:
@@ -1690,7 +1707,7 @@ def _handle_set_protection(account: str, request: Mapping[str, Any], kind: str):
     except Exception as exc:  # noqa: BLE001
         return make_failure(operation, name, account, "AZVERSE_POSITIONS_ORDERS_ERROR", _redact(exc, credentials))
     display = _short_symbol(native)
-    current = existing_tp if kind == "tp" else existing_sl
+    current = _protection_price(kind_rows[0], kind) if kind_rows else (existing_tp if kind == "tp" else existing_sl)
     other = existing_sl if kind == "tp" else existing_tp
     removing = price == 0
     if removing and current is None:
@@ -1727,44 +1744,66 @@ def _handle_set_protection(account: str, request: Mapping[str, Any], kind: str):
             data={"dry_run": True},
         )
     try:
-        if removing and existing_id and other is None:
-            _signed_request(credentials, "POST", PROFIT_CANCEL_PATH, body={"profitId": existing_id})
-        elif existing_id:
-            body: Dict[str, Any] = {"profitId": existing_id}
-            if kind == "tp":
-                if not removing:
-                    body["triggerProfitPrice"] = _format_decimal(price)
-                if other is not None:
-                    body["triggerStopPrice"] = _format_decimal(other)
-            else:
-                if not removing:
-                    body["triggerStopPrice"] = _format_decimal(price)
-                if other is not None:
-                    body["triggerProfitPrice"] = _format_decimal(other)
-            _signed_request(credentials, "POST", PROFIT_UPDATE_PATH, body=body)
+        if removing:
+            cancelled_ids = set()
+            cleared_ids = set()
+            for item in kind_rows:
+                profit_id = _profit_id(item)
+                if not profit_id:
+                    continue
+                other_price = _protection_price(item, "sl" if kind == "tp" else "tp")
+                if other_price is None:
+                    _signed_request(credentials, "POST", PROFIT_CANCEL_PATH, body={"profitId": profit_id})
+                    cancelled_ids.add(profit_id)
+                    continue
+                body = {"profitId": profit_id}
+                if kind == "tp":
+                    body["triggerStopPrice"] = _format_decimal(other_price)
+                else:
+                    body["triggerProfitPrice"] = _format_decimal(other_price)
+                _signed_request(credentials, "POST", PROFIT_UPDATE_PATH, body=body)
+                cleared_ids.add(profit_id)
         else:
-            body = {
-                "symbol": native,
-                "positionSide": "LONG" if side == "long" else "SHORT",
-                "origQty": _format_decimal(size),
-                "triggerPriceType": "MARK_PRICE",
-            }
-            if kind == "tp":
-                body["triggerProfitPrice"] = _format_decimal(price)
-                if existing_sl is not None:
-                    body["triggerStopPrice"] = _format_decimal(existing_sl)
+            cancelled_ids = set()
+            cleared_ids = set()
+            if existing_id:
+                body = {"profitId": existing_id}
+                if kind == "tp":
+                    body["triggerProfitPrice"] = _format_decimal(price)
+                    if other is not None:
+                        body["triggerStopPrice"] = _format_decimal(other)
+                else:
+                    body["triggerStopPrice"] = _format_decimal(price)
+                    if other is not None:
+                        body["triggerProfitPrice"] = _format_decimal(other)
+                _signed_request(credentials, "POST", PROFIT_UPDATE_PATH, body=body)
             else:
-                body["triggerStopPrice"] = _format_decimal(price)
-                if existing_tp is not None:
-                    body["triggerProfitPrice"] = _format_decimal(existing_tp)
-            _signed_request(credentials, "POST", PROFIT_CREATE_PATH, body=body)
+                body = {
+                    "symbol": native,
+                    "positionSide": "LONG" if side == "long" else "SHORT",
+                    "origQty": _format_decimal(size),
+                    "triggerPriceType": "MARK_PRICE",
+                }
+                if kind == "tp":
+                    body["triggerProfitPrice"] = _format_decimal(price)
+                    if existing_sl is not None:
+                        body["triggerStopPrice"] = _format_decimal(existing_sl)
+                else:
+                    body["triggerStopPrice"] = _format_decimal(price)
+                    if existing_tp is not None:
+                        body["triggerProfitPrice"] = _format_decimal(existing_tp)
+                _signed_request(credentials, "POST", PROFIT_CREATE_PATH, body=body)
         refreshed = _profits_for_position(_fetch_open_profits(credentials, native), native, side)
-        verified = _protection_verified(refreshed, kind, price, removing)
+        verified = _protection_verified(
+            refreshed, kind, price, removing, ignored_ids=cancelled_ids, cleared_ids=cleared_ids
+        )
         retries = 0
         while not verified and retries < 3:
             time.sleep(0.4)
             refreshed = _profits_for_position(_fetch_open_profits(credentials, native), native, side)
-            verified = _protection_verified(refreshed, kind, price, removing)
+            verified = _protection_verified(
+                refreshed, kind, price, removing, ignored_ids=cancelled_ids, cleared_ids=cleared_ids
+            )
             retries += 1
         result = CanonicalPositionActionResult(
             operation=operation,

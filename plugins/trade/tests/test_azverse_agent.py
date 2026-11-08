@@ -1307,6 +1307,171 @@ class AzverseAgentTests(unittest.TestCase):
         self.assertNotEqual(response.error.code, "VERIFICATION_FAILED")
         self.assertIn("Do not retry", response.error.message)
 
+    def test_remove_sl_cancels_sl_profit_even_when_first_row_is_tp_only(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                if any(item["path"] == azverse.PROFIT_CANCEL_PATH for item in calls):
+                    return {
+                        "items": [
+                            {
+                                "profitId": "p-tp",
+                                "symbol": "zec_usdt",
+                                "positionSide": "SHORT",
+                                "state": "NOT_TRIGGERED",
+                                "triggerProfitPrice": "1000",
+                                "triggerStopPrice": None,
+                                "origQty": "50",
+                            }
+                        ],
+                        "total": 1,
+                    }
+                return {
+                    "items": [
+                        {
+                            "profitId": "p-tp",
+                            "symbol": "zec_usdt",
+                            "positionSide": "SHORT",
+                            "state": "NOT_TRIGGERED",
+                            "triggerProfitPrice": "1000",
+                            "triggerStopPrice": None,
+                            "origQty": "50",
+                        },
+                        {
+                            "profitId": "p-sl",
+                            "symbol": "zec_usdt",
+                            "positionSide": "SHORT",
+                            "state": "NOT_TRIGGERED",
+                            "triggerProfitPrice": None,
+                            "triggerStopPrice": "1400",
+                            "origQty": "50",
+                        },
+                    ],
+                    "total": 2,
+                }
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"path": path, "body": body})
+            return {"profitId": body.get("profitId")}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {"operation": "set_sl", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "0"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertTrue(response.position_action.removed)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(response.position_action.operation, "set_sl")
+        self.assertEqual([item["path"] for item in calls], [azverse.PROFIT_CANCEL_PATH])
+        self.assertEqual(calls[0]["body"], {"profitId": "p-sl"})
+        self.assertNotEqual(response.error.code if response.error else None, "PROTECTION_STATUS_UNKNOWN")
+
+    def test_remove_sl_ack_treats_stale_profit_list_row_as_gone(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+        stale = {
+            "items": [
+                {
+                    "profitId": "p-tp",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": "1000",
+                    "triggerStopPrice": None,
+                    "origQty": "50",
+                },
+                {
+                    "profitId": "p-sl",
+                    "symbol": "zec_usdt",
+                    "positionSide": "SHORT",
+                    "state": "NOT_TRIGGERED",
+                    "triggerProfitPrice": None,
+                    "triggerStopPrice": "1400",
+                    "origQty": "50",
+                },
+            ],
+            "total": 2,
+        }
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                return stale
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"path": path, "body": body})
+            return {"profitId": body.get("profitId")}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request), mock.patch.object(azverse.time, "sleep"):
+            response = azverse.execute(
+                {"operation": "set_sl", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "0"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertTrue(response.position_action.removed)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(calls[0]["body"], {"profitId": "p-sl"})
+        self.assertNotEqual(getattr(response.error, "code", None), "PROTECTION_STATUS_UNKNOWN")
+
+    def test_remove_tp_cancels_every_tp_row_not_only_the_first(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        calls = []
+
+        def fake_get(_creds, path, query=None):
+            if path == azverse.POSITIONS_PATH:
+                return [self._short_zec_position()]
+            if path == azverse.PROFIT_LIST_PATH:
+                remaining = [
+                    {
+                        "profitId": "p-tp-1",
+                        "symbol": "zec_usdt",
+                        "positionSide": "SHORT",
+                        "state": "NOT_TRIGGERED",
+                        "triggerProfitPrice": "1000",
+                        "triggerStopPrice": None,
+                        "origQty": "50",
+                    },
+                    {
+                        "profitId": "p-tp-2",
+                        "symbol": "zec_usdt",
+                        "positionSide": "SHORT",
+                        "state": "NOT_TRIGGERED",
+                        "triggerProfitPrice": "1000",
+                        "triggerStopPrice": None,
+                        "origQty": "50",
+                    },
+                ]
+                cancelled = {item["body"]["profitId"] for item in calls if item["path"] == azverse.PROFIT_CANCEL_PATH}
+                items = [row for row in remaining if row["profitId"] not in cancelled]
+                return {"items": items, "total": len(items)}
+            return {"items": [], "total": 0}
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"path": path, "body": body})
+            return {"profitId": body.get("profitId")}
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request), mock.patch.object(azverse.time, "sleep"):
+            response = azverse.execute(
+                {"operation": "set_tp", "exchange": "azverse", "account": "amiroo", "symbol": "ZEC", "side": "sell", "price": "0"}
+            )
+        self.assertTrue(response.success, response)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual([item["body"]["profitId"] for item in calls], ["p-tp-1", "p-tp-2"])
+        self.assertTrue(all(item["path"] == azverse.PROFIT_CANCEL_PATH for item in calls))
+        self.assertNotEqual(getattr(response.error, "code", None), "PROTECTION_STATUS_UNKNOWN")
+
     def test_signed_post_includes_json_body_in_hmac_and_rejects_redirects(self) -> None:
         creds = {"account": "amiroo", "api_key": "app-key", "secret": "super-secret", "api_base": azverse.DEFAULT_API_BASE}
         captured = {}
