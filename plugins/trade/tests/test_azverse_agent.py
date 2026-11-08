@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import os
 import sys
 import traceback
 import unittest
@@ -19,6 +21,15 @@ from plugins.trade.tradedesk import _exchange_name_from_filename  # noqa: E402
 
 
 class AzverseAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        env_patch = mock.patch.dict(
+            os.environ,
+            {"AZVERSE_WRITE_ENABLED": "", "AZVERSE_DRY_RUN": "1"},
+            clear=False,
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
     def test_trade_filename_parser_accepts_azverse_agent(self) -> None:
         self.assertEqual(_exchange_name_from_filename("x_azverse_agent.py"), "azverse")
         self.assertIsNone(_exchange_name_from_filename("x_azverse_agent_spot.py"))
@@ -43,13 +54,24 @@ class AzverseAgentTests(unittest.TestCase):
         with mock.patch.object(azverse, "_combined_azverse_env", return_value=combined):
             self.assertEqual(azverse._discover_credential_map()["main"], {"key": "env-key", "secret": "env-secret"})
 
-    def test_capabilities_are_read_only_balance_positions_and_orders(self) -> None:
+    def test_capabilities_include_new_order_and_cancel_without_ladder(self) -> None:
+        caps = azverse.capabilities()
         self.assertEqual(
-            azverse.capabilities(),
-            ["balance", "positions_orders", "positions_management"],
+            caps,
+            [
+                "balance",
+                "positions_orders",
+                "positions_management",
+                "new_order",
+                "cancel_orders",
+                "cancel_order_group",
+                "list_instruments",
+                "resolve_instrument",
+                "market_price",
+            ],
         )
-        for forbidden in ("new_order", "cancel_orders", "ladder", "close_position", "set_tp", "set_sl"):
-            self.assertNotIn(forbidden, azverse.capabilities())
+        for forbidden in ("ladder", "close_position", "set_tp", "set_sl"):
+            self.assertNotIn(forbidden, caps)
 
     def test_balance_maps_live_futures_fields(self) -> None:
         payload = [
@@ -286,11 +308,13 @@ class AzverseAgentTests(unittest.TestCase):
         self.assertNotIn(creds["api_key"], response.error.message)
         self.assertNotIn(creds["secret"], response.error.message)
 
-    def test_mutating_operations_are_not_implemented_without_http(self) -> None:
+    def test_unadvertised_mutations_are_not_implemented_without_http(self) -> None:
         with mock.patch.object(azverse, "_signed_get") as signed:
-            response = azverse.execute({"operation": "new_order", "exchange": "azverse", "account": "amiroo"})
-        self.assertFalse(response.success)
-        self.assertEqual(response.error.code, "NOT_IMPLEMENTED")
+            for operation in ("ladder", "close_position", "set_tp", "set_sl"):
+                with self.subTest(operation=operation):
+                    response = azverse.execute({"operation": operation, "exchange": "azverse", "account": "amiroo"})
+                    self.assertFalse(response.success)
+                    self.assertEqual(response.error.code, "NOT_IMPLEMENTED")
         signed.assert_not_called()
 
 
@@ -477,6 +501,298 @@ class AzverseAgentTests(unittest.TestCase):
         ]
         with mock.patch.object(azverse, "_signed_get", side_effect=pages), self.assertRaises(ValueError):
             azverse._fetch_open_orders(credentials)
+
+    def _live_write_env(self) -> mock._patch:
+        return mock.patch.dict(
+            os.environ,
+            {"AZVERSE_WRITE_ENABLED": "1", "AZVERSE_DRY_RUN": "0"},
+            clear=False,
+        )
+
+    def test_new_order_dry_run_does_not_post(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        catalog = [{"symbol": "btc_usdt", "baseCoin": "btc", "quoteCoin": "usdt", "tradeSwitch": True, "isOpenApi": True, "contractType": "PERPETUAL"}]
+        posted = []
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=catalog
+        ), mock.patch.object(azverse, "_signed_request", side_effect=lambda *a, **k: posted.append((a, k)) or {}):
+            response = azverse.execute(
+                {
+                    "operation": "new_order",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "order_type": "limit",
+                    "volume": "0.01",
+                    "price": "75000",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.order.status, "dry_run")
+        self.assertFalse(response.order.verified)
+        self.assertEqual(response.order.symbol, "BTC")
+        self.assertEqual(response.order.side, "buy")
+        self.assertEqual(posted, [])
+
+    def test_new_order_rejects_market_and_invalid_numbers(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        catalog = [{"symbol": "btc_usdt", "baseCoin": "btc", "quoteCoin": "usdt", "tradeSwitch": True, "isOpenApi": True, "contractType": "PERPETUAL"}]
+        cases = [
+            {"order_type": "market", "volume": "1", "price": "100", "code": "UNSUPPORTED_ORDER_TYPE"},
+            {"order_type": "limit", "volume": "0", "price": "100", "code": "INVALID_REQUEST"},
+            {"order_type": "limit", "volume": "1", "price": "-1", "code": "INVALID_REQUEST"},
+        ]
+        for case in cases:
+            with self.subTest(case=case), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+                azverse, "_symbol_rows", return_value=catalog
+            ), mock.patch.object(azverse, "_signed_request") as posted:
+                response = azverse.execute(
+                    {
+                        "operation": "new_order",
+                        "exchange": "azverse",
+                        "account": "amiroo",
+                        "symbol": "btc_usdt",
+                        "side": "buy",
+                        "order_type": case["order_type"],
+                        "volume": case["volume"],
+                        "price": case["price"],
+                    }
+                )
+            self.assertFalse(response.success)
+            self.assertEqual(response.error.code, case["code"])
+            posted.assert_not_called()
+
+    def test_new_order_live_posts_limit_create_body(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        catalog = [{"symbol": "btc_usdt", "baseCoin": "btc", "quoteCoin": "usdt", "tradeSwitch": True, "isOpenApi": True, "contractType": "PERPETUAL"}]
+        calls = []
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"method": method, "path": path, "query": query, "body": body})
+            if method == "POST" and path == azverse.ORDER_CREATE_PATH:
+                return {"orderId": "ord-1", "origQty": "0.01", "price": "75000.0"}
+            raise AssertionError((method, path))
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_symbol_rows", return_value=catalog
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {
+                    "operation": "new_order",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "order_type": "limit",
+                    "volume": "0.01",
+                    "price": "75000",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.order.status, "success")
+        self.assertTrue(response.order.verified)
+        self.assertEqual(response.order.exchange_order_id, "ord-1")
+        self.assertEqual(calls[0]["method"], "POST")
+        self.assertEqual(calls[0]["path"], azverse.ORDER_CREATE_PATH)
+        self.assertEqual(calls[0]["body"]["symbol"], "btc_usdt")
+        self.assertEqual(calls[0]["body"]["orderSide"], "BUY")
+        self.assertEqual(calls[0]["body"]["orderType"], "LIMIT")
+        self.assertEqual(calls[0]["body"]["positionSide"], "LONG")
+        self.assertEqual(calls[0]["body"]["origQty"], "0.01")
+        self.assertEqual(calls[0]["body"]["price"], "75000")
+        self.assertEqual(calls[0]["body"]["timeInForce"], "GTC")
+
+    def test_cancel_order_group_dry_run_does_not_post(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        orders = {
+            "items": [
+                {
+                    "orderId": "keep-sell",
+                    "symbol": "btc_usdt",
+                    "orderSide": "SELL",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "76000",
+                },
+                {
+                    "orderId": "cancel-buy",
+                    "symbol": "btc_usdt",
+                    "orderSide": "BUY",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "74000",
+                },
+            ],
+            "total": 2,
+        }
+        posted = []
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", return_value=orders
+        ), mock.patch.object(azverse, "_signed_request", side_effect=lambda *a, **k: posted.append((a, k)) or {}):
+            response = azverse.execute(
+                {
+                    "operation": "cancel_order_group",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "order_type": "LIMIT",
+                }
+            )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "AZVERSE_DRY_RUN")
+        self.assertEqual(posted, [])
+
+    def test_cancel_order_group_live_cancels_matching_ids_only(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        open_before = {
+            "items": [
+                {
+                    "orderId": "keep-sell",
+                    "symbol": "btc_usdt",
+                    "orderSide": "SELL",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "76000",
+                },
+                {
+                    "orderId": "cancel-buy",
+                    "symbol": "btc_usdt",
+                    "orderSide": "BUY",
+                    "orderType": "LIMIT",
+                    "origQty": "1",
+                    "executedQty": "0",
+                    "price": "74000",
+                },
+            ],
+            "total": 2,
+        }
+        open_after = {"items": [open_before["items"][0]], "total": 1}
+        calls = []
+        gets = {"n": 0}
+
+        def fake_get(_creds, path, query=None):
+            self.assertEqual(path, azverse.ORDERS_PATH)
+            gets["n"] += 1
+            return open_before if gets["n"] == 1 else open_after
+
+        def fake_request(_creds, method, path, query=None, body=None):
+            calls.append({"method": method, "path": path, "body": body})
+            if method == "POST" and path == azverse.ORDER_CANCEL_PATH:
+                return {"orderId": body["orderId"]}
+            raise AssertionError((method, path))
+
+        with self._live_write_env(), mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_signed_get", side_effect=fake_get
+        ), mock.patch.object(azverse, "_signed_request", side_effect=fake_request):
+            response = azverse.execute(
+                {
+                    "operation": "cancel_orders",
+                    "exchange": "azverse",
+                    "account": "amiroo",
+                    "symbol": "BTC",
+                    "side": "buy",
+                    "order_type": "LIMIT",
+                }
+            )
+        self.assertTrue(response.success, response)
+        self.assertEqual(response.cancel_group.cancelled_order_count, 1)
+        self.assertTrue(response.cancel_group.verified)
+        self.assertEqual(calls, [{"method": "POST", "path": azverse.ORDER_CANCEL_PATH, "body": {"orderId": "cancel-buy"}}])
+        self.assertNotIn("/order/cancel-all", [item["path"] for item in calls])
+
+    def test_signed_post_includes_json_body_in_hmac_and_rejects_redirects(self) -> None:
+        creds = {"account": "amiroo", "api_key": "app-key", "secret": "super-secret", "api_base": azverse.DEFAULT_API_BASE}
+        captured = {}
+
+        class _Resp:
+            def read(self):
+                return json.dumps({"returnCode": 0, "result": {"orderId": "x"}}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["headers"] = {k.lower(): v for k, v in request.header_items()}
+            captured["body"] = request.data
+            captured["timeout"] = timeout
+            return _Resp()
+
+        with mock.patch.object(azverse, "_open_no_redirect", side_effect=fake_open):
+            result = azverse._signed_request(
+                creds,
+                "POST",
+                azverse.ORDER_CREATE_PATH,
+                body={"symbol": "btc_usdt", "orderSide": "BUY"},
+            )
+        self.assertEqual(result, {"orderId": "x"})
+        body = captured["body"].decode("utf-8")
+        self.assertEqual(body, '{"symbol":"btc_usdt","orderSide":"BUY"}')
+        signature = captured["headers"]["validate-signature"]
+        timestamp = captured["headers"]["validate-timestamp"]
+        expected = hmac.new(
+            b"super-secret",
+            f"validate-appkey=app-key&validate-timestamp={timestamp}#{azverse.ORDER_CREATE_PATH}#{body}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(signature, expected)
+        self.assertNotIn("super-secret", body)
+
+    def test_list_resolve_and_market_price_use_public_catalog(self) -> None:
+        creds = {"account": "amiroo", "api_key": "key", "secret": "secret", "api_base": azverse.DEFAULT_API_BASE}
+        catalog = {
+            "symbols": [
+                {
+                    "symbol": "btc_usdt",
+                    "enName": "BTCUSDT Perpetual",
+                    "baseCoin": "btc",
+                    "quoteCoin": "usdt",
+                    "tradeSwitch": True,
+                    "isOpenApi": True,
+                    "isDisplay": True,
+                    "contractType": "PERPETUAL",
+                    "minQty": "0.001",
+                    "minNotional": "5",
+                    "minStepPrice": "0.1",
+                    "quantityPrecision": 3,
+                    "pricePrecision": 1,
+                }
+            ]
+        }
+        ticker = {"s": "btc_usdt", "c": "75753.5", "mx": "75753.5"}
+        mark = {"s": "btc_usdt", "p": "75754.1"}
+
+        def fake_public(_path, query=None):
+            if _path == azverse.SYMBOLS_PATH:
+                return catalog
+            if _path == azverse.TICKER_PATH:
+                return ticker
+            if _path == azverse.MARK_PATH:
+                return mark
+            raise AssertionError(_path)
+
+        with mock.patch.object(azverse, "_lookup_credentials", return_value=creds), mock.patch.object(
+            azverse, "_public_get", side_effect=fake_public
+        ):
+            listed = azverse.execute({"operation": "list_instruments", "account": "amiroo", "query": "BTC"})
+            resolved = azverse.execute({"operation": "resolve_instrument", "account": "amiroo", "symbol": "BTC"})
+            priced = azverse.execute({"operation": "market_price", "account": "amiroo", "symbol": "BTC"})
+        self.assertTrue(listed.success, listed)
+        self.assertEqual(listed.data["instruments"][0]["native_symbol"], "btc_usdt")
+        self.assertTrue(resolved.success, resolved)
+        self.assertEqual(resolved.instrument.symbol, "btc_usdt")
+        self.assertTrue(priced.success, priced)
+        self.assertEqual(priced.market_price.mark_price, "75754.1")
+        self.assertEqual(priced.market_price.price, "75753.5")
 
 
 if __name__ == "__main__":

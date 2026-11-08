@@ -1,13 +1,15 @@
-"""Read-only AZverse futures agent for KAM ``/trade``.
+"""AZverse futures agent for KAM ``/trade``.
 
 Credentials are discovered from ``AZVERSE_<ALIAS>_API_KEY``/``_KEY`` and
 ``AZVERSE_<ALIAS>_SECRET_KEY``/``_SECRET`` in the process environment or
 ``$HERMES_HOME/.env``. Environment values win. Secrets never leave this
 module and are redacted from all errors.
 
-Supported operations are deliberately limited to balance, positions/orders,
-and the positions-management read alias. No exchange mutation is implemented
-or advertised.
+Read operations: balance, positions/orders, instrument catalog, and
+market price. Writes are limited to limit ``new_order`` and per-order
+``cancel_order_group``. Live POSTs require ``AZVERSE_WRITE_ENABLED=1``
+and ``AZVERSE_DRY_RUN=0``; otherwise Confirm is dry-run only. Ladder,
+TP/SL, and close-position are not implemented.
 """
 
 from __future__ import annotations
@@ -26,7 +28,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..canonical import (
+    CanonicalCancelGroupResult,
+    CanonicalInstrument,
+    CanonicalMarketPrice,
     CanonicalOrderGroup,
+    CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
     make_failure,
@@ -42,6 +48,12 @@ API_TIMEOUT_SECONDS = 30
 BALANCE_PATH = "/az/future/user/v1/balance/list"
 POSITIONS_PATH = "/az/future/user/v1/position/list"
 ORDERS_PATH = "/az/future/trade/v1/order/list"
+ORDER_CREATE_PATH = "/az/future/trade/v1/order/create"
+ORDER_CANCEL_PATH = "/az/future/trade/v1/order/cancel"
+SYMBOLS_PATH = "/az/future/market/v3/public/symbol/list"
+TICKER_PATH = "/az/future/market/v1/public/q/ticker"
+MARK_PATH = "/az/future/market/v1/public/q/symbol-mark-price"
+_ALLOWED_POST_PATHS = frozenset({ORDER_CREATE_PATH, ORDER_CANCEL_PATH})
 _USER_AGENT = "Hermes-KAM-AZverseAgent/1.0"
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _KEY_SUFFIXES = ("API_KEY", "KEY")
@@ -132,7 +144,17 @@ def list_accounts() -> List[str]:
 
 
 def capabilities() -> List[str]:
-    return ["balance", "positions_orders", "positions_management"]
+    return [
+        "balance",
+        "positions_orders",
+        "positions_management",
+        "new_order",
+        "cancel_orders",
+        "cancel_order_group",
+        "list_instruments",
+        "resolve_instrument",
+        "market_price",
+    ]
 
 
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
@@ -192,14 +214,100 @@ def _open_no_redirect(request: urllib.request.Request, timeout: int):
     return opener.open(request, timeout=timeout)
 
 
-def _signed_get(
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _falsey(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"0", "false", "no", "off", "live"}
+
+
+def _is_dry_run(request: Optional[Mapping[str, Any]] = None) -> bool:
+    if isinstance(request, Mapping) and "dry_run" in request:
+        return bool(request.get("dry_run"))
+    if not _truthy(os.environ.get("AZVERSE_WRITE_ENABLED", "")):
+        return True
+    return not _falsey(os.environ.get("AZVERSE_DRY_RUN", "1"))
+
+
+def _json_body(body: Optional[Mapping[str, Any]]) -> str:
+    if body is None:
+        return ""
+    if not isinstance(body, Mapping):
+        raise ValueError("AZverse request body must be an object.")
+    return json.dumps(dict(body), separators=(",", ":"), ensure_ascii=False)
+
+
+def _read_http_payload(
+    credentials: Optional[Mapping[str, str]],
+    request: urllib.request.Request,
+    extra_secrets: Tuple[str, ...] = (),
+) -> str:
+    transport_error: Optional[str] = None
+    body = ""
+    try:
+        with _open_no_redirect(request, API_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(error_body)
+            message = str(parsed.get("msgInfo") or parsed.get("error") or parsed.get("message") or exc.reason)
+            code = parsed.get("returnCode") or parsed.get("code") or exc.code
+            transport_error = _redact(f"AZverse HTTP {exc.code} ({code}): {message}", credentials, extra_secrets)
+        except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            transport_error = _redact(f"AZverse HTTP {exc.code}: {exc.reason}", credentials, extra_secrets)
+        except Exception as body_exc:  # noqa: BLE001 - error-body readers are untrusted
+            transport_error = _redact(body_exc, credentials, extra_secrets)
+    except urllib.error.URLError as exc:
+        transport_error = _redact(f"AZverse request failed: {exc.reason}", credentials, extra_secrets)
+    except Exception as exc:  # noqa: BLE001 - fail closed and redact auth material
+        transport_error = _redact(exc, credentials, extra_secrets)
+    if transport_error is not None:
+        raise RuntimeError(transport_error)
+    return body
+
+
+def _parse_envelope(body: str, credentials: Optional[Mapping[str, str]] = None, extra_secrets: Tuple[str, ...] = ()) -> Any:
+    processing_error: Optional[str] = None
+    result: Any = None
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, Mapping):
+            processing_error = "AZverse returned a non-object response envelope."
+        else:
+            result = _unwrap_envelope(payload)
+    except json.JSONDecodeError:
+        processing_error = "AZverse returned invalid JSON."
+    except Exception as exc:  # noqa: BLE001 - response processing must also redact
+        processing_error = _redact(exc, credentials, extra_secrets)
+    if processing_error is not None:
+        raise RuntimeError(processing_error)
+    return result
+
+
+def _signed_request(
     credentials: Mapping[str, str],
+    method: str,
     path: str,
     query: Optional[Mapping[str, Any]] = None,
+    body: Optional[Mapping[str, Any]] = None,
 ) -> Any:
+    method_upper = str(method or "").strip().upper()
+    if method_upper not in {"GET", "POST"}:
+        raise RuntimeError(f"AZverse does not allow {method_upper} requests.")
+    if method_upper == "POST" and path not in _ALLOWED_POST_PATHS:
+        raise RuntimeError("AZverse mutation path is not allowed.")
+    if method_upper == "GET" and body is not None:
+        raise RuntimeError("AZverse GET requests cannot carry a body.")
     query_string = _query_string(query)
+    body_string = _json_body(body)
     timestamp = str(int(time.time() * 1000))
-    request_part = f"#{path}" + (f"#{query_string}" if query_string else "")
+    request_part = f"#{path}"
+    if query_string:
+        request_part += f"#{query_string}"
+    if body_string:
+        request_part += f"#{body_string}"
     presign = (
         f"validate-appkey={credentials['api_key']}"
         f"&validate-timestamp={timestamp}{request_part}"
@@ -212,6 +320,37 @@ def _signed_get(
     url = f"{str(credentials.get('api_base') or DEFAULT_API_BASE).rstrip('/')}{path}"
     if query_string:
         url += "?" + query_string
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": _USER_AGENT,
+        "validate-appkey": str(credentials["api_key"]),
+        "validate-timestamp": timestamp,
+        "validate-signature": signature,
+    }
+    request = urllib.request.Request(
+        url,
+        data=body_string.encode("utf-8") if method_upper == "POST" else None,
+        method=method_upper,
+        headers=headers,
+    )
+    raw = _read_http_payload(credentials, request, (signature,))
+    return _parse_envelope(raw, credentials, (signature,))
+
+
+def _signed_get(
+    credentials: Mapping[str, str],
+    path: str,
+    query: Optional[Mapping[str, Any]] = None,
+) -> Any:
+    return _signed_request(credentials, "GET", path, query=query)
+
+
+def _public_get(path: str, query: Optional[Mapping[str, Any]] = None) -> Any:
+    query_string = _query_string(query)
+    url = f"{DEFAULT_API_BASE.rstrip('/')}{path}"
+    if query_string:
+        url += "?" + query_string
     request = urllib.request.Request(
         url,
         method="GET",
@@ -219,49 +358,9 @@ def _signed_get(
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": _USER_AGENT,
-            "validate-appkey": str(credentials["api_key"]),
-            "validate-timestamp": timestamp,
-            "validate-signature": signature,
         },
     )
-    transport_error: Optional[str] = None
-    body = ""
-    try:
-        with _open_no_redirect(request, API_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        try:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            parsed = json.loads(error_body)
-            message = str(parsed.get("msgInfo") or parsed.get("error") or parsed.get("message") or exc.reason)
-            code = parsed.get("returnCode") or parsed.get("code") or exc.code
-            transport_error = _redact(f"AZverse HTTP {exc.code} ({code}): {message}", credentials, (signature,))
-        except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
-            transport_error = _redact(f"AZverse HTTP {exc.code}: {exc.reason}", credentials, (signature,))
-        except Exception as body_exc:  # noqa: BLE001 - error-body readers are untrusted
-            transport_error = _redact(body_exc, credentials, (signature,))
-    except urllib.error.URLError as exc:
-        transport_error = _redact(f"AZverse request failed: {exc.reason}", credentials, (signature,))
-    except Exception as exc:  # noqa: BLE001 - fail closed and redact auth material
-        transport_error = _redact(exc, credentials, (signature,))
-    if transport_error is not None:
-        raise RuntimeError(transport_error)
-
-    processing_error: Optional[str] = None
-    result: Any = None
-    try:
-        payload = json.loads(body)
-        if not isinstance(payload, Mapping):
-            processing_error = "AZverse returned a non-object response envelope."
-        else:
-            result = _unwrap_envelope(payload)
-    except json.JSONDecodeError:
-        processing_error = "AZverse returned invalid JSON."
-    except Exception as exc:  # noqa: BLE001 - response processing must also redact
-        processing_error = _redact(exc, credentials, (signature,))
-    if processing_error is not None:
-        raise RuntimeError(processing_error)
-    return result
+    return _parse_envelope(_read_http_payload(None, request))
 
 
 def _unwrap_envelope(payload: Mapping[str, Any]) -> Any:
@@ -675,6 +774,390 @@ def _handle_positions(account: str, operation: str, include_orders: bool):
         return make_failure(operation, name, account, "AZVERSE_POSITIONS_ORDERS_ERROR", _redact(exc, credentials))
 
 
+def _compact_symbol(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").strip().upper())
+
+
+def _symbol_matches(row: Mapping[str, Any], requested: str) -> bool:
+    native = str(row.get("symbol") or "").strip()
+    if not native or not requested:
+        return False
+    requested_norm = requested.strip()
+    compact_requested = _compact_symbol(requested_norm)
+    candidates = {
+        native.lower(),
+        _short_symbol(native).lower(),
+        str(row.get("baseCoin") or "").strip().lower(),
+        str(row.get("pair") or "").strip().lower(),
+        _compact_symbol(native).lower(),
+        _compact_symbol(_short_symbol(native)).lower(),
+    }
+    return requested_norm.lower() in candidates or compact_requested.lower() in candidates
+
+
+def _is_tradable_symbol(row: Mapping[str, Any]) -> bool:
+    if row.get("isBlack") is True:
+        return False
+    if row.get("tradeSwitch") is False:
+        return False
+    if row.get("isOpenApi") is False:
+        return False
+    contract = str(row.get("contractType") or row.get("productType") or "").strip().upper()
+    if contract and "PERPETUAL" not in contract and contract != "PERP":
+        return False
+    return True
+
+
+def _symbol_rows() -> List[Mapping[str, Any]]:
+    payload = _public_get(SYMBOLS_PATH)
+    rows: Any
+    if isinstance(payload, Mapping) and "symbols" in payload:
+        rows = payload.get("symbols")
+    else:
+        rows = payload
+    if not isinstance(rows, list):
+        raise ValueError("AZverse symbol catalog is not a list.")
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise ValueError("AZverse symbol catalog contained a malformed row.")
+    tradable = [row for row in rows if _is_tradable_symbol(row) and str(row.get("symbol") or "").strip()]
+    if not tradable:
+        raise ValueError("AZverse symbol catalog contained no tradable perpetual contracts.")
+    return tradable
+
+
+def _precision_step(row: Mapping[str, Any], key: str) -> Optional[str]:
+    raw = row.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        precision = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if precision < 0 or precision > 18:
+        return None
+    step = Decimal("1").scaleb(-precision)
+    return _format_decimal(step)
+
+
+def _instrument_dict(row: Mapping[str, Any]) -> Dict[str, Any]:
+    native = str(row.get("symbol") or "").strip()
+    if not native:
+        raise ValueError("AZverse instrument omitted symbol.")
+    base = str(row.get("baseCoin") or "").strip().upper() or None
+    quote = str(row.get("quoteCoin") or "").strip().upper() or None
+    display = str(row.get("enName") or "").strip() or _short_symbol(native)
+    min_qty = row.get("minQty")
+    min_notional = row.get("minNotional")
+    step_price = row.get("minStepPrice")
+    return {
+        "instrument": native,
+        "symbol": native,
+        "native_symbol": native,
+        "display_symbol": _short_symbol(native),
+        "display_name": display,
+        "base": base,
+        "quote": quote,
+        "market_type": "perp",
+        "price_increment": str(step_price).strip() if step_price not in (None, "") else _precision_step(row, "pricePrecision"),
+        "size_increment": _precision_step(row, "quantityPrecision"),
+        "minimum_size": str(min_qty).strip() if min_qty not in (None, "") else None,
+        "minimum_notional": str(min_notional).strip() if min_notional not in (None, "") else None,
+    }
+
+
+def _canonical_instrument(row: Mapping[str, Any], requested: str) -> CanonicalInstrument:
+    data = _instrument_dict(row)
+    return CanonicalInstrument(
+        requested_symbol=requested,
+        symbol=str(data["symbol"]),
+        display_name=str(data["display_name"]),
+        native_symbol=str(data["native_symbol"]),
+        display_symbol=str(data["display_symbol"]),
+        base=data.get("base"),
+        quote=data.get("quote"),
+        market_type="perp",
+        price_increment=data.get("price_increment"),
+        size_increment=data.get("size_increment"),
+        minimum_size=data.get("minimum_size"),
+        minimum_notional=data.get("minimum_notional"),
+    )
+
+
+def _find_symbol_row(requested: str) -> Mapping[str, Any]:
+    query = str(requested or "").strip()
+    if not query:
+        raise ValueError("Symbol is required.")
+    matches = [row for row in _symbol_rows() if _symbol_matches(row, query)]
+    if len(matches) == 1:
+        return matches[0]
+    exact = [
+        row
+        for row in matches
+        if str(row.get("symbol") or "").strip().lower() == query.lower()
+        or _short_symbol(row.get("symbol")).lower() == query.lower()
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if not matches:
+        raise ValueError(f"AZverse instrument {query!r} was not found.")
+    raise ValueError(f"AZverse instrument {query!r} is ambiguous.")
+
+
+def _handle_list_instruments(account: str, request: Mapping[str, Any]):
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure("list_instruments", name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    query = str(request.get("query") or request.get("symbol") or "").strip()
+    try:
+        rows = _symbol_rows()
+        if query:
+            rows = [row for row in rows if _symbol_matches(row, query)]
+        instruments = [_instrument_dict(row) for row in rows]
+        return make_success("list_instruments", name, credentials["account"], data={"instruments": instruments})
+    except Exception as exc:  # noqa: BLE001
+        return make_failure("list_instruments", name, account, "CATALOG_UNAVAILABLE", _redact(exc, credentials))
+
+
+def _handle_resolve_instrument(account: str, request: Mapping[str, Any]):
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure("resolve_instrument", name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure("resolve_instrument", name, account, "INVALID_REQUEST", "Symbol is required.")
+    try:
+        row = _find_symbol_row(requested)
+        return make_success(
+            "resolve_instrument",
+            name,
+            credentials["account"],
+            instrument=_canonical_instrument(row, requested),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure("resolve_instrument", name, account, "INSTRUMENT_NOT_FOUND", _redact(exc, credentials))
+
+
+def _handle_market_price(account: str, request: Mapping[str, Any]):
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure("market_price", name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    requested = str(request.get("symbol") or request.get("requested_symbol") or "").strip()
+    if not requested:
+        return make_failure("market_price", name, account, "INVALID_REQUEST", "Symbol is required.")
+    try:
+        row = _find_symbol_row(requested)
+        native = str(row.get("symbol") or "").strip()
+        ticker = _public_get(TICKER_PATH, {"symbol": native})
+        mark_payload = _public_get(MARK_PATH, {"symbol": native})
+        if not isinstance(ticker, Mapping) or not isinstance(mark_payload, Mapping):
+            raise ValueError("AZverse market-price response is not an object.")
+        last = _optional_decimal(ticker.get("c"))
+        mark = _optional_decimal(mark_payload.get("p") if mark_payload.get("p") not in (None, "") else ticker.get("mx"))
+        if last is not None and last <= 0:
+            raise ValueError("AZverse last price is invalid.")
+        if mark is not None and mark <= 0:
+            raise ValueError("AZverse mark price is invalid.")
+        if last is None and mark is None:
+            raise ValueError("AZverse market price omitted last and mark.")
+        instrument = _canonical_instrument(row, requested)
+        return make_success(
+            "market_price",
+            name,
+            credentials["account"],
+            market_price=CanonicalMarketPrice(
+                requested_symbol=requested,
+                market=native,
+                symbol=native,
+                display_name=instrument.display_name,
+                native_symbol=native,
+                display_symbol=instrument.display_symbol,
+                base=instrument.base,
+                quote=instrument.quote,
+                market_type="perp",
+                price_increment=instrument.price_increment,
+                size_increment=instrument.size_increment,
+                minimum_size=instrument.minimum_size,
+                minimum_notional=instrument.minimum_notional,
+                mark_price=_format_decimal(mark) if mark is not None else None,
+                price=_format_decimal(last) if last is not None else (_format_decimal(mark) if mark is not None else None),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure("market_price", name, account, "MARKET_PRICE_UNAVAILABLE", _redact(exc, credentials))
+
+
+def _positive_decimal(value: Any, field: str) -> Decimal:
+    parsed = _optional_decimal(value)
+    if parsed is None or parsed <= 0:
+        raise ValueError(f"{field} must be a positive number.")
+    return parsed
+
+
+def _order_id_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, Mapping):
+        value = _order_value(payload, "orderId", "id", "entrustId")
+        return str(value) if value not in (None, "") else None
+    if payload not in (None, ""):
+        return str(payload)
+    return None
+
+
+def _handle_new_order(account: str, request: Mapping[str, Any]):
+    operation = "new_order"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    requested_symbol = str(request.get("symbol") or "").strip()
+    side = str(request.get("side") or "").strip().lower()
+    order_type = str(request.get("order_type") or request.get("type") or "limit").strip().lower()
+    if order_type not in {"limit", ""}:
+        return make_failure(operation, name, account, "UNSUPPORTED_ORDER_TYPE", "AZverse /trade new_order supports limit orders only.")
+    if side not in {"buy", "sell"}:
+        return make_failure(operation, name, account, "INVALID_REQUEST", "Side must be buy or sell.")
+    try:
+        volume = _positive_decimal(request.get("volume") or request.get("size") or request.get("quantity"), "volume")
+        price = _positive_decimal(request.get("price"), "price")
+        row = _find_symbol_row(requested_symbol)
+        native = str(row.get("symbol") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "INVALID_REQUEST", _redact(exc, credentials))
+    display = _short_symbol(native)
+    body = {
+        "symbol": native,
+        "orderSide": "BUY" if side == "buy" else "SELL",
+        "orderType": "LIMIT",
+        "origQty": _format_decimal(volume),
+        "positionSide": "LONG" if side == "buy" else "SHORT",
+        "price": _format_decimal(price),
+        "timeInForce": "GTC",
+    }
+    result = CanonicalOrderResult(
+        symbol=display,
+        side=side,
+        order_type="limit",
+        requested_volume=_format_decimal(volume),
+        requested_price=_format_decimal(price),
+        submitted_volume=_format_decimal(volume),
+        submitted_price=_format_decimal(price),
+        verified=False,
+        status="dry_run",
+    )
+    if _is_dry_run(request):
+        return make_success(operation, name, credentials["account"], order=result, data={"dry_run": True, "native_symbol": native})
+    try:
+        payload = _signed_request(credentials, "POST", ORDER_CREATE_PATH, body=body)
+        exchange_order_id = _order_id_from_payload(payload)
+        if not exchange_order_id:
+            return make_failure(operation, name, account, "ORDER_UNVERIFIED", "AZverse create response omitted orderId.")
+        submitted_volume = volume
+        submitted_price = price
+        if isinstance(payload, Mapping):
+            if payload.get("origQty") not in (None, ""):
+                submitted_volume = _required_decimal(payload, "origQty")
+            if payload.get("price") not in (None, ""):
+                submitted_price = _required_decimal(payload, "price")
+        live = CanonicalOrderResult(
+            symbol=display,
+            side=side,
+            order_type="limit",
+            requested_volume=_format_decimal(volume),
+            requested_price=_format_decimal(price),
+            submitted_volume=_format_decimal(submitted_volume),
+            submitted_price=_format_decimal(submitted_price),
+            verified=True,
+            status="success",
+            exchange_order_id=exchange_order_id,
+        )
+        return make_success(operation, name, credentials["account"], order=live)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_ORDER_ERROR", _redact(exc, credentials))
+
+
+def _order_matches_cancel(row: Mapping[str, Any], symbol: str, side: str, order_type: str) -> bool:
+    native = str(_order_value(row, "symbol", "contract") or "").strip()
+    if not native:
+        return False
+    if _short_symbol(native).lower() != symbol.lower() and native.lower() != symbol.lower():
+        return False
+    row_side = str(_order_value(row, "orderSide", "side") or "").strip().lower()
+    if row_side != side:
+        return False
+    if not order_type:
+        return True
+    _classification, display_type = _order_classification(row)
+    return display_type.upper() == order_type.upper()
+
+
+def _handle_cancel_order_group(account: str, request: Mapping[str, Any]):
+    operation = "cancel_order_group"
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure(operation, name, account, "MISSING_CREDENTIALS", "AZverse account credentials are not configured.")
+    symbol = str(request.get("symbol") or "").strip()
+    side = str(request.get("side") or "").strip().lower()
+    order_type = str(request.get("order_type") or "").strip()
+    if not symbol or side not in {"buy", "sell"}:
+        return make_failure(operation, name, account, "INVALID_REQUEST", "Symbol and buy/sell side are required.")
+    try:
+        rows = _fetch_open_orders(credentials)
+        targets = [row for row in rows if _order_matches_cancel(row, symbol, side, order_type)]
+        target_ids = []
+        for row in targets:
+            order_id = _order_value(row, "orderId", "id", "entrustId")
+            if order_id in (None, ""):
+                raise ValueError("AZverse open order omitted orderId.")
+            target_ids.append(str(order_id))
+        if _is_dry_run(request):
+            return make_failure(
+                operation,
+                name,
+                credentials["account"],
+                "AZVERSE_DRY_RUN",
+                f"AZverse writes are dry-run; {len(target_ids)} matching order(s) were not cancelled.",
+            )
+        batches: List[Dict[str, Any]] = []
+        cancelled: List[str] = []
+        for order_id in target_ids:
+            _signed_request(credentials, "POST", ORDER_CANCEL_PATH, body={"orderId": order_id})
+            batches.append({"order_id": order_id, "ok": True, "status": "CANCELLED"})
+            cancelled.append(order_id)
+        remaining_rows = _fetch_open_orders(credentials)
+        remaining_ids = {
+            str(_order_value(row, "orderId", "id", "entrustId"))
+            for row in remaining_rows
+            if _order_matches_cancel(row, symbol, side, order_type)
+        }
+        still_open = [order_id for order_id in target_ids if order_id in remaining_ids]
+        verified = not still_open
+        result = CanonicalCancelGroupResult(
+            symbol=_short_symbol(symbol) if "_" in symbol else symbol,
+            side=side,
+            targeted_order_count=len(target_ids),
+            cancelled_order_count=len(target_ids) - len(still_open),
+            confirmed_absent_count=len(target_ids) - len(still_open),
+            remaining_target_count=len(still_open),
+            verified=verified,
+            partial=not verified,
+            status="success" if verified else "partial",
+            batch_count=len(batches),
+            batches=batches,
+            requested_cancel_count=len(target_ids),
+            verified_cancel_count=len(target_ids) - len(still_open),
+        )
+        if verified:
+            return make_success(operation, name, credentials["account"], cancel_group=result)
+        return make_failure(
+            operation,
+            name,
+            credentials["account"],
+            "PARTIAL_CANCEL",
+            f"Cancelled {result.cancelled_order_count}/{result.targeted_order_count} AZverse orders.",
+            cancel_group=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "AZVERSE_CANCEL_ERROR", _redact(exc, credentials))
+
+
 def execute(request: Mapping[str, Any]):
     operation = str(request.get("operation") or "").strip().lower()
     account = str(request.get("account") or "").strip()
@@ -684,6 +1167,16 @@ def execute(request: Mapping[str, Any]):
         return _handle_positions(account, operation, include_orders=True)
     if operation == "positions_management":
         return _handle_positions(account, operation, include_orders=False)
+    if operation == "list_instruments":
+        return _handle_list_instruments(account, request)
+    if operation == "resolve_instrument":
+        return _handle_resolve_instrument(account, request)
+    if operation == "market_price":
+        return _handle_market_price(account, request)
+    if operation == "new_order":
+        return _handle_new_order(account, request)
+    if operation in {"cancel_orders", "cancel_order_group"}:
+        return _handle_cancel_order_group(account, request)
     return make_failure(
         operation or "unknown",
         name,
