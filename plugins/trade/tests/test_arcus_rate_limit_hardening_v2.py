@@ -157,27 +157,64 @@ class ArcusCancellationHierarchyTests(unittest.TestCase):
 class ArcusBatchSemanticsTests(unittest.TestCase):
     """Batch cancellation body/chunking + ladder placement remains batched."""
 
-    def test_batch_cancel_builds_cancels_array(self):
+    def test_batch_cancel_includes_address_without_changing_signatures_or_body(self):
         hl = arcus()
         captured: Dict[str, Any] = {}
+        fixed_timestamp_ns = 1_794_488_000_123_456_789
+        rows = [{"orderId": "ord-1"}, {"orderId": "ord-2"}]
 
-        def fake_post(url, headers=None, data=None, timeout=20):
-            captured["data"] = data.decode("utf-8") if isinstance(data, bytes) else data
-            captured["headers"] = headers
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
             return Resp(text='{"responses":[]}')
 
         with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
-             mock.patch("requests.post", side_effect=fake_post):
+             mock.patch.object(hl.time, "time_ns", return_value=fixed_timestamp_ns), \
+             mock.patch("requests.post", side_effect=fake_post) as post:
             gate.wait_for_slot.return_value = 0.0
-            hl._submit_batch_cancel(_creds(), 1, [
-                {"orderId": "ord-1"}, {"orderId": "ord-2"},
-            ], operation="cancel_order_group")
+            hl._submit_batch_cancel(
+                _creds(), 1, rows, operation="cancel_order_group"
+            )
+
         body = json.loads(captured["data"])
-        self.assertIn("cancels", body)
+        expected_typed = hl._build_arcus_typed_payload_cancel(
+            credentials=_creds(),
+            market_id=1,
+            order_id="ord-1",
+            timestamp_ns=fixed_timestamp_ns,
+        )
+        expected_signature = hl._ed25519_private_key_from_hex(
+            _creds()["private_key_hex"]
+        ).sign(hl._typed_payload_bytes(expected_typed).encode("utf-8")).hex()
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(captured["url"], "http://test/v1/batchCancelOrders")
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
+        self.assertEqual(list(body), ["cancels"])
         self.assertEqual(len(body["cancels"]), 2)
-        self.assertEqual(body["cancels"][0]["kind"], "orderId")
-        self.assertIn("signature", body["cancels"][0])
-        self.assertIn("X-Signature", captured["headers"])
+        self.assertEqual(body["cancels"][0]["address"], _creds()["wallet"])
+        self.assertEqual(body["cancels"][0]["accountIndex"], 0)
+        self.assertEqual(body["cancels"][0]["timestamp"], fixed_timestamp_ns)
+        self.assertEqual(body["cancels"][0]["signature"], expected_signature)
+        self.assertEqual(captured["headers"]["X-Timestamp"], str(fixed_timestamp_ns))
+        self.assertEqual(captured["headers"]["X-Signature"], expected_signature)
+
+    def test_batch_cancel_http_failure_is_not_retried(self):
+        hl = arcus()
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch(
+                 "requests.post",
+                 return_value=Resp(status_code=401, text='{"error":"Invalid API key"}'),
+             ) as post:
+            gate.wait_for_slot.return_value = 0.0
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401: Invalid API key"):
+                hl._submit_batch_cancel(
+                    _creds(), 1, [{"orderId": "ord-1"}],
+                    operation="cancel_order_group",
+                )
+
+        self.assertEqual(post.call_count, 1)
 
     def test_cancellation_batches_chunk_at_100(self):
         hl = arcus()
@@ -294,30 +331,178 @@ class ArcusTpslAuthRegressionTests(unittest.TestCase):
         self.assertIn("X-Timestamp", captured["headers"])
         self.assertIn("X-Signature", captured["headers"])
 
-    def test_new_order_signed_post_request_behavior_is_unchanged(self):
+    def test_signed_place_and_cancel_posts_include_address_without_changing_payload(self):
+        hl = arcus()
+        cases = [
+            (
+                "/v1/placeOrder",
+                {
+                    "ad": _creds()["wallet"].lower(), "ai": 0, "ct": 123456789,
+                    "g": 1234567890000, "m": 1, "op": hl._ARCUS_OP_PLACE,
+                    "p": 700000, "q": 10000000, "r": 0, "s": 0, "t": 0, "v": 1,
+                },
+                {"address": _creds()["wallet"], "accountIndex": 0, "marketId": 1},
+            ),
+            (
+                "/v1/cancelOrder",
+                {
+                    "ad": _creds()["wallet"].lower(), "ai": 0, "ct": 123456789,
+                    "id": "ord-1", "m": 1, "op": hl._ARCUS_OP_CANCEL, "v": 1,
+                },
+                {
+                    "address": _creds()["wallet"], "accountIndex": 0,
+                    "marketId": 1, "kind": "orderId", "orderId": "ord-1",
+                },
+            ),
+        ]
+
+        for path, typed_payload, body in cases:
+            with self.subTest(path=path):
+                captured: Dict[str, Any] = {}
+
+                def fake_post(url, **kwargs):
+                    captured["url"] = url
+                    captured.update(kwargs)
+                    return Resp(text='{"orderId":"abc"}')
+
+                with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+                     mock.patch("requests.post", side_effect=fake_post) as post:
+                    gate.wait_for_slot.return_value = 0.0
+                    out = hl._signed_post(
+                        _creds(), path, body,
+                        typed_payload=typed_payload,
+                        operation="auth_regression",
+                    )
+
+                self.assertEqual(out, {"orderId": "abc"})
+                self.assertEqual(post.call_count, 1)
+                self.assertEqual(captured["url"], f"http://test{path}")
+                self.assertEqual(
+                    captured.get("params"), {"address": _creds()["wallet"]}
+                )
+                self.assertEqual(captured["headers"]["X-Timestamp"], "123456789")
+                self.assertEqual(json.loads(captured["data"]), body)
+
+    def test_plain_batch_place_includes_address_without_changing_signature(self):
         hl = arcus()
         captured: Dict[str, Any] = {}
-        typed_payload = {
-            "ad": _creds()["wallet"].lower(), "ai": 0, "ct": 123456789,
-            "g": 1234567890000, "m": 1, "op": hl._ARCUS_OP_PLACE,
-            "p": 700000, "q": 10000000, "r": 0, "s": 0, "t": 0, "v": 1,
+        timestamp_ns = 1_794_488_001_123_456_789
+        good_til_time_us = 4_102_444_800_000_000
+        child = {
+            "price": Decimal("70000.0"),
+            "size": Decimal("0.10000000"),
+            "client_id": "ladder-1",
+            "_market_id": 1,
+            "_side": "buy",
+            "_price_ticks": 700000,
+            "_qty_quantums": 10000000,
+            "_size_precision": 8,
+            "_price_precision": 1,
         }
-        body = {"address": _creds()["wallet"], "accountIndex": 0, "marketId": 1}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Resp(text='{"responses":[{"orderId":"abc"}]}')
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post) as post:
+            gate.wait_for_slot.return_value = 0.0
+            out = hl._submit_arcus_ladder_batch(
+                _creds(), [child], timestamp_ns=timestamp_ns,
+                good_til_time_us=good_til_time_us,
+            )
+
+        body = json.loads(captured["data"].decode("utf-8"))
+        expected_signature, _ = hl._sign_arcus_ladder_child(
+            credentials=_creds(), market_id=1, price_ticks=700000,
+            qty_quantums=10000000, side="buy", time_in_force="gtt",
+            good_til_time_us=good_til_time_us, timestamp_ns=timestamp_ns,
+            reduce_only=False, client_id="ladder-1",
+        )
+        self.assertEqual(out, {"responses": [{"orderId": "abc"}]})
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(captured["url"], "http://test/v1/batchPlaceOrders")
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
+        self.assertEqual(body["orders"][0]["signature"], expected_signature)
+        self.assertEqual(captured["headers"]["X-Signature"], expected_signature)
+
+    def test_cancel_all_includes_address_without_changing_body(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Resp(status_code=202, text='{"status":"CANCEL_ALL_ACKNOWLEDGED"}')
+
+        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
+             mock.patch("requests.post", side_effect=fake_post) as post:
+            gate.wait_for_slot.return_value = 0.0
+            out = hl._submit_cancel_all(
+                _creds(), market_id=1, operation="cancel_order_group"
+            )
+
+        self.assertEqual(out, {"status": "CANCEL_ALL_ACKNOWLEDGED"})
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(captured["url"], "http://test/v1/cancelAllOrders")
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
+        self.assertEqual(
+            json.loads(captured["data"].decode("utf-8")),
+            {"address": _creds()["wallet"], "accountIndex": 0, "marketId": 1},
+        )
+
+    def test_market_order_direct_post_includes_address(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
 
         def fake_post(url, **kwargs):
             captured["url"] = url
             captured.update(kwargs)
             return Resp(text='{"orderId":"abc"}')
 
-        with mock.patch.object(hl, "_ARCUS_WRITE_GATE") as gate, \
-             mock.patch("requests.post", side_effect=fake_post):
-            gate.wait_for_slot.return_value = 0.0
-            out = hl._signed_post(_creds(), "/v1/placeOrder", body, typed_payload=typed_payload, operation="new_order")
-        self.assertEqual(out, {"orderId": "abc"})
+        with mock.patch.object(hl, "_arcus_fetch_mark_price", return_value=Decimal("70000")), \
+             mock.patch("requests.post", side_effect=fake_post) as post:
+            out = hl._arcus_place_market_order(
+                credentials=_creds(), account="amiroo", market=_MARKET,
+                symbol="BTC-USD", side="buy", quantity=Decimal("0.1"),
+                reduce_only=False, client_id="market-1",
+                requested_volume=Decimal("0.1"),
+            )
+
+        self.assertTrue(out.success)
+        self.assertEqual(post.call_count, 1)
         self.assertEqual(captured["url"], "http://test/v1/placeOrder")
-        self.assertNotIn("params", captured)
-        self.assertEqual(captured["headers"]["X-Timestamp"], "123456789")
-        self.assertEqual(json.loads(captured["data"]), body)
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
+
+    def test_close_position_direct_post_includes_address(self):
+        hl = arcus()
+        captured: Dict[str, Any] = {}
+        context = ("long", Decimal("0.1"), Decimal("70000"), [])
+        market_meta = {
+            "market_id": 1, "tickSize": Decimal("0.1"),
+            "stepSize": Decimal("0.00000001"),
+            "size_precision": 8, "price_precision": 1,
+        }
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Resp(text='{"orderId":"abc"}')
+
+        with mock.patch.object(hl, "_lookup_credentials", return_value=_creds()), \
+             mock.patch.object(hl, "_arcus_position_context", side_effect=[context, None]), \
+             mock.patch.object(hl, "_arcus_resolve_market_meta", return_value=market_meta), \
+             mock.patch.object(hl.time, "sleep", return_value=None), \
+             mock.patch("requests.post", side_effect=fake_post) as post:
+            out = hl._execute_close_position(
+                "amiroo", {"symbol": "BTC-USD", "client_id": "close-1"}
+            )
+
+        self.assertTrue(out.success)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(captured["url"], "http://test/v1/placeOrder")
+        self.assertEqual(captured.get("params"), {"address": _creds()["wallet"]})
 
     def test_failed_responses_preserve_http_status_and_log_safely(self):
         hl = arcus()

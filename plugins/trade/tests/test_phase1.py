@@ -1152,8 +1152,9 @@ class TestArcusAgentPhase1(unittest.TestCase):
             def json(self):
                 return {"orderId": "ord-1", "status": "OPEN"}
 
-        def fake_post(url, *, headers, data, timeout):
+        def fake_post(url, *, params, headers, data, timeout):
             captured["url"] = url
+            captured["params"] = dict(params)
             captured["headers"] = dict(headers)
             captured["data"] = data
             captured["timeout"] = timeout
@@ -1165,6 +1166,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
 
         self.assertEqual(response, {"orderId": "ord-1", "status": "OPEN"})
         self.assertEqual(captured["url"], "https://api.arcus.xyz/v1/placeOrder")
+        self.assertEqual(captured["params"], {"address": credentials["wallet"]})
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["X-API-Key"], priv.public_key().public_bytes_raw().hex())
         self.assertEqual(len(captured["headers"]["X-Signature"]), 128)
@@ -1620,8 +1622,9 @@ class TestArcusAgentPhase1(unittest.TestCase):
             def json(self):
                 return {"orderId": "deadbeef"}
 
-        def fake_post(url, *, headers, data, timeout):
+        def fake_post(url, *, params, headers, data, timeout):
             captured["url"] = url
+            captured["params"] = dict(params)
             captured["headers"] = dict(headers)
             captured["data"] = data
             return _Resp()
@@ -1658,6 +1661,7 @@ class TestArcusAgentPhase1(unittest.TestCase):
 
             self.assertEqual(captured["headers"]["X-Timestamp"], "1785530953972340120")
             self.assertEqual(captured["headers"]["X-API-Key"], pub)
+            self.assertEqual(captured["params"], {"address": creds["wallet"]})
             self.assertEqual(captured["data"], arcus._canonical_json(body))
             self.assertNotIn('"op"', captured["data"])
             expected_signed = arcus._typed_payload_bytes(typed).encode("utf-8")

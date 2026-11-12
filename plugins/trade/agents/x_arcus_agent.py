@@ -708,6 +708,7 @@ def _signed_post(
     t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}{path}",
+        params={"address": credentials["wallet"]},
         headers=headers,
         data=body,
         timeout=API_TIMEOUT_SECONDS,
@@ -1701,6 +1702,7 @@ def _submit_arcus_ladder_batch(
     t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}/v1/batchPlaceOrders",
+        params={"address": credentials["wallet"]},
         headers=headers,
         data=json.dumps({"orders": batch_body}, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
         timeout=API_TIMEOUT_SECONDS,
@@ -2890,6 +2892,7 @@ def _execute_close_position(account: str, request: Dict[str, Any]) -> CanonicalR
     try:
         response = requests.post(
             f"{credentials['base_url']}/v1/placeOrder",
+            params={"address": credentials["wallet"]},
             headers=headers,
             data=json.dumps(close_body, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
             timeout=API_TIMEOUT_SECONDS,
@@ -3006,6 +3009,7 @@ def _submit_batch_cancel(
     t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}/v1/batchCancelOrders",
+        params={"address": credentials["wallet"]},
         headers=headers,
         data=body,
         timeout=API_TIMEOUT_SECONDS,
@@ -3074,6 +3078,7 @@ def _submit_cancel_all(
     t0 = time.time()
     response = requests.post(
         f"{credentials['base_url']}/v1/cancelAllOrders",
+        params={"address": credentials["wallet"]},
         headers=headers,
         data=body.encode("utf-8"),
         timeout=API_TIMEOUT_SECONDS,
@@ -3347,6 +3352,7 @@ def _arcus_place_market_order(
     try:
         response = requests.post(
             f"{credentials['base_url']}/v1/placeOrder",
+            params={"address": credentials["wallet"]},
             headers=headers,
             data=json.dumps(body, separators=(",", ":"), ensure_ascii=False, sort_keys=False).encode("utf-8"),
             timeout=API_TIMEOUT_SECONDS,
