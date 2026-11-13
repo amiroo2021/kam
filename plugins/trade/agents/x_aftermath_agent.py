@@ -519,7 +519,12 @@ def _canonical_positions(account_obj: Mapping[str, Any]) -> List[CanonicalPositi
     return positions
 
 
-def _pending_orders_for_market(credentials: Dict[str, str], market_id: str) -> List[Dict[str, Any]]:
+def _pending_orders_for_market(
+    credentials: Dict[str, str],
+    market_id: str,
+    *,
+    strict: bool = False,
+) -> List[Dict[str, Any]]:
     """Return CCXT-shaped open-order rows for one market on this account.
 
     Aftermath's native ``/api/perpetuals/accounts/positions`` payload only
@@ -543,6 +548,8 @@ def _pending_orders_for_market(credentials: Dict[str, str], market_id: str) -> L
             market_id[:14] + "…",
             _redact_credentials(str(exc), credentials),
         )
+        if strict:
+            raise
         return []
     if isinstance(response, list):
         return [r for r in response if isinstance(r, dict)]
@@ -840,6 +847,11 @@ _SUBMIT_ROUTES: Dict[str, str] = {
     "cancelOrders": "/api/ccxt/submit/cancelOrders",
     "setLeverage": "/api/ccxt/submit/setLeverage",
 }
+
+# Aftermath's /api/ccxt/build/createOrders rejects large `orders[]` arrays with
+# HTTP 500 (PTB size / computation limit on Sui). We therefore cap each
+# createOrders PTB at this many child orders and submit multiple PTBs when N>cap.
+AFTERMATH_MAX_ORDERS_PER_PTB: int = 20
 
 
 def _build_metadata(credentials: Dict[str, str], *, gas_from_address_balance: bool = True) -> Dict[str, Any]:
@@ -1661,6 +1673,55 @@ def _resolve_open_order_ids(
     return resolved_symbol, ch_id, open_orders
 
 
+def _normalize_order_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) > 1 and text.endswith("n") and text[:-1].isdigit():
+        return text[:-1]
+    return text
+
+
+def _cancel_id_chunks(order_ids: Sequence[str]) -> List[List[str]]:
+    rows = [oid for oid in (_normalize_order_id(x) for x in order_ids) if oid]
+    size = max(1, int(AFTERMATH_MAX_ORDERS_PER_PTB))
+    return [rows[i : i + size] for i in range(0, len(rows), size)]
+
+
+def _cancel_submit_accepted(submit_response: Any) -> bool:
+    """True only when the submit body shows an executed cancel, not mere HTTP 200."""
+    if submit_response is None:
+        return False
+    if isinstance(submit_response, list):
+        if not submit_response:
+            return False
+        for item in submit_response:
+            if not isinstance(item, Mapping):
+                return False
+            status = str(item.get("status") or "").lower()
+            if status in {"error", "rejected", "expired", "failed", "failure"}:
+                return False
+        return True
+    if not isinstance(submit_response, Mapping):
+        return False
+    if submit_response.get("success") is False:
+        return False
+    err = submit_response.get("error")
+    if err:
+        return False
+    effects = submit_response.get("effects")
+    if isinstance(effects, Mapping):
+        status = effects.get("status")
+        if isinstance(status, Mapping):
+            if status.get("error"):
+                return False
+            flag = str(status.get("status") or "").lower()
+            if flag in {"failure", "failed", "error"}:
+                return False
+        elif isinstance(status, str) and status.lower() in {"failure", "failed", "error"}:
+            return False
+    digest = str(submit_response.get("digest") or submit_response.get("txDigest") or "").strip()
+    return bool(digest)
+
+
 def _verify_cancellations(
     credentials: Dict[str, str],
     ch_id: str,
@@ -1669,40 +1730,65 @@ def _verify_cancellations(
     """Re-read open orders and report how many of the targeted ids are gone.
 
     Returns ``(cancelled_count, remaining_count, remaining_ids)``.
+    Raises on a failed pending-order read so callers can mark verification unknown.
     """
-    if not ch_id or not targeted_ids:
+    wanted = [_normalize_order_id(tid) for tid in targeted_ids if _normalize_order_id(tid)]
+    if not ch_id or not wanted:
         return 0, 0, []
-    remaining_orders = _open_orders_for(credentials, ch_id)
-    remaining_ids = {str(o.get("id") or o.get("orderId") or "") for o in remaining_orders}
-    remaining = [tid for tid in targeted_ids if tid in remaining_ids]
-    cancelled = len(targeted_ids) - len(remaining)
+    remaining_orders = _pending_orders_for_market(credentials, ch_id, strict=True)
+    remaining_ids = {
+        _normalize_order_id(o.get("id") or o.get("orderId"))
+        for o in remaining_orders
+        if isinstance(o, Mapping)
+    }
+    remaining = [tid for tid in wanted if tid in remaining_ids]
+    cancelled = len(wanted) - len(remaining)
     return cancelled, len(remaining), remaining
+
+
+def _log_cancel_group(
+    credentials: Mapping[str, str],
+    *,
+    symbol: str,
+    side: str,
+    targeted: int,
+    cancelled: int,
+    remaining: int,
+    dry_run: bool,
+    outcome: str,
+    error: str = "",
+) -> None:
+    logger.warning(
+        "Aftermath cancel_order_group account=%s symbol=%s side=%s targeted=%s cancelled=%s remaining=%s dry_run=%s outcome=%s error=%s",
+        credentials.get("account", ""),
+        symbol,
+        side,
+        targeted,
+        cancelled,
+        remaining,
+        dry_run,
+        outcome,
+        _redact_credentials(error, dict(credentials)) if error else "",
+    )
 
 
 def _cancel_orders(credentials: Dict[str, str], request: Mapping[str, Any]) -> CanonicalResponse:
     symbol = str(request.get("symbol") or "").strip()
     side = request.get("side")
+    side_text = _side_text(side) if side else ""
     display_symbol = symbol
     ch_id = ""
-    targeted_ids: List[str] = []
     open_orders: List[Dict[str, Any]] = []
-    explicit_ids = _order_ids_from_request(request)
+    explicit_ids = [_normalize_order_id(x) for x in _order_ids_from_request(request) if _normalize_order_id(x)]
+    dry_run = _is_dry_run(request)
     try:
         resolved_symbol, ch_id, open_orders = _resolve_open_order_ids(credentials, symbol, side)
         display_symbol = resolved_symbol
-        if explicit_ids:
-            targeted_ids = list(explicit_ids)
-        else:
-            targeted_ids = [
-                str(o.get("id") or o.get("orderId") or "")
-                for o in open_orders
-                if (o.get("id") or o.get("orderId"))
-            ]
     except ValueError:
         if not explicit_ids:
             cancel = CanonicalCancelGroupResult(
                 symbol=symbol or "",
-                side=_side_text(side) if side else "",
+                side=side_text,
                 targeted_order_count=0,
                 cancelled_order_count=0,
                 confirmed_absent_count=0,
@@ -1713,57 +1799,146 @@ def _cancel_orders(credentials: Dict[str, str], request: Mapping[str, Any]) -> C
                 requested_cancel_count=0,
                 verified_cancel_count=0,
             )
+            _log_cancel_group(
+                credentials, symbol=symbol, side=side_text, targeted=0, cancelled=0,
+                remaining=0, dry_run=dry_run, outcome="no_open_orders",
+            )
             return make_success(
                 operation="cancel_order_group",
                 exchange=name,
                 account=credentials.get("account", ""),
-                data={"status": "no_open_orders", "symbol": symbol, "side": _side_text(side) if side else ""},
+                data={"status": "no_open_orders", "symbol": symbol, "side": side_text},
                 cancel_group=cancel,
             )
-        targeted_ids = list(explicit_ids)
-    if not targeted_ids:
+    live_ids = [
+        _normalize_order_id(o.get("id") or o.get("orderId"))
+        for o in open_orders
+        if _normalize_order_id(o.get("id") or o.get("orderId"))
+    ]
+    live_set = set(live_ids)
+    if explicit_ids:
+        targeted_ids = list(dict.fromkeys(explicit_ids))
+    else:
+        targeted_ids = list(dict.fromkeys(live_ids))
+    already_absent = [oid for oid in targeted_ids if oid not in live_set]
+    to_cancel = [oid for oid in targeted_ids if oid in live_set]
+
+    def _result(
+        *,
+        cancelled: int,
+        remaining: int,
+        verified: bool,
+        status: str,
+        batch_count: int,
+        success: bool,
+        error: str = "",
+        digest: str = "",
+        remaining_ids: Optional[List[str]] = None,
+        data_extra: Optional[Dict[str, Any]] = None,
+    ) -> CanonicalResponse:
         cancel = CanonicalCancelGroupResult(
             symbol=display_symbol,
-            side=_side_text(side) if side else "",
-            targeted_order_count=0,
-            cancelled_order_count=0,
-            confirmed_absent_count=0,
-            remaining_target_count=0,
-            verified=True,
-            status="no_open_orders",
-            batch_count=0,
-            requested_cancel_count=0,
-            verified_cancel_count=0,
+            side=side_text,
+            targeted_order_count=len(targeted_ids),
+            cancelled_order_count=cancelled,
+            confirmed_absent_count=cancelled + len(already_absent) if status != "dry_run" else 0,
+            remaining_target_count=remaining,
+            verified=verified,
+            partial=remaining > 0 and cancelled > 0,
+            status=status,
+            batch_count=batch_count,
+            requested_cancel_count=len(targeted_ids),
+            verified_cancel_count=cancelled,
+            exchange_reason=error or None,
         )
-        return make_success(
+        _log_cancel_group(
+            credentials,
+            symbol=display_symbol,
+            side=side_text,
+            targeted=len(targeted_ids),
+            cancelled=cancelled,
+            remaining=remaining,
+            dry_run=dry_run,
+            outcome=status,
+            error=error,
+        )
+        payload: Dict[str, Any] = {
+            "status": status,
+            "symbol": display_symbol,
+            "side": side_text,
+            "requested_cancel_count": len(targeted_ids),
+            "cancelled_order_count": cancelled,
+            "remaining_count": remaining,
+            "remaining_ids": remaining_ids or [],
+            "already_absent_count": 0 if status == "dry_run" else len(already_absent),
+            "verified": verified,
+            "verified_via": "/api/ccxt/myPendingOrders",
+            "transaction_digest": digest,
+            "dry_run": dry_run,
+        }
+        if data_extra:
+            payload.update(data_extra)
+        if success:
+            return make_success(
+                operation="cancel_order_group",
+                exchange=name,
+                account=credentials.get("account", ""),
+                data=payload,
+                cancel_group=cancel,
+            )
+        return make_failure(
             operation="cancel_order_group",
             exchange=name,
             account=credentials.get("account", ""),
-            data={"status": "no_open_orders", "symbol": display_symbol, "side": _side_text(side) if side else ""},
+            code="CANCEL_UNVERIFIED",
+            message=error or "Aftermath cancellation was not verified.",
             cancel_group=cancel,
+            data=payload,
         )
-    build_payload: Dict[str, Any] = {
-        "accountId": _resolve_cap_id(credentials),
-        "chId": ch_id,
-        "orderIds": [str(x) for x in targeted_ids],
-        "deallocateFreeCollateral": False,
-        "metadata": _build_metadata(credentials),
-        "shouldAbortOnMissingId": False,
-    }
-    if _is_dry_run(request):
+
+    if not targeted_ids:
+        return _result(
+            cancelled=0, remaining=0, verified=True, status="no_open_orders",
+            batch_count=0, success=True,
+        )
+    if not to_cancel and not dry_run:
+        return _result(
+            cancelled=0, remaining=0, verified=True, status="already_absent",
+            batch_count=0, success=True,
+        )
+
+    def _payload_for(order_ids: Sequence[str]) -> Dict[str, Any]:
+        return {
+            "accountId": _resolve_cap_id(credentials),
+            "chId": ch_id,
+            "orderIds": [str(x) for x in order_ids],
+            "deallocateFreeCollateral": False,
+            "metadata": _build_metadata(credentials),
+            "shouldAbortOnMissingId": False,
+        }
+
+    chunks = _cancel_id_chunks(to_cancel or targeted_ids if dry_run else to_cancel)
+    if dry_run:
+        preview_ids = chunks[0] if chunks else list(targeted_ids)
+        build_payload = _payload_for(preview_ids)
         build_response = _post_json(credentials, _BUILD_ROUTES["cancelOrders"], build_payload)
         cancel = CanonicalCancelGroupResult(
             symbol=display_symbol,
-            side=_side_text(side) if side else "",
+            side=side_text,
             targeted_order_count=len(targeted_ids),
             cancelled_order_count=0,
             confirmed_absent_count=0,
             remaining_target_count=len(targeted_ids),
             verified=False,
             status="dry_run",
-            batch_count=1,
+            batch_count=len(chunks),
             requested_cancel_count=len(targeted_ids),
             verified_cancel_count=0,
+        )
+        _log_cancel_group(
+            credentials, symbol=display_symbol, side=side_text,
+            targeted=len(targeted_ids), cancelled=0, remaining=len(targeted_ids),
+            dry_run=True, outcome="dry_run",
         )
         return _dryrun_success(
             "cancel_orders",
@@ -1772,46 +1947,58 @@ def _cancel_orders(credentials: Dict[str, str], request: Mapping[str, Any]) -> C
             data={"build_path": _BUILD_ROUTES["cancelOrders"], "payload": _safe_payload(build_payload)},
             cancel_group=cancel,
         )
-    submit = _sign_and_submit(credentials, "cancelOrders", build_payload)
-    submit_response = submit.get("submit_response") if isinstance(submit, Mapping) else None
-    digest = ""
-    if isinstance(submit_response, Mapping):
-        digest = str(submit_response.get("digest") or submit_response.get("txDigest") or "")
-    cancelled, remaining_count, remaining_ids = _verify_cancellations(
-        credentials, ch_id, targeted_ids,
-    )
-    verified = remaining_count == 0 and cancelled > 0
-    cancel = CanonicalCancelGroupResult(
-        symbol=display_symbol,
-        side=_side_text(side) if side else "",
-        targeted_order_count=len(targeted_ids),
-        cancelled_order_count=cancelled,
-        confirmed_absent_count=cancelled,
-        remaining_target_count=remaining_count,
+
+    batch_errors: List[str] = []
+    unknown = False
+    last_digest = ""
+    for chunk in chunks:
+        build_payload = _payload_for(chunk)
+        try:
+            submit = _sign_and_submit(credentials, "cancelOrders", build_payload)
+        except Exception as exc:  # noqa: BLE001
+            msg = _redact_credentials(str(exc), credentials)
+            batch_errors.append(msg)
+            lowered = msg.lower()
+            if "timeout" in lowered or "timed out" in lowered:
+                unknown = True
+                break
+            continue
+        submit_response = submit.get("submit_response") if isinstance(submit, Mapping) else None
+        if not _cancel_submit_accepted(submit_response):
+            batch_errors.append("transaction_not_accepted")
+            continue
+        if isinstance(submit_response, Mapping):
+            last_digest = str(submit_response.get("digest") or submit_response.get("txDigest") or "") or last_digest
+
+    verify_unknown = False
+    remaining_ids: List[str] = list(to_cancel)
+    cancelled = 0
+    remaining_count = len(to_cancel)
+    try:
+        cancelled, remaining_count, remaining_ids = _verify_cancellations(credentials, ch_id, targeted_ids)
+    except Exception as exc:  # noqa: BLE001
+        verify_unknown = True
+        unknown = True
+        batch_errors.append(_redact_credentials(str(exc), credentials))
+
+    still_open = remaining_count
+    verified = (not unknown) and (not verify_unknown) and (not batch_errors) and still_open == 0
+    status = "submitted" if verified else ("unknown" if unknown else "partial")
+    return _result(
+        cancelled=cancelled if not dry_run else 0,
+        remaining=still_open,
         verified=verified,
-        status="submitted" if verified else "partial",
-        batch_count=1,
-        requested_cancel_count=len(targeted_ids),
-        verified_cancel_count=cancelled,
-    )
-    return _live_success(
-        "cancel_orders",
-        credentials,
-        submit,
-        data={
+        status=status,
+        batch_count=len(chunks),
+        success=verified,
+        error=batch_errors[0] if batch_errors else "",
+        digest=last_digest,
+        remaining_ids=remaining_ids,
+        data_extra={
             "build_path": _BUILD_ROUTES["cancelOrders"],
             "submit_path": _SUBMIT_ROUTES["cancelOrders"],
-            "payload": _safe_payload(build_payload),
-            "operation": "cancel_orders",
-            "transaction_digest": digest,
-            "requested_cancel_count": len(targeted_ids),
-            "cancelled_order_count": cancelled,
-            "remaining_count": remaining_count,
-            "remaining_ids": remaining_ids,
-            "verified": verified,
-            "verified_via": "/api/ccxt/myPendingOrders",
+            "batch_errors": batch_errors,
         },
-        cancel_group=cancel,
     )
 
 

@@ -255,6 +255,7 @@ class TestCancelOrdersWizard(unittest.TestCase):
             "account": "TRADE",
             "symbol": "HYPE",
             "side": "sell",
+            "dry_run": False,
         })
 
     def test_cancel_menu_never_exposes_raw_order_ids(self):

@@ -2666,6 +2666,7 @@ class TradeWizard:
             "account": state.account or "",
             "symbol": state.cancel.get("symbol") or "",
             "side": state.cancel.get("side") or "",
+            "dry_run": False,
         }
         order_type = str(state.cancel.get("order_type") or "").strip()
         if order_type:
@@ -2673,17 +2674,38 @@ class TradeWizard:
         response: CanonicalResponse = self._desk.execute(request)
         state.state = "cancel_result"
         lines = ["Cancel Orders"]
-        if response.success and getattr(response, "cancel_group", None) is not None:
-            result = response.cancel_group
+        result = getattr(response, "cancel_group", None)
+        if result is not None:
+            targeted = int(
+                result.requested_cancel_count
+                if result.requested_cancel_count is not None
+                else (result.targeted_order_count or 0)
+            )
+            cancelled = int(result.cancelled_order_count or 0)
+            remaining = int(result.remaining_target_count or 0)
+            failed = max(0, remaining)
+            status = str(result.status or "").strip().lower()
+            verified = bool(result.verified) and remaining == 0
+            if status == "dry_run":
+                title = "🧪 Cancellation Preview"
+            elif verified and targeted > 0 and cancelled > 0:
+                title = "✅ Orders Cancelled"
+            elif cancelled > 0 and remaining > 0:
+                title = "⚠️ Cancellation Unverified"
+            else:
+                title = "❌ Cancellation Failed"
             lines.extend([
                 "",
-                "✅ Orders Cancelled",
+                title,
                 f"Exchange: {state.exchange}",
                 f"Account: {state.account}",
                 "",
                 f"{_direction_emoji(result.side)} {result.symbol} {result.side}",
-                f"Cancelled: {result.cancelled_order_count} orders",
-                f"Verification: {'Passed' if result.verified else 'Failed'}",
+                f"Targeted: {targeted}",
+                f"Cancelled: {cancelled}",
+                f"Remaining: {remaining}",
+                f"Failed: {failed}",
+                f"Verification: {'Passed' if verified else 'Failed'}",
             ])
         else:
             error = response.error
