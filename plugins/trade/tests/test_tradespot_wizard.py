@@ -643,6 +643,12 @@ class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
         self.assertEqual([r for r in self.desk.requests if r.get("operation") == "new_order"][-1]["quantity"], "0.12")
         self.assertIn("0.12 SOL/USDC", screen.text)
 
+    def test_preview_uses_real_line_breaks_not_literal_backslash_n(self) -> None:
+        preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101")
+        assert preview is not None
+        self.assertIn("\nLIMIT order preview\n\nSide: BUY\n", preview.text)
+        self.assertNotIn("\\n", preview.text)
+
     def test_price_normalization(self) -> None:
         preview = self._preview("SOL", "SOL/USDC", "buy", "0.1", "101.239")
         assert preview is not None
