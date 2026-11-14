@@ -990,6 +990,21 @@ class TradeSpotMexcCancelOrdersTests(unittest.TestCase):
         self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
         self.assertEqual(len(self.desk.open_orders), 3)
 
+    def test_cancel_confirm_has_no_diagnostic_preflight_button_or_callback(self) -> None:
+        self.desk.open_orders = [
+            _spot_open(str(i), "SUIUSDT", "SUI/USDT", "BUY", "0.4", "1")
+            for i in range(100)
+        ]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        labels = _labels(confirm)
+        callbacks = _callbacks(confirm)
+        self.assertNotIn("🔍 READ-ONLY PREFLIGHT", labels)
+        self.assertFalse(any(str(cb).startswith("pf:") for cb in callbacks))
+        self.assertIn("❌ Cancel 100 Orders", labels)
+        self.assertNotIn("cancel_preflight", [r.get("operation") for r in self.desk.requests])
+
     def test_confirmation_screen_refreshes_live_orders(self) -> None:
         self.desk.open_orders = [
             _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
