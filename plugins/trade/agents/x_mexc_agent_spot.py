@@ -47,6 +47,8 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "mexc"
+residential_capability = "verified"
+
 
 # MEXC spot enforces a per-child minimum notional of 1 USDT/USDC (cost.min
 # in CCXT markets for every spot pair tested; minNotional is not always

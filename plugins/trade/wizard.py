@@ -88,6 +88,10 @@ BUTTON_LADDER_UNIFORM = ("Uniform", "distribution:uniform")
 BUTTON_LADDER_BUY = ("Buy", "side:buy")
 BUTTON_LADDER_SELL = ("Sell", "side:sell")
 BUTTON_LADDER_CONFIRM = ("✅ Confirm", "confirm")
+BUTTON_RESIDENTIAL_IP = ("🌐 Residential IP", "rip")
+BUTTON_RIP_ENABLE = ("🟢 Enable Residential IP", "rip:on")
+BUTTON_RIP_DISABLE = ("🔴 Disable Residential IP", "rip:off")
+BUTTON_RIP_REFRESH = ("🔄 Refresh Status", "rip:ref")
 # Trade 2.0 — instrument resolution confirm / failure actions.
 BUTTON_RESOLVE_AGREE = ("Agree", "resolve:agree")
 BUTTON_RESOLVE_OTHER = ("Other...", "resolve:other")
@@ -485,6 +489,8 @@ class TradeWizard:
             return self._handle_ladder_text_callback(chat_key, suffix, "start_price")
         if state.state == "awaiting_ladder_end_price":
             return self._handle_ladder_text_callback(chat_key, suffix, "end_price")
+        if state.state == "residential_ip":
+            return self._handle_residential_ip(chat_key, suffix)
 
         # Unknown state — restart.
         return self.open(chat_key)
@@ -626,6 +632,7 @@ class TradeWizard:
                     )
                 )
             rows.append(row)
+        rows.append([_button_row(*BUTTON_RESIDENTIAL_IP)])
         rows.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
         return Screen(
             text=(
@@ -646,6 +653,8 @@ class TradeWizard:
         if suffix == "back":
             state.account = None
             return self._render_select_account(chat_key)
+        if suffix == "rip":
+            return self._render_residential_ip(chat_key)
         if not suffix.startswith("action:"):
             return self._render_action(chat_key)
         action = suffix[len("action:"):].strip()
@@ -678,6 +687,98 @@ class TradeWizard:
             ],
             state="action",
         )
+
+    def _render_residential_ip(self, chat_key: Tuple[Any, ...]) -> Screen:
+        from plugins.trade.residential_proxy import get_manager
+
+        state = self._state_for(chat_key)
+        state.state = "residential_ip"
+        exchange = str(state.exchange or "")
+        account = str(state.account or "")
+        manager = get_manager()
+        agent = None
+        try:
+            agents = getattr(self._desk, "_agents", None)
+            if isinstance(agents, dict):
+                agent = agents.get(exchange)
+        except Exception:
+            agent = None
+        try:
+            status = manager.inspect(exchange, account, probe=True, agent=agent) if manager else None
+            text = status.as_text() if status is not None else (
+                "🌐 Residential IP\n\n"
+                f"Exchange: {exchange}\n"
+                f"Account: {account}\n\n"
+                "Mode: Application-level HTTP CONNECT\n"
+                "Status: ⚠️ ERROR\n"
+                "Compatibility: UNVERIFIED\n"
+                "\n"
+                "Direct VPS IP: Unknown\n"
+                "Residential IP: Unknown\n"
+                "Active Trading IP: Unverified\n"
+                "\n"
+                "Proxy: Missing\n"
+                "Connection: Disconnected"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade wizard: residential status failed: %s", type(exc).__name__)
+            text = (
+                "🌐 Residential IP\n\n"
+                f"Exchange: {exchange}\n"
+                f"Account: {account}\n\n"
+                "Mode: Application-level HTTP CONNECT\n"
+                "Status: ⚠️ ERROR\n"
+                "Compatibility: UNVERIFIED\n"
+                "\n"
+                "Direct VPS IP: Unknown\n"
+                "Residential IP: Unknown\n"
+                "Active Trading IP: Unverified\n"
+                "\n"
+                "Proxy: Configured\n"
+                "Connection: Disconnected"
+            )
+        return Screen(
+            text=text,
+            buttons=[
+                [_button_row(*BUTTON_RIP_ENABLE)],
+                [_button_row(*BUTTON_RIP_DISABLE)],
+                [_button_row(*BUTTON_RIP_REFRESH)],
+                [_button_row(*BUTTON_BACK)],
+            ],
+            state="residential_ip",
+        )
+
+    def _handle_residential_ip(
+        self,
+        chat_key: Tuple[Any, ...],
+        suffix: str,
+    ) -> Screen:
+        from plugins.trade.residential_proxy import get_manager
+
+        state = self._state_for(chat_key)
+        if suffix == "back":
+            return self._render_action(chat_key)
+        manager = get_manager()
+        exchange = str(state.exchange or "")
+        account = str(state.account or "")
+        agent = None
+        try:
+            agents = getattr(self._desk, "_agents", None)
+            if isinstance(agents, dict):
+                agent = agents.get(exchange)
+        except Exception:
+            agent = None
+        if manager is not None and suffix == "rip:on":
+            try:
+                manager.enable(exchange, account, agent=agent)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("trade wizard: residential enable failed: %s", type(exc).__name__)
+        elif manager is not None and suffix == "rip:off":
+            try:
+                manager.disable(exchange, account)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("trade wizard: residential disable failed: %s", type(exc).__name__)
+        return self._render_residential_ip(chat_key)
 
     # -- Trade 2.0: instrument resolution + priced picker (once) --------
 

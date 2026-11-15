@@ -195,6 +195,12 @@ class TradeDesk:
                 "TradeDesk registered agent: %s (from %s)",
                 module.name, path.name,
             )
+            try:
+                from plugins.trade.residential_proxy import note_agent_capability
+
+                note_agent_capability(module.name, module)
+            except Exception:
+                logger.debug("residential capability note skipped for %s", module.name, exc_info=True)
 
     def list_exchanges(self) -> List[str]:
         """Return sorted list of currently loaded exchange names."""
@@ -363,7 +369,10 @@ class TradeDesk:
         # a canonical error — TradeDesk never lets an exchange-native
         # exception escape.
         try:
-            response = agent.execute(request)
+            from plugins.trade.residential_proxy import bind_route
+
+            with bind_route(str(exchange), str(account)):
+                response = agent.execute(request)
         except Exception as exc:  # noqa: BLE001
             return make_failure(
                 operation=operation,

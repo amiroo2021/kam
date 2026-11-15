@@ -57,6 +57,8 @@ from ..canonical import (
 )
 
 name = "edgex"
+residential_capability = "verified"
+
 BASE_URL = "https://edgex-prod-v2.edgex.exchange"
 _REQUIRED = ("ACCOUNTID", "APIKEY", "APISECRET", "APIPASSPHRASE")
 _FIELDS = {

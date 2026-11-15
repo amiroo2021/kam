@@ -65,6 +65,8 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "mexc"
+residential_capability = "verified"
+
 
 DEFAULT_CONTRACT_BASE = "https://contract.mexc.com"
 DEFAULT_SPOT_BASE = "https://api.mexc.com"

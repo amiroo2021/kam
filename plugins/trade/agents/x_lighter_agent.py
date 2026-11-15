@@ -123,6 +123,8 @@ LIGHTER_CANCEL_TX_BATCH_SIZE = 30
 LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = 3.0
 
 name = "lighter"
+residential_capability = "verified"
+
 
 
 class _LighterSlidingWindowLimiter:

@@ -62,6 +62,8 @@ from ..ladder_math import build_ladder_children
 logger = logging.getLogger(__name__)
 
 name = "mt5linux"
+residential_capability = "unsupported"
+
 display_name = "MT5Linux"
 
 # mt5linux_<ALIAS>_ACCOUNT|PASSWORD|SERVER  (case-insensitive prefix/suffix)

@@ -21,6 +21,8 @@ from ..canonical import make_failure, make_success, normalize_balance
 from . import x_azverse_agent as futures
 
 name = "azverse"
+residential_capability = "verified"
+
 
 DEFAULT_SPOT_BASE = "https://s-api.azverse.xyz"
 BALANCES_PATH = "/az/spot/balances"

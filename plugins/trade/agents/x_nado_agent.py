@@ -64,6 +64,8 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "nado"
+residential_capability = "verified"
+
 
 DEFAULT_GATEWAY_REST = "https://api.prod.nado.xyz/gateway/v1"
 DEFAULT_TRIGGER_REST = "https://api.prod.nado.xyz/trigger/v1"
