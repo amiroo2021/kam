@@ -56,8 +56,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "perpl"
-residential_capability = "verified"
-
 
 _DEFAULT_API_URL = "https://app.perpl.xyz/api"
 _DEFAULT_WS_URL = "wss://app.perpl.xyz"

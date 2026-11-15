@@ -80,8 +80,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "pacifica"
-residential_capability = "verified"
-
 
 DEFAULT_API_BASE = "https://api.pacifica.fi/api/v1"
 API_TIMEOUT_SECONDS = 20

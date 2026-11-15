@@ -46,8 +46,6 @@ from ..canonical import (
 )
 
 name = "azverse"
-residential_capability = "verified"
-
 
 DEFAULT_API_BASE = "https://f-api.azverse.xyz"
 API_TIMEOUT_SECONDS = 30

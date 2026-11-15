@@ -49,8 +49,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "bulk"
-residential_capability = "verified"
-
 DEFAULT_API_BASE = "https://mainnet-api1.bulk.trade/api/v1"
 API_TIMEOUT_SECONDS = 20
 DEFAULT_UNIT = "USDC"

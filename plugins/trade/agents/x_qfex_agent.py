@@ -56,8 +56,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "qfex"
-residential_capability = "verified"
-
 DEFAULT_API_BASE = "https://api.qfex.com"
 API_TIMEOUT_SECONDS = 20
 DEFAULT_UNIT = "USDT"

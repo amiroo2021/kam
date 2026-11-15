@@ -72,8 +72,6 @@ LADDER_CHILD_PAUSE_SECONDS = 0.08
 logger = logging.getLogger(__name__)
 
 name = "phemex"
-residential_capability = "verified"
-
 
 DEFAULT_API_BASE = "https://api.phemex.com"
 API_TIMEOUT_SECONDS = 20

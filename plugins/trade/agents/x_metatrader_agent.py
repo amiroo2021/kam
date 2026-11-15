@@ -47,8 +47,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "metatrader"
-residential_capability = "unsupported"
-
 
 _ACCOUNT_KEY_RE = re.compile(r"^MT_([A-Z0-9_]+)_ACCOUNT$")
 _ALIAS_RE = re.compile(r"^[A-Z0-9_]+$")

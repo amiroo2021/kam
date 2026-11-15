@@ -59,8 +59,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "apex"
-residential_capability = "verified"
-
 
 # Apex Omni mainnet REST base URL — overridden by apexomni.constants at runtime
 # if the SDK is available; this constant is the documented fallback.

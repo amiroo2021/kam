@@ -51,8 +51,6 @@ from ._sui_signer import SuiSigner, SuiSigningError
 logger = logging.getLogger(__name__)
 
 name = "aftermath"
-residential_capability = "verified"
-
 DEFAULT_API_BASE = "https://aftermath.finance"
 API_TIMEOUT_SECONDS = 25
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")

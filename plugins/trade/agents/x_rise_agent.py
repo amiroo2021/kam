@@ -57,8 +57,6 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "rise"
-residential_capability = "verified"
-
 
 # V2 client_order_id canonical format.
 # The V2 integer is 48 bits, packed as (magic | version | direction | role | cycle_uid | step | seq).

@@ -56,8 +56,6 @@ from ..canonical import (
 )
 
 name = "arcus"
-residential_capability = "verified"
-
 DEFAULT_API_BASE = "https://api.arcus.xyz"
 API_TIMEOUT_SECONDS = 20
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")

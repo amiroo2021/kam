@@ -14,8 +14,6 @@ from typing import Any, Dict, Mapping
 from ..canonical import CanonicalInstrument, CanonicalMarketPrice, make_failure, make_success, sanitize_error_message
 
 name = "binance"
-residential_capability = "verified"
-
 _SPOT = "https://api.binance.com"
 _FUTURES = "https://fapi.binance.com"
 _TIMEOUT = 15
