@@ -2888,13 +2888,31 @@ class TradeWizard:
     def _selected_position(self, chat_key: Tuple[Any, ...], suffix: str = "") -> Optional[Dict[str, Any]]:
         state = self._state_for(chat_key)
         if suffix.startswith("position:"):
-            parts = suffix.split(":", 2)
-            if len(parts) == 3:
-                symbol = parts[1].strip().upper()
-                side = parts[2].strip().lower()
+            # Parse symbol/side from the RIGHT so HIP-3 route symbols that
+            # contain a colon (e.g. "xyz:GOLD") survive intact. The callback
+            # format is unchanged: "position:{symbol}:{side}".
+            payload = suffix[len("position:"):]
+            symbol, separator, side = payload.rpartition(":")
+            if separator:
+                symbol = symbol.strip().upper()
+                side = side.strip().lower()
                 for position in state.positions:
                     if str(position.get("symbol", "")).strip().upper() == symbol and str(position.get("side", "")).strip().lower() == side:
                         return dict(position)
+                # A position callback that matches nothing must NEVER fall
+                # through to the previously-selected position: that would
+                # silently open a different position's management menu.
+                logger.warning(
+                    "trade wizard: position callback matched no open position "
+                    "(symbol=%r side=%r); showing positions list",
+                    symbol, side,
+                )
+                return None
+            logger.warning(
+                "trade wizard: malformed position callback (no side separator): %r",
+                suffix,
+            )
+            return None
         current = state.position if state.position else None
         return dict(current) if current else None
 

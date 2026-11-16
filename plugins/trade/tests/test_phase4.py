@@ -352,6 +352,128 @@ class TestPositionsManagementWizard(unittest.TestCase):
         self.assertIn("Set SL", detail_labels)
         self.assertIn("Close Position", detail_labels)
 
+    def test_position_buttons_select_hype_zec_and_hip3_symbols_without_writes(self):
+        positions = [
+            CanonicalPosition(symbol="HYPE", side="long", size="26824.51", entry_price="10", pnl="1", tp=None, sl=None),
+            CanonicalPosition(symbol="ZEC", side="short", size="2071.57", entry_price="20", pnl="2", tp=None, sl=None),
+            CanonicalPosition(symbol="xyz:GOLD", side="long", size="11.8602", entry_price="30", pnl="3", tp=None, sl=None),
+        ]
+        for expected_symbol in ("HYPE", "ZEC", "xyz:GOLD"):
+            with self.subTest(symbol=expected_symbol):
+                desk = SequenceDesk([self._positions_response(positions)])
+                wizard, key = self._open_positions_management(desk)
+                menu = wizard.handle_callback(key, "action:positions_management")
+                callback = next(
+                    button["callback_data"]
+                    for row in menu.buttons
+                    for button in row
+                    if expected_symbol in button["text"]
+                )
+
+                detail = wizard.handle_callback(key, callback)
+
+                self.assertEqual(detail.state, "position_detail")
+                self.assertIn(f"💼 {expected_symbol} Position", detail.text)
+                labels = [button["text"] for row in detail.buttons for button in row]
+                self.assertIn("Set TP", labels)
+                self.assertIn("Set SL", labels)
+                self.assertIn("Close Position", labels)
+                self.assertEqual(
+                    [request["operation"] for request in desk.requests],
+                    ["positions_management"],
+                )
+
+    def test_position_action_menus_require_confirmation_and_back_is_safe(self):
+        response = self._positions_response([
+            CanonicalPosition(symbol="xyz:GOLD", side="long", size="11.8602", entry_price="30", pnl="3", tp=None, sl=None),
+        ])
+        desk = SequenceDesk([response])
+        wizard, key = self._open_positions_management(desk)
+        menu = wizard.handle_callback(key, "action:positions_management")
+        callback = next(
+            button["callback_data"]
+            for row in menu.buttons
+            for button in row
+            if "xyz:GOLD" in button["text"]
+        )
+        wizard.handle_callback(key, callback)
+
+        tp = wizard.handle_callback(key, "set_tp")
+        self.assertEqual(tp.state, "awaiting_tp_price")
+        self.assertEqual(wizard.handle_callback(key, "back").state, "position_detail")
+        sl = wizard.handle_callback(key, "set_sl")
+        self.assertEqual(sl.state, "awaiting_sl_price")
+        self.assertEqual(wizard.handle_callback(key, "back").state, "position_detail")
+        close = wizard.handle_callback(key, "close_position")
+        self.assertEqual(close.state, "position_close_confirm")
+        self.assertIn("Confirm Close", [button["text"] for row in close.buttons for button in row])
+        self.assertEqual(wizard.handle_callback(key, "back").state, "position_detail")
+        self.assertEqual(
+            [request["operation"] for request in desk.requests],
+            ["positions_management"],
+        )
+
+    def test_stale_malformed_and_unknown_position_callbacks_never_execute_actions(self):
+        response = self._positions_response([
+            CanonicalPosition(symbol="HYPE", side="long", size="1", entry_price="10", pnl="1", tp=None, sl=None),
+        ])
+        stale_desk = SequenceDesk([response])
+        stale_wizard = TradeWizard(tradedesk=stale_desk)  # type: ignore[arg-type]
+        stale = stale_wizard.handle_callback(("stale",), "position:HYPE:long")
+        self.assertEqual(stale.state, "select_exchange")
+        self.assertEqual(stale_desk.requests, [])
+
+        for callback in (
+            "position:",
+            "position:HYPE",
+            "position:UNKNOWN:long",
+            "position:HYPE:unknown",
+        ):
+            with self.subTest(callback=callback):
+                desk = SequenceDesk([response])
+                wizard, key = self._open_positions_management(desk)
+                wizard.handle_callback(key, "action:positions_management")
+                screen = wizard.handle_callback(key, callback)
+                self.assertEqual(screen.state, "positions_management")
+                self.assertTrue(all(
+                    request["operation"] == "positions_management"
+                    for request in desk.requests
+                ))
+
+    def test_unmatched_position_callback_never_opens_another_position(self):
+        """A position callback that matches nothing must not silently open a
+        DIFFERENT position's management menu.
+        """
+        response = self._positions_response([
+            CanonicalPosition(symbol="xyz:GOLD", side="short", size="11.8602", entry_price="30", pnl="3", tp=None, sl=None),
+            CanonicalPosition(symbol="HYPE", side="short", size="26824.51", entry_price="10", pnl="1", tp=None, sl=None),
+        ])
+        desk = SequenceDesk([response])
+        wizard, key = self._open_positions_management(desk)
+        wizard.handle_callback(key, "action:positions_management")
+
+        # From the positions list, a callback naming a position that is NOT
+        # open must not select some other position.
+        screen = wizard.handle_callback(key, "position:NOPE:short")
+        self.assertEqual(screen.state, "positions_management")
+        self.assertNotIn("Position —", screen.text)
+
+        # Select a real position, then send an unmatched callback from the
+        # detail screen: it must NOT swap to another position's detail view.
+        selected = wizard.handle_callback(key, "position:xyz:GOLD:short")
+        self.assertEqual(selected.state, "position_detail")
+        self.assertIn("xyz:GOLD", selected.text)
+
+        still = wizard.handle_callback(key, "position:NOPE:short")
+        self.assertEqual(still.state, "position_detail")
+        self.assertIn("xyz:GOLD", still.text)
+        self.assertNotIn("HYPE", still.text)
+
+        self.assertTrue(all(
+            request["operation"] == "positions_management"
+            for request in desk.requests
+        ))
+
     def test_position_detail_hides_unsupported_actions_when_caps_known(self):
         """When the desk advertises capabilities without set_tp/set_sl/close,
         the detail screen must not show those buttons (Bulk path).
