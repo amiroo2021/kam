@@ -461,6 +461,11 @@ class TradeWizard:
             return self._handle_ladder_side(chat_key, suffix)
         if state.state == "ladder_confirm":
             return self._handle_ladder_confirm(chat_key, suffix)
+        if state.state == "ladder_submitting" and state.exchange in {"pacifica", "lighter"}:
+            # A duplicate Telegram Confirm must not create a second ladder.
+            venue = "Pacifica" if state.exchange == "pacifica" else "Lighter"
+            return Screen(text=f"{venue} ladder already submitting; wait for its result.",
+                          buttons=[], state="ladder_submitting")
         if state.state == "ladder_result":
             return self._handle_ladder_result(chat_key, suffix)
         if state.state == "cancel_orders":
@@ -2409,7 +2414,16 @@ class TradeWizard:
             request["total_volume_underlying"] = state.ladder.get("total_volume_underlying")
             request["volume_unit"] = state.ladder.get("qty_unit") or ""
             request["contract_size"] = state.ladder.get("contract_size") or ""
-        response: CanonicalResponse = self._desk.execute(request)
+        if state.exchange in {"pacifica", "lighter"}:
+            # Mark before calling the blocking desk: concurrent Confirm
+            # callbacks see the in-flight state instead of submitting twice.
+            state.state = "ladder_submitting"
+        try:
+            response: CanonicalResponse = self._desk.execute(request)
+        except Exception:
+            if state.exchange in {"pacifica", "lighter"}:
+                state.state = "ladder_result"
+            raise
         state.state = "ladder_result"
         lines = ["Ladder"]
         data = response.data if isinstance(response.data, dict) else {}

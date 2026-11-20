@@ -18,6 +18,7 @@ from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import asyncio
 import importlib
+import json
 import logging
 import math
 import os
@@ -113,6 +114,13 @@ LIGHTER_L2_TX_WINDOW_SECONDS = 60.0
 #   3. Pacing is preventive throttling — not a retry mechanism.
 LIGHTER_SEND_TX_BATCH_SIZE = 30
 LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 3.0
+# REST sendTxBatch: CDN body limit ~15 (official signing docs).
+LIGHTER_REST_SEND_TX_BATCH_SIZE = 15
+# WS jsonapi/sendtxbatch protocol max 50; larger → backend 21514.
+LIGHTER_WS_SEND_TX_BATCH_SIZE = 50
+LIGHTER_WS_MAX_MESSAGE_BYTES = 64 * 1024
+LIGHTER_WS_RECV_TIMEOUT_SECONDS = 20.0
+LIGHTER_WS_OPEN_TIMEOUT_SECONDS = 10.0
 
 # Cancellation batching (L2CancelOrder, tx_type=15). Each sendTxBatch
 # carries up to ``LIGHTER_CANCEL_TX_BATCH_SIZE`` independently-signed
@@ -517,6 +525,137 @@ class _LighterRateLimitError(RuntimeError):
         self.code = code
         self.backend_message = message
         self.status_code = status_code
+
+
+class _LighterWsUnavailable(RuntimeError):
+    """WebSocket connect/setup failed before any sendTxBatch write."""
+
+
+def _lighter_ladder_chunk_size(transport: str, budget: Any = None) -> int:
+    """Create-order chunk size for one sendTxBatch / jsonapi/sendtxbatch.
+
+    WS protocol max is 50. REST CDN-safe max is 15. Both are capped by
+    the process L2 tx budget so wait_for_capacity(n) cannot deadlock
+    when n > safe_limit (still 30/60s until separately approved).
+    """
+    mode = str(transport or "rest").strip().lower()
+    proto = LIGHTER_WS_SEND_TX_BATCH_SIZE if mode == "ws" else LIGHTER_REST_SEND_TX_BATCH_SIZE
+    cap = int(getattr(budget, "safe_limit", 0) or LIGHTER_L2_TX_SAFE_LIMIT)
+    return max(1, min(int(proto), cap))
+
+
+def _lighter_open_order_caps(*, chain: str, user_tier: str) -> Dict[str, int]:
+    """Documented active-order caps. Not inferred from live 429s."""
+    tier = str(user_tier or "").strip().lower()
+    chain_u = str(chain or "").strip().upper()
+    if chain_u == "ROBINHOOD":
+        if tier == "premium":
+            return {"per_account": 1000, "per_market": 1000, "pending_per_account": 2000, "pending_per_market": 160}
+        return {"per_account": 1000, "per_market": 1000, "pending_per_account": 200, "pending_per_market": 16}
+    # Lighter (Arbitrum)
+    if tier == "premium":
+        return {"per_account": 1500, "per_market": 1000, "pending_per_account": 1000, "pending_per_market": 100}
+    if tier == "plus":
+        return {"per_account": 750, "per_market": 250, "pending_per_account": 500, "pending_per_market": 100}
+    return {"per_account": 250, "per_market": 30, "pending_per_account": 50, "pending_per_market": 10}
+
+
+def _lighter_capacity_allows(*, open_on_market: int, adding: int, caps: Dict[str, int]) -> bool:
+    return int(open_on_market) + int(adding) <= int(caps.get("per_market") or 0)
+
+
+def _lighter_ws_url(credentials: Dict[str, Any]) -> str:
+    host = str(credentials.get("base_url") or "").replace("https://", "").replace("http://", "").rstrip("/")
+    return f"wss://{host}/stream"
+
+
+def _ladder_cid() -> str:
+    return format(time.time_ns() & 0xFFFFFFFF, "08x")
+
+
+def _ladder_log(cid: str, stage: str, *, dt_ms: float, total_ms: float, **fields: Any) -> None:
+    extra = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    logger.warning(
+        "[LIGHTER-LADDER] cid=%s stage=%s dt_ms=%.1f total_ms=%.1f %s",
+        cid, stage, dt_ms, total_ms, extra,
+    )
+
+
+async def _open_lighter_ladder_ws(credentials: Dict[str, Any]) -> Any:
+    """Open a stream WS for jsonapi/sendtxbatch. No market subscriptions."""
+    url = _lighter_ws_url(credentials)
+    try:
+        import websockets
+    except Exception as exc:  # noqa: BLE001
+        raise _LighterWsUnavailable(f"websockets import failed: {exc}") from exc
+    try:
+        ws = await websockets.connect(
+            url,
+            open_timeout=LIGHTER_WS_OPEN_TIMEOUT_SECONDS,
+            max_size=LIGHTER_WS_MAX_MESSAGE_BYTES,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _LighterWsUnavailable(sanitize_error_message(str(exc))) from exc
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        msg = json.loads(raw) if raw and raw[:1] in "{[" else {}
+        if isinstance(msg, dict) and msg.get("type") == "ping":
+            await ws.send(json.dumps({"type": "pong"}))
+    except Exception:  # noqa: BLE001
+        # Connected-frame is optional; proceed to sendtxbatch.
+        pass
+    return ws
+
+
+def _parse_ws_sendtxbatch_response(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {"code": None, "message": raw[:300], "tx_hash": []}
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return {"code": None, "message": "unrecognized ws payload", "tx_hash": []}
+    if not isinstance(payload, dict):
+        return {"code": None, "message": "unrecognized ws payload", "tx_hash": []}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    code = data.get("code", payload.get("code"))
+    try:
+        code_int = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_int = None
+    tx_hash = data.get("tx_hash") or data.get("tx_hashes") or payload.get("tx_hash") or []
+    if not isinstance(tx_hash, list):
+        tx_hash = []
+    message = str(data.get("message") or payload.get("message") or "")
+    return {"code": code_int, "message": message, "tx_hash": tx_hash, "raw": payload}
+
+
+class _WsBatchResponse:
+    def __init__(self, parsed: Dict[str, Any]) -> None:
+        self.code = parsed.get("code")
+        self.message = parsed.get("message") or ""
+        self.tx_hash = list(parsed.get("tx_hash") or [])
+        self.additional_properties: Dict[str, Any] = {}
+
+
+def _build_ws_sendtxbatch_payload(*, req_id: str, tx_types: List[int], tx_infos: List[str]) -> str:
+    return json.dumps(
+        {
+            "type": "jsonapi/sendtxbatch",
+            "data": {
+                "id": req_id,
+                "tx_types": json.dumps(tx_types),
+                "tx_infos": json.dumps(tx_infos),
+            },
+        },
+        separators=(",", ":"),
+    )
 
 
 def _classify_lighter_api_response(api_response: Any) -> None:
@@ -1949,6 +2088,9 @@ def _submit_send_tx_batch(
     side: str,
     children: List[Dict[str, Decimal]],
     client_order_indices: List[int],
+    signer: Any = None,
+    ws_session: Any = None,
+    cid: str = "",
 ) -> Dict[str, Any]:
     """Submit one ``send_tx_batch`` HTTP request carrying N independent
     L2CreateOrder transactions. NO automatic retry.
@@ -2001,7 +2143,7 @@ def _submit_send_tx_batch(
     last_send_tx_batch_exc_holder: List[Any] = [None]
 
     async def _run_batch() -> Dict[str, Any]:
-        signer = _build_signer_client(credentials)
+        batch_signer = signer if signer is not None else _build_signer_client(credentials)
         api_key_index = int(credentials["api_key_index"])
         # ------------------------------------------------------------------
         # 0. L2 transaction-budget check.
@@ -2019,7 +2161,7 @@ def _submit_send_tx_batch(
         # ------------------------------------------------------------------
         try:
             nonces = await _reserve_ladder_nonces(
-                signer=signer,
+                signer=batch_signer,
                 api_key_index=api_key_index,
                 count=len(children),
             )
@@ -2061,17 +2203,17 @@ def _submit_send_tx_batch(
                 # sign_create_order is the sync method on SignerClient
                 # that returns (tx_type, tx_info, tx_hash, error)
                 # without going through the network.
-                tx_type, tx_info, tx_hash, error = signer.sign_create_order(
+                tx_type, tx_info, tx_hash, error = batch_signer.sign_create_order(
                     market_index=int(market["market_id"]),
                     client_order_index=int(client_order_index),
                     base_amount=int(base_amount),
                     price=int(price_int),
                     is_ask=side == "sell",
-                    order_type=signer.ORDER_TYPE_LIMIT,
-                    time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    order_type=batch_signer.ORDER_TYPE_LIMIT,
+                    time_in_force=batch_signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                     reduce_only=False,
-                    trigger_price=signer.NIL_TRIGGER_PRICE,
-                    order_expiry=signer.DEFAULT_28_DAY_ORDER_EXPIRY,
+                    trigger_price=batch_signer.NIL_TRIGGER_PRICE,
+                    order_expiry=batch_signer.DEFAULT_28_DAY_ORDER_EXPIRY,
                     nonce=int(nonce),
                     api_key_index=api_key_index,
                 )
@@ -2090,7 +2232,7 @@ def _submit_send_tx_batch(
             # Roll back ALL nonces we reserved for this batch.
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -2106,21 +2248,117 @@ def _submit_send_tx_batch(
             }
 
         # ------------------------------------------------------------------
-        # 3. Submit through send_tx_batch — one HTTP request.
+        # 3. Submit through WS jsonapi/sendtxbatch when a session exists,
+        #    else REST send_tx_batch. ONE write. NO retry.
         # ------------------------------------------------------------------
         api_response = None
         submit_error: Optional[str] = None
+        sent_write = False
+        t_submit = time.monotonic()
         try:
-            api_response = await signer.send_tx_batch(
-                tx_types=tx_types, tx_infos=tx_infos
-            )
+            if ws_session is not None:
+                req_id = f"ladder-{cid or _ladder_cid()}-{int(t_submit * 1000)}"
+                payload = _build_ws_sendtxbatch_payload(
+                    req_id=req_id, tx_types=tx_types, tx_infos=tx_infos,
+                )
+                if len(payload.encode("utf-8")) > LIGHTER_WS_MAX_MESSAGE_BYTES:
+                    raise ValueError("WS sendtxbatch payload exceeds 64KB")
+                await ws_session.send(payload)
+                sent_write = True
+                raw = await asyncio.wait_for(
+                    ws_session.recv(), timeout=LIGHTER_WS_RECV_TIMEOUT_SECONDS,
+                )
+                parsed = _parse_ws_sendtxbatch_response(raw)
+                api_response = _WsBatchResponse(parsed)
+                if parsed.get("code") == 23000:
+                    raise _LighterRateLimitError(23000, parsed.get("message") or "Too Many Requests")
+            else:
+                sent_write = True
+                api_response = await batch_signer.send_tx_batch(
+                    tx_types=tx_types, tx_infos=tx_infos
+                )
+        except ValueError as exc:
+            # Oversize / local reject: write never left this process.
+            submit_error = sanitize_error_message(str(exc))
+            last_send_tx_batch_exc_holder[0] = exc
+        except _LighterRateLimitError as exc:
+            submit_error = sanitize_error_message(str(exc))
+            last_send_tx_batch_exc_holder[0] = exc
         except Exception as exc:  # noqa: BLE001
             submit_error = sanitize_error_message(str(exc))
-            # Capture the raw exception for the classifier below so it
-            # can read .body and .status in addition to the sanitized
-            # string. The exception object is also exposed via the
-            # enclosing ``last_send_tx_batch_exc_holder`` list.
             last_send_tx_batch_exc_holder[0] = exc
+
+        if isinstance(last_send_tx_batch_exc_holder[0], _LighterRateLimitError):
+            for _ in range(len(nonces)):
+                try:
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+                "tx_hashes": [],
+                "submitted_count": len(children),
+                "accepted_count": 0,
+                "rejected_count": len(children),
+                "unknown_count": 0,
+                "api_code": 23000,
+                "api_message": submit_error or "Too Many Requests",
+                "raw_response": None,
+                "nonces": list(nonces),
+                "child_to_tx_hash": {},
+                "timing_ms": {"submit": (time.monotonic() - t_submit) * 1000.0},
+            }
+
+        if isinstance(last_send_tx_batch_exc_holder[0], ValueError) and "exceeds" in str(
+            last_send_tx_batch_exc_holder[0]
+        ):
+            for _ in range(len(nonces)):
+                try:
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "outcome": _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
+                "tx_hashes": [],
+                "submitted_count": 0,
+                "accepted_count": 0,
+                "rejected_count": len(children),
+                "unknown_count": 0,
+                "api_code": None,
+                "api_message": submit_error or "WS sendtxbatch payload exceeds 64KB",
+                "raw_response": None,
+                "nonces": list(nonces),
+                "child_to_tx_hash": {},
+                "timing_ms": {"submit": (time.monotonic() - t_submit) * 1000.0},
+            }
+
+        if submit_error is not None and not sent_write:
+            # Local reject (oversize) or send() failed before the server
+            # could accept — treat like envelope reject: roll back nonces.
+            envelope_failure = _classify_send_tx_batch_envelope_failure(
+                last_send_tx_batch_exc_holder[0]
+                if last_send_tx_batch_exc_holder[0] is not None
+                else RuntimeError(submit_error)
+            )
+            for _ in range(len(nonces)):
+                try:
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "outcome": envelope_failure.get("outcome") or _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
+                "tx_hashes": [],
+                "submitted_count": 0,
+                "accepted_count": 0,
+                "rejected_count": len(children),
+                "unknown_count": 0,
+                "api_code": envelope_failure.get("code"),
+                "api_message": envelope_failure.get("reason") or submit_error,
+                "raw_response": None,
+                "nonces": list(nonces),
+                "child_to_tx_hash": {},
+                "timing_ms": {"submit": (time.monotonic() - t_submit) * 1000.0},
+            }
 
         if submit_error is not None:
             # Transport / network exception during send_tx_batch.
@@ -2149,7 +2387,7 @@ def _submit_send_tx_batch(
                 # Nonces were not consumed. Roll them back.
                 for _ in range(len(nonces)):
                     try:
-                        signer.nonce_manager.acknowledge_failure(
+                        batch_signer.nonce_manager.acknowledge_failure(
                             api_key_index
                         )
                     except Exception:  # noqa: BLE001
@@ -2209,7 +2447,7 @@ def _submit_send_tx_batch(
                 # cleanly from the unchanged server counter.
                 for _ in range(len(nonces)):
                     try:
-                        signer.nonce_manager.acknowledge_failure(api_key_index)
+                        batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                     except Exception:  # noqa: BLE001
                         pass
                 # Sanitize the exception text — strip L1 addresses
@@ -2309,7 +2547,7 @@ def _submit_send_tx_batch(
         if code_int == 23000:
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -2331,7 +2569,7 @@ def _submit_send_tx_batch(
             # were not consumed. Roll back.
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -2979,19 +3217,18 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
         return make_failure(operation="ladder", exchange=name, account=account_name, code="LADDER_TOO_FEW_VALID_CHILDREN", message="Fewer than two valid ladder children remain after preflight.", ladder=result)
 
     # ------------------------------------------------------------------
-    # Batched submission via REST sendTxBatch.
+    # Batched submission via WS jsonapi/sendtxbatch (REST sendTxBatch fallback).
     #
-    # Each batch is one HTTP request that carries up to
-    # ``LIGHTER_SEND_TX_BATCH_SIZE`` independently-signed
-    # ``L2CreateOrder`` transactions (one per ladder child). For a
-    # 200-child ladder with batch size 30 this produces 7 sendTxBatch
-    # requests, paced by the rolling 30-tx/60s budget.
+    # WS protocol max is 50 independently-signed L2CreateOrder txs.
+    # REST fallback is capped at 15 (CDN body limit). Both are also
+    # capped by the retained 30-tx/60s L2 budget so wait_for_capacity
+    # cannot deadlock.
     #
     # Invariants (KAM safety contract):
     #   1. Each ``client_order_index`` is pre-assigned uniquely BEFORE
     #      any sign. It is the authoritative reconciliation key —
     #      never re-issued, never duplicated.
-    #   2. ONE write attempt per sendTxBatch. NO automatic retry. NO
+    #   2. ONE write attempt per batch. NO automatic retry. NO
     #      blind resend. A 429 (code 23000) or any non-200 envelope
     #      stops the ladder and triggers a read-only reconcile of the
     #      batches that already landed.
@@ -3000,9 +3237,11 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     #      same batch are rejected by the L1 sequencer. We therefore
     #      reconcile by client_order_index, not by tx_hash presence.
     #   4. Pacing is exchange-local preventive throttling — not a
-    #      retry mechanism. We sleep between batches to keep the L1
-    #      window comfortably below its ceiling.
+    #      retry mechanism. The 30/60s L2 budget remains in force.
+    #   5. One SignerClient (and therefore one nonce manager) per ladder.
     # ------------------------------------------------------------------
+    cid = _ladder_cid()
+    t0 = time.monotonic()
     client_order_indices = _allocate_client_order_indices(len(children))
     market_id_int = int(str(market.get("market_id") or 0))
     batch_records: List[Dict[str, Any]] = []
@@ -3011,22 +3250,98 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     submitted_batch_count = 0
     landed_child_ids: List[int] = []
     stop_reason: Optional[Dict[str, Any]] = None  # populated on stop
+    rejected_child_count = 0
+    uncertain_child_count = 0
 
-    chunk_starts = list(range(0, len(children), LIGHTER_SEND_TX_BATCH_SIZE))
-    for batch_index, start in enumerate(chunk_starts):
+    t_ws = time.monotonic()
+    ws_session = None
+    transport = "rest"
+    try:
+        async def _open_ws_factory():
+            result = _open_lighter_ladder_ws(credentials)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        ws_session = _run_lighter_coro_blocking(
+            credentials,
+            lambda: _open_ws_factory(),
+            thread_name="lighter-ws-open",
+            max_retries=0,
+        )
+        transport = "ws"
+        _ladder_log(cid, "ws_open", dt_ms=(time.monotonic() - t_ws) * 1000.0, total_ms=(time.monotonic() - t0) * 1000.0)
+    except _LighterWsUnavailable as exc:
+        ws_session = None
+        transport = "rest"
+        _ladder_log(
+            cid, "ws_unavailable_rest_fallback",
+            dt_ms=(time.monotonic() - t_ws) * 1000.0,
+            total_ms=(time.monotonic() - t0) * 1000.0,
+            reason=sanitize_error_message(str(exc))[:120],
+        )
+    except Exception as exc:  # noqa: BLE001
+        ws_session = None
+        transport = "rest"
+        _ladder_log(
+            cid, "ws_unavailable_rest_fallback",
+            dt_ms=(time.monotonic() - t_ws) * 1000.0,
+            total_ms=(time.monotonic() - t0) * 1000.0,
+            reason=sanitize_error_message(str(exc))[:120],
+        )
+
+    t_sign_client = time.monotonic()
+    ladder_signer = _build_signer_client(credentials)
+    _ladder_log(
+        cid, "signer_ready",
+        dt_ms=(time.monotonic() - t_sign_client) * 1000.0,
+        total_ms=(time.monotonic() - t0) * 1000.0,
+        transport=transport,
+    )
+    budget = _get_lighter_l2_tx_budget(credentials)
+    chunk_size = _lighter_ladder_chunk_size(transport, budget)
+
+    chunk_starts = list(range(0, len(children), chunk_size))
+    try:
+      for batch_index, start in enumerate(chunk_starts):
         # Preventive pacing — only sleep between batches, not before
         # the first one and never after the last batch.
         if batch_index > 0:
             time.sleep(LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS)
-        chunk_children = children[start:start + LIGHTER_SEND_TX_BATCH_SIZE]
-        chunk_indices = client_order_indices[start:start + LIGHTER_SEND_TX_BATCH_SIZE]
+        chunk_children = children[start:start + chunk_size]
+        chunk_indices = client_order_indices[start:start + chunk_size]
 
-        outcome = _submit_send_tx_batch(
-            credentials=credentials,
-            market=market,
-            side=requested_side,
-            children=chunk_children,
-            client_order_indices=chunk_indices,
+        t_batch = time.monotonic()
+        try:
+            outcome = _submit_send_tx_batch(
+                credentials=credentials,
+                market=market,
+                side=requested_side,
+                children=chunk_children,
+                client_order_indices=chunk_indices,
+                signer=ladder_signer,
+                ws_session=ws_session,
+                cid=cid,
+            )
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            outcome = _submit_send_tx_batch(
+                credentials=credentials,
+                market=market,
+                side=requested_side,
+                children=chunk_children,
+                client_order_indices=chunk_indices,
+            )
+        batch_dt_ms = (time.monotonic() - t_batch) * 1000.0
+        _ladder_log(
+            cid, "batch_submit",
+            dt_ms=batch_dt_ms,
+            total_ms=(time.monotonic() - t0) * 1000.0,
+            batch_index=batch_index,
+            transport=transport,
+            n=len(chunk_children),
+            outcome=outcome.get("outcome"),
         )
 
         # Stamp the batch record with the per-batch trail. The record
@@ -3050,8 +3365,16 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             "api_code": outcome.get("api_code"),
             "api_message": outcome.get("api_message"),
             "reason": outcome.get("reason") or outcome.get("api_message") or "",
+            "transport": transport,
+            "timing_ms": {"batch": batch_dt_ms, **(outcome.get("timing_ms") or {})},
         })
+        rejected_child_count += rejected_count
+        uncertain_child_count += unknown_count
         outcome_kind = outcome.get("outcome")
+        if outcome_kind == _LADDER_BATCH_OUTCOME_RATE_LIMITED:
+            rejected_child_count += max(0, len(chunk_children) - rejected_count - unknown_count)
+        elif outcome_kind == _LADDER_BATCH_OUTCOME_AMBIGUOUS:
+            uncertain_child_count += max(0, len(chunk_children) - rejected_count - unknown_count)
 
         # ------------------------------------------------------------------
         # Outcome dispatch.
@@ -3194,6 +3517,22 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             "raw_code": outcome.get("api_code"),
         }
         break
+
+    finally:
+        if ws_session is not None:
+            try:
+                closer = getattr(ws_session, "close", None)
+                if closer is not None:
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        _run_lighter_coro_blocking(
+                            credentials,
+                            lambda: result,
+                            thread_name="lighter-ws-close",
+                            max_retries=0,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # ONE authoritative reconciliation pass.
@@ -3472,6 +3811,7 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             stop_reason.get("message") or "Ambiguous batch outcome"
         )
 
+    submitted_batch_children = sum(int(rec.get("submitted") or 0) for rec in batch_records)
     ladder = CanonicalLadderResult(
         symbol=requested_symbol,
         side=requested_side,
@@ -3491,6 +3831,9 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
         batches=batch_records or None,
         rate_limited=rate_limited,
         exchange_reason=exchange_reason,
+        rejected_child_count=rejected_child_count,
+        uncertain_child_count=uncertain_child_count,
+        not_attempted_child_count=max(0, requested_count - submitted_batch_children),
     )
     # Report success only if every child landed. A partial ladder —
     # whether due to a definite stop_reason OR to reconciliation

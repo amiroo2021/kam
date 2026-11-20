@@ -395,6 +395,11 @@ def _patch_lighter_for_test(
         mock.patch.object(lighter, "_mint_auth_token_cached", side_effect=fake_mint_auth_token_cached),
         mock.patch.object(lighter, "_fetch_active_orders", side_effect=fake_fetch_active_orders),
         mock.patch.object(lighter, "_resolve_market", side_effect=fake_resolve_market),
+        mock.patch.object(
+            lighter,
+            "_open_lighter_ladder_ws",
+            side_effect=lighter._LighterWsUnavailable("test-rest-fallback"),
+        ),
         # L2-tx budget: use a generous safe limit for offline tests so
         # consecutive batches don't block on the rolling-window throttle.
         mock.patch.object(
@@ -480,10 +485,12 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
         # Save transport knobs so individual tests can override them
         # without leaking across tests.
         self._saved_batch_size = lighter.LIGHTER_SEND_TX_BATCH_SIZE
+        self._saved_rest_size = lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE
         self._saved_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
         self._saved_backoff_cap = lighter.LIGHTER_RATELIMIT_BACKOFF_CAP_SECONDS
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 0.0
         lighter.LIGHTER_RATELIMIT_BACKOFF_CAP_SECONDS = 0.01
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = lighter.LIGHTER_SEND_TX_BATCH_SIZE
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
@@ -500,6 +507,7 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
             _StubSigner.send_tx_batch = self._original_stub_send_tx_batch
             _StubSigner.sign_create_order = self._original_stub_sign_create_order
         lighter.LIGHTER_SEND_TX_BATCH_SIZE = self._saved_batch_size
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest_size
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_pause
         lighter.LIGHTER_RATELIMIT_BACKOFF_CAP_SECONDS = self._saved_backoff_cap
 
@@ -2391,13 +2399,16 @@ class LighterRateLimitAndThrottleTests(unittest.TestCase):
         # Make sure the executor pauses don't add 3s between batches
         # in the integration tests below.
         self._saved_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
+        self._saved_rest = lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 0.0
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = lighter.LIGHTER_SEND_TX_BATCH_SIZE
 
     def tearDown(self) -> None:
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_pause
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
 
     # ------------------------------------------------------------------
     # L1Address redaction — exact 40-hex semantics
@@ -3407,17 +3418,20 @@ class LighterBatch30SchedulerTests(unittest.TestCase):
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
         self._saved_send = lighter.LIGHTER_SEND_TX_BATCH_SIZE
+        self._saved_rest = lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE
         self._saved_cancel = lighter.LIGHTER_CANCEL_TX_BATCH_SIZE
         self._saved_send_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
         self._saved_cancel_pause = lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS
         # Freeze the production batch sizes for these tests.
         lighter.LIGHTER_SEND_TX_BATCH_SIZE = 30
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = 30
         lighter.LIGHTER_CANCEL_TX_BATCH_SIZE = 30
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 0.0
         lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = 0.0
 
     def tearDown(self) -> None:
         lighter.LIGHTER_SEND_TX_BATCH_SIZE = self._saved_send
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
         lighter.LIGHTER_CANCEL_TX_BATCH_SIZE = self._saved_cancel
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_send_pause
         lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = self._saved_cancel_pause
