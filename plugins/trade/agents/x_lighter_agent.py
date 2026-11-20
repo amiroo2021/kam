@@ -531,6 +531,111 @@ class _LighterWsUnavailable(RuntimeError):
     """WebSocket connect/setup failed before any sendTxBatch write."""
 
 
+class _LighterWsSession:
+    """A WebSocket session bound to ONE dedicated event loop.
+
+    ``websockets`` connections are bound to the loop that created them.
+    Opening the session inside one ``asyncio.run()`` and then using it
+    from a second ``asyncio.run()`` raises
+    ``RuntimeError: ... got Future ... attached to a different loop`` —
+    and ``asyncio.run()`` closes its loop on exit, so the original loop
+    is gone entirely.
+
+    This wrapper owns a long-lived loop in a dedicated thread and
+    executes every WS coroutine on THAT loop. The ladder opens the
+    session once and reuses it for every batch, so all sends share one
+    loop, one connection, and one keepalive.
+    """
+
+    def __init__(self, session: Any, loop: Any) -> None:
+        self._session = session
+        self._loop = loop
+
+    @property
+    def session(self) -> Any:
+        return self._session
+
+    @staticmethod
+    def _loop_forever(loop: Any) -> None:
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                for task in asyncio.all_tasks(loop):
+                    task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _submit_to_loop(loop: Any, coro: Any, timeout: Optional[float]) -> Any:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout=timeout)
+        except BaseException:
+            future.cancel()
+            raise
+
+    @classmethod
+    def open(cls, credentials: Dict[str, Any]) -> "_LighterWsSession":
+        """Connect on a dedicated loop and return the bound session."""
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=cls._loop_forever,
+            args=(loop,),
+            name="lighter-ws-loop",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            raw = cls._submit_to_loop(
+                loop,
+                _open_lighter_ladder_ws(credentials),
+                LIGHTER_WS_OPEN_TIMEOUT_SECONDS + 15.0,
+            )
+        except BaseException:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        return cls(raw, loop)
+
+    def _await_on_owner(self, coro: Any, timeout: Optional[float]) -> Any:
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        wrapped = asyncio.wrap_future(future)
+
+        async def _wait() -> Any:
+            try:
+                if timeout is None:
+                    return await wrapped
+                return await asyncio.wait_for(wrapped, timeout=timeout)
+            except BaseException:
+                future.cancel()
+                raise
+
+        return _wait()
+
+    async def send(self, payload: str) -> None:
+        await self._await_on_owner(self._session.send(payload), None)
+
+    async def recv(self, timeout: Optional[float] = None) -> Any:
+        return await self._await_on_owner(self._session.recv(), timeout)
+
+    async def close(self) -> None:
+        try:
+            await self._await_on_owner(self._session.close(), 5.0)
+        finally:
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _lighter_ladder_chunk_size(transport: str, budget: Any = None) -> int:
     """Create-order chunk size for one sendTxBatch / jsonapi/sendtxbatch.
 
@@ -2424,10 +2529,17 @@ def _submit_send_tx_batch(
             # Special case: HTTP 429 / SDK BadRequestException carrying
             # backend code 23000 is a definitive RATE_LIMITED signal,
             # not ambiguity. Promote it.
-            last_send_tx_batch_exc_holder[0] = exc
-            backend_code_from_exc = _extract_backend_code_from_exception(exc)
+            #
+            # NOTE: ``exc`` is deleted by Python when its ``except``
+            # block ends, so the original exception is read from
+            # ``last_send_tx_batch_exc_holder`` — never from ``exc``.
+            transport_exc = last_send_tx_batch_exc_holder[0]
+            if transport_exc is None:
+                transport_exc = RuntimeError(submit_error)
+            backend_code_from_exc = _extract_backend_code_from_exception(transport_exc)
             exc_status = (
-                getattr(exc, "status", None) or getattr(exc, "status_code", None)
+                getattr(transport_exc, "status", None)
+                or getattr(transport_exc, "status_code", None)
             )
             is_rate_limit = (
                 backend_code_from_exc == 23000
@@ -2880,10 +2992,17 @@ def _submit_cancel_tx_batch(
                     ],
                 }
             # Genuine transport ambiguity. Promote definite rate-limit.
-            last_send_tx_batch_exc_holder[0] = exc
-            backend_code_from_exc = _extract_backend_code_from_exception(exc)
+            #
+            # NOTE: ``exc`` is deleted by Python when its ``except``
+            # block ends, so the original exception is read from
+            # ``last_send_tx_batch_exc_holder`` — never from ``exc``.
+            transport_exc = last_send_tx_batch_exc_holder[0]
+            if transport_exc is None:
+                transport_exc = RuntimeError(submit_error)
+            backend_code_from_exc = _extract_backend_code_from_exception(transport_exc)
             exc_status = (
-                getattr(exc, "status", None) or getattr(exc, "status_code", None)
+                getattr(transport_exc, "status", None)
+                or getattr(transport_exc, "status_code", None)
             )
             is_rate_limit = (
                 backend_code_from_exc == 23000
@@ -3257,18 +3376,7 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     ws_session = None
     transport = "rest"
     try:
-        async def _open_ws_factory():
-            result = _open_lighter_ladder_ws(credentials)
-            if asyncio.iscoroutine(result):
-                return await result
-            return result
-
-        ws_session = _run_lighter_coro_blocking(
-            credentials,
-            lambda: _open_ws_factory(),
-            thread_name="lighter-ws-open",
-            max_retries=0,
-        )
+        ws_session = _LighterWsSession.open(credentials)
         transport = "ws"
         _ladder_log(cid, "ws_open", dt_ms=(time.monotonic() - t_ws) * 1000.0, total_ms=(time.monotonic() - t0) * 1000.0)
     except _LighterWsUnavailable as exc:

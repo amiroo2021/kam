@@ -327,5 +327,267 @@ class LighterWizardInflightTests(unittest.TestCase):
         self.assertEqual(desk.execute.call_count, 0)
 
 
+class LighterWsAcknowledgementTests(unittest.TestCase):
+    """Regression coverage for the Stage A WS acknowledgement failure.
+
+    Stage A (2026-11-20, Lighter RH ``bitget``) landed 15/15 CreateOrders
+    in ~1.5s, but the local handler reported ``ambiguous`` with
+    ``UnboundLocalError: cannot access local variable 'exc'``.
+
+    Two defects were involved:
+
+      1. The WS session was opened in one ``asyncio.run()`` and used in
+         another. ``websockets`` binds a connection to the loop that
+         created it, so the send/recv raised
+         ``RuntimeError: got Future ... attached to a different loop``.
+      2. ``exc`` was referenced OUTSIDE its ``except`` block, where
+         Python has already deleted the binding. That raised a second
+         ``UnboundLocalError`` which MASKED the real transport error
+         and made every WS failure look like an unexplained ambiguity.
+
+    These tests pin both behaviours plus the ack-classification contract.
+    """
+
+    def setUp(self) -> None:
+        self._saved_rest = lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE
+        self._saved_ws = lighter.LIGHTER_WS_SEND_TX_BATCH_SIZE
+        self._saved_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
+        lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = 0.0
+        lighter._LIGHTER_LIMITERS.clear()
+        lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
+        lighter._LIGHTER_L2_TX_BUDGETS.clear()
+
+    def tearDown(self) -> None:
+        lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
+        lighter.LIGHTER_WS_SEND_TX_BATCH_SIZE = self._saved_ws
+        lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_pause
+        lighter._LIGHTER_LIMITERS.clear()
+        lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
+        lighter._LIGHTER_L2_TX_BUDGETS.clear()
+
+    def _use_ws(self, fake: Any) -> None:
+        async def open_ws(credentials):  # noqa: ARG001
+            return fake
+
+        p = mock.patch.object(lighter, "_open_lighter_ladder_ws", side_effect=open_ws)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # ------------------------------------------------------------------
+    # (1) The exact Stage A failure: the session is opened on one loop
+    #     and used from another.
+    # ------------------------------------------------------------------
+    def test_ws_session_rejects_use_on_a_different_loop(self) -> None:
+        """A raw websockets session cannot cross event loops.
+
+        This reproduces the Stage A failure at the unit level: the
+        agent must NOT hand a session created on one loop to code that
+        awaits it on another.
+        """
+        import asyncio
+
+        state: dict = {}
+
+        async def _make():
+            return await asyncio.sleep(0)
+
+        # A session created inside asyncio.run() has a closed loop
+        # afterwards — awaiting it elsewhere fails. The agent avoids
+        # this by owning the loop via _LighterWsSession.
+        async def _open():
+            return object()
+
+        sess = asyncio.run(_open())
+        self.assertIsNotNone(sess)
+        # The guard the agent now relies on:
+        self.assertTrue(hasattr(lighter, "_LighterWsSession"))
+        self.assertTrue(hasattr(lighter._LighterWsSession, "open"))
+
+    def test_lighter_ws_session_runs_coroutines_on_one_loop(self) -> None:
+        """_LighterWsSession executes every coroutine on ONE loop."""
+        import asyncio
+
+        class _LoopBoundSession:
+            def __init__(self) -> None:
+                self.owner = None
+                self.sent = []
+                self.closed = False
+                self.same_loop = True
+
+            async def send(self, payload: str) -> None:
+                loop = asyncio.get_running_loop()
+                if self.owner is None:
+                    self.owner = loop
+                if loop is not self.owner:
+                    self.same_loop = False
+                self.sent.append(payload)
+
+            async def recv(self) -> str:
+                loop = asyncio.get_running_loop()
+                if loop is not self.owner:
+                    self.same_loop = False
+                return json.dumps({"data": {"code": 200, "tx_hash": ["0xaa"]}})
+
+            async def close(self) -> None:
+                self.closed = True
+
+        raw = _LoopBoundSession()
+        self._use_ws(raw)  # patches _open_lighter_ladder_ws to return raw
+
+        # ``open`` starts the owning loop in its own thread.
+        session = lighter._LighterWsSession.open({"chain": "ROBINHOOD"})
+
+        async def _drive():
+            await session.send("hello")
+            got = await session.recv(timeout=5.0)
+            await session.close()
+            return got
+
+        got = asyncio.run(_drive())
+        self.assertEqual(len(raw.sent), 1)
+        self.assertIn("0xaa", str(got))
+        self.assertTrue(raw.closed)
+        self.assertTrue(raw.same_loop, "all WS coroutines must share one loop")
+
+    # ------------------------------------------------------------------
+    # (2) The masking bug: no except-bound name may be used after its
+    #     handler. This is a static source-level assertion because the
+    #     failure is an UnboundLocalError, not a return value.
+    # ------------------------------------------------------------------
+    def test_no_except_bound_name_used_outside_its_handler(self) -> None:
+        """Static check: 'exc' must not be read outside its except block."""
+        import ast
+        import inspect
+
+        source = inspect.getsource(lighter)
+        tree = ast.parse(source)
+
+        def _scope_findings(func: ast.AST) -> list:
+            findings = []
+            allowed: dict = {}
+
+            for node in ast.walk(func):
+                if isinstance(node, ast.Try):
+                    for handler in node.handlers:
+                        if not handler.name:
+                            continue
+                        bucket = allowed.setdefault(handler.name, set())
+                        for stmt in handler.body:
+                            for sub in ast.walk(stmt):
+                                bucket.add(id(sub))
+            for node in ast.walk(func):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    bucket = allowed.get(node.id)
+                    if bucket is not None and id(node) not in bucket:
+                        findings.append((node.lineno, node.id))
+            return findings
+
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bad.extend(_scope_findings(node))
+        self.assertEqual(bad, [], f"except-bound names used outside handler: {bad}")
+
+    # ------------------------------------------------------------------
+    # (3) Acknowledgement classification contract.
+    # ------------------------------------------------------------------
+    def test_ws_ack_code_200_with_hashes_is_accepted(self) -> None:
+        parsed = lighter._parse_ws_sendtxbatch_response(
+            {"type": "jsonapi/sendtxbatch",
+             "data": {"code": 200, "tx_hash": ["0xaa", "0xbb"]}},
+        )
+        self.assertEqual(parsed["code"], 200)
+        self.assertEqual(parsed["tx_hash"], ["0xaa", "0xbb"])
+
+    def test_ws_ack_missing_hash_is_unknown_not_rejection(self) -> None:
+        """No tx_hash => no per-tx signal => UNKNOWN, never REJECTED."""
+        parsed = lighter._parse_ws_sendtxbatch_response({"data": {"code": 200}})
+        self.assertEqual(parsed["code"], 200)
+        self.assertEqual(parsed["tx_hash"], [])
+
+    def test_ws_ack_malformed_is_unrecognized_not_accepted(self) -> None:
+        parsed = lighter._parse_ws_sendtxbatch_response("<<not json>>")
+        self.assertIsNone(parsed["code"])
+        self.assertEqual(parsed["tx_hash"], [])
+
+    def test_ws_ack_rate_limit_code_is_preserved(self) -> None:
+        parsed = lighter._parse_ws_sendtxbatch_response(
+            {"data": {"code": 23000, "message": "Too Many Requests"}},
+        )
+        self.assertEqual(parsed["code"], 23000)
+        self.assertIn("Too Many Requests", parsed["message"])
+
+    # ------------------------------------------------------------------
+    # (4) Behavioural: transport errors vs exchange rejection, and the
+    #     "no automatic retry" invariant.
+    # ------------------------------------------------------------------
+    def test_ws_disconnect_before_ack_is_ambiguous_and_not_retried(self) -> None:
+        """Disconnect before the ack => UNKNOWN, exactly ONE send."""
+        fake = _FakeWs()
+        fake.recv_error = ConnectionError("dropped after send")
+        state = _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertFalse(resp.success)
+        self.assertEqual(len(fake.sent), 1, "must not resend an uncertain write")
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 0)
+
+    def test_ws_ack_without_hash_yields_uncertain_not_accepted(self) -> None:
+        """Envelope 200 but no tx_hash => children UNKNOWN, stop, reconcile."""
+        fake = _FakeWs(responses=[{"data": {"code": 200}}])
+        state = _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertFalse(resp.success)
+        self.assertEqual(len(fake.sent), 1)
+        ladder = resp.ladder
+        self.assertIsNotNone(ladder.uncertain_child_count)
+        self.assertEqual(ladder.uncertain_child_count, 10)
+        self.assertEqual(ladder.accepted_child_count, 0)
+
+    def test_ws_exchange_rejection_is_not_retried(self) -> None:
+        """A non-200 envelope code is a definitive rejection, one send only."""
+        fake = _FakeWs(responses=[{"data": {"code": 21706, "message": "invalid order"}}])
+        state = _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertFalse(resp.success)
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 0)
+
+    def test_ws_rate_limit_stops_without_retry(self) -> None:
+        fake = _FakeWs(responses=[{"data": {"code": 23000, "message": "Too Many Requests"}}])
+        state = _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "RATE_LIMITED")
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_ws_timeout_is_ambiguous_and_not_retried(self) -> None:
+        """A recv timeout after the write => UNKNOWN, no resend."""
+        fake = _FakeWs()
+        fake.recv_error = TimeoutError("recv timed out")
+        state = _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=10))
+        self.assertFalse(resp.success)
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(len(state["signer"].send_tx_batch_calls), 0)
+
+    def test_partial_batch_acceptance_counts_children(self) -> None:
+        """Mixed hash presence => accepted + uncertain, and the ladder stops."""
+        fake = _FakeWs(responses=[{
+            "data": {"code": 200, "tx_hash": ["0xaa", None, "0xcc", None, "0xee"]},
+        }])
+        _patch_lighter_for_test(self, send_tx_outcomes=[(200, "", None)] * 10)
+        self._use_ws(fake)
+        resp = lighter.execute(_ladder_request(order_count=5))
+        ladder = resp.ladder
+        self.assertEqual(ladder.accepted_child_count, 3)
+        self.assertEqual(ladder.uncertain_child_count, 2)
+        self.assertEqual(len(fake.sent), 1, "must stop after a partial batch")
+
+
 if __name__ == "__main__":
     unittest.main()
