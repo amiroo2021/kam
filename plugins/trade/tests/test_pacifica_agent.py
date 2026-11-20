@@ -134,9 +134,11 @@ class TestPacificaLadderOrientation(unittest.TestCase):
             with mock.patch.object(pacifica, "_lookup_credentials", return_value=creds), \
                  mock.patch.object(pacifica, "_get_market_info", return_value=market), \
                  mock.patch.object(pacifica, "_post_signed", side_effect=fake_post_signed), \
-                 mock.patch.object(pacifica, "_http_get_json", side_effect=fake_get_json):
+                 mock.patch.object(pacifica, "_http_get_json", side_effect=fake_get_json), \
+                 mock.patch.object(pacifica.time, "sleep"):
                 response = pacifica.execute({
                     "operation": "ladder",
+                    "submission_mode": "sequential",  # preserve legacy transport contract
                     "exchange": "pacifica",
                     "account": "amiroo",
                     "symbol": "SOL",
@@ -174,6 +176,211 @@ class TestPacificaLadderOrientation(unittest.TestCase):
                 (Decimal("65.86"), Decimal("13.83")),
             ],
         )
+
+
+class TestPacificaLadderOutcomes(unittest.TestCase):
+    def _run(self, count: int, submit: Any, snapshot: Any) -> Any:
+        with mock.patch.object(pacifica, "_lookup_credentials", return_value={"account": "example", "address": "addr"}), \
+             mock.patch.object(pacifica, "_get_market_info", return_value={"tick_size": "0.01", "lot_size": "0.01"}), \
+             mock.patch.object(pacifica, "_post_signed", side_effect=submit), \
+             mock.patch.object(pacifica, "_http_get_json", side_effect=snapshot), \
+             mock.patch.object(pacifica.time, "sleep"):
+            return pacifica.execute({
+                "operation": "ladder", "submission_mode": "sequential",
+                "account": "example", "symbol": "SOL",
+                "side": "sell", "distribution": "uniform", "order_count": count,
+                "total_volume": str(count), "start_price": "100", "end_price": "101",
+            })
+
+    def test_250_children_with_scattered_rejections_are_partial_not_success(self) -> None:
+        attempts: list[dict[str, Any]] = []
+        accepted: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            if len(attempts) % 2 == 0 or len(attempts) > 242:
+                raise pacifica._PacificaHTTPError(status=422, path="/orders/create", body="insufficient balance")
+            accepted.append(dict(payload))
+            return {"i": str(len(attempts))}
+
+        response = self._run(250, submit, lambda _url, params=None: {
+            "data": [{"client_order_id": row["client_order_id"]} for row in accepted]
+        })
+        self.assertEqual((len(attempts), len(accepted)), (250, 121))
+        self.assertEqual(len({row["client_order_id"] for row in attempts}), 250)
+        self.assertEqual(response.ladder.status, "partial_success")
+        self.assertFalse(response.success)
+        self.assertEqual(response.ladder.accepted_child_count, 121)
+        self.assertEqual(response.ladder.rejected_child_count, 129)
+        self.assertEqual(response.ladder.uncertain_child_count, 0)
+        self.assertEqual(
+            response.ladder.accepted_child_count + response.ladder.rejected_child_count
+            + response.ladder.uncertain_child_count, 250,
+        )
+        self.assertEqual(response.ladder.batches[1]["index"], 1)
+
+    def test_timeout_reconciled_by_client_id_without_retry(self) -> None:
+        attempts: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            if len(attempts) == 2:
+                raise TimeoutError("read timed out")
+            return {"i": str(len(attempts))}
+
+        response = self._run(3, submit, lambda _url, params=None: {
+            "data": [{"client_order_id": row["client_order_id"]} for row in attempts]
+        })
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(response.ladder.accepted_child_count, 3)
+        self.assertEqual(response.ladder.uncertain_child_count, 0)
+        self.assertEqual(response.ladder.status, "success")
+
+
+    def test_rate_limit_is_rejected_without_unsafe_retry(self) -> None:
+        attempts: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            if len(attempts) == 2:
+                raise pacifica._PacificaHTTPError(status=429, path="/orders/create", body="rate limited")
+            return {"i": str(len(attempts))}
+
+        response = self._run(3, submit, lambda _url, params=None: {
+            "data": [{"client_order_id": row["client_order_id"]} for i, row in enumerate(attempts) if i != 1]
+        })
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(response.ladder.status, "partial_success")
+        self.assertEqual(response.ladder.rejected_child_count, 1)
+        self.assertTrue(response.ladder.rate_limited)
+
+    def test_unresolved_timeout_is_not_counted_as_rejection(self) -> None:
+        attempts: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            if len(attempts) == 2:
+                raise TimeoutError("read timed out")
+            return {"i": str(len(attempts))}
+
+        response = self._run(3, submit, lambda _url, params=None: {
+            "data": [{"client_order_id": row["client_order_id"]} for i, row in enumerate(attempts) if i != 1]
+        })
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(response.ladder.status, "partial_success")
+        self.assertEqual(response.ladder.accepted_child_count, 2)
+        self.assertEqual(response.ladder.rejected_child_count, 0)
+        self.assertEqual(response.ladder.uncertain_child_count, 1)
+
+
+    def test_timeout_found_in_order_history_counts_as_accepted(self) -> None:
+        attempts: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            if len(attempts) == 2:
+                raise TimeoutError("read timed out")
+            return {"i": str(len(attempts))}
+
+        def read(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            if url.endswith("/orders/history"):
+                return {"data": [{"client_order_id": attempts[1]["client_order_id"],
+                                  "order_status": "filled", "order_id": 902}], "has_more": False}
+            return {"data": [{"client_order_id": row["client_order_id"]}
+                             for i, row in enumerate(attempts) if i != 1]}
+
+        response = self._run(3, submit, read)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(response.ladder.accepted_child_count, 3)
+        self.assertEqual(response.ladder.uncertain_child_count, 0)
+        self.assertEqual(response.ladder.status, "success")
+
+
+    def test_scattered_failures_emit_per_child_diagnostic_indices(self) -> None:
+        posted: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            posted.append(dict(payload))
+            if len(posted) == 2:
+                raise pacifica._PacificaHTTPError(status=422, path="/orders/create", body="insufficient balance")
+            return {"i": str(len(posted))}
+
+        with self.assertLogs(pacifica.logger, level="WARNING") as captured:
+            self._run(3, submit, lambda _url, params=None: {
+                "data": [{"client_order_id": row["client_order_id"]} for i, row in enumerate(posted) if i != 1]
+            })
+        self.assertTrue(any("index=1" in line and "insufficient balance" in line for line in captured.output))
+        self.assertTrue(any("index=0" in line and "outcome=accepted" in line for line in captured.output))
+
+
+    def test_all_explicit_rejections_are_failed_with_exchange_reason(self) -> None:
+        def reject(*_args: Any) -> dict[str, Any]:
+            raise pacifica._PacificaHTTPError(status=422, path="/orders/create", body="insufficient balance")
+
+        response = self._run(3, reject, lambda _url, params=None: {"data": []})
+        self.assertEqual(response.ladder.status, "failed")
+        self.assertFalse(response.ladder.partial)
+        self.assertEqual(response.ladder.rejected_child_count, 3)
+        self.assertIn("insufficient balance", response.ladder.exchange_reason)
+
+
+    def test_history_rejected_timeout_is_rejected_not_uncertain(self) -> None:
+        attempts: list[dict[str, Any]] = []
+
+        def submit(_creds: dict[str, Any], _path: str, _op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            attempts.append(dict(payload))
+            raise TimeoutError("read timed out")
+
+        def read(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            if url.endswith("/orders/history"):
+                return {"data": [{"client_order_id": row["client_order_id"],
+                                  "order_status": "rejected", "order_id": i,
+                                  "reason": "margin unavailable"}
+                                 for i, row in enumerate(attempts)], "has_more": False}
+            return {"data": []}
+
+        response = self._run(3, submit, read)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(response.ladder.status, "failed")
+        self.assertEqual(response.ladder.rejected_child_count, 3)
+        self.assertEqual(response.ladder.uncertain_child_count, 0)
+        self.assertIn("margin unavailable", response.ladder.exchange_reason)
+
+
+class TestPacificaWizardReporting(unittest.TestCase):
+    def test_partial_ladder_shows_counts_and_rejection_reason(self) -> None:
+        from plugins.trade.wizard import TradeWizard
+
+        ladder = pacifica.CanonicalLadderResult(
+            symbol="SOL", side="sell", distribution="uniform",
+            requested_order_count=250, submitted_order_count=121,
+            requested_volume="250", submitted_volume="121", batch_count=250,
+            verified=True, partial=True, status="partial_success",
+            accepted_child_count=121, rejected_child_count=129,
+            uncertain_child_count=0, exchange_reason="insufficient balance",
+        )
+        response = pacifica.make_failure(
+            operation="ladder", exchange="pacifica", account="example",
+            code="LADDER_PARTIAL_SUCCESS", message="Partial submission", ladder=ladder,
+        )
+        desk = mock.Mock()
+        desk.execute.return_value = response
+        wizard = TradeWizard(tradedesk=desk)
+        key = ("offline",)
+        state = wizard._state_for(key)
+        state.exchange, state.account = "pacifica", "example"
+        state.ladder.update({
+            "symbol": "SOL", "side": "sell", "distribution": "uniform",
+            "order_count": "250", "total_volume": "250",
+            "start_price": "100", "end_price": "101",
+        })
+        screen = wizard._handle_ladder_confirm(key, "confirm")
+        self.assertIn("Status: partial_success", screen.text)
+        self.assertIn("Accepted: 121", screen.text)
+        self.assertIn("Rejected: 129", screen.text)
+        self.assertIn("Uncertain: 0", screen.text)
+        self.assertIn("insufficient balance", screen.text)
+        self.assertNotIn("Submitted.\n", screen.text)
 
 
 class TestPacificaCancelOrderGroupSide(unittest.TestCase):

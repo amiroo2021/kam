@@ -449,6 +449,10 @@ class CanonicalLadderResult:
     # the sanitized backend message (no L1 address, no SDK internals).
     rate_limited: Optional[bool] = None
     exchange_reason: Optional[str] = None
+    rejected_child_count: Optional[int] = None
+    uncertain_child_count: Optional[int] = None
+    # Children filtered locally or deliberately not sent; not exchange rejects.
+    not_attempted_child_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -475,6 +479,12 @@ class CanonicalLadderResult:
             data["rate_limited"] = self.rate_limited
         if self.exchange_reason is not None:
             data["exchange_reason"] = self.exchange_reason
+        if self.rejected_child_count is not None:
+            data["rejected_child_count"] = self.rejected_child_count
+        if self.uncertain_child_count is not None:
+            data["uncertain_child_count"] = self.uncertain_child_count
+        if self.not_attempted_child_count is not None:
+            data["not_attempted_child_count"] = self.not_attempted_child_count
         return data
 
 

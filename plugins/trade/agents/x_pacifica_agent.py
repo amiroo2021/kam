@@ -52,6 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -168,19 +169,471 @@ PACIFICA_CANCEL_RETRY_BACKOFF_SECONDS = 0.4
 PACIFICA_CANCEL_VERIFY_ATTEMPTS = 3
 PACIFICA_CANCEL_VERIFY_DELAY_SECONDS = 0.5
 
-# Ladder tuning. A ladder is N child limit orders, each submitted as
-# its own signed POST. For typical 3-15 child ladders, sequential
-# submission at ~150ms per POST is fine (the wizard blocks the chat
-# thread on the response anyway). For larger ladders (30+) the user
-# can wait — the cost of a thread pool here is more code than
-# benefit, and the wizard's text rendering is the bottleneck, not
-# the round-trips. The hard upper bound on the order count is what
-# we accept from the wizard; Pacifica has no documented per-account
-# cap on open orders.
+# Pacifica batch supports at most 10 individually signed actions. Credits
+# are charged per action, NOT per HTTP call: the unidentified-IP floor is
+# 100 credits / 60s, shared with other API traffic. Eight seconds per 10
+# actions budgets 75 credits/minute, leaving a modest reserve for reads.
+# A caller may choose a smaller batch or a *slower* pace, but not faster
+# than this conservative floor. No submitted order is ever replayed.
 PACIFICA_LADDER_MIN_NOTIONAL_USD = PACIFICA_MIN_NOTIONAL_USD  # $10 per child
-PACIFICA_LADDER_BATCH_SIZE = 5  # for diagnostic batch reporting
+PACIFICA_LADDER_BATCH_SIZE = 10
+PACIFICA_LADDER_MIN_SECONDS_PER_ACTION = 0.8
+PACIFICA_LADDER_MAX_CONSECUTIVE_429 = 3
 PACIFICA_LADDER_VERIFY_ATTEMPTS = 3
 PACIFICA_LADDER_VERIFY_DELAY_SECONDS = 0.4
+# Docs multiply credit header fields by 10. t/w are seconds, not credits.
+PACIFICA_RATELIMIT_CREDIT_SCALE = Decimal("10")
+PACIFICA_CREDIT_PER_CREATE = Decimal("1")
+PACIFICA_CREDIT_BATCH_ENVELOPE = Decimal("1")
+# Documented unidentified-IP heavy GET ceiling. Not an observed cost.
+PACIFICA_CREDIT_HEAVY_GET = Decimal("12")
+# Only learned from a clean GET→GET remaining drop of exactly this size.
+PACIFICA_CREDIT_MEASURED_GET = Decimal("1")
+# Applied only when remaining is unknown. Not a model of sibling rate.
+PACIFICA_LADDER_SHARED_TRAFFIC_RESERVE = Decimal("20")
+PACIFICA_LADDER_DEFAULT_QUOTA = Decimal("100")
+PACIFICA_LADDER_CREDIT_WINDOW_SECONDS = 60.0
+PACIFICA_RATELIMIT_HEADER_MAX_AGE_SECONDS = 15.0
+_pacifica_rate_limit: Dict[str, Any] = {}
+_pacifica_credit_spends: deque = deque()
+
+
+def reset_pacifica_rate_limit_state() -> None:
+    """Test helper: drop captured headers and the local rolling window."""
+    _pacifica_rate_limit.clear()
+    _pacifica_credit_spends.clear()
+
+
+def parse_pacifica_ratelimit_headers(headers: Any) -> Dict[str, Any]:
+    """Parse Pacifica REST ``ratelimit`` / ``ratelimit-policy`` headers.
+
+    Credit fields ``r`` and ``q`` are documented as ×10. ``t`` and ``w``
+    are seconds and are not scaled. Missing or malformed input is
+    unreliable; callers must then use the conservative local window.
+    """
+    empty = {
+        "remaining": None, "quota": None, "reset_seconds": None,
+        "window_seconds": None, "reliable": False,
+        "raw_ratelimit": "", "raw_policy": "",
+    }
+    try:
+        getter = headers.get if headers is not None else None
+        if getter is None:
+            return empty
+        raw_rl = str(getter("ratelimit") or getter("Ratelimit") or "")
+        raw_pol = str(getter("ratelimit-policy") or getter("Ratelimit-Policy") or "")
+    except Exception:  # noqa: BLE001
+        return empty
+    pairs: Dict[str, str] = {}
+    for blob in (raw_rl, raw_pol):
+        for match in re.finditer(r"([rqtw])=([0-9]+(?:\.[0-9]+)?)", blob):
+            pairs[match.group(1)] = match.group(2)
+    try:
+        remaining = (
+            Decimal(pairs["r"]) / PACIFICA_RATELIMIT_CREDIT_SCALE if "r" in pairs else None
+        )
+        quota = (
+            Decimal(pairs["q"]) / PACIFICA_RATELIMIT_CREDIT_SCALE if "q" in pairs else None
+        )
+        reset_seconds = float(pairs["t"]) if "t" in pairs else None
+        window_seconds = float(pairs["w"]) if "w" in pairs else None
+    except (KeyError, ValueError, ArithmeticError):
+        return {**empty, "raw_ratelimit": raw_rl, "raw_policy": raw_pol}
+    reliable = (
+        remaining is not None and quota is not None and remaining >= 0 and quota > 0
+        and remaining <= quota
+        and (reset_seconds is None or reset_seconds >= 0)
+        and (window_seconds is None or window_seconds > 0)
+    )
+    return {
+        "remaining": remaining, "quota": quota, "reset_seconds": reset_seconds,
+        "window_seconds": window_seconds, "reliable": reliable,
+        "raw_ratelimit": raw_rl, "raw_policy": raw_pol,
+    }
+
+
+def _pacifica_should_learn_get_cost(
+    *,
+    kind: Optional[str],
+    prev_kind: Any,
+    observed: Optional[Decimal],
+    reset_seconds: Optional[float],
+    prev_reset_seconds: Any,
+) -> bool:
+    """True only for a clean GET→GET drop equal to the measured light GET.
+
+    A remaining decrease is not assumed to be caused exclusively by the
+    latest GET. POST→GET gaps include delayed POST accounting. GET→GET
+    drops larger than one credit mix in sibling traffic or window
+    recovery. ``t`` jumping up is recovery, not GET cost.
+    """
+    if str(kind or "") != "get" or str(prev_kind or "") != "get":
+        return False
+    if observed != PACIFICA_CREDIT_MEASURED_GET:
+        return False
+    if (
+        reset_seconds is not None
+        and prev_reset_seconds is not None
+        and float(reset_seconds) > float(prev_reset_seconds)
+    ):
+        return False
+    return True
+
+
+def record_pacifica_ratelimit_headers(
+    headers: Any,
+    now: Optional[float] = None,
+    kind: Optional[str] = None,
+) -> Dict[str, Any]:
+    parsed = parse_pacifica_ratelimit_headers(headers)
+    captured = float(now if now is not None else time.monotonic())
+    parsed["captured_at"] = captured
+    parsed["kind"] = kind
+    prev = dict(_pacifica_rate_limit)
+    prev_captured = prev.get("captured_at")
+    if parsed.get("reliable") and prev_captured is not None and captured < float(prev_captured):
+        parsed["ignored_out_of_order"] = True
+        return parsed
+    if parsed.get("reliable"):
+        observed = None
+        prev_remaining = prev.get("remaining")
+        if prev.get("reliable") and prev_remaining is not None:
+            delta = prev_remaining - parsed["remaining"]
+            if delta > 0:
+                observed = delta
+        parsed["observed_spend"] = observed
+        established = prev.get("get_cost")
+        if established is not None:
+            parsed["get_cost"] = established
+            parsed["get_cost_source"] = prev.get("get_cost_source") or "observed"
+        elif _pacifica_should_learn_get_cost(
+            kind=kind,
+            prev_kind=prev.get("kind"),
+            observed=observed,
+            reset_seconds=parsed.get("reset_seconds"),
+            prev_reset_seconds=prev.get("reset_seconds"),
+        ):
+            parsed["get_cost"] = PACIFICA_CREDIT_MEASURED_GET
+            parsed["get_cost_source"] = "observed"
+        else:
+            parsed["get_cost_source"] = "documented_max"
+        parsed["last_remaining"] = parsed["remaining"]
+        _pacifica_rate_limit.clear()
+        _pacifica_rate_limit.update(parsed)
+    else:
+        last_r = prev.get("remaining")
+        if last_r is None:
+            last_r = prev.get("last_remaining")
+        _pacifica_rate_limit["reliable"] = False
+        _pacifica_rate_limit["remaining"] = None
+        _pacifica_rate_limit["reset_seconds"] = None
+        _pacifica_rate_limit["captured_at"] = captured
+        _pacifica_rate_limit["observed_spend"] = None
+        _pacifica_rate_limit["last_remaining"] = last_r
+        if parsed.get("quota") is not None:
+            _pacifica_rate_limit["quota"] = parsed["quota"]
+        elif prev.get("quota") is not None:
+            _pacifica_rate_limit["quota"] = prev["quota"]
+        if prev.get("get_cost") is not None:
+            _pacifica_rate_limit["get_cost"] = prev["get_cost"]
+        if prev.get("get_cost_source") is not None:
+            _pacifica_rate_limit["get_cost_source"] = prev["get_cost_source"]
+    return parsed
+
+
+def record_pacifica_credit_spend(credits: float, now: Optional[float] = None) -> None:
+    _pacifica_credit_spends.append((float(now if now is not None else time.monotonic()), float(credits)))
+
+
+def _record_pacifica_spend_observed_or_estimate(estimate: Decimal, now: Optional[float] = None) -> Decimal:
+    """Record header-observed spend when present; otherwise the estimate.
+
+    Retry/worst-case reserves are never written here.
+    """
+    observed = _pacifica_rate_limit.get("observed_spend")
+    _pacifica_rate_limit["observed_spend"] = None
+    amount = estimate if observed is None else Decimal(str(observed))
+    record_pacifica_credit_spend(float(amount), now=now)
+    return amount
+
+
+def _pacifica_window_used(now: float, window: float = PACIFICA_LADDER_CREDIT_WINDOW_SECONDS) -> float:
+    cutoff = now - window
+    while _pacifica_credit_spends and _pacifica_credit_spends[0][0] < cutoff:
+        _pacifica_credit_spends.popleft()
+    return sum(amount for _, amount in _pacifica_credit_spends)
+
+
+def pacifica_effective_rate_limit(now: Optional[float] = None) -> Dict[str, Any]:
+    """Return the in-process snapshot, dropping remaining once headers age out."""
+    clock = float(now if now is not None else time.monotonic())
+    snap = dict(_pacifica_rate_limit)
+    captured = snap.get("captured_at")
+    fresh = bool(
+        snap.get("reliable")
+        and captured is not None
+        and (clock - float(captured)) <= PACIFICA_RATELIMIT_HEADER_MAX_AGE_SECONDS
+    )
+    if not fresh:
+        last_r = snap.get("remaining")
+        if last_r is None:
+            last_r = snap.get("last_remaining")
+        quota = snap.get("quota") or PACIFICA_LADDER_DEFAULT_QUOTA
+        snap["remaining"] = None
+        snap["reliable"] = False
+        snap["reset_seconds"] = None
+        snap["stale"] = True
+        snap["last_remaining"] = last_r
+        if last_r is not None:
+            snap["implied_used"] = max(Decimal("0"), quota - last_r)
+        else:
+            snap["implied_used"] = None
+    else:
+        snap["stale"] = False
+        quota = snap.get("quota") or PACIFICA_LADDER_DEFAULT_QUOTA
+        remaining = snap.get("remaining")
+        snap["implied_used"] = (
+            max(Decimal("0"), quota - remaining) if remaining is not None else None
+        )
+    return snap
+
+
+def _pacifica_local_wait_for_budget(
+    now: float,
+    budget: Decimal,
+    cap: Decimal,
+    window: float,
+) -> float:
+    """Seconds until local spends leave enough room for ``budget`` credits."""
+    cutoff = now - window
+    spends = [(ts, amount) for ts, amount in _pacifica_credit_spends if ts >= cutoff]
+    used = Decimal(str(sum(amount for _, amount in spends)))
+    if used + budget <= cap:
+        return 0.0
+    remaining_used = used
+    for ts, amount in spends:
+        remaining_used -= Decimal(str(amount))
+        if remaining_used + budget <= cap:
+            return max(0.0, ts + window - now)
+    return window
+
+
+def _pacifica_time_until_local_credits_expire(
+    now: float,
+    amount: Decimal,
+    window: float,
+) -> Optional[float]:
+    """Seconds until ``amount`` of *this process* credits leave the window.
+
+    Returns None when the local ledger does not contain that many credits —
+    sibling spend cannot be assumed to expire on our schedule.
+    """
+    cutoff = now - window
+    spends = [(ts, Decimal(str(credits))) for ts, credits in _pacifica_credit_spends if ts >= cutoff]
+    total = sum((credits for _, credits in spends), Decimal("0"))
+    if total < amount:
+        return None
+    recovered = Decimal("0")
+    for ts, credits in spends:
+        recovered += credits
+        if recovered >= amount:
+            return max(0.0, ts + window - now)
+    return None
+
+
+def pacifica_batch_commit_need(action_count: int) -> Decimal:
+    """Credits consumed by the POST itself: one per Create plus envelope estimate."""
+    return Decimal(int(action_count)) * PACIFICA_CREDIT_PER_CREATE + PACIFICA_CREDIT_BATCH_ENVELOPE
+
+
+def pacifica_batch_wait_need(
+    action_count: int,
+    get_cost: Optional[Decimal] = None,
+) -> Decimal:
+    """Credits that must remain before the next POST.
+
+    Expected path is one verify GET. Extra retry GETs are a halt-on-429
+    safeguard, not a pre-batch reservation recorded as spend.
+    """
+    verify = get_cost if get_cost is not None else PACIFICA_CREDIT_HEAVY_GET
+    return pacifica_batch_commit_need(action_count) + Decimal(str(verify))
+
+
+def pacifica_batch_credit_need(
+    action_count: int,
+    verify_attempts: Optional[int] = None,
+    get_cost: Optional[Decimal] = None,
+) -> Decimal:
+    """Wait-need for the expected path. ``verify_attempts`` is ignored.
+
+    Kept so older tests/callers still import a single helper. Worst-case
+    three-GET cost is ``commit + 3 * get`` and is *not* used for pacing.
+    """
+    del verify_attempts
+    return pacifica_batch_wait_need(action_count, get_cost=get_cost)
+
+
+def pacifica_batch_credit_wait_seconds(
+    *,
+    action_count: int,
+    floor_seconds: float,
+    adaptive: bool,
+    remaining: Optional[Decimal] = None,
+    reset_seconds: Optional[float] = None,
+    quota: Optional[Decimal] = None,
+    now: Optional[float] = None,
+    header_age_seconds: Optional[float] = None,
+    get_cost: Optional[Decimal] = None,
+    implied_used: Optional[Decimal] = None,
+) -> float:
+    """Return sleep seconds before the next batch POST. Never undercuts floor.
+
+    Fresh ``remaining`` is authoritative and is not reduced by the local
+    ledger. Header age above the freshness cap discards remaining.
+    ``t`` is a lower bound only; a shortfall waits until *our* ledger
+    proves enough credits expire, else the window.
+    """
+    floor = max(0.0, float(floor_seconds))
+    if not adaptive:
+        return floor
+    if (
+        remaining is not None
+        and header_age_seconds is not None
+        and float(header_age_seconds) > PACIFICA_RATELIMIT_HEADER_MAX_AGE_SECONDS
+    ):
+        remaining = None
+    need = pacifica_batch_wait_need(action_count, get_cost=get_cost)
+    window = PACIFICA_LADDER_CREDIT_WINDOW_SECONDS
+    clock = float(now if now is not None else time.monotonic())
+    if remaining is not None:
+        if remaining >= need:
+            return floor
+        deficit = need - remaining
+        cover_wait = _pacifica_time_until_local_credits_expire(clock, deficit, window)
+        if cover_wait is not None:
+            return max(floor, cover_wait)
+        t = float(reset_seconds) if reset_seconds is not None and reset_seconds > 0 else 0.0
+        return max(floor, t, window)
+    cap = quota if quota is not None else PACIFICA_LADDER_DEFAULT_QUOTA
+    local_used = Decimal(str(_pacifica_window_used(clock, window)))
+    used = local_used
+    if implied_used is not None:
+        used = max(used, Decimal(str(implied_used)))
+    else:
+        last_r = _pacifica_rate_limit.get("last_remaining")
+        if last_r is not None:
+            used = max(used, cap - Decimal(str(last_r)))
+    budget = need + PACIFICA_LADDER_SHARED_TRAFFIC_RESERVE
+    local_wait = _pacifica_local_wait_for_budget(clock, budget, cap, window)
+    if used + budget <= cap and local_wait <= 0:
+        return floor
+    occupancy_wait = local_wait
+    if used + budget > cap:
+        occupancy_wait = max(local_wait, _pacifica_time_until_local_credits_expire(
+            clock, used + budget - cap, window,
+        ) or window)
+    return max(floor, occupancy_wait)
+
+
+def simulate_pacifica_ladder_pacing(
+    *,
+    order_count: int,
+    batch_size: int = 10,
+    post_seconds: float = 0.55,
+    verify_seconds: float = 0.01,
+    scenario: str = "normal",
+) -> Dict[str, Any]:
+    """Offline wall-time model. Adaptive never undercuts the 0.8s/action floor.
+
+    Scenarios:
+      normal — one verify GET at measured 1 credit, fresh headers
+      heavy_get — one verify GET at 12 credits, fresh headers
+      missing_header — no remaining, local ledger + shared reserve
+      bursty_sibling — fresh headers, 40-credit sibling hit every 5th batch
+    """
+    posts = (order_count + batch_size - 1) // batch_size
+    gaps = max(0, posts - 1)
+    per = post_seconds + verify_seconds
+    floor = batch_size * PACIFICA_LADDER_MIN_SECONDS_PER_ACTION
+    window = PACIFICA_LADDER_CREDIT_WINDOW_SECONDS
+    quota = PACIFICA_LADDER_DEFAULT_QUOTA
+    get_cost = Decimal("1") if scenario in {"normal", "bursty_sibling"} else PACIFICA_CREDIT_HEAVY_GET
+    verify_gets = 3 if scenario == "heavy_get" else 1
+    use_headers = scenario != "missing_header"
+
+    def _fixed(gap: float) -> Dict[str, Any]:
+        batches_in_60 = 1 + int((60.0 - 1e-9) // gap) if gap else posts
+        return {
+            "posts": posts,
+            "wall_s": gaps * gap + posts * per,
+            "peak_create_credits_per_60s": min(posts, batches_in_60) * batch_size,
+        }
+
+    def _recover(now: float, remaining: Decimal) -> Decimal:
+        recovered = Decimal("0")
+        kept: List[Tuple[float, float]] = []
+        for ts, amount in _pacifica_credit_spends:
+            if ts < now - window:
+                recovered += Decimal(str(amount))
+            else:
+                kept.append((ts, amount))
+        _pacifica_credit_spends.clear()
+        _pacifica_credit_spends.extend(kept)
+        return min(quota, remaining + recovered)
+
+    reset_pacifica_rate_limit_state()
+    now = 0.0
+    wall = 0.0
+    remaining = quota
+    create_events: List[Tuple[float, int]] = []
+    try:
+        for index in range(posts):
+            remaining_orders = order_count - index * batch_size
+            n = min(batch_size, remaining_orders)
+            if index:
+                wait = pacifica_batch_credit_wait_seconds(
+                    action_count=n,
+                    floor_seconds=floor,
+                    adaptive=True,
+                    remaining=remaining if use_headers else None,
+                    quota=quota,
+                    now=now,
+                    header_age_seconds=0.0 if use_headers else None,
+                    get_cost=get_cost,
+                )
+                wall += wait
+                now += wait
+                remaining = _recover(now, remaining)
+            if scenario == "bursty_sibling" and index and index % 5 == 0:
+                remaining = max(Decimal("0"), remaining - Decimal("40"))
+            post_cost = float(pacifica_batch_commit_need(n))
+            record_pacifica_credit_spend(post_cost, now=now)
+            remaining = max(Decimal("0"), remaining - Decimal(str(post_cost)))
+            for _ in range(verify_gets):
+                record_pacifica_credit_spend(float(get_cost), now=now)
+                remaining = max(Decimal("0"), remaining - get_cost)
+            create_events.append((now, n))
+            wall += per
+            now += per
+        peak = 0
+        for ts, _n in create_events:
+            peak = max(peak, sum(nn for t2, nn in create_events if ts - window < t2 <= ts))
+        adaptive = {
+            "posts": posts,
+            "wall_s": round(wall, 3),
+            "peak_create_credits_per_60s": peak,
+            "scenario": scenario,
+        }
+    finally:
+        reset_pacifica_rate_limit_state()
+
+    return {
+        "fixed_12s": _fixed(12.0),
+        "fixed_10s": _fixed(10.0),
+        "fixed_8s": _fixed(floor),
+        "adaptive": adaptive,
+    }
+
 
 # Position-management tuning.
 #
@@ -420,6 +873,10 @@ def capabilities() -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+class _PacificaRejectedError(RuntimeError):
+    """The exchange explicitly rejected a write (not a transport ambiguity)."""
+
+
 class _PacificaHTTPError(RuntimeError):
     def __init__(self, *, status: int, path: str, body: str) -> None:
         self.status = status
@@ -440,9 +897,14 @@ def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
+            record_pacifica_ratelimit_headers(resp.headers, kind="get")
             charset = resp.headers.get_content_charset() or "utf-8"
             text = resp.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
+        try:
+            record_pacifica_ratelimit_headers(getattr(exc, "headers", None), kind="get")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:  # noqa: BLE001
@@ -774,7 +1236,7 @@ def _post_signed(
             or response_obj.get("msg")
             or "Pacifica POST failed"
         )
-        raise RuntimeError(f"{message} (code={response_obj.get('code')})")
+        raise _PacificaRejectedError(f"{message} (code={response_obj.get('code')})")
     data = response_obj.get("data")
     if not isinstance(data, dict):
         raise RuntimeError("Pacifica POST response missing data object")
@@ -1362,36 +1824,175 @@ def _ladder_build_children(
     return children, kept_volume, omitted_below_minimum, len(children)
 
 
+def _ladder_order_payload(child: Dict[str, Any], client_order_id: str) -> Dict[str, Any]:
+    """One limit-order payload, identical for sequential and batch transport."""
+    if str(child.get("order_type") or PACIFICA_LIMIT_ORDER_TYPE).lower() != PACIFICA_LIMIT_ORDER_TYPE:
+        raise ValueError("Pacifica ladder only supports limit orders")
+    return {
+        "symbol": child["symbol"],
+        "price": child["price"],
+        "reduce_only": child.get("reduce_only", False),
+        "amount": child["size"],
+        "side": PACIFICA_SIDE_TO_PACIFICA[str(child["side"]).lower()],
+        "tif": child.get("tif", PACIFICA_DEFAULT_TIF),
+        "client_order_id": client_order_id,
+    }
+
+
+def _post_ladder_batch(actions: List[Dict[str, Any]]) -> Any:
+    """POST individually signed actions; preserve the complete response.
+
+    No outer signature exists. Neither HTTP 200 nor the envelope's success
+    field proves any individual Create succeeded; the caller parses results.
+    """
+    url = f"{_api_base()}/orders/batch"
+    req = urllib.request.Request(
+        url, method="POST",
+        data=json.dumps({"actions": actions}, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "*/*"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
+            record_pacifica_ratelimit_headers(resp.headers, kind="post")
+            text = resp.read().decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            record_pacifica_ratelimit_headers(getattr(exc, "headers", None), kind="post")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                body = str(parsed.get("error") or parsed.get("message") or body)
+        except (ValueError, TypeError):
+            pass
+        raise _PacificaHTTPError(
+            status=int(exc.code), path="/orders/batch", body=body or str(exc.reason),
+        ) from exc
+    # Invalid JSON is uncertain: the HTTP write may already have executed.
+    return json.loads(text)
+
+
+def _ladder_submit_batch(
+    credentials: Dict[str, str], children: List[Dict[str, Any]], start_index: int,
+) -> Tuple[List[Dict[str, Any]], bool, bool]:
+    """Submit one batch exactly once, returning rows, rate-limit and preflight flags.
+
+    Sign ALL actions before transport. An exception while signing is local
+    and has not sent anything; an exception after starting the POST is
+    ambiguous, including HTTP 429. Never retry an ambiguous batch.
+    """
+    rows: List[Dict[str, Any]] = []
+    actions: List[Dict[str, Any]] = []
+    used_ids: Set[str] = set()
+    for index, child in enumerate(children, start_index):
+        cloid = str(child.get("client_order_id") or uuid.uuid4())
+        rows.append({
+            "submitted": 1, "accepted": 0, "ok": False,
+            "outcome": "uncertain", "client_order_id": cloid,
+            "price": child["price"], "size": child["size"], "index": index,
+        })
+        # Signing happens before I/O. Do not let a half-signed batch out.
+        try:
+            if cloid in used_ids:
+                raise ValueError("duplicate client_order_id in batch")
+            used_ids.add(cloid)
+            payload = _ladder_order_payload(child, cloid)
+            signed = _build_signed_body(
+                credentials=credentials, operation_type="create_order", payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = f"Batch not sent: {sanitize_error_message(str(exc))}"
+            for row in rows:
+                row.update(submitted=0, outcome="not_attempted", reason=reason)
+            for pending in children[len(rows):]:
+                rows.append({"submitted": 0, "accepted": 0, "ok": False,
+                             "outcome": "not_attempted", "client_order_id": str(pending.get("client_order_id") or uuid.uuid4()),
+                             "price": pending["price"], "size": pending["size"],
+                             "index": start_index + len(rows), "reason": reason})
+            return rows, False, True
+        actions.append({"type": "Create", "data": signed})
+    try:
+        envelope = _post_ladder_batch(actions)
+    except _PacificaHTTPError as exc:
+        reason = sanitize_error_message(str(exc))
+        for row in rows:
+            row["reason"] = reason
+        return rows, exc.status == 429, False
+    except Exception as exc:  # noqa: BLE001
+        reason = sanitize_error_message(str(exc))
+        for row in rows:
+            row["reason"] = reason
+        return rows, False, False
+
+    results = (envelope.get("data") or {}).get("results") if (
+        isinstance(envelope, dict) and isinstance(envelope.get("data"), dict)
+    ) else None
+    if not isinstance(envelope, dict) or envelope.get("success") is not True:
+        reason = sanitize_error_message(str(envelope.get("error") or envelope.get("message") or
+                                            "Batch response did not confirm execution")) if isinstance(envelope, dict) else "Invalid batch response"
+        for row in rows:
+            row["reason"] = reason
+        return rows, False, False
+    if not isinstance(results, list) or len(results) != len(rows):
+        # A short/long positional list cannot safely be correlated with
+        # specific actions: the missing result may be in the middle.
+        for row in rows:
+            row["reason"] = "Invalid batch results count; reconcile all client order IDs"
+        return rows, False, False
+    for index, row in enumerate(rows):
+        result = results[index]
+        if not isinstance(result, dict):
+            row["reason"] = "Missing or invalid action result; reconcile client order ID"
+        elif result.get("success") is False and result.get("order_id") is not None:
+            row["reason"] = "Conflicting action result; reconcile client order ID"
+        elif result.get("success") is False:
+            row.update(outcome="rejected", reason=sanitize_error_message(str(
+                result.get("error") or result.get("message") or "Exchange rejected action"
+            )))
+        elif result.get("success") is True and result.get("order_id") is not None:
+            try:
+                order_id = int(str(result["order_id"]))
+            except (TypeError, ValueError):
+                row["reason"] = "Invalid order ID in action result; reconcile client order ID"
+            else:
+                row.update(outcome="accepted", accepted=1, ok=True, exchange_order_id=order_id)
+        else:
+            row["reason"] = "Action was not individually acknowledged; reconcile client order ID"
+    return rows, False, False
+
+
 def _ladder_submit_child(
     credentials: Dict[str, str],
     child: Dict[str, Any],
-) -> Tuple[Optional[int], Optional[str], str]:
-    """Submit a single ladder child as a signed ``create_order`` POST.
+) -> Tuple[Optional[int], Optional[str], str, str]:
+    """Submit one child with a fresh client ID; never retry ambiguous writes.
 
-    Returns ``(exchange_order_id, error_message, client_order_id)``.
+    Returns ``(exchange_order_id, error_message, client_order_id, outcome)``.
     On success, ``error_message`` is None and ``client_order_id`` is
     the UUID the wizard (and the verifier) will look up. On failure
     we keep the client_order_id so the user can correlate partial
     successes.
     """
-    client_order_id = str(uuid.uuid4())
-    child_with_cloid = {**child, "client_order_id": client_order_id}
-    pacifica_side = PACIFICA_SIDE_TO_PACIFICA[str(child["side"]).lower()]
-    payload = {
-        "symbol": child["symbol"],
-        "price": child["price"],
-        "reduce_only": False,
-        "amount": child["size"],
-        "side": pacifica_side,
-        "tif": PACIFICA_DEFAULT_TIF,
-        "client_order_id": client_order_id,
-    }
+    client_order_id = str(child.get("client_order_id") or uuid.uuid4())
+    payload = _ladder_order_payload(child, client_order_id)
     try:
         response_data = _post_signed(
             credentials, "/orders/create", "create_order", payload,
         )
+    except _PacificaHTTPError as exc:
+        outcome = "rejected" if 400 <= exc.status < 500 else "uncertain"
+        return None, sanitize_error_message(str(exc)), client_order_id, outcome
+    except _PacificaRejectedError as exc:
+        return None, sanitize_error_message(str(exc)), client_order_id, "rejected"
     except Exception as exc:  # noqa: BLE001
-        return None, sanitize_error_message(str(exc)), client_order_id
+        # A timeout/connection reset or malformed response is not proof that
+        # the exchange did not process the POST. Never retry it blindly.
+        return None, sanitize_error_message(str(exc)), client_order_id, "uncertain"
 
     # The create-order response carries the exchange_order_id in
     # `data.i`; we don't strictly need it for verification (we look up
@@ -1401,23 +2002,23 @@ def _ladder_submit_child(
         exchange_order_id = int(str(raw_id)) if raw_id is not None else None
     except (TypeError, ValueError):
         exchange_order_id = None
-    return exchange_order_id, None, client_order_id
+    return exchange_order_id, None, client_order_id, "accepted"
 
 
 def _ladder_verify_children(
     credentials: Dict[str],
     child_cloids: List[str],
-) -> Tuple[int, List[str]]:
+) -> Tuple[Set[str], List[str]]:
     """Confirm a set of child orders (by client_order_id) are visible.
 
     Polls the open-orders snapshot a few times because Pacifica's
     read-after-write consistency is fast but not instant for
     cross-endpoint lookups.
 
-    Returns ``(confirmed_count, missing_cloids)``.
+    Returns ``(confirmed_client_ids, missing_client_ids)``.
     """
     if not child_cloids:
-        return 0, []
+        return set(), []
     missing: Set[str] = set(child_cloids)
     for attempt in range(PACIFICA_LADDER_VERIFY_ATTEMPTS):
         try:
@@ -1438,12 +2039,68 @@ def _ladder_verify_children(
                 "Pacifica ladder verify attempt %d/%d failed: %s",
                 attempt + 1, PACIFICA_LADDER_VERIFY_ATTEMPTS, exc,
             )
+        finally:
+            estimate = _pacifica_rate_limit.get("get_cost") or PACIFICA_CREDIT_HEAVY_GET
+            _record_pacifica_spend_observed_or_estimate(Decimal(str(estimate)))
         if not missing:
             break
         if attempt < PACIFICA_LADDER_VERIFY_ATTEMPTS - 1:
             time.sleep(PACIFICA_LADDER_VERIFY_DELAY_SECONDS * (attempt + 1))
-    confirmed = len(child_cloids) - len(missing)
-    return confirmed, sorted(missing)
+    return set(child_cloids) - missing, sorted(missing)
+
+
+def _ladder_history_by_client_id(
+    credentials: Dict[str, str], client_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Bounded, read-only reconciliation of children absent from open orders.
+
+    A missing ID is never evidence of rejection: the account may have more
+    history than these pages, or the read may fail/race the write.
+    """
+    pending = set(client_ids)
+    found: Dict[str, Dict[str, Any]] = {}
+    cursor: Optional[str] = None
+    for _ in range(3):
+        if not pending:
+            break
+        params: Dict[str, Any] = {"account": credentials["address"], "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = _http_get_json(f"{_api_base()}/orders/history", params=params)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Pacifica ladder history reconciliation failed: %s", type(exc).__name__)
+            estimate = _pacifica_rate_limit.get("get_cost") or PACIFICA_CREDIT_HEAVY_GET
+            _record_pacifica_spend_observed_or_estimate(Decimal(str(estimate)))
+            break
+        estimate = _pacifica_rate_limit.get("get_cost") or PACIFICA_CREDIT_HEAVY_GET
+        _record_pacifica_spend_observed_or_estimate(Decimal(str(estimate)))
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            break
+        for row in payload["data"]:
+            if isinstance(row, dict):
+                cloid = str(row.get("client_order_id") or "").strip()
+                if cloid in pending and row.get("order_id") is not None:
+                    found[cloid] = row
+                    pending.remove(cloid)
+        next_cursor = str(payload.get("next_cursor") or "")
+        if payload.get("has_more") is not True or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return found
+
+
+def _ladder_log_outcomes(account: str, symbol: str, batches: List[Dict[str, Any]]) -> None:
+    """Keep enough sanitized evidence to reconcile a partial write later."""
+    for batch in batches:
+        logger.warning(
+            "Pacifica ladder child account=%s symbol=%s index=%s client_order_id=%s "
+            "outcome=%s exchange_order_id=%s reason=%s",
+            account, symbol, batch["index"], batch["client_order_id"],
+            batch["outcome"], batch.get("exchange_order_id"),
+            (sanitize_error_message(str(batch["reason"]))
+             if batch.get("reason") else ""),
+        )
 
 
 def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
@@ -1458,19 +2115,15 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
          by weight (uniform or half-gaussian), floor each child's
          size to the lot, drop children below the $10 USD notional
          floor (no redistribution).
-      3. Submit each surviving child as a separate signed
-         ``create_order`` POST. Each child gets its own UUID
-         client_order_id so the verify pass can confirm it landed.
-      4. Re-snapshot /orders and confirm every submitted child's
-         client_order_id is visible. Survivors-of-survivors count as
-         the accepted_child_count.
+      3. Submit surviving children via Pacifica's batch Create endpoint,
+         up to 10 individually signed actions per POST, with per-action
+         UUIDs; explicitly selectable sequential transport stays available.
+      4. Re-snapshot /orders and history by client_order_id, including
+         ambiguous POSTs; never replay a sent batch on timeout or 429.
 
-    Submission is **sequential** rather than parallel. The cancel
-    operation parallelises because we have at most ~280 targets and
-    the bottleneck is server-side; for a typical 3-15 child ladder,
-    sequential submission at ~150ms per POST keeps the code simpler
-    and avoids racing the user against themselves (each child is a
-    real new order that hits the orderbook).
+    No concurrent writes: Pacifica charges credits per action, so fewer
+    HTTP requests do not bypass its documented credit quota. Conservative
+    pacing may make a large ladder slower than the old sequential path.
     """
     creds = _lookup_credentials(account)
     if creds is None:
@@ -1598,8 +2251,11 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             requested_order_count=order_count, submitted_order_count=0,
             requested_volume=_format_market_value(total_volume, lot_size),
             submitted_volume="0",
-            batch_count=0, verified=False, partial=True, status="failed",
+            batch_count=0, verified=False, partial=False, status="failed",
             accepted_child_count=0,
+            rejected_child_count=0,
+            uncertain_child_count=0,
+            not_attempted_child_count=order_count,
             omitted_order_count=order_count - kept_count,
             omitted_below_minimum=omitted_below_minimum,
             child_order_ids=[], batches=[],
@@ -1615,46 +2271,152 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             ladder=ladder_result,
         )
 
-    # --- 3. submit each child sequentially ---
+    # --- 3. choose Pacifica-only transport (sequential is the default) ---
+    # Batch and adaptive pacing require an explicit request field or env
+    # override. Request options override env for direct TradeDesk callers.
+    # No config is written by this code.
+    tuning = _combined_pacifica_env()
+    submission_mode = str(request.get("submission_mode") or
+                          tuning.get("PACIFICA_LADDER_SUBMISSION_MODE") or "sequential").strip().lower()
+    if submission_mode not in {"batch", "sequential"}:
+        return make_failure(operation="ladder", exchange=name, account=creds["account"],
+                            code="INVALID_SUBMISSION_MODE", message="Use batch or sequential.")
+    batch_size = PACIFICA_LADDER_BATCH_SIZE
+    pace = batch_size * PACIFICA_LADDER_MIN_SECONDS_PER_ACTION
+    if submission_mode == "batch":
+        try:
+            batch_size = int(request.get("batch_size", tuning.get(
+                "PACIFICA_LADDER_BATCH_SIZE", PACIFICA_LADDER_BATCH_SIZE,
+            )))
+            pace = float(request.get("batch_interval_seconds", tuning.get(
+                "PACIFICA_LADDER_BATCH_INTERVAL_SECONDS",
+                batch_size * PACIFICA_LADDER_MIN_SECONDS_PER_ACTION,
+            )))
+            if not 1 <= batch_size <= 10 or not (
+                batch_size * PACIFICA_LADDER_MIN_SECONDS_PER_ACTION <= pace <= 120
+            ):
+                raise ValueError("batch size must be 1–10 and pacing must respect the credit floor")
+        except (TypeError, ValueError) as exc:
+            return make_failure(operation="ladder", exchange=name, account=creds["account"],
+                                code="INVALID_BATCH_CONFIG", message=f"Invalid Pacifica batch configuration: {exc}")
+        adaptive_raw = request.get("adaptive_pacing", tuning.get("PACIFICA_LADDER_ADAPTIVE_PACING", False))
+        adaptive_pacing = _coerce_bool_safe(adaptive_raw)
+    else:
+        adaptive_pacing = False
+
     batches: List[Dict[str, Any]] = []
     accepted_cloids: List[str] = []
     accepted_order_ids: List[int] = []
-    for index, child in enumerate(children):
-        exchange_order_id, error, cloid = _ladder_submit_child(creds, child)
-        if error is None:
-            accepted_cloids.append(cloid)
-            if exchange_order_id is not None:
-                accepted_order_ids.append(exchange_order_id)
-            batches.append({
-                "submitted": 1, "accepted": 1, "ok": True,
-                "client_order_id": cloid,
-                "exchange_order_id": exchange_order_id,
-                "price": child["price"],
-                "size": child["size"],
-                "index": index,
-            })
-        else:
-            batches.append({
-                "submitted": 1, "accepted": 0, "ok": False,
-                "client_order_id": cloid,
-                "reason": error,
-                "price": child["price"],
-                "size": child["size"],
-                "index": index,
-            })
-        # We do NOT abort the ladder on a single-child failure — the
-        # user explicitly asked for N orders, and partial fills are
-        # the right behaviour here. The final result surfaces the
-        # accept count so the wizard can show "Submitted: 8 of 10".
+    request_count = 0
+    rate_limit_seen = False
+    if submission_mode == "sequential":
+        for index, child in enumerate(children):
+            if index:
+                # Even legacy single-order requests spend one credit per
+                # child. Preserve transport but respect the same quota floor.
+                time.sleep(PACIFICA_LADDER_MIN_SECONDS_PER_ACTION)
+            exchange_order_id, error, cloid, outcome = _ladder_submit_child(creds, child)
+            request_count += 1
+            row = {
+                "submitted": 1, "accepted": int(outcome == "accepted"),
+                "ok": outcome == "accepted", "outcome": outcome,
+                "client_order_id": cloid, "exchange_order_id": exchange_order_id,
+                "price": child["price"], "size": child["size"], "index": index,
+            }
+            if error:
+                row["reason"] = error
+            batches.append(row)
+    else:
+        for start in range(0, kept_count, batch_size):
+            chunk = children[start:start + batch_size]
+            if request_count:
+                # Credits are per action. Adaptive wait may exceed the
+                # floor when remaining credits cannot cover this batch
+                # plus a verification GET; it never undercuts the floor.
+                wait = pace
+                if adaptive_pacing:
+                    snap = pacifica_effective_rate_limit()
+                    captured = snap.get("captured_at")
+                    age = (time.monotonic() - float(captured)) if captured is not None else None
+                    wait = pacifica_batch_credit_wait_seconds(
+                        action_count=len(chunk),
+                        floor_seconds=pace,
+                        adaptive=True,
+                        remaining=snap.get("remaining"),
+                        reset_seconds=snap.get("reset_seconds"),
+                        quota=snap.get("quota"),
+                        header_age_seconds=age,
+                        get_cost=snap.get("get_cost"),
+                        implied_used=snap.get("implied_used"),
+                    )
+                time.sleep(wait)
+            rows, rate_limited, preflight_failed = _ladder_submit_batch(creds, chunk, start)
+            batches.extend(rows)
+            if not preflight_failed:
+                request_count += 1
+                _record_pacifica_spend_observed_or_estimate(
+                    pacifica_batch_commit_need(len(chunk)),
+                )
+            rate_limit_seen |= rate_limited
+            halt = preflight_failed or rate_limited
+            halt_reason = None
+            if preflight_failed:
+                halt_reason = "Not attempted: batch signing failed"
+            elif rate_limited:
+                halt_reason = "Not attempted: halted after HTTP 429 rate limit"
+            elif any(row.get("outcome") == "rejected" for row in rows):
+                halt = True
+                halt_reason = "Not attempted: prior batch contained a rejected child"
+            elif start + batch_size < kept_count:
+                recon_ids = [row["client_order_id"] for row in rows
+                             if row.get("outcome") in {"accepted", "uncertain"}]
+                confirmed_now, missing_now = _ladder_verify_children(creds, recon_ids)
+                incomplete = (
+                    any(row.get("outcome") == "uncertain" for row in rows)
+                    or any(
+                        row.get("outcome") == "accepted"
+                        and row.get("client_order_id") not in confirmed_now
+                        for row in rows
+                    )
+                )
+                if incomplete:
+                    halt = True
+                    halt_reason = "Not attempted: prior batch reconciliation incomplete"
+            if halt:
+                for index in range(start + len(chunk), kept_count):
+                    child = children[index]
+                    batches.append({
+                        "submitted": 0, "accepted": 0, "ok": False,
+                        "outcome": "not_attempted",
+                        "client_order_id": str(child.get("client_order_id") or uuid.uuid4()),
+                        "price": child["price"], "size": child["size"],
+                        "index": index, "reason": halt_reason,
+                    })
+                break
 
-    if not accepted_cloids:
+    for row in batches:
+        if row["outcome"] == "accepted":
+            accepted_cloids.append(row["client_order_id"])
+            if row.get("exchange_order_id") is not None:
+                accepted_order_ids.append(row["exchange_order_id"])
+
+    if not accepted_cloids and not any(b["outcome"] == "uncertain" for b in batches):
+        _ladder_log_outcomes(creds["account"], requested_symbol, batches)
         ladder_result = CanonicalLadderResult(
             symbol=requested_symbol, side=requested_side, distribution=distribution,
             requested_order_count=order_count, submitted_order_count=0,
             requested_volume=_format_market_value(total_volume, lot_size),
             submitted_volume="0",
-            batch_count=len(batches), verified=False, partial=True, status="failed",
+            batch_count=request_count, verified=False, partial=False, status="failed",
             accepted_child_count=0,
+            rejected_child_count=sum(b["outcome"] == "rejected" for b in batches),
+            uncertain_child_count=0,
+            not_attempted_child_count=(order_count - kept_count +
+                                       sum(b["outcome"] == "not_attempted" for b in batches)),
+            exchange_reason="; ".join(dict.fromkeys(
+                str(b["reason"]) for b in batches if b.get("reason")
+            ))[:500] or None,
+            rate_limited=rate_limit_seen or any("HTTP 429" in str(b.get("reason", "")) for b in batches),
             omitted_order_count=order_count - kept_count,
             omitted_below_minimum=omitted_below_minimum,
             child_order_ids=[], batches=batches,
@@ -1666,53 +2428,93 @@ def _execute_ladder(account: str, request: Dict[str, Any]) -> CanonicalResponse:
             ladder=ladder_result,
         )
 
-    # --- 4. verify accepted children are visible ---
-    confirmed_count, missing_cloids = _ladder_verify_children(creds, accepted_cloids)
-    # If the verify pass missed a child, downgrade the result to
-    # partial. The per-order POSTs all returned success but the
-    # snapshot disagrees — likely a transient read-after-write
-    # race; the operator can refresh positions_orders and see the
-    # child.
-    verified = not missing_cloids
-    submitted_volume = sum(
-        _decimal_or_zero(b["size"]) for b in batches if b.get("ok")
+    # --- 4. reconcile acknowledgements and ambiguous writes by client ID ---
+    # Only a positive lookup can resolve an uncertain POST. Absence from the
+    # open snapshot is not a rejection: it may already have filled/cancelled.
+    uncertain_ids = [b["client_order_id"] for b in batches if b["outcome"] == "uncertain"]
+    confirmed_ids, missing_cloids = _ladder_verify_children(
+        creds, accepted_cloids + uncertain_ids,
     )
-    status = "success" if verified else "partial"
-    partial = not verified
-
-    # If the user wanted 10 orders and we placed 10, but the snapshot
-    # confirms only 8, the wizard should still see "Submitted: 10,
-    # Verified: 8". The accepted_child_count is the number of
-    # children the agent placed, the confirmed count is implicit in
-    # the verified flag.
+    history = _ladder_history_by_client_id(creds, missing_cloids) if missing_cloids else {}
+    for batch in batches:
+        cloid = batch["client_order_id"]
+        row = history.get(cloid)
+        if row and str(row.get("order_status") or "").lower() == "rejected":
+            batch["outcome"] = "rejected"
+            batch["ok"] = False
+            batch["accepted"] = 0
+            batch["reason"] = sanitize_error_message(str(row.get("reason") or "Exchange rejected order"))
+            if cloid in accepted_cloids:
+                accepted_cloids.remove(cloid)
+        elif batch["outcome"] == "uncertain" and (cloid in confirmed_ids or row):
+            batch["outcome"] = "accepted"
+            batch["ok"] = True
+            batch["accepted"] = 1
+            batch["reason"] = "POST response uncertain; client ID found in exchange orders"
+            accepted_cloids.append(cloid)
+            if row:
+                try:
+                    accepted_order_ids.append(int(row["order_id"]))
+                except (TypeError, ValueError):
+                    pass
+    submitted_volume = sum(
+        (_decimal_or_zero(b["size"]) for b in batches if b.get("ok")),
+        Decimal("0"),
+    )
     accepted_child_count = len(accepted_cloids)
-    submitted_order_count = accepted_child_count  # what was actually sent to the exchange
+    rejected_count = sum(b["outcome"] == "rejected" for b in batches)
+    uncertain_count = sum(b["outcome"] == "uncertain" for b in batches)
+    not_attempted_count = (order_count - kept_count +
+                           sum(b["outcome"] == "not_attempted" for b in batches))
+    verified = uncertain_count == 0 and all(
+        cloid in confirmed_ids or cloid in history for cloid in accepted_cloids
+    )
+    status = (
+        "success" if accepted_child_count == order_count and verified
+        else "partial_success" if accepted_child_count else "failed"
+    )
+    partial = status == "partial_success"
+    submitted_order_count = accepted_child_count
+    _ladder_log_outcomes(creds["account"], requested_symbol, batches)
 
     ladder_result = CanonicalLadderResult(
         symbol=requested_symbol, side=requested_side, distribution=distribution,
         requested_order_count=order_count, submitted_order_count=submitted_order_count,
         requested_volume=_format_market_value(total_volume, lot_size),
         submitted_volume=_format_market_value(submitted_volume, lot_size),
-        batch_count=len(batches),
+        batch_count=request_count,
         verified=verified, partial=partial, status=status,
         accepted_child_count=accepted_child_count,
+        rejected_child_count=rejected_count,
+        uncertain_child_count=uncertain_count,
+        not_attempted_child_count=not_attempted_count,
+        exchange_reason="; ".join(dict.fromkeys(
+            str(b["reason"]) for b in batches
+            if b.get("reason") and b["outcome"] != "accepted"
+        ))[:500] or None,
+        rate_limited=rate_limit_seen or any(
+            "HTTP 429" in str(b.get("reason", ""))
+            for b in batches
+        ),
         omitted_order_count=order_count - submitted_order_count,
         omitted_below_minimum=omitted_below_minimum,
         child_order_ids=accepted_order_ids or None,
         batches=batches,
     )
-    if verified:
+    if status == "success":
         return make_success(
             operation="ladder", exchange=name,
             account=creds["account"], ladder=ladder_result,
         )
     return make_failure(
         operation="ladder", exchange=name, account=creds["account"],
-        code="LADDER_VERIFICATION_INCOMPLETE",
+        code=("LADDER_PARTIAL_SUCCESS" if accepted_child_count else
+              "LADDER_SUBMISSION_UNCERTAIN" if uncertain_count else "LADDER_SUBMISSION_FAILED"),
         message=(
-            f"{confirmed_count}/{accepted_child_count} submitted children "
-            f"confirmed on the book. Refresh the positions view to see "
-            f"the residual; the others may appear shortly."
+            f"Accepted: {accepted_child_count}/{order_count}; rejected: {rejected_count}; "
+            f"uncertain: {uncertain_count}; not attempted: {not_attempted_count}. "
+            f"Confirmed in open orders/history: {len(confirmed_ids | set(history))}/"
+            f"{len(accepted_cloids) + uncertain_count}."
         ),
         ladder=ladder_result,
     )
