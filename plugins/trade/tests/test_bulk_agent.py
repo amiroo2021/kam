@@ -141,9 +141,19 @@ class TestBulkAgent(unittest.TestCase):
                 self.assertEqual((p.symbol, p.side, p.size, p.entry_price, p.mark, p.pnl), single)
 
         self.assertIn("positions_management", bulk.capabilities())
-        self.assertIn("set_tp", bulk.capabilities())
-        self.assertIn("set_sl", bulk.capabilities())
+        self.assertNotIn("set_tp", bulk.capabilities())
+        self.assertNotIn("set_sl", bulk.capabilities())
         self.assertIn("close_position", bulk.capabilities())
+
+        # TP/SL remain NOT_IMPLEMENTED and must not enter the write path.
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_submit_order") as submit:
+            for op in ("set_tp", "set_sl"):
+                bad = bulk.execute({"operation": op, "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "long", "price": "1"})
+                self.assertFalse(bad.success)
+                self.assertEqual(bad.error.code, "NOT_IMPLEMENTED")
+                self.assertNotIn("read-only adapter", bad.error.message)
+        submit.assert_not_called()
 
     def test_close_position_uses_bulk_native_reduce_only_market_order_for_short(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
@@ -378,24 +388,15 @@ class TestBulkAgent(unittest.TestCase):
         self.assertNotEqual(result.data.get("close_status"), "fully_closed")
         submit.assert_called_once()
 
-    def test_set_tp_and_set_sl_are_no_longer_not_implemented(self) -> None:
+    def test_close_position_returns_not_implemented_for_tp_sl(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
-        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3}
-        live = {"positions": [{"symbol": "BTC-USD", "size": -0.125, "iso": False}], "openOrders": []}
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
-             mock.patch.object(bulk, "_find_market", return_value=market), \
-             mock.patch.object(bulk, "_live_account", return_value=live), \
              mock.patch.object(bulk, "_submit_order") as submit:
-            submit.side_effect = RuntimeError("network unreachable")
             for operation in ("set_tp", "set_sl"):
-                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC", "price": "70000"})
+                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC"})
                 self.assertFalse(resp.success)
-                # Must reach the real submission path (and fail there, since
-                # the network is mocked to error) rather than being rejected
-                # up front as unimplemented.
-                self.assertNotEqual(resp.error.code, "NOT_IMPLEMENTED")
-                self.assertIn(resp.error.code, ("TP_PLACEMENT_FAILED", "SL_PLACEMENT_FAILED"))
-        self.assertEqual(submit.call_count, 2)
+                self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+        submit.assert_not_called()
 
     def test_positions_management_attaches_tp_sl_from_open_orders(self) -> None:
         creds = {

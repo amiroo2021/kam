@@ -11,11 +11,6 @@
 #   - Pacifica (Solana): signed write operations import `solders` (the
 #     official Solana Python SDK) and `base58`. Read-only operations
 #     (balance / positions) do not require either.
-#   - Bulk Trade: signed write operations import `bulk_keychain`, Bulk's
-#     official Rust/pyo3 signing SDK. It is NOT on PyPI; install it from
-#     the vendored wheel at plugins/trade/vendor/bulk_keychain/ with:
-#       pip install --no-index plugins/trade/vendor/bulk_keychain/*.whl
-#     Read-only operations (balance / positions_orders) do not require it.
 
 requests>=2.28
 fastapi>=0.115
