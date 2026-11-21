@@ -399,6 +399,66 @@ class AftermathAgentTests(unittest.TestCase):
             self.assertTrue(response.success, msg=req["operation"])
             self.assertEqual(calls[-1][0], expected_path)
 
+    def test_find_position_normalizes_order_and_position_side_names(self) -> None:
+        positions = [
+            {"marketId": "ZEC-LONG", "baseAssetAmount": "24.48"},
+            {"marketId": "ZEC-SHORT", "baseAssetAmount": "-24.48"},
+        ]
+        with mock.patch.object(aftermath, "_account_positions", return_value={"positions": positions}):
+            for side in ("buy", "long"):
+                self.assertIs(aftermath._find_position({}, "ZEC-LONG", side), positions[0])
+            for side in ("sell", "short"):
+                self.assertIs(aftermath._find_position({}, "ZEC-SHORT", side), positions[1])
+
+    def test_find_position_rejects_opposite_and_unknown_sides(self) -> None:
+        positions = [
+            {"marketId": "ZEC-LONG", "baseAssetAmount": "24.48"},
+            {"marketId": "ZEC-SHORT", "baseAssetAmount": "-24.48"},
+        ]
+        with mock.patch.object(aftermath, "_account_positions", return_value={"positions": positions}):
+            for symbol, side in (
+                ("ZEC-LONG", "sell"),
+                ("ZEC-SHORT", "buy"),
+                ("ZEC-SHORT", "sideways"),
+                ("ZEC-SHORT", " "),
+                ("ZEC-LONG", " buy "),
+            ):
+                with self.subTest(symbol=symbol, side=side):
+                    with self.assertRaisesRegex(ValueError, "matching position not found"):
+                        aftermath._find_position({}, symbol, side)
+            self.assertIs(aftermath._find_position({}, "ZEC-SHORT", ""), positions[1])
+            with self.assertRaisesRegex(ValueError, "matching position not found"):
+                aftermath._find_position({}, "BTC", "")
+
+    def test_tp_sl_and_close_accept_sell_for_short_position(self) -> None:
+        self.set_account()
+        market_id = "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f"
+        payload = self.native_positions_payload()
+        payload["accounts"][0]["positions"][0]["baseAssetAmount"] = "-24.48"
+
+        def fake_short_post(credentials, path, body):
+            if path == "/api/perpetuals/accounts/positions":
+                return payload
+            return self.fake_native_post(credentials, path, body)
+
+        operations = [
+            {"operation": "set_tp", "price": "25"},
+            {"operation": "set_sl", "price": "15"},
+            {"operation": "close_position"},
+        ]
+        for operation in operations:
+            request = {
+                **operation,
+                "account": "main",
+                "symbol": market_id,
+                "side": "sell",
+                "dry_run": True,
+            }
+            with self.subTest(operation=operation["operation"]):
+                with mock.patch.object(aftermath, "_post_json", side_effect=fake_short_post):
+                    response = aftermath.execute(request)
+                self.assertTrue(response.success, msg=response)
+
     def test_live_write_without_dry_run_attempts_sign_and_submit(self) -> None:
         """When ``dry_run=False`` is explicit, the agent builds a PTB and signs
         the resulting ``txKind`` with the configured Sui key.

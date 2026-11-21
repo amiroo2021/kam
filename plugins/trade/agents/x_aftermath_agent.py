@@ -734,13 +734,18 @@ def _order_ids_from_request(request: Mapping[str, Any]) -> List[str]:
 def _find_position(credentials: Dict[str, str], symbol: str, side: str = "") -> Dict[str, Any]:
     obj = _account_positions(credentials)
     wanted = symbol.strip()
+    wanted_side = side.lower()
+    if wanted_side == "buy":
+        wanted_side = "long"
+    elif wanted_side == "sell":
+        wanted_side = "short"
     for pos in obj.get("positions") or []:
         if not isinstance(pos, dict):
             continue
         if wanted and wanted not in {str(pos.get("marketId") or ""), _position_symbol(pos)}:
             continue
         size = _decimal(pos.get("baseAssetAmount"), "0")
-        if side and _position_side(size) != side.lower():
+        if wanted_side and _position_side(size) != wanted_side:
             continue
         if size != 0:
             return pos
