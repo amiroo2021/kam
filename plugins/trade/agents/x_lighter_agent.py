@@ -17,6 +17,7 @@ from __future__ import annotations
 from plugins.trade.candles import handle_candles_operation, has_native_candles
 
 import asyncio
+import contextlib
 import importlib
 import json
 import logging
@@ -124,11 +125,149 @@ LIGHTER_WS_OPEN_TIMEOUT_SECONDS = 10.0
 
 # Cancellation batching (L2CancelOrder, tx_type=15). Each sendTxBatch
 # carries up to ``LIGHTER_CANCEL_TX_BATCH_SIZE`` independently-signed
-# cancel transactions in ONE HTTP request. The L1-address transaction
-# quota is shared with the create path (n txs consume n quota), so the
-# same ``_LighterL2TxBudget`` (safe_limit=30 / 60s) governs cancels.
-LIGHTER_CANCEL_TX_BATCH_SIZE = 30
+# cancel transactions in ONE HTTP request.
+#
+# The cancel path submits over REST ``sendTxBatch``. The official
+# signing docs warn: "request-body size limits at the CDN edge can
+# reject a large REST batch before it reaches the API (you'll get an
+# HTTP error without Lighter's JSON body). REST batches of up to ~15
+# orders are safe." The cancel path has NO WebSocket transport, so it
+# must use the CDN-safe REST size — not the WS protocol max.
+#
+# (Phase 3 safety review: this was 30, above the documented CDN-safe
+# REST size. The 200-order cancel regression test exercised the pacing
+# math, not the wire format, so it did not catch it.)
+LIGHTER_CANCEL_TX_BATCH_SIZE = LIGHTER_REST_SEND_TX_BATCH_SIZE  # 15
 LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS = 3.0
+
+# ---------------------------------------------------------------------------
+# Tier-aware transaction pacing (Phase 3).
+#
+# Lighter documents THREE independent limit families. They must not be
+# collapsed into one number:
+#
+#   1. REST request weight (per rolling minute). Standard 60 requests/min;
+#      Plus/Premium 24,000 weighted requests/min. sendTx/sendTxBatch are
+#      EXCLUDED from this bucket on Plus/Premium and have their own.
+#   2. sendTx/sendTxBatch request bucket (per rolling minute), keyed by
+#      account tier AND staked tokens:
+#        - Plus:          8000 sendTx/sendTxBatch per minute
+#        - Premium:       5000 + stake tier, up to 24000 (Lighter chain);
+#                         RH chain table differs
+#      This bucket is measured in REQUESTS, not transactions.
+#   3. Transaction-TYPE limit (default 40 requests/minute). Per the docs
+#      this applies "to all account types, OTHERWISE sendTx limits apply",
+#      so on Plus/Premium the sendTx bucket governs instead.
+#
+# On Plus/Premium there is a fourth, separate resource: the VOLUME QUOTA.
+# Only these transaction types consume it:
+#       L2CreateOrder (14), L2CancelAllOrders (16), L2ModifyOrder (17),
+#       L2CreateGroupedOrders (28)
+# and "if you include n transactions in a sendTxBatch request, n quota
+# will be consumed". CRITICALLY: "Single-order cancels (L2CancelOrder,
+# 15) do not consume quota and have no rate limit."
+#
+# Consequences for this agent:
+#   * CreateOrder draws on BOTH the sendTx request bucket AND volume
+#     quota (n txs consume n quota for n txs in one request).
+#   * CancelOrder (L2CancelOrder) consumes NEITHER volume quota NOR a
+#     quota-bearing rate limit. It is bounded by the sendTx request
+#     bucket only. So the create path and the cancel path need
+#     DIFFERENT policies — they must not share one counter.
+#   * Volume quota is "shared across all sub-accounts under the same L1
+#     address", so the quota ledger must be keyed by L1 address, not by
+#     (chain, account_index), and must coordinate across processes.
+#
+# Everything below is CONSERVATIVE by construction: any uncertainty
+# (unreadable tier, malformed quota payload, missing L1 address, stale
+# ledger) falls back to the Standard 30-tx/60s behaviour that is
+# already proven in production.
+# ---------------------------------------------------------------------------
+
+# Tier identifiers as reported by GET /api/v1/accountLimits → user_tier.
+LIGHTER_TIER_STANDARD = "standard"
+LIGHTER_TIER_PLUS = "plus"
+LIGHTER_TIER_PREMIUM = "premium"
+LIGHTER_TIER_UNKNOWN = "unknown"
+
+# Documented sendTx/sendTxBatch REQUESTS per rolling minute.
+# Premium is stake-dependent; we use the LOWEST documented tier
+# (5000) as the working assumption and never assume the maximum.
+LIGHTER_PREMIUM_SEND_TX_RPM_LOW = 5000
+LIGHTER_PLUS_SEND_TX_RPM = 8000
+
+# Documented volume-quota cap for Premium accounts is 15,000,000 with a
+# 30,000,000 purchase cap. We never plan against the cap; we plan
+# against the REMAINING value the exchange reports.
+LIGHTER_VOLUME_QUOTA_FLOOR = 1
+
+# Headroom applied to exchange-reported remaining quota. We keep a
+# reserve so a concurrent writer (another process) cannot drive us to
+# zero between our read and our submit.
+LIGHTER_VOLUME_QUOTA_HEADROOM_RATIO = 0.10
+
+# How long a tier/quota probe result is trusted before re-reading.
+LIGHTER_TIER_CACHE_TTL_SECONDS = 300.0
+
+# Per-account ceiling on how many transactions we will place in one
+# rolling window even for Premium. This is the "conservative,
+# configurable headroom rather than assuming unlimited throughput"
+# requirement: it is a POLICY cap, not an exchange limit.
+#
+# Sizing rationale: at Premium the exchange-side limits that could bind
+# are the sendTx request bucket (>= 5000 requests/min) and the volume
+# quota (observed 1,589,890 remaining against a 15,000,000 cap). A
+# 250-order ladder is 5 WS batches = 5 requests and 250 quota units —
+# three orders of magnitude below both. So the ceiling exists to bound
+# a runaway loop, not to mirror an exchange limit, and it is sized so
+# that realistic ladder sizes (50/100/250) complete inside one window.
+#
+# Override with LIGHTER_PREMIUM_TX_PER_WINDOW / LIGHTER_PLUS_TX_PER_WINDOW.
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return value if value > 0 else int(default)
+
+
+LIGHTER_PREMIUM_TX_PER_WINDOW = _env_int("LIGHTER_PREMIUM_TX_PER_WINDOW", 500)
+LIGHTER_PLUS_TX_PER_WINDOW = _env_int("LIGHTER_PLUS_TX_PER_WINDOW", 250)
+
+# Cross-process coordination.
+# The volume quota is shared per L1 address across processes, so the
+# quota ledger must live OUTSIDE the process. A file-backed ledger with
+# an advisory lock is used; if the lock cannot be taken the caller
+# falls back to the conservative Standard policy.
+LIGHTER_QUOTA_LEDGER_DIR = Path(
+    os.environ.get("LIGHTER_QUOTA_LEDGER_DIR", "/tmp/lighter-quota-ledger")
+)
+LIGHTER_QUOTA_LEDGER_TIMEOUT_SECONDS = 5.0
+
+# Per-account nonce lease (Phase 3 safety review).
+#
+# Lighter nonces are tracked PER API KEY and must be strictly
+# ``previous + 1``. Two clients on one account would hand out
+# colliding nonces, and a discarded client leaves a hole that poisons
+# every later transaction on that key. The lease guarantees only one
+# nonce-allocating client is live per account + API key at a time.
+#
+# It is cross-process (an exclusive flock on a per-account lock file),
+# mirroring the quota ledger, so two Hermes processes on one host
+# cannot interleave nonce streams either.
+LIGHTER_NONCE_LEASE_DIR = Path(
+    os.environ.get("LIGHTER_NONCE_LEASE_DIR", "/tmp/lighter-nonce-lease")
+)
+LIGHTER_NONCE_LEASE_TIMEOUT_SECONDS = float(
+    os.environ.get("LIGHTER_NONCE_LEASE_TIMEOUT_SECONDS", "30")
+)
+
+# Tier-aware pacing policy constants.
+LIGHTER_STANDARD_TX_PER_WINDOW = LIGHTER_L2_TX_SAFE_LIMIT  # 30
+LIGHTER_STANDARD_WINDOW_SECONDS = LIGHTER_L2_TX_WINDOW_SECONDS  # 60.0
 
 name = "lighter"
 
@@ -197,6 +336,14 @@ _LIGHTER_LIMITERS_LOCK = threading.Lock()
 
 class _LighterL2TxBudget:
     """Threadsafe rolling-window tracker for L2 transactions.
+
+    LEGACY (Phase 3): the agent's submit paths now use
+    ``_LighterTierBudget``, whose limit comes from the account's tier
+    policy. This class is retained because it still documents and
+    exercises the fixed 30-tx/60s Standard rolling-window behaviour
+    that the tier policy falls back to, and the existing regression
+    tests assert against it directly. Do not wire new call sites to
+    it — use ``_get_lighter_tier_budget``.
 
     Lighter enforces a per-account-type transaction-type limit (default
     40/min for Standard accounts). One sendTxBatch with N L2CreateOrder
@@ -336,6 +483,771 @@ def _get_lighter_limiter(credentials: Dict[str, Any]) -> _LighterSlidingWindowLi
             )
             _LIGHTER_LIMITERS[key] = limiter
         return limiter
+
+
+# ---------------------------------------------------------------------------
+# Tier + quota probing
+# ---------------------------------------------------------------------------
+
+
+class _LighterTierPolicy:
+    """Resolved pacing policy for one Lighter account.
+
+    Attributes
+    ----------
+    tier:
+        ``standard`` | ``plus`` | ``premium`` | ``unknown``.
+    tx_per_window:
+        How many quota-bearing transactions (CreateOrder) we allow in one
+        rolling window. Standard keeps the proven 30/60s behaviour.
+    window_seconds:
+        Length of that rolling window.
+    send_tx_rpm:
+        The sendTx/sendTxBatch REQUEST bucket (requests per minute).
+        Requests and transactions are counted separately — a batch of
+        50 txs is ONE request but FIFTY transactions.
+    quota_remaining:
+        Exchange-reported remaining volume quota, or ``None`` when the
+        account is not quota-bearing or the payload was unreadable.
+    quota_bearing:
+        True only when the account is Plus/Premium AND the exchange
+        reported a usable remaining-quota value.
+    l1_address:
+        The L1 address the quota is shared across, when known.
+    reason:
+        Human-readable justification, logged for auditability.
+    """
+
+    __slots__ = (
+        "tier",
+        "tx_per_window",
+        "window_seconds",
+        "send_tx_rpm",
+        "quota_remaining",
+        "quota_bearing",
+        "l1_address",
+        "reason",
+    )
+
+    def __init__(
+        self,
+        *,
+        tier: str,
+        tx_per_window: int,
+        window_seconds: float,
+        send_tx_rpm: int,
+        quota_remaining: Optional[int],
+        quota_bearing: bool,
+        l1_address: Optional[str],
+        reason: str,
+    ) -> None:
+        self.tier = tier
+        self.tx_per_window = int(tx_per_window)
+        self.window_seconds = float(window_seconds)
+        self.send_tx_rpm = int(send_tx_rpm)
+        self.quota_remaining = quota_remaining
+        self.quota_bearing = bool(quota_bearing)
+        self.l1_address = l1_address
+        self.reason = reason
+
+    @property
+    def is_conservative(self) -> bool:
+        """True when the policy must not exceed the Standard behaviour."""
+        return self.tier in (LIGHTER_TIER_STANDARD, LIGHTER_TIER_UNKNOWN)
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "tier": self.tier,
+            "tx_per_window": self.tx_per_window,
+            "window_seconds": self.window_seconds,
+            "send_tx_rpm": self.send_tx_rpm,
+            "quota_remaining": self.quota_remaining,
+            "quota_bearing": self.quota_bearing,
+            "reason": self.reason,
+        }
+
+
+def _standard_lighter_policy(reason: str) -> _LighterTierPolicy:
+    """The conservative fallback: exactly today's proven behaviour."""
+    return _LighterTierPolicy(
+        tier=LIGHTER_TIER_UNKNOWN,
+        tx_per_window=LIGHTER_STANDARD_TX_PER_WINDOW,
+        window_seconds=LIGHTER_STANDARD_WINDOW_SECONDS,
+        send_tx_rpm=LIGHTER_RATELIMIT_MAX_REQUESTS,
+        quota_remaining=None,
+        quota_bearing=False,
+        l1_address=None,
+        reason=reason,
+    )
+
+
+def _normalize_lighter_tier(raw: Any) -> str:
+    """Map an ``accountLimits`` tier string to a known tier.
+
+    Unrecognised values map to ``unknown`` so the caller falls back to
+    the conservative policy. Never guess upwards.
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return LIGHTER_TIER_UNKNOWN
+    if "premium" in text or "advanced" in text:
+        return LIGHTER_TIER_PREMIUM
+    if "plus" in text:
+        return LIGHTER_TIER_PLUS
+    if "standard" in text or "basic" in text:
+        return LIGHTER_TIER_STANDARD
+    return LIGHTER_TIER_UNKNOWN
+
+
+def _parse_quota_remaining(raw: Any) -> Optional[int]:
+    """Parse an exchange-reported remaining volume quota.
+
+    Returns ``None`` for any value that is not a usable non-negative
+    integer. A malformed quota payload must NEVER be interpreted as
+    "plenty of quota" — it degrades to the conservative policy.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        # A non-integral float is a malformed payload, not a rounding
+        # opportunity.
+        return int(raw) if float(raw).is_integer() and raw >= 0 else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+    return None
+
+
+def _build_tier_policy(
+    *,
+    tier: str,
+    quota_remaining: Optional[int],
+    quota_cap: Optional[int],
+    l1_address: Optional[str],
+    send_tx_rpm_hint: Optional[int] = None,
+) -> _LighterTierPolicy:
+    """Build the pacing policy for a resolved tier.
+
+    Conservative by construction:
+      * ``unknown`` tier → the proven Standard 30/60s behaviour.
+      * Plus/Premium without a usable quota value → still capped by the
+        per-window policy ceiling, but never above the Standard window.
+      * A quota value at or below the floor is treated as EXHAUSTED:
+        the policy allows no quota-bearing transactions.
+    """
+    normalized = _normalize_lighter_tier(tier)
+
+    if normalized == LIGHTER_TIER_UNKNOWN:
+        return _standard_lighter_policy(
+            "tier not recognised; using conservative standard pacing"
+        )
+
+    if normalized == LIGHTER_TIER_STANDARD:
+        return _LighterTierPolicy(
+            tier=LIGHTER_TIER_STANDARD,
+            tx_per_window=LIGHTER_STANDARD_TX_PER_WINDOW,
+            window_seconds=LIGHTER_STANDARD_WINDOW_SECONDS,
+            send_tx_rpm=LIGHTER_RATELIMIT_MAX_REQUESTS,
+            quota_remaining=quota_remaining,
+            quota_bearing=False,
+            l1_address=l1_address,
+            reason="standard tier; documented 40/min tx-type limit applies",
+        )
+
+    # Plus / Premium.
+    ceiling = (
+        LIGHTER_PREMIUM_TX_PER_WINDOW
+        if normalized == LIGHTER_TIER_PREMIUM
+        else LIGHTER_PLUS_TX_PER_WINDOW
+    )
+    rpm = int(send_tx_rpm_hint or 0) or (
+        LIGHTER_PREMIUM_SEND_TX_RPM_LOW
+        if normalized == LIGHTER_TIER_PREMIUM
+        else LIGHTER_PLUS_SEND_TX_RPM
+    )
+
+    usable_quota = quota_remaining is not None
+    if usable_quota and quota_remaining <= LIGHTER_VOLUME_QUOTA_FLOOR:
+        # Quota exhausted (or effectively so). Allow nothing.
+        return _LighterTierPolicy(
+            tier=normalized,
+            tx_per_window=0,
+            window_seconds=LIGHTER_STANDARD_WINDOW_SECONDS,
+            send_tx_rpm=rpm,
+            quota_remaining=quota_remaining,
+            quota_bearing=True,
+            l1_address=l1_address,
+            reason="volume quota exhausted; no quota-bearing transactions allowed",
+        )
+
+    # Apply headroom to the reported remaining quota so a concurrent
+    # writer cannot strand us. The window cap stays the binding limit
+    # in normal operation — quota is a hard ceiling, not a pacing knob.
+    if usable_quota:
+        reserve = int(quota_remaining * LIGHTER_VOLUME_QUOTA_HEADROOM_RATIO)
+        budget = max(0, int(quota_remaining) - reserve)
+    else:
+        budget = ceiling
+
+    tx_per_window = max(0, min(ceiling, budget))
+
+    reason = (
+        f"{normalized} tier; sendTx bucket {rpm} req/min; "
+        f"quota_remaining={quota_remaining}; "
+        f"window cap {ceiling} txs, headroom-adjusted {tx_per_window}"
+    )
+    return _LighterTierPolicy(
+        tier=normalized,
+        tx_per_window=tx_per_window,
+        window_seconds=LIGHTER_STANDARD_WINDOW_SECONDS,
+        send_tx_rpm=rpm,
+        quota_remaining=quota_remaining,
+        quota_bearing=usable_quota,
+        l1_address=l1_address,
+        reason=reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live tier/quota probe
+# ---------------------------------------------------------------------------
+
+_LIGHTER_TIER_CACHE: Dict[Tuple[str, int], Tuple[float, _LighterTierPolicy]] = {}
+_LIGHTER_TIER_CACHE_LOCK = threading.Lock()
+
+
+def _fetch_lighter_account_limits(
+    credentials: Dict[str, Any],
+    auth_token: str,
+) -> Optional[Dict[str, Any]]:
+    """GET ``/api/v1/accountLimits`` and return the parsed JSON body.
+
+    Returns ``None`` on any transport/parse failure. The caller treats
+    ``None`` as "tier unknown" and falls back to conservative pacing.
+    """
+    try:
+        response = requests.get(
+            f"{credentials['base_url']}/api/v1/accountLimits",
+            params={"account_index": str(credentials["account_index"])},
+            headers={"Accept": "application/json", "authorization": auth_token},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LIGHTER-TIER] accountLimits probe failed: %s",
+            sanitize_error_message(str(exc))[:160],
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # A non-200 envelope means the probe itself failed.
+    code = payload.get("code")
+    if code is not None and int(code) != 200:
+        logger.warning(
+            "[LIGHTER-TIER] accountLimits returned code=%s", sanitize_error_message(str(code))[:80]
+        )
+        return None
+    return payload
+
+
+def _fetch_lighter_l1_address(
+    credentials: Dict[str, Any],
+    auth_token: str,
+) -> Optional[str]:
+    """Read the account's L1 address, which the volume quota is shared on.
+
+    The L1 address is NOT in the credential model, so it must be read
+    from ``/api/v1/account``. Returns a normalized lowercase hex string
+    or ``None`` when unavailable.
+    """
+    try:
+        response = requests.get(
+            f"{credentials['base_url']}/api/v1/account",
+            params={
+                "by": "index",
+                "value": str(credentials["account_index"]),
+                "auth": auth_token,
+            },
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LIGHTER-TIER] account probe failed: %s",
+            sanitize_error_message(str(exc))[:160],
+        )
+        return None
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(accounts, list) or not accounts:
+        return None
+    first = accounts[0]
+    if not isinstance(first, dict):
+        return None
+    raw = first.get("l1_address")
+    text = str(raw or "").strip().lower()
+    if not text.startswith("0x") or len(text) < 10:
+        return None
+    return text
+
+
+def _probe_lighter_tier_policy(
+    credentials: Dict[str, Any],
+    *,
+    use_cache: bool = True,
+) -> _LighterTierPolicy:
+    """Resolve the account's tier and build its pacing policy.
+
+    Reads two documented endpoints:
+      * ``/api/v1/accountLimits`` → ``user_tier``, ``volume_quota_remaining``
+      * ``/api/v1/account``       → ``l1_address`` (quota sharing key)
+
+    Any failure degrades to the conservative Standard policy. Results
+    are cached for ``LIGHTER_TIER_CACHE_TTL_SECONDS`` so a ladder does
+    not re-probe per batch.
+    """
+    chain = str(credentials.get("chain") or "").strip().upper()
+    account_index = int(credentials.get("account_index") or 0)
+    cache_key = (chain, account_index)
+
+    if use_cache:
+        with _LIGHTER_TIER_CACHE_LOCK:
+            cached = _LIGHTER_TIER_CACHE.get(cache_key)
+            if cached is not None:
+                expires_at, policy = cached
+                if time.monotonic() < expires_at:
+                    return policy
+
+    try:
+        auth_token = _mint_auth_token_cached(credentials)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LIGHTER-TIER] auth token unavailable: %s",
+            sanitize_error_message(str(exc))[:160],
+        )
+        return _cache_tier_policy(
+            cache_key,
+            _standard_lighter_policy("auth token unavailable; conservative pacing"),
+        )
+
+    limits = _fetch_lighter_account_limits(credentials, auth_token)
+    if not limits:
+        return _cache_tier_policy(
+            cache_key,
+            _standard_lighter_policy(
+                "accountLimits unavailable; conservative pacing"
+            ),
+        )
+
+    tier_raw = limits.get("user_tier") or limits.get("user_tier_name")
+    quota_remaining = _parse_quota_remaining(limits.get("volume_quota_remaining"))
+    quota_cap = _parse_quota_remaining(limits.get("volume_quota_cap"))
+
+    l1_address = _fetch_lighter_l1_address(credentials, auth_token)
+
+    policy = _build_tier_policy(
+        tier=str(tier_raw or ""),
+        quota_remaining=quota_remaining,
+        quota_cap=quota_cap,
+        l1_address=l1_address,
+    )
+    logger.warning("[LIGHTER-TIER] %s", policy.reason)
+
+    return _cache_tier_policy(cache_key, policy)
+
+
+def _cache_tier_policy(
+    cache_key: Tuple[str, int],
+    policy: _LighterTierPolicy,
+) -> _LighterTierPolicy:
+    """Store the policy in the TTL cache and return it.
+
+    Every probe outcome — including the conservative fallbacks — is
+    cached. Otherwise a failing probe would re-hit the network on every
+    batch, consuming rate-limit slots for no benefit.
+    """
+    with _LIGHTER_TIER_CACHE_LOCK:
+        _LIGHTER_TIER_CACHE[cache_key] = (
+            time.monotonic() + LIGHTER_TIER_CACHE_TTL_SECONDS,
+            policy,
+        )
+    return policy
+
+
+def _get_lighter_tier_policy(
+    credentials: Dict[str, Any],
+    *,
+    use_cache: bool = True,
+) -> _LighterTierPolicy:
+    """Return the cached tier policy, probing only when needed."""
+    chain = str(credentials.get("chain") or "").strip().upper()
+    account_index = int(credentials.get("account_index") or 0)
+    cache_key = (chain, account_index)
+    if use_cache:
+        with _LIGHTER_TIER_CACHE_LOCK:
+            cached = _LIGHTER_TIER_CACHE.get(cache_key)
+            if cached is not None:
+                expires_at, policy = cached
+                if time.monotonic() < expires_at:
+                    return policy
+    return _probe_lighter_tier_policy(credentials, use_cache=False)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process volume-quota ledger
+# ---------------------------------------------------------------------------
+
+
+class _LighterQuotaLedgerUnavailable(RuntimeError):
+    """The cross-process quota ledger could not be locked."""
+
+
+class _LighterQuotaLedger:
+    """File-backed ledger of volume quota consumed per L1 address.
+
+    The volume quota is "shared across all sub-accounts under the same
+    L1 address", so the ledger is keyed by L1 address and lives on disk
+    so that SEPARATE Hermes processes share it. Each record is a list
+    of ``(timestamp, amount)`` entries within the rolling window.
+
+    The lock is an exclusive ``flock`` on a per-L1 lock file. If the
+    lock cannot be acquired within the timeout, the caller MUST fall
+    back to conservative pacing rather than proceed unserialised.
+    """
+
+    def __init__(self, l1_address: str, *, window_seconds: float = 60.0) -> None:
+        self.l1_address = str(l1_address or "").strip().lower()
+        self.window_seconds = float(window_seconds)
+        safe = re.sub(r"[^0-9a-z]", "_", self.l1_address) or "unknown"
+        self.directory = Path(LIGHTER_QUOTA_LEDGER_DIR)
+        self.path = self.directory / f"{safe}.json"
+        self.lock_path = self.directory / f"{safe}.lock"
+
+    def _prune(self, records: List[List[Any]], now: float) -> List[List[Any]]:
+        cutoff = now - self.window_seconds
+        return [r for r in records if isinstance(r, list) and len(r) == 2 and float(r[0]) > cutoff]
+
+    def _read(self) -> List[List[Any]]:
+        try:
+            raw = self.path.read_text()
+        except (FileNotFoundError, OSError):
+            return []
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            # A corrupt ledger is NOT "no usage". Treat it as unknown
+            # so the caller can fail closed.
+            raise _LighterQuotaLedgerUnavailable("quota ledger is unreadable")
+        if not isinstance(data, list):
+            raise _LighterQuotaLedgerUnavailable("quota ledger has an unexpected shape")
+        return data
+
+    def _write(self, records: List[List[Any]]) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+        tmp.write_text(json.dumps(records))
+        os.replace(tmp, self.path)
+
+    def reserve(
+        self,
+        amount: int,
+        *,
+        remaining_hint: Optional[int] = None,
+        ceiling: Optional[int] = None,
+    ) -> int:
+        """Reserve ``amount`` quota units, returning the amount reserved.
+
+        ``remaining_hint`` is the exchange-reported remaining quota. It
+        is authoritative but may be STALE (read up to the tier-cache TTL
+        ago), so it is treated as an upper bound on what is left.
+
+        ``ceiling`` is the hard cap this account may consume in the
+        window. When both the ledger's own accumulated usage and the
+        hint are known, the reservation is refused if it would exceed
+        either — that is what stops two processes on one host from
+        jointly oversubscribing the shared per-L1 quota.
+
+        Raises ``_LighterQuotaLedgerUnavailable`` when the ledger cannot
+        be locked or read, OR when the reservation would exceed the
+        available quota. The caller must then fall back to conservative
+        pacing rather than proceed without coordination.
+        """
+        amount = int(amount)
+        if amount <= 0:
+            return 0
+        self.directory.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            deadline = time.monotonic() + LIGHTER_QUOTA_LEDGER_TIMEOUT_SECONDS
+            locked = False
+            while time.monotonic() < deadline:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except (BlockingIOError, OSError):
+                    time.sleep(0.02)
+            if not locked:
+                raise _LighterQuotaLedgerUnavailable(
+                    "could not lock the cross-process quota ledger"
+                )
+            now = time.monotonic()
+            records = self._prune(self._read(), now)
+            used = sum(int(r[1]) for r in records if isinstance(r[1], (int, float)))
+            if remaining_hint is not None:
+                # The exchange-reported remaining is authoritative. If a
+                # concurrent process consumed quota we cannot see, the
+                # hint reflects it — refuse when the hint is exhausted.
+                if int(remaining_hint) <= LIGHTER_VOLUME_QUOTA_FLOOR:
+                    raise _LighterQuotaLedgerUnavailable(
+                        "exchange reports volume quota exhausted"
+                    )
+            if ceiling is not None:
+                # Enforce the ceiling against BOTH the ledger's own
+                # accumulated usage and the exchange hint, whichever is
+                # the tighter constraint.
+                available = int(ceiling) - used
+                if remaining_hint is not None:
+                    available = min(available, int(remaining_hint))
+                if amount > available:
+                    raise _LighterQuotaLedgerUnavailable(
+                        f"quota reservation of {amount} exceeds available {available} "
+                        f"(used={used}, ceiling={ceiling}, hint={remaining_hint})"
+                    )
+            records.append([now, amount])
+            self._write(records)
+            return amount
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            os.close(lock_fd)
+
+    def release(self, amount: int) -> None:
+        """Return ``amount`` quota units after a pre-apply rejection."""
+        amount = int(amount)
+        if amount <= 0:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            deadline = time.monotonic() + LIGHTER_QUOTA_LEDGER_TIMEOUT_SECONDS
+            locked = False
+            while time.monotonic() < deadline:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except (BlockingIOError, OSError):
+                    time.sleep(0.02)
+            if not locked:
+                return
+            now = time.monotonic()
+            records = self._prune(self._read(), now)
+            # Each record holds an AMOUNT, not a count of one. Release
+            # must subtract quota units, not drop records.
+            outstanding = sum(
+                int(r[1]) for r in records if isinstance(r[1], (int, float))
+            )
+            to_release = min(int(amount), outstanding)
+            remaining = outstanding - to_release
+            # Rebuild the record list preserving the surviving usage.
+            rebuilt: List[List[Any]] = []
+            left = remaining
+            for record in records:
+                if left <= 0:
+                    break
+                value = int(record[1]) if isinstance(record[1], (int, float)) else 0
+                if value <= left:
+                    rebuilt.append(record)
+                    left -= value
+                else:
+                    rebuilt.append([record[0], left])
+                    left = 0
+            self._write(rebuilt)
+        except _LighterQuotaLedgerUnavailable:
+            return
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            os.close(lock_fd)
+
+    def used_in_window(self) -> int:
+        """Total quota units recorded inside the rolling window."""
+        try:
+            records = self._prune(self._read(), time.monotonic())
+        except _LighterQuotaLedgerUnavailable:
+            return 0
+        return sum(int(r[1]) for r in records if isinstance(r[1], (int, float)))
+
+
+# ---------------------------------------------------------------------------
+# Tier-aware budgets
+# ---------------------------------------------------------------------------
+
+
+class _LighterTierBudget:
+    """Rolling-window budget whose limit comes from the tier policy.
+
+    Two INDEPENDENT budgets exist per account, because the exchange
+    charges them differently:
+
+    ``create``
+        Counts L2CreateOrder transactions. Bounded by the transaction
+        window cap AND (on Plus/Premium) by the shared volume quota.
+
+    ``cancel``
+        Counts L2CancelOrder transactions. Per the official docs
+        "Single-order cancels (L2CancelOrder, 15) do not consume quota
+        and have no rate limit" — so cancels are bounded only by the
+        sendTx REQUEST bucket, not by volume quota and not by the
+        40/min transaction-type limit.
+
+    Keeping them separate is a correctness requirement, not an
+    optimisation: sharing one counter would make cancels wait behind
+    creates (and, worse, would let creates consume the quota that the
+    docs say they do not).
+    """
+
+    __slots__ = ("safe_limit", "window_seconds", "_hits", "_lock", "kind")
+
+    def __init__(self, safe_limit: int, window_seconds: float, *, kind: str = "create") -> None:
+        self.safe_limit = int(safe_limit)
+        self.window_seconds = float(window_seconds)
+        self.kind = kind
+        self._hits: "deque[float]" = deque()
+        self._lock = threading.Lock()
+
+    def _evict_locked(self) -> None:
+        cutoff = time.monotonic() - self.window_seconds
+        while self._hits and self._hits[0] < cutoff:
+            self._hits.popleft()
+
+    def current_usage(self) -> int:
+        with self._lock:
+            self._evict_locked()
+            return len(self._hits)
+
+    def can_acquire(self, n: int) -> bool:
+        with self._lock:
+            self._evict_locked()
+            return len(self._hits) + n <= self.safe_limit
+
+    def wait_for_capacity(self, n: int) -> float:
+        """Block until ``n`` slots are free, then reserve them.
+
+        Returns the seconds waited. A ``safe_limit`` of 0 means the
+        policy forbids these transactions entirely — the caller must
+        check ``can_acquire`` first and abort rather than wait forever.
+        """
+        n = int(n)
+        if n <= 0:
+            return 0.0
+        if self.safe_limit <= 0:
+            raise _LighterBudgetExhausted(
+                "tier policy forbids this transaction type (quota exhausted)"
+            )
+        if n > self.safe_limit:
+            raise _LighterBudgetExhausted(
+                f"batch of {n} exceeds the per-window limit {self.safe_limit}"
+            )
+        waited = 0.0
+        while True:
+            with self._lock:
+                self._evict_locked()
+                if len(self._hits) + n <= self.safe_limit:
+                    now = time.monotonic()
+                    for _ in range(n):
+                        self._hits.append(now)
+                    return waited
+                sleep_for = self.window_seconds - (time.monotonic() - self._hits[0])
+            sleep_for = max(sleep_for, 0.0) + 0.01
+            time.sleep(sleep_for)
+            waited += sleep_for
+
+    def rollback(self, n: int) -> None:
+        """Reverse the most-recent N reservations (pre-apply rejection)."""
+        with self._lock:
+            rollback_n = min(int(n), len(self._hits))
+            for _ in range(rollback_n):
+                self._hits.pop()
+
+
+class _LighterBudgetExhausted(RuntimeError):
+    """The tier policy does not permit the requested transactions."""
+
+
+_LIGHTER_TIER_BUDGETS: Dict[Tuple[str, int, str], _LighterTierBudget] = {}
+_LIGHTER_TIER_BUDGETS_LOCK = threading.Lock()
+
+
+def _get_lighter_tier_budget(
+    credentials: Dict[str, Any],
+    policy: _LighterTierPolicy,
+    *,
+    kind: str = "create",
+) -> _LighterTierBudget:
+    """Return the tier-aware budget for one account and transaction kind.
+
+    The limit is refreshed from the policy each time the budget is
+    (re)built, and the existing tracker is reused so the rolling window
+    survives a policy refresh. Reusing the tracker is what prevents a
+    policy change from resetting the window and allowing a burst.
+    """
+    chain = str(credentials.get("chain") or "").strip().upper()
+    account_index = int(credentials.get("account_index") or 0)
+    key = (chain, account_index, kind)
+
+    if kind == "cancel":
+        # Cancels have no volume-quota cost and no 40/min type limit.
+        # They are bounded by the sendTx REQUEST bucket. We still apply
+        # a bounded per-window cap so a runaway loop cannot spin, but it
+        # is far higher than the create cap.
+        #
+        # For a Standard/unknown account the sendTx bucket is the
+        # shared 40/min request budget, so the cancel cap stays at that
+        # documented figure — cancels are NOT given a free pass when the
+        # tier is unknown.
+        rpm = int(policy.send_tx_rpm or 0)
+        if rpm <= 0:
+            rpm = LIGHTER_RATELIMIT_MAX_REQUESTS
+        limit = max(1, min(rpm, LIGHTER_PREMIUM_TX_PER_WINDOW * 2))
+        window = LIGHTER_STANDARD_WINDOW_SECONDS
+    else:
+        limit = max(0, int(policy.tx_per_window))
+        window = float(policy.window_seconds)
+
+    with _LIGHTER_TIER_BUDGETS_LOCK:
+        budget = _LIGHTER_TIER_BUDGETS.get(key)
+        if budget is None:
+            budget = _LighterTierBudget(limit, window, kind=kind)
+            _LIGHTER_TIER_BUDGETS[key] = budget
+        else:
+            budget.safe_limit = limit
+            budget.window_seconds = window
+        return budget
 
 
 _LIGHTER_429_RETRY_AFTER_RE = re.compile(r"retry[- ]after[^0-9]*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
@@ -640,8 +1552,14 @@ def _lighter_ladder_chunk_size(transport: str, budget: Any = None) -> int:
     """Create-order chunk size for one sendTxBatch / jsonapi/sendtxbatch.
 
     WS protocol max is 50. REST CDN-safe max is 15. Both are capped by
-    the process L2 tx budget so wait_for_capacity(n) cannot deadlock
-    when n > safe_limit (still 30/60s until separately approved).
+    the account's tier-aware tx budget so ``wait_for_capacity(n)``
+    cannot deadlock when ``n > safe_limit``.
+
+    For a Standard account the cap is the proven 30/60s limit, so the
+    chunk size is unchanged from before Phase 3. For Plus/Premium the
+    cap is the tier policy's per-window transaction ceiling, which is
+    well above the protocol max — so the protocol max (50 WS / 15 REST)
+    remains the binding constraint.
     """
     mode = str(transport or "rest").strip().lower()
     proto = LIGHTER_WS_SEND_TX_BATCH_SIZE if mode == "ws" else LIGHTER_REST_SEND_TX_BATCH_SIZE
@@ -1729,44 +2647,79 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
     # HTTP request per order with no preventive rolling budget. Now
     # each sendTxBatch carries up to ``LIGHTER_CANCEL_TX_BATCH_SIZE``
     # independently-signed cancel transactions in ONE HTTP request, and
-    # the shared ``_LighterL2TxBudget`` (safe_limit=30 / 60s) paces the
-    # rolling L1-address transaction quota. One attempt per batch; on
+    # the account's tier-aware CANCEL budget paces the rolling
+    # sendTx request bucket. One attempt per batch; on
     # 429 / rejection / ambiguity we STOP and reconcile — no auto-retry.
     # ------------------------------------------------------------------
     accepted_count = 0
     submitted_count = 0
     stop_reason: Optional[Dict[str, Any]] = None
     batches: List[Dict[str, Any]] = []
-    chunk_starts = list(range(0, len(target_ids), LIGHTER_CANCEL_TX_BATCH_SIZE))
-    for batch_index, start in enumerate(chunk_starts):
-        # Preventive pacing — only between batches, never before the
-        # first or after the last.
-        if batch_index > 0:
-            time.sleep(LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS)
-        chunk_ids = target_ids[start:start + LIGHTER_CANCEL_TX_BATCH_SIZE]
-        outcome = _submit_cancel_tx_batch(
-            credentials=credentials,
-            market_id=market_id,
-            order_ids=chunk_ids,
+    # Per-account nonce lease (Phase 3 safety review). Cancels allocate
+    # nonces on the SAME per-API-key stream as creates, so they must not
+    # run concurrently with a create on the same account.
+    cancel_lease_cm = None
+    try:
+        cancel_lease_cm = _lighter_account_lease(
+            credentials, int(credentials["api_key_index"])
         )
-        submitted_count += int(outcome.get("submitted_count") or 0)
-        accepted_count += int(outcome.get("accepted_count") or 0)
-        batches.append({
-            "batch_index": batch_index,
-            "order_ids": list(chunk_ids),
-            "submitted": int(outcome.get("submitted_count") or 0),
-            "accepted": int(outcome.get("accepted_count") or 0),
-            "rejected": int(outcome.get("rejected_count") or 0),
-            "unknown": int(outcome.get("unknown_count") or 0),
-            "outcome": outcome.get("outcome"),
-            "api_code": outcome.get("api_code"),
-            "api_message": outcome.get("api_message"),
-            "per_tx": outcome.get("per_tx"),
-        })
-        # Continuation gate: continue ONLY if the batch fully succeeded.
-        if outcome.get("outcome") != _LADDER_BATCH_OUTCOME_SUCCESS:
-            stop_reason = outcome
-            break
+        cancel_lease_cm.__enter__()
+    except _LighterNonceLeaseUnavailable as exc:
+        return make_failure(
+            operation="cancel_order_group",
+            exchange=name,
+            account=account_name,
+            code="LIGHTER_NONCE_LEASE_UNAVAILABLE",
+            message=(
+                "Another Lighter operation is already running for this account; "
+                "refusing to cancel with a second nonce stream."
+            ),
+            exchange_reason=sanitize_error_message(str(exc))[:160],
+        )
+    try:
+        # One SignerClient for the WHOLE group so the SDK's nonce
+        # counter continues across consecutive batches. Building a new
+        # client per batch would re-seed the counter from the server's
+        # nextNonce and hand out colliding nonces (Phase 3 safety
+        # review).
+        cancel_signer = _build_signer_client(credentials)
+        chunk_starts = list(range(0, len(target_ids), LIGHTER_CANCEL_TX_BATCH_SIZE))
+        for batch_index, start in enumerate(chunk_starts):
+            # Preventive pacing — only between batches, never before the
+            # first or after the last.
+            if batch_index > 0:
+                time.sleep(LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS)
+            chunk_ids = target_ids[start:start + LIGHTER_CANCEL_TX_BATCH_SIZE]
+            outcome = _submit_cancel_tx_batch(
+                credentials=credentials,
+                market_id=market_id,
+                order_ids=chunk_ids,
+                signer=cancel_signer,
+            )
+            submitted_count += int(outcome.get("submitted_count") or 0)
+            accepted_count += int(outcome.get("accepted_count") or 0)
+            batches.append({
+                "batch_index": batch_index,
+                "order_ids": list(chunk_ids),
+                "submitted": int(outcome.get("submitted_count") or 0),
+                "accepted": int(outcome.get("accepted_count") or 0),
+                "rejected": int(outcome.get("rejected_count") or 0),
+                "unknown": int(outcome.get("unknown_count") or 0),
+                "outcome": outcome.get("outcome"),
+                "api_code": outcome.get("api_code"),
+                "api_message": outcome.get("api_message"),
+                "per_tx": outcome.get("per_tx"),
+            })
+            # Continuation gate: continue ONLY if the batch fully succeeded.
+            if outcome.get("outcome") != _LADDER_BATCH_OUTCOME_SUCCESS:
+                stop_reason = outcome
+                break
+    finally:
+        try:
+            if cancel_lease_cm is not None:
+                cancel_lease_cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Post-cancel reconciliation — exact target identity.
@@ -1898,21 +2851,197 @@ _LADDER_BATCH_OUTCOME_INVALID_ORDER = "invalid_order"
 _LADDER_BATCH_OUTCOME_PRICE_TOO_FAR = "price_too_far_from_mark"
 
 
+# ---------------------------------------------------------------------------
+# Per-account nonce coordination (Phase 3 safety review).
+#
+# The SDK's nonce counter and per-key lock live on the SignerClient
+# INSTANCE. Every call site in this agent builds its own client, so two
+# concurrent ladders would each seed a private counter from the server's
+# ``nextNonce`` and hand out the SAME nonces.
+#
+# WHY THIS IS NOT SOLVED BY A HIGH-WATER MARK: Lighter's nonce contract
+# is strictly ``new_nonce = previous_nonce + 1`` and nonces are tracked
+# PER API KEY. The docs are explicit that a hole is as fatal as a
+# collision -- "when a transaction fails WITHOUT consuming its nonce,
+# any transactions you already sent on the same key with higher nonces
+# will fail too". The SDK's own rollback (``acknowledge_failure``)
+# decrements the CLIENT's counter, so a process-wide high-water mark
+# that cannot be rolled back would leave a permanent hole and poison
+# every later transaction on that key.
+#
+# THE FIX: keep the SDK's per-client counter authoritative (so its
+# rollback stays correct and hole-free), and make sure only ONE client
+# per account+API key is ever live at a time. A process-wide lease
+# serialises trading per account:
+#
+#   * The lease is HELD for the whole of a ladder / order submission,
+#     so the nonce counter of that client is the only one in use.
+#   * A second concurrent caller on the same account either waits for
+#     the lease or is refused with a clear, safe error. It never
+#     allocates nonces from a second, unsynchronised client.
+#   * Because the lease spans the whole submission, the SDK counter
+#     stays consistent and ``acknowledge_failure`` can roll it back
+#     exactly, leaving no hole.
+#
+# The lease is also cross-process: it is an exclusive ``flock`` on a
+# per-account lock file, mirroring ``_LighterQuotaLedger``. If the lock
+# cannot be taken, the caller MUST refuse to trade rather than proceed
+# with an unsynchronised nonce stream.
+#
+# Why a plain ``threading.Lock`` for the in-process part: each batch
+# runs under its own ``asyncio.run()`` (or a worker thread), and an
+# ``asyncio.Lock`` is bound to the loop that created it. A plain lock
+# is correct across threads AND event loops.
+# ---------------------------------------------------------------------------
+
+_LIGHTER_NONCE_LEASES: Dict[Tuple[str, int, int], threading.Lock] = {}
+_LIGHTER_NONCE_LEASES_GUARD = threading.Lock()
+
+
+def _nonce_scope_key(
+    credentials: Optional[Dict[str, Any]],
+    api_key_index: int,
+) -> Tuple[str, int, int]:
+    """Build the process-wide nonce key for one account + API key."""
+    creds = credentials or {}
+    chain = str(creds.get("chain") or "").strip().upper()
+    account_index = int(creds.get("account_index") or 0)
+    return (chain, account_index, int(api_key_index))
+
+
+def _get_nonce_lease(scope: Tuple[str, int, int]) -> threading.Lock:
+    """Return the in-process lease lock for one account + API key."""
+    with _LIGHTER_NONCE_LEASES_GUARD:
+        lease = _LIGHTER_NONCE_LEASES.get(scope)
+        if lease is None:
+            lease = _LIGHTER_NONCE_LEASES[scope] = threading.Lock()
+        return lease
+
+
+def _process_wide_nonce_guard() -> threading.Lock:
+    """Return the guard that protects the nonce lease table.
+
+    One lock for every account: the critical sections are microseconds
+    long, so a single lock is simpler and safer than per-key locks
+    (which would need their own lifecycle across loops).
+    """
+    return _LIGHTER_NONCE_LEASES_GUARD
+
+
+class _LighterNonceLeaseUnavailable(RuntimeError):
+    """The per-account nonce lease could not be acquired."""
+
+
+@contextlib.contextmanager
+def _lighter_account_lease(
+    credentials: Optional[Dict[str, Any]],
+    api_key_index: int,
+    *,
+    timeout_seconds: Optional[float] = None,
+):
+    """Hold the per-account nonce lease for the duration of a submission.
+
+    Lighter nonces are tracked PER API KEY and must be strictly
+    ``previous + 1``. Two clients on the same account would each seed
+    their own counter from the server and hand out colliding nonces;
+    and a client that is discarded mid-flight leaves a hole that
+    poisons every later transaction on that key.
+
+    The lease therefore guarantees that, for one account + API key, only
+    ONE nonce-allocating client is live at a time:
+
+      * an in-process ``threading.Lock`` (correct across threads and
+        across the per-batch ``asyncio.run`` loops); and
+      * a cross-process exclusive ``flock`` on a per-account lock file,
+        mirroring ``_LighterQuotaLedger``.
+
+    If the lock cannot be acquired within the timeout, this RAISES
+    rather than proceeding — trading with an unsynchronised nonce
+    stream is exactly the failure mode we are preventing.
+
+    Read-only operations must NOT take this lease; only paths that
+    allocate nonces need it.
+    """
+    scope = _nonce_scope_key(credentials, api_key_index)
+    lease = _get_nonce_lease(scope)
+    if timeout_seconds is None:
+        timeout_seconds = LIGHTER_NONCE_LEASE_TIMEOUT_SECONDS
+
+    directory = Path(LIGHTER_NONCE_LEASE_DIR)
+    safe = re.sub(r"[^0-9a-z]", "_", "_".join(str(p) for p in scope)) or "unknown"
+    lock_path = directory / f"{safe}.lock"
+
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    acquired_inproc = False
+    try:
+        # In-process first: cheap, and it prevents two threads in this
+        # process from ever competing for the file lock.
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if lease.acquire(timeout=0.05):
+                acquired_inproc = True
+                break
+            if time.monotonic() >= deadline:
+                raise _LighterNonceLeaseUnavailable(
+                    "timed out waiting for the in-process Lighter nonce lease"
+                )
+        # Cross-process: exclusive flock on the per-account lock file.
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise _LighterNonceLeaseUnavailable(
+                        "timed out waiting for the cross-process Lighter nonce lease"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:  # noqa: BLE001
+            pass
+        os.close(lock_fd)
+        if acquired_inproc:
+            lease.release()
+
+
 async def _reserve_ladder_nonces(
     *,
     signer: Any,
     api_key_index: int,
     count: int,
+    credentials: Optional[Dict[str, Any]] = None,
 ) -> List[int]:
     """Reserve ``count`` consecutive nonces for ``api_key_index``.
 
-    Returns a list of nonces in order. Each call to
-    ``nonce_manager.async_next_nonce(api_key_index)`` increments the
-    manager's local counter by one. We hold the key's per-key lock
-    for the duration so concurrent callers can't interleave our
-    reservation. Caller MUST ``acknowledge_failure(api_key_index)``
-    if any of the subsequent sign operations fail, so the reserved
-    nonces are released.
+    Returns a list of nonces in order. Caller MUST
+    ``acknowledge_failure(api_key_index)`` if any of the subsequent sign
+    operations fail, so the reserved nonces are released.
+
+    SAFETY (Phase 3 review): the SDK's per-key lock and nonce counter
+    live on the SignerClient INSTANCE. Each call site builds its own
+    client, so two concurrent ladders in the same process would each
+    seed their private counter from the server's ``nextNonce`` and
+    allocate OVERLAPPING nonces. Lighter's contract is per-API-key
+    ``previous + 1``, and a collision or a hole poisons every later
+    transaction on that key.
+
+    We therefore allocate from the SDK's own counter (so
+    ``acknowledge_failure`` can roll it back exactly, leaving NO hole)
+    while holding BOTH:
+      * the SDK's per-key lock, so callers sharing one client cannot
+        interleave; and
+      * the per-account lease taken by the caller for the whole
+        submission, so callers using DIFFERENT clients on the same
+        account cannot interleave either.
     """
     reserved: List[int] = []
     async with signer.nonce_manager.lock(api_key_index):
@@ -2251,16 +3380,89 @@ def _submit_send_tx_batch(
         batch_signer = signer if signer is not None else _build_signer_client(credentials)
         api_key_index = int(credentials["api_key_index"])
         # ------------------------------------------------------------------
-        # 0. L2 transaction-budget check.
+        # 0. Tier-aware L2 transaction-budget check.
         #
-        # Lighter limits per-account-type L2 transactions in a rolling
-        # 60-second window (40/min observed live for the Standard
-        # account). sendTxBatch with N L2CreateOrder transactions
-        # consumes N against this budget. We refuse to submit a batch
-        # that would push us over the safe limit.
+        # The limit depends on the account tier:
+        #   * Standard / unknown → the documented 40/min tx-type limit,
+        #     applied conservatively at 30 txs per 60 s (today's proven
+        #     behaviour).
+        #   * Plus / Premium     → the sendTx request bucket governs and
+        #     L2CreateOrder additionally consumes VOLUME QUOTA (n txs in
+        #     one request consume n quota). The volume quota is shared
+        #     per L1 address across processes, so it is reserved in the
+        #     cross-process ledger before we sign.
+        #
+        # A sendTxBatch with N L2CreateOrder transactions consumes N
+        # against this budget AND counts as ONE request against the
+        # sendTx bucket. Requests and transactions are counted
+        # separately.
         # ------------------------------------------------------------------
-        budget = _get_lighter_l2_tx_budget(credentials)
-        budget.wait_for_capacity(len(children))
+        policy = _get_lighter_tier_policy(credentials)
+        budget = _get_lighter_tier_budget(credentials, policy, kind="create")
+        quota_ledger: Optional[_LighterQuotaLedger] = None
+        quota_reserved = 0
+        if policy.quota_bearing and policy.l1_address:
+            quota_ledger = _LighterQuotaLedger(
+                policy.l1_address,
+                window_seconds=policy.window_seconds,
+            )
+        try:
+            budget.wait_for_capacity(len(children))
+        except _LighterBudgetExhausted as exc:
+            return {
+                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+                "tx_hashes": [],
+                "submitted_count": len(children),
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "unknown_count": 0,
+                "api_code": 23000,
+                "api_message": sanitize_error_message(str(exc)),
+                "raw_response": None,
+                "nonces": [],
+                "child_to_tx_hash": {},
+                "rate_limit_reason": sanitize_error_message(str(exc)),
+                "tier_policy": policy.describe(),
+            }
+        if quota_ledger is not None:
+            try:
+                quota_reserved = quota_ledger.reserve(
+                    len(children),
+                    remaining_hint=policy.quota_remaining,
+                    ceiling=policy.quota_remaining,
+                )
+            except _LighterQuotaLedgerUnavailable as exc:
+                # Cross-process coordination is unavailable. Roll the
+                # local reservation back and fall back to the
+                # conservative budget rather than proceed unserialised.
+                budget.rollback(len(children))
+                logger.warning(
+                    "[LIGHTER-TIER] quota ledger unavailable (%s); "
+                    "falling back to conservative pacing",
+                    sanitize_error_message(str(exc))[:160],
+                )
+                fallback = _standard_lighter_policy(
+                    "cross-process quota ledger unavailable; conservative pacing"
+                )
+                budget = _get_lighter_tier_budget(credentials, fallback, kind="create")
+                try:
+                    budget.wait_for_capacity(len(children))
+                except _LighterBudgetExhausted as exc2:
+                    return {
+                        "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+                        "tx_hashes": [],
+                        "submitted_count": len(children),
+                        "accepted_count": 0,
+                        "rejected_count": 0,
+                        "unknown_count": 0,
+                        "api_code": 23000,
+                        "api_message": sanitize_error_message(str(exc2)),
+                        "raw_response": None,
+                        "nonces": [],
+                        "child_to_tx_hash": {},
+                        "rate_limit_reason": sanitize_error_message(str(exc2)),
+                        "tier_policy": fallback.describe(),
+                    }
         # ------------------------------------------------------------------
         # 1. Reserve nonces for every child in this batch.
         # ------------------------------------------------------------------
@@ -2269,6 +3471,7 @@ def _submit_send_tx_batch(
                 signer=batch_signer,
                 api_key_index=api_key_index,
                 count=len(children),
+                credentials=credentials,
             )
         except Exception as exc:  # noqa: BLE001
             return {
@@ -2553,6 +3756,11 @@ def _submit_send_tx_batch(
                 # API layer. Roll back the local budget reservation
                 # so a future batch can use the slots.
                 budget.rollback(len(children))
+                # The volume quota was not consumed either (the txs
+                # never reached the sequencer), so release it back to
+                # the cross-process ledger.
+                if quota_ledger is not None and quota_reserved:
+                    quota_ledger.release(quota_reserved)
                 # Nonces were NOT consumed by the server because the
                 # batch envelope never reached the sequencer. Roll
                 # them back so the next batch's reservation starts
@@ -2803,6 +4011,7 @@ def _submit_cancel_tx_batch(
     credentials: Dict[str, Any],
     market_id: int,
     order_ids: List[int],
+    signer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Submit one ``send_tx_batch`` HTTP request carrying N independent
     L2CancelOrder transactions (tx_type=15). NO automatic retry.
@@ -2815,12 +4024,22 @@ def _submit_cancel_tx_batch(
     HTTP request — but N against the L1-address transaction quota.
 
     Rate-limit scope (primary sources):
-      * Lighter enforces a per-L1Address rolling 60s **per-transaction**
-        quota ("40 requests per 60 second is allowed"; "n transactions
-        in SendTxBatch consume n quota"). L2CancelOrder (tx_type=15)
-        draws from the SAME L1-address transaction budget as
-        L2CreateOrder (tx_type=14). We therefore reuse the shared
-        ``_LighterL2TxBudget`` keyed ``(chain, account_index)``.
+      * Per the official volume-quota documentation: "Single-order
+        cancels (L2CancelOrder, 15) do not consume quota and have no
+        rate limit." The volume quota is consumed only by
+        L2CreateOrder (14), L2CancelAllOrders (16), L2ModifyOrder (17)
+        and L2CreateGroupedOrders (28).
+      * L2CancelOrder therefore draws on NEITHER the volume quota NOR
+        the 40/min transaction-type limit. It is bounded by the
+        sendTx/sendTxBatch REQUEST bucket.
+      * Consequently cancels use their OWN tier-aware budget (the
+        "cancel" kind), separate from the create budget. Sharing one
+        counter would make cancels queue behind creates and would let
+        creates consume quota that cancels do not touch.
+      * A Standard/unknown account still shares the documented 40/min
+        request budget, so its cancel cap stays at that figure.
+      * Transport: REST ``sendTxBatch``, so the batch is capped at the
+        CDN-safe REST size (15), not the WS protocol max.
 
     Targeting: EXACT order identity only (``order_ids``). Never
     cancel-all / market-wide / side-wide.
@@ -2855,23 +4074,47 @@ def _submit_cancel_tx_batch(
     last_send_tx_batch_exc_holder: List[Any] = [None]
 
     async def _run_batch() -> Dict[str, Any]:
-        signer = _build_signer_client(credentials)
+        # Reuse the caller's signer when supplied so the SDK's nonce
+        # counter continues across batches. Building a NEW client per
+        # batch would re-seed the counter from the server's nextNonce
+        # and hand out colliding nonces (Phase 3 safety review).
+        batch_signer = signer if signer is not None else _build_signer_client(credentials)
         api_key_index = int(credentials["api_key_index"])
         # ------------------------------------------------------------------
         # 0. L2 transaction-budget check (shared L1-address quota).
         # N L2CancelOrder transactions consume N against the same rolling
         # 60s budget used by the ladder create path.
         # ------------------------------------------------------------------
-        budget = _get_lighter_l2_tx_budget(credentials)
-        budget.wait_for_capacity(len(order_ids))
+        policy = _get_lighter_tier_policy(credentials)
+        budget = _get_lighter_tier_budget(credentials, policy, kind="cancel")
+        try:
+            budget.wait_for_capacity(len(order_ids))
+        except _LighterBudgetExhausted as exc:
+            return {
+                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+                "tx_hashes": [],
+                "submitted_count": len(order_ids),
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "unknown_count": 0,
+                "api_code": 23000,
+                "api_message": sanitize_error_message(str(exc)),
+                "raw_response": None,
+                "nonces": [],
+                "order_to_tx_hash": {},
+                "per_tx": [],
+                "rate_limit_reason": sanitize_error_message(str(exc)),
+                "tier_policy": policy.describe(),
+            }
         # ------------------------------------------------------------------
         # 1. Reserve nonces for every cancel in this batch.
         # ------------------------------------------------------------------
         try:
             nonces = await _reserve_ladder_nonces(
-                signer=signer,
+                signer=batch_signer,
                 api_key_index=api_key_index,
                 count=len(order_ids),
+                credentials=credentials,
             )
         except Exception as exc:  # noqa: BLE001
             return {
@@ -2900,11 +4143,11 @@ def _submit_cancel_tx_batch(
                 # sign_cancel_order is the sync method on SignerClient
                 # that returns (tx_type, tx_info, tx_hash, error)
                 # without going through the network. tx_type is 15
-                # (L2CancelOrder) per the native signer.
-                tx_type, tx_info, tx_hash, error = signer.sign_cancel_order(
+                # (L2CancelOrder) per the native batch_signer.
+                tx_type, tx_info, tx_hash, error = batch_signer.sign_cancel_order(
                     int(market_id),
                     int(order_id),
-                    signer.SKIP_NONCE_OFF,
+                    batch_signer.SKIP_NONCE_OFF,
                     int(nonce),
                     api_key_index,
                 )
@@ -2923,7 +4166,7 @@ def _submit_cancel_tx_batch(
             # Roll back ALL nonces reserved for this batch.
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -2945,7 +4188,7 @@ def _submit_cancel_tx_batch(
         api_response = None
         submit_error: Optional[str] = None
         try:
-            api_response = await signer.send_tx_batch(
+            api_response = await batch_signer.send_tx_batch(
                 tx_types=tx_types, tx_infos=tx_infos
             )
         except Exception as exc:  # noqa: BLE001
@@ -2963,7 +4206,7 @@ def _submit_cancel_tx_batch(
                 # Nonces were not consumed. Roll them back.
                 for _ in range(len(nonces)):
                     try:
-                        signer.nonce_manager.acknowledge_failure(api_key_index)
+                        batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                     except Exception:  # noqa: BLE001
                         pass
                 return {
@@ -3015,7 +4258,7 @@ def _submit_cancel_tx_batch(
                 budget.rollback(len(order_ids))
                 for _ in range(len(nonces)):
                     try:
-                        signer.nonce_manager.acknowledge_failure(api_key_index)
+                        batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                     except Exception:  # noqa: BLE001
                         pass
                 sanitized_exc_msg = sanitize_lighter_message(submit_error)
@@ -3107,7 +4350,7 @@ def _submit_cancel_tx_batch(
         if code_int == 23000:
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -3128,7 +4371,7 @@ def _submit_cancel_tx_batch(
             # Envelope-level rejection (non-200, non-23000). Roll back.
             for _ in range(len(nonces)):
                 try:
-                    signer.nonce_manager.acknowledge_failure(api_key_index)
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
                 except Exception:  # noqa: BLE001
                     pass
             return {
@@ -3406,7 +4649,40 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
         total_ms=(time.monotonic() - t0) * 1000.0,
         transport=transport,
     )
-    budget = _get_lighter_l2_tx_budget(credentials)
+    # ------------------------------------------------------------------
+    # Per-account nonce lease (Phase 3 safety review).
+    #
+    # Lighter nonces are per-API-key and strictly ``previous + 1``. The
+    # SDK's counter lives on the SignerClient instance, so a SECOND
+    # ladder on the same account would seed its own counter from the
+    # server and hand out colliding nonces -- and an unused earlier
+    # nonce poisons every later transaction on that key. The lease
+    # guarantees only one nonce-allocating client is live per account.
+    #
+    # The lease is held across the whole batch loop so the SDK's
+    # ``acknowledge_failure`` rollback stays exact (no hole).
+    # ------------------------------------------------------------------
+    lease_api_key_index = int(credentials["api_key_index"])
+    try:
+        lease_cm = _lighter_account_lease(credentials, lease_api_key_index)
+        lease_cm.__enter__()
+    except _LighterNonceLeaseUnavailable as exc:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=account_name,
+            code="LIGHTER_NONCE_LEASE_UNAVAILABLE",
+            message=(
+                "Another Lighter operation is already running for this account; "
+                "refusing to trade with a second nonce stream."
+            ),
+            exchange_reason=sanitize_error_message(str(exc))[:160],
+        )
+    budget = _get_lighter_tier_budget(
+        credentials,
+        _get_lighter_tier_policy(credentials),
+        kind="create",
+    )
     chunk_size = _lighter_ladder_chunk_size(transport, budget)
 
     chunk_starts = list(range(0, len(children), chunk_size))
@@ -3641,6 +4917,14 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
                         )
             except Exception:  # noqa: BLE001
                 pass
+        # Release the per-account nonce lease. This MUST happen even on
+        # an ambiguous outcome: the lease guards the nonce STREAM, and
+        # an ambiguous batch may have consumed its nonces. Holding it
+        # longer would needlessly block the account.
+        try:
+            lease_cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # ONE authoritative reconciliation pass.
@@ -4017,10 +5301,29 @@ def _submit_new_order(
     async def _run_submit() -> Dict[str, Any]:
         signer = _build_signer_client(credentials)
         try:
+            # Per-account nonce lease (Phase 3 safety review). This path
+            # allocates a nonce from the SDK's per-API-key counter, so
+            # it must not run alongside another nonce-allocating
+            # operation on the same account.
+            with _lighter_account_lease(
+                credentials, int(credentials["api_key_index"])
+            ):
+                return await _run_submit_locked(signer)
+        finally:
+            api_client = getattr(signer, "api_client", None)
+            if api_client is not None and hasattr(api_client, "close"):
+                try:
+                    await api_client.close()
+                except Exception:
+                    pass
+
+    async def _run_submit_locked(signer: Any) -> Dict[str, Any]:
+        try:
             # L2CreateOrder budget check. This is shared with the
             # ladder path. _submit_tpsl_order has its own transaction
             # type (TpSlOrder) and is NOT throttled here.
-            budget = _get_lighter_l2_tx_budget(credentials)
+            policy = _get_lighter_tier_policy(credentials)
+            budget = _get_lighter_tier_budget(credentials, policy, kind="create")
             budget.wait_for_capacity(1)
             size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
             price_decimals = int(market.get("price_decimals") or market.get("supported_price_decimals") or 0)
@@ -4863,6 +6166,22 @@ def _submit_tpsl_order(credentials: Dict[str, Any], market: Dict[str, Any], *, o
     async def _run_submit() -> Dict[str, Any]:
         signer = _build_signer_client(credentials)
         try:
+            # Per-account nonce lease (Phase 3 safety review): this path
+            # allocates a nonce from the SDK's per-API-key counter.
+            with _lighter_account_lease(
+                credentials, int(credentials["api_key_index"])
+            ):
+                return await _run_submit_locked(signer)
+        finally:
+            api_client = getattr(signer, "api_client", None)
+            if api_client is not None and hasattr(api_client, "close"):
+                try:
+                    await api_client.close()
+                except Exception:
+                    pass
+
+    async def _run_submit_locked(signer: Any) -> Dict[str, Any]:
+        try:
             size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
             price_decimals = int(market.get("price_decimals") or market.get("supported_price_decimals") or 0)
             submitted_volume = _quantize_down(current_size, size_decimals)
@@ -4918,6 +6237,22 @@ def _submit_close_position(
 ) -> Dict[str, Any]:
     async def _run_submit() -> Dict[str, Any]:
         signer = _build_signer_client(credentials)
+        try:
+            # Per-account nonce lease (Phase 3 safety review): this path
+            # allocates a nonce from the SDK's per-API-key counter.
+            with _lighter_account_lease(
+                credentials, int(credentials["api_key_index"])
+            ):
+                return await _run_submit_locked(signer)
+        finally:
+            api_client = getattr(signer, "api_client", None)
+            if api_client is not None and hasattr(api_client, "close"):
+                try:
+                    await api_client.close()
+                except Exception:
+                    pass
+
+    async def _run_submit_locked(signer: Any) -> Dict[str, Any]:
         try:
             size_decimals = int(market.get("size_decimals") or market.get("supported_size_decimals") or 0)
             submitted_volume = _quantize_down(current_size, size_decimals)

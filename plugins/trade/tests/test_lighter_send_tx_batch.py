@@ -406,6 +406,27 @@ def _patch_lighter_for_test(
             lighter, "_get_lighter_l2_tx_budget",
             return_value=lighter._LighterL2TxBudget(safe_limit=1000000, window_seconds=60.0),
         ),
+        # Phase 3 tier-aware budget. The offline tests must not touch
+        # the network to resolve the account tier, and must not block
+        # on the real 30/60s window. Patch the POLICY to an unlimited
+        # Standard-shaped one and the budget to a generous tracker.
+        mock.patch.object(
+            lighter, "_get_lighter_tier_policy",
+            return_value=lighter._LighterTierPolicy(
+                tier=lighter.LIGHTER_TIER_STANDARD,
+                tx_per_window=1000000,
+                window_seconds=60.0,
+                send_tx_rpm=1000000,
+                quota_remaining=None,
+                quota_bearing=False,
+                l1_address=None,
+                reason="offline test policy",
+            ),
+        ),
+        mock.patch.object(
+            lighter, "_get_lighter_tier_budget",
+            return_value=lighter._LighterTierBudget(safe_limit=1000000, window_seconds=60.0),
+        ),
     ]
     for p in patches:
         p.start()
@@ -494,6 +515,10 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
     def tearDown(self) -> None:
         import sys
@@ -2396,6 +2421,10 @@ class LighterRateLimitAndThrottleTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
         # Make sure the executor pauses don't add 3s between batches
         # in the integration tests below.
         self._saved_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
@@ -2407,6 +2436,10 @@ class LighterRateLimitAndThrottleTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
         lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS = self._saved_pause
         lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
 
@@ -3417,6 +3450,10 @@ class LighterBatch30SchedulerTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
         self._saved_send = lighter.LIGHTER_SEND_TX_BATCH_SIZE
         self._saved_rest = lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE
         self._saved_cancel = lighter.LIGHTER_CANCEL_TX_BATCH_SIZE
@@ -3481,9 +3518,15 @@ class LighterBatch30SchedulerTests(unittest.TestCase):
         # Supersede the helper's generous-budget patch with OUR small
         # budget for the rest of this test. A plain start() (not a
         # nested `with`) makes this the active patch for the execute().
+        # Phase 3: the agent now reads the tier-aware budget, so that
+        # seam must be superseded too.
         p = mock.patch.object(lighter, "_get_lighter_l2_tx_budget", return_value=budget)
         p.start()
         self.addCleanup(p.stop)
+        tier_budget = lighter._LighterTierBudget(safe_limit=30, window_seconds=60.0)
+        p_tier = mock.patch.object(lighter, "_get_lighter_tier_budget", return_value=tier_budget)
+        p_tier.start()
+        self.addCleanup(p_tier.stop)
 
         # Record the authoritative reservation timestamp of every batch.
         # wait_for_capacity is a __slots__ method (cannot rebind on the
@@ -3491,7 +3534,10 @@ class LighterBatch30SchedulerTests(unittest.TestCase):
         # cleanup. The reservation time is sim-now at the moment the
         # reservation lands (after wait_for_capacity returns).
         reservations: List[tuple] = []  # (n_reserved, timestamp)
-        cls = type(budget)
+        # Phase 3: the agent now reserves against the tier-aware budget
+        # class, so instrument THAT class — patching the legacy
+        # ``_LighterL2TxBudget`` class would record nothing.
+        cls = type(tier_budget)
         orig_wait = cls.wait_for_capacity
 
         def recording_wait(self, n):
@@ -3616,13 +3662,20 @@ class LighterBatch30SchedulerTests(unittest.TestCase):
             baseline = self._cancel_baseline(248)
             ct._patch_cancel_env(target_oids=target, baseline_oids=baseline)
             # Supersede the helper's generous-budget patch with OUR budget.
+            # Phase 3: the agent now reads the tier-aware budget, so that
+            # seam must be superseded too.
             p = mock.patch.object(lighter, "_get_lighter_l2_tx_budget", return_value=budget)
             p.start()
             self.addCleanup(p.stop)
+            tier_budget = lighter._LighterTierBudget(safe_limit=30, window_seconds=60.0)
+            p_tier = mock.patch.object(lighter, "_get_lighter_tier_budget", return_value=tier_budget)
+            p_tier.start()
+            self.addCleanup(p_tier.stop)
 
             # Record authoritative reservation timestamps via the class method.
             reservations: List[tuple] = []
-            cls = type(budget)
+            # Phase 3: instrument the tier-aware budget class.
+            cls = type(tier_budget)
             orig_wait = cls.wait_for_capacity
 
             def recording_wait(self, n):
@@ -3750,6 +3803,10 @@ class LighterCancelBatchTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
         self._saved_cancel_batch = lighter.LIGHTER_CANCEL_TX_BATCH_SIZE
         self._saved_cancel_pause = lighter.LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS
         self._saved_backoff = lighter.LIGHTER_RATELIMIT_BACKOFF_CAP_SECONDS
@@ -3763,6 +3820,10 @@ class LighterCancelBatchTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
 
 
@@ -3842,6 +3903,24 @@ class LighterCancelBatchTests(unittest.TestCase):
                 lighter, "_get_lighter_l2_tx_budget",
                 return_value=lighter._LighterL2TxBudget(safe_limit=1000000, window_seconds=60.0),
             ),
+            # Phase 3 tier-aware budget seam (see _patch_lighter_for_test).
+            mock.patch.object(
+                lighter, "_get_lighter_tier_policy",
+                return_value=lighter._LighterTierPolicy(
+                    tier=lighter.LIGHTER_TIER_STANDARD,
+                    tx_per_window=1000000,
+                    window_seconds=60.0,
+                    send_tx_rpm=1000000,
+                    quota_remaining=None,
+                    quota_bearing=False,
+                    l1_address=None,
+                    reason="offline test policy",
+                ),
+            ),
+            mock.patch.object(
+                lighter, "_get_lighter_tier_budget",
+                return_value=lighter._LighterTierBudget(safe_limit=1000000, window_seconds=60.0),
+            ),
             # HTTP request limiter: replace with a no-op so offline tests
             # never pace on the real 40/60s sliding window (which would
             # accumulate across the test class and cause real sleeps).
@@ -3861,8 +3940,11 @@ class LighterCancelBatchTests(unittest.TestCase):
                 "account": "amiroo", "symbol": symbol, "side": side}
 
     # ------------------------------------------------------------------
-    # A. 200 cancel targets -> correct batch count (200/30 = 7 batches)
-    #    sizes [30,30,30,30,30,30,20]
+    # A. 200 cancel targets -> correct batch count (200/15 = 14 batches)
+    #    sizes [15]*13 + [5]
+    #
+    # Phase 3: the cancel path submits over REST, so the batch size is
+    # the CDN-safe 15, not the WS protocol max of 30.
     # ------------------------------------------------------------------
     def test_A_200_targets_correct_batch_count(self):
         target = list(range(500000, 500200))  # 200 targets
@@ -3872,7 +3954,7 @@ class LighterCancelBatchTests(unittest.TestCase):
         self.assertTrue(resp.success, f"expected success, got {resp.error}")
         cg = resp.cancel_group
         self.assertEqual(cg.requested_cancel_count, 200)
-        self.assertEqual(cg.batch_count, 7)
+        self.assertEqual(cg.batch_count, 14)
         self.assertEqual(cg.cancelled_order_count, 200)
         self.assertEqual(cg.verified_cancel_count, 200)
         self.assertEqual(cg.remaining_target_count, 0)
@@ -3880,10 +3962,10 @@ class LighterCancelBatchTests(unittest.TestCase):
         self.assertFalse(cg.partial)
         self.assertEqual(cg.status, "success")
         self.assertIsNone(cg.rate_limited or None)
-        # 7 sendTxBatch calls; sizes [30,30,30,30,30,30,20].
-        self.assertEqual(len(cg.batches), 7)
+        # 14 sendTxBatch calls; sizes [15]*13 + [5].
+        self.assertEqual(len(cg.batches), 14)
         sizes = [b["submitted"] for b in cg.batches]
-        self.assertEqual(sizes, [30, 30, 30, 30, 30, 30, 20])
+        self.assertEqual(sizes, [15] * 13 + [5])
         for b in cg.batches:
             self.assertEqual(b["accepted"], b["submitted"])
 
@@ -3902,12 +3984,16 @@ class LighterCancelBatchTests(unittest.TestCase):
         def fake_sleep(s):
             sim["now"][0] += s
 
-        budget = lighter._LighterL2TxBudget(safe_limit=30, window_seconds=60.0)
+        budget = lighter._LighterTierBudget(safe_limit=30, window_seconds=60.0)
         reserved_ts: List[float] = []
         target = list(range(500000, 500060))  # 60 targets -> 6 batches
         baseline = list(range(900000, 900010))
         self._patch_cancel_env(target_oids=target, baseline_oids=baseline)
         with mock.patch.object(lighter, "_get_lighter_l2_tx_budget", return_value=budget), \
+             mock.patch.object(
+                 lighter, "_get_lighter_tier_budget",
+                 return_value=budget,
+             ), \
              mock.patch.object(lighter.time, "monotonic", side_effect=fake_monotonic), \
              mock.patch.object(lighter.time, "sleep", side_effect=fake_sleep):
             resp = lighter.execute(self._cancel_request())
@@ -3971,7 +4057,7 @@ class LighterCancelBatchTests(unittest.TestCase):
     # E. 429 stops further cancellation
     # ------------------------------------------------------------------
     def test_E_429_stops_cancellation(self):
-        target = list(range(500000, 500120))  # 120 targets -> 4 batches (30×4)
+        target = list(range(500000, 500120))  # 120 targets -> 8 batches (15×8)
         baseline = list(range(900000, 900010))
         # 2 successful batches then a 429 on the 3rd.
         outcomes = [
@@ -3979,9 +4065,9 @@ class LighterCancelBatchTests(unittest.TestCase):
             (200, "", None),
             (23000, "Too Many Requests!: L1Address ratelimit reached 0x1E03A8Db70F1e27A48a3Ae1D3F86F146bE23de01. 40 requests per 60 second is allowed", None),
         ]
-        # Post-active: batches 1-2 (60 targets) cancelled; batches 3-4
-        # (60 targets) still present; baseline preserved.
-        post = self._make_orders_mixed(list(range(500060, 500120)), baseline)
+        # Post-active: batches 1-2 (30 targets) cancelled; batches 3-8
+        # (90 targets) still present; baseline preserved.
+        post = self._make_orders_mixed(list(range(500030, 500120)), baseline)
         state = self._patch_cancel_env(target_oids=target, baseline_oids=baseline,
                                        send_tx_outcomes=outcomes, post_active=post)
         resp = lighter.execute(self._cancel_request())
@@ -4015,22 +4101,22 @@ class LighterCancelBatchTests(unittest.TestCase):
     # G. partial cancellation accounting (60 of 200 cancelled before 429)
     # ------------------------------------------------------------------
     def test_G_partial_accounting(self):
-        target = list(range(500000, 500200))  # 200 targets -> 7 batches (30×6+20)
+        target = list(range(500000, 500200))  # 200 targets -> 14 batches (15×13+5)
         baseline = list(range(900000, 900010))
-        # 2 successful batches (60 cancels) then a 429 on the 3rd.
+        # 2 successful batches (30 cancels) then a 429 on the 3rd.
         outcomes = [(200, "", None)] * 2 + [
             (23000, "Too Many Requests!: L1Address ratelimit reached 0x1E03A8Db70F1e27A48a3Ae1D3F86F146bE23de01. 40 requests per 60 second is allowed", None)
         ]
-        # Post-active: 60 targets gone, 140 remain + baseline.
-        post = self._make_orders_mixed(list(range(500060, 500200)), baseline)
+        # Post-active: 30 targets gone, 170 remain + baseline.
+        post = self._make_orders_mixed(list(range(500030, 500200)), baseline)
         self._patch_cancel_env(target_oids=target, baseline_oids=baseline,
                                send_tx_outcomes=outcomes, post_active=post)
         resp = lighter.execute(self._cancel_request())
         self.assertFalse(resp.success)
         cg = resp.cancel_group
-        self.assertEqual(cg.cancelled_order_count, 60)
-        self.assertEqual(cg.verified_cancel_count, 60)
-        self.assertEqual(cg.remaining_target_count, 140)
+        self.assertEqual(cg.cancelled_order_count, 30)
+        self.assertEqual(cg.verified_cancel_count, 30)
+        self.assertEqual(cg.remaining_target_count, 170)
         self.assertTrue(cg.partial)
         self.assertTrue(cg.rate_limited)
         self.assertFalse(cg.verified)
@@ -4211,6 +4297,10 @@ class LighterAsyncBridgeTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
         self._saved_send = lighter.LIGHTER_SEND_TX_BATCH_SIZE
         self._saved_cancel = lighter.LIGHTER_CANCEL_TX_BATCH_SIZE
         self._saved_send_pause = lighter.LIGHTER_SEND_TX_BATCH_PAUSE_SECONDS
@@ -4295,7 +4385,7 @@ class LighterAsyncBridgeTests(unittest.TestCase):
             resp = captured["resp"]
             self.assertTrue(resp.success, f"cancel failed inside running loop: {resp.error}")
             self.assertEqual(resp.cancel_group.cancelled_order_count, 3)
-            # One batch for 3 targets (batch size 30).
+            # One batch for 3 targets (cancel batch size 15).
             self.assertEqual(len(state["signer"].send_tx_batch_calls), 1)
         finally:
             ct.doCleanups()

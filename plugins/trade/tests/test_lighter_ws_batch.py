@@ -79,6 +79,10 @@ class LighterWsBatchLadderTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3 module-level state — cleared for test isolation.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
     def tearDown(self) -> None:
         lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
@@ -87,6 +91,9 @@ class LighterWsBatchLadderTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
     def _force_rest(self, test_state_owner: unittest.TestCase) -> None:
         p = mock.patch.object(
@@ -356,6 +363,13 @@ class LighterWsAcknowledgementTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        # Phase 3: the agent's submit paths now use the tier-aware
+        # budget and the process-wide nonce high-water mark. Both are
+        # module-level state, so they must be cleared for isolation —
+        # otherwise a prior test's reservations block this one.
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
     def tearDown(self) -> None:
         lighter.LIGHTER_REST_SEND_TX_BATCH_SIZE = self._saved_rest
@@ -364,6 +378,9 @@ class LighterWsAcknowledgementTests(unittest.TestCase):
         lighter._LIGHTER_LIMITERS.clear()
         lighter._LIGHTER_AUTH_TOKEN_CACHE.clear()
         lighter._LIGHTER_L2_TX_BUDGETS.clear()
+        lighter._LIGHTER_TIER_BUDGETS.clear()
+        lighter._LIGHTER_TIER_CACHE.clear()
+        lighter._LIGHTER_NONCE_LEASES.clear()
 
     def _use_ws(self, fake: Any) -> None:
         async def open_ws(credentials):  # noqa: ARG001
