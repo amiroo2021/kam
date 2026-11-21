@@ -7,11 +7,20 @@ Credentials (``.env`` / environment):
   Optional: ``BULK_<ALIAS>_BASE_URL``  default https://mainnet-api1.bulk.trade/api/v1
 
 Reads use unsigned POST /account {type: fullAccount, user}.
-Writes use signed POST /order (new_order, ladder, cancel_order_group, close_position).
+Writes use signed POST /order (new_order, ladder, cancel_order_group,
+close_position, set_tp, set_sl). Signing is delegated to bulk_keychain,
+Bulk's official Rust/pyo3 signing SDK (vendored wheel at
+plugins/trade/vendor/bulk_keychain/) rather than a hand-rolled wire-format
+encoder, because the real wincode schema (v12, with trailing optional
+commission/slippage fields) is not safe to re-derive by hand for a live
+signing path.
 
 Wizard Positions Management lists via operation ``positions_management``,
 which is an alias of the same fullAccount snapshot as ``positions_orders``.
-Bulk-native ``close_position`` is supported; ``set_tp`` / ``set_sl`` are not.
+Bulk-native ``close_position``, ``set_tp``, and ``set_sl`` are supported;
+set_tp/set_sl follow the same flow as other exchange agents: a price of 0
+removes the existing protective order, a nonzero price replaces (cancel +
+place in one atomic signed group) or newly places it.
 """
 
 from __future__ import annotations
@@ -174,7 +183,6 @@ def list_accounts() -> list[str]:
 
 def capabilities() -> list[str]:
     # positions_management is the wizard list op (alias of positions_orders).
-    # set_tp / set_sl / close_position are intentionally absent until implemented.
     return [
         "balance",
         "positions_orders",
@@ -186,6 +194,8 @@ def capabilities() -> list[str]:
         "list_instruments",
         "market_price",
         "close_position",
+        "set_tp",
+        "set_sl",
     ]
 
 
@@ -822,18 +832,19 @@ def _market_price(credentials: Mapping[str, str], account: str, request: Mapping
 # Bulk signing / trading helpers
 # ---------------------------------------------------------------------------
 
-def _domain_byte(credentials: Mapping[str, str]) -> int:
+def _domain_name(credentials: Mapping[str, str]) -> str:
+    """Return the Bulk SDK's signature-domain name ("mainnet"/"testnet"/"devnet")."""
     configured = str(credentials.get("signature_domain") or "").strip().lower()
     if configured in {"1", "mainnet", "main"}:
-        return 1
+        return "mainnet"
     if configured in {"2", "testnet", "test"}:
-        return 2
+        return "testnet"
     if configured in {"3", "devnet", "dev"}:
-        return 3
+        return "devnet"
     base = str(credentials.get("base_url") or DEFAULT_API_BASE).lower()
     if "exchange-api.bulk.trade" in base:
-        return 2
-    return 1
+        return "testnet"
+    return "mainnet"
 
 
 def _b58decode(value: str) -> bytes:
@@ -849,56 +860,78 @@ def _b58encode(value: bytes) -> str:
     return base58.b58encode(value).decode("ascii")
 
 
-def _write_string(value: str) -> bytes:
-    raw = str(value).encode("utf-8")
-    return struct.pack("<Q", len(raw)) + raw
+def _to_official_order_item(action: Mapping[str, Any]) -> Dict[str, Any]:
+    """Translate our internal compact action dict into bulk_keychain's typed schema.
 
-
-def _write_bool(value: bool) -> bytes:
-    return b"\x01" if value else b"\x00"
-
-
-def _write_scaled(value: Any) -> bytes:
-    scaled = int((_decimal(value) * Decimal("100000000")).to_integral_value(rounding=ROUND_HALF_UP))
-    if scaled < 0:
-        raise ValueError("Bulk scaled numeric field cannot be negative")
-    return struct.pack("<Q", scaled)
-
-
-def _encode_action(action: Mapping[str, Any]) -> bytes:
+    bulk_keychain (the vendored official signing library; see
+    plugins/trade/vendor/bulk_keychain/) only accepts the verbose
+    {"type": ...} item shape for order/cancel/cancel_all/stop/take_profit -
+    it does not expose a compact-tag parser for "st"/"tp". This function is
+    the single place that bridges our internal compact dicts (which we also
+    keep for the human/log-friendly "actions" we echo back) to that schema.
+    """
     if "m" in action:
         row = action["m"]
-        return b"".join([
-            struct.pack("<I", 0), _write_string(row["c"]), _write_bool(bool(row["b"])),
-            _write_scaled(row["sz"]), _write_bool(bool(row.get("r", False))), _write_bool(bool(row.get("i", False))),
-        ])
+        return {
+            "type": "order", "symbol": str(row["c"]), "is_buy": bool(row["b"]),
+            "price": 0.0, "size": float(row["sz"]),
+            "reduce_only": bool(row.get("r", False)), "iso": bool(row.get("i", False)),
+            "order_type": {"type": "market", "is_market": True, "trigger_px": 0.0},
+        }
     if "l" in action:
         row = action["l"]
-        tif_map = {"GTC": 0, "IOC": 1, "ALO": 2}
-        tif = tif_map.get(str(row.get("tif") or "GTC").upper())
-        if tif is None:
+        tif = str(row.get("tif") or "GTC").upper()
+        if tif not in {"GTC", "IOC", "ALO"}:
             raise ValueError("Unsupported Bulk time-in-force")
-        return b"".join([
-            struct.pack("<I", 1), _write_string(row["c"]), _write_bool(bool(row["b"])),
-            _write_scaled(row["px"]), _write_scaled(row["sz"]), struct.pack("<I", tif),
-            _write_bool(bool(row.get("r", False))), _write_bool(bool(row.get("i", False))),
-        ])
+        return {
+            "type": "order", "symbol": str(row["c"]), "is_buy": bool(row["b"]),
+            "price": float(row["px"]), "size": float(row["sz"]),
+            "reduce_only": bool(row.get("r", False)), "iso": bool(row.get("i", False)),
+            "order_type": {"type": "limit", "tif": tif},
+        }
     if "cx" in action:
         row = action["cx"]
-        return b"".join([struct.pack("<I", 3), _write_string(row["c"]), _b58decode(str(row["oid"]))])
+        return {"type": "cancel", "symbol": str(row["c"]), "order_id": str(row["oid"])}
     if "cxa" in action:
         row = action["cxa"]
-        symbols = list(row.get("c") or [])
-        return b"".join([struct.pack("<I", 4), struct.pack("<Q", len(symbols)), *[_write_string(s) for s in symbols]])
+        return {"type": "cancel_all", "symbols": [str(s) for s in (row.get("c") or [])]}
+    if "st" in action:
+        row = action["st"]
+        return {
+            "type": "stop", "symbol": str(row["c"]), "is_buy": bool(row["d"]),
+            "size": float(row["sz"]), "trigger_price": float(row["tr"]),
+            "limit_price": (float(row["lim"]) if row.get("lim") is not None else None),
+            "iso": bool(row.get("i", False)),
+        }
+    if "tp" in action:
+        row = action["tp"]
+        return {
+            "type": "take_profit", "symbol": str(row["c"]), "is_buy": bool(row["d"]),
+            "size": float(row["sz"]), "trigger_price": float(row["tr"]),
+            "limit_price": (float(row["lim"]) if row.get("lim") is not None else None),
+            "iso": bool(row.get("i", False)),
+        }
     raise ValueError("Unsupported Bulk action for signing")
 
 
 def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str, Any]], nonce: Optional[int] = None) -> Dict[str, Any]:
-    from nacl.signing import SigningKey  # type: ignore
+    """Sign a Bulk transaction using bulk_keychain, the official signing SDK.
+
+    We previously hand-rolled this wire format; that encoder was missing
+    the trailing optional commission/slippage tags bulk_keychain's own
+    "all_modes_match_real_sdk_bytes_and_signatures" test proves are part of
+    the real signed bytes, and it had no encoder at all for stop/take_profit
+    actions. Delegating to bulk_keychain avoids re-deriving (and
+    re-risking) that wire format by hand.
+    """
+    from bulk_keychain import Keypair, Signer, prepare_order_group  # type: ignore
     import base58  # type: ignore
 
     account_pubkey = str(credentials.get("account_pubkey") or "")
-    account_bytes = _b58decode(account_pubkey)
+    if not account_pubkey:
+        raise ValueError("Missing Bulk account_pubkey credential")
+    _b58decode(account_pubkey)  # validates shape/length before handing to the signer
+
     secret_raw = base58.b58decode(str(credentials.get("agent_private_key") or ""))
     if len(secret_raw) == 64:
         seed = secret_raw[:32]
@@ -906,27 +939,25 @@ def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str,
         seed = secret_raw
     else:
         raise ValueError("Bulk agent private key must be a 32-byte seed or 64-byte keypair encoded as base58")
-    signing_key = SigningKey(seed)
-    derived_signer = _b58encode(bytes(signing_key.verify_key))
+    keypair = Keypair.from_bytes(seed)
+    derived_signer = keypair.pubkey
     configured_signer = str(credentials.get("agent_public_key") or "").strip()
     signer_pubkey = configured_signer or derived_signer
     if configured_signer and configured_signer != derived_signer:
         raise ValueError("Configured Bulk agent public key does not match the private key")
+
     tx_nonce = int(nonce if nonce is not None else time.time_ns())
-    message = b"".join([
-        struct.pack("<Q", len(actions)),
-        *[_encode_action(a) for a in actions],
-        struct.pack("<Q", tx_nonce),
-        account_bytes,
-        bytes([_domain_byte(credentials)]),
-    ])
-    signature = signing_key.sign(message).signature
+    domain = _domain_name(credentials)
+    order_items = [_to_official_order_item(a) for a in actions]
+    prepared = prepare_order_group(order_items, domain, account_pubkey, signer=signer_pubkey, nonce=tx_nonce)
+    signer = Signer(keypair, domain)
+    signed = signer.sign_prepared(prepared)
     return {
         "actions": [dict(a) for a in actions],
         "nonce": str(tx_nonce),
-        "account": account_pubkey,
-        "signer": signer_pubkey,
-        "signature": _b58encode(signature),
+        "account": signed["account"],
+        "signer": signed["signer"],
+        "signature": signed["signature"],
     }
 
 
@@ -1596,6 +1627,9 @@ def _positions_orders(
 _close_guard_lock = threading.Lock()
 _close_guard: set[tuple[str, str, bool]] = set()
 
+_protection_guard_lock = threading.Lock()
+_protection_guard: set[tuple[str, str, bool, str]] = set()
+
 
 def _position_rows(full_account: Mapping[str, Any], symbol: str) -> list[Dict[str, Any]]:
     rows = full_account.get("positions")
@@ -1704,8 +1738,131 @@ def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
     return _decimal(lane_rows[0].get("size")) if lane_rows else Decimal("0")
 
 
+def _protection_classification(operation: str) -> str:
+    return "take_profit" if operation == "set_tp" else "stop_loss"
+
+
+def _bulk_set_protection(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Set, replace, or remove (price 0) a native Bulk take-profit or stop-loss.
+
+    Mirrors _bulk_position_action's close_position verification rigor:
+    resolve the live position fresh (never a stale displayed size), refuse
+    on any ambiguity, submit via the one true _submit_order/_sign_transaction
+    path (bulk_keychain), and re-verify against a fresh post-submission
+    snapshot rather than trusting the HTTP response alone.
+    """
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+    try:
+        market = _find_market(credentials, requested)
+    except Exception:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Bulk market {requested!r} was not found.")
+    symbol = str(market.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", "Bulk market row has no symbol.")
+
+    try:
+        price = _decimal(request.get("price"))
+    except Exception:
+        return make_failure(operation, name, account, "INVALID_PRICE", "Price must be a number (0 removes the order).")
+    if price < 0:
+        return make_failure(operation, name, account, "INVALID_PRICE", "Price cannot be negative.")
+
+    try:
+        before_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+    except PermissionError as exc:
+        return make_failure(operation, name, account, "ACCOUNT_IDENTITY_INVALID", sanitize_error_message(str(exc)))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "ACCOUNT_SNAPSHOT_INVALID", sanitize_error_message(str(exc)))
+
+    positions = _position_rows(before_account, symbol)
+    if not positions:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if len(positions) != 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_POSITION", f"Multiple open Bulk rows match {symbol}; refusing to choose a lane.")
+    position = positions[0]
+    size = _decimal(position.get("size"))
+    if size == 0:
+        return make_failure(operation, name, account, "POSITION_SIZE_UNRESOLVED", f"Live Bulk position size for {symbol} in account {account!r} resolved to zero; refusing to substitute a stale displayed size.")
+    if not isinstance(position.get("iso"), bool):
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk position snapshot omitted its base/isolated routing flag.")
+    isolated = position["iso"]
+
+    abs_size = abs(size)
+    # Protective order side is opposite the position side (closes it).
+    protect_side = "buy" if size < 0 else "sell"
+    classification = _protection_classification(operation)
+
+    existing = [
+        row for row in _orders_for(before_account, symbol, protect_side)
+        if bool(row.get("reduceOnly")) and bool(row.get("iso", False)) == isolated
+        and _classification(str(row.get("orderType") or ""), True) == classification
+    ]
+    if len(existing) > 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_PROTECTIVE_ORDER", f"Multiple existing {classification} orders match {symbol}; refusing to choose one to replace.")
+    existing_order_id = str(existing[0].get("orderId") or existing[0].get("oid") or "") if existing else None
+
+    guard_key = (str(credentials.get("account_pubkey") or ""), symbol.upper(), isolated, classification)
+    with _protection_guard_lock:
+        if guard_key in _protection_guard:
+            return make_failure(operation, name, account, "PROTECTION_OUTCOME_UNKNOWN", "A prior Bulk TP/SL submission for this account/market/lane is unresolved; reconcile state before another submission.", data={"protection_status": "unknown", "retry_safe": False})
+        _protection_guard.add(guard_key)
+
+    actions: list[Dict[str, Any]] = []
+    if existing_order_id:
+        actions.append({"cx": {"c": symbol, "oid": existing_order_id}})
+    if price > 0:
+        action_tag = "tp" if classification == "take_profit" else "st"
+        actions.append({action_tag: {"c": symbol, "d": protect_side == "buy", "sz": float(abs_size), "tr": float(price), "lim": None, "i": isolated}})
+
+    if not actions:
+        # price == 0 and nothing existed: already in the desired (unset) state.
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_success(operation, name, account, data={"protection_status": "already_unset", "verified": True, "symbol": symbol})
+
+    try:
+        response = _submit_order(credentials, actions)
+    except Exception as exc:  # noqa: BLE001 - submission may have reached Bulk
+        return make_failure(operation, name, account, "TP_PLACEMENT_FAILED" if classification == "take_profit" else "SL_PLACEMENT_FAILED", "Bulk submission outcome is uncertain. No automatic retry was made.", data={"protection_status": "unknown", "verified": False, "retry_safe": False, "error_type": type(exc).__name__, "error": sanitize_error_message(str(exc))})
+
+    parsed = _position_action_status(response)
+    bulk_status = parsed["classification"]
+    if bulk_status == "rejected":
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_failure(operation, name, account, "TP_REJECTED" if classification == "take_profit" else "SL_REJECTED", "Bulk rejected the protective order submission.", data={"protection_status": "rejected", "verified": True, "bulk_status": bulk_status, "order_ids": parsed["order_ids"]})
+
+    try:
+        after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+        after_orders = [
+            row for row in _orders_for(after_account, symbol, protect_side)
+            if bool(row.get("reduceOnly")) and bool(row.get("iso", False)) == isolated
+            and _classification(str(row.get("orderType") or ""), True) == classification
+        ]
+    except Exception as exc:  # noqa: BLE001
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_failure(operation, name, account, "PROTECTION_VERIFICATION_UNAVAILABLE", "Bulk returned a response but a valid, account-bound snapshot could not verify the result; no retry was made.", data={"protection_status": "unknown", "verified": False, "retry_safe": False, "order_ids": parsed["order_ids"], "bulk_status": bulk_status, "verification_error": sanitize_error_message(str(exc))})
+
+    with _protection_guard_lock:
+        _protection_guard.discard(guard_key)
+
+    common = {"verified": True, "symbol": symbol, "requested_price": _plain_decimal(price), "order_ids": parsed["order_ids"], "bulk_status": bulk_status, "native_statuses": parsed["statuses"]}
+    if price == 0:
+        if not after_orders:
+            return make_success(operation, name, account, data={**common, "protection_status": "removed"})
+        return make_failure(operation, name, account, "PROTECTION_REMOVAL_UNCONFIRMED", "Bulk accepted the cancellation but a matching protective order is still open; the removal is not confirmed.", data={**common, "protection_status": "unknown"})
+    if len(after_orders) == 1 and _plain_decimal(_decimal(after_orders[0].get("price") if after_orders[0].get("price") is not None else after_orders[0].get("triggerPrice"))) == _plain_decimal(price):
+        return make_success(operation, name, account, data={**common, "protection_status": "set"})
+    return make_failure(operation, name, account, "TP_PLACEMENT_UNCONFIRMED" if classification == "take_profit" else "SL_PLACEMENT_UNCONFIRMED", "Bulk response did not establish the protective order at the requested price; no automatic retry was made.", data={**common, "protection_status": "unknown"})
+
+
 def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
-    """Close a Bulk position natively; TP/SL remain intentionally unsupported."""
+    """Close, or set/replace/remove TP or SL on, a Bulk position natively."""
+    if operation in ("set_tp", "set_sl"):
+        return _bulk_set_protection(credentials, account, operation, request)
     if operation != "close_position":
         return make_failure(operation, name, account, "NOT_IMPLEMENTED", f"Bulk {operation} is not implemented.")
     requested = str(request.get("symbol") or "").strip()
@@ -1831,8 +1988,7 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _positions_orders(credentials, account, operation="positions_orders")
         if operation == "positions_management":
             # Wizard list op — same fullAccount snapshot as positions_orders.
-            # Mutation actions (set_tp/set_sl/close_position) are separate ops
-            # and remain NOT_IMPLEMENTED until explicitly wired.
+            # Mutation actions (set_tp/set_sl/close_position) are separate ops.
             return _positions_orders(credentials, account, operation="positions_management")
         if operation == "list_instruments":
             return _list_instruments(credentials, account)
