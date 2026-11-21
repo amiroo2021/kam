@@ -35,17 +35,37 @@ from plugins.trade.ladder_harness import (  # noqa: E402
 
 
 def _lighter_agent():
-    """Import the Lighter agent FRESH.
+    """Load the REPO's Lighter agent, by explicit file path.
 
-    ``plugins/trade/tests/conftest.py`` drops every ``plugins.trade.*``
-    entry from ``sys.modules`` between test modules, so a module-scope
-    import would go stale and the agent would no longer expose
-    ``_submit_cancel_tx_batch_async``. Importing inside each test gets
-    the CURRENT module object.
+    Two traps make a plain ``import`` unreliable here:
+
+    1. ``plugins/trade/tests/conftest.py`` drops every
+       ``plugins.trade.*`` entry from ``sys.modules`` between test
+       modules, so a module-scope import goes stale.
+    2. That conftest is a *pytest* conftest. Under
+       ``unittest discover`` it never runs, so the editable-install
+       finder still maps ``plugins.*`` to the INSTALLED tree under
+       ``/usr/local/lib/hermes-agent`` -- an OLDER agent that predates
+       the async cancel core and has no
+       ``_submit_cancel_tx_batch_async`` at all.
+
+    Loading the file directly from this repository's path sidesteps
+    both: the module object always comes from the source under test.
     """
-    import importlib
+    import importlib.util
 
-    return importlib.import_module("plugins.trade.agents.x_lighter_agent")
+    agent_path = _REPO_ROOT / "plugins" / "trade" / "agents" / "x_lighter_agent.py"
+    # The agent uses RELATIVE imports ("from ..canonical import ..."), so
+    # the module must be loaded inside a package context for them to
+    # resolve. Give it the repo's package name.
+    module_name = "plugins.trade.agents.x_lighter_agent_repo_under_test"
+    spec = importlib.util.spec_from_file_location(module_name, agent_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Make the parent package importable so "from ..canonical" works.
+    module.__package__ = "plugins.trade.agents"
+    spec.loader.exec_module(module)
+    return module
 
 
 class EvidenceLogTests(unittest.TestCase):
@@ -132,7 +152,8 @@ class CancelChunkTimingTests(unittest.TestCase):
 
         def fake_group_runner(*, credentials, market_id, target_ids):
             # The production runner awaits the async core on its own
-            # event loop. Reproduce that shape exactly.
+            # event loop. Reproduce that shape exactly, against the
+            # SAME module object the harness patches.
             async def _run():
                 rows = []
                 for start in range(0, len(target_ids), 15):
@@ -162,6 +183,7 @@ class CancelChunkTimingTests(unittest.TestCase):
                     "target_ids": list(range(250)),
                 },
                 timings=timings,
+                module_hint=agent,
             )
         finally:
             agent._submit_cancel_tx_batch_async = saved_stub
@@ -208,6 +230,7 @@ class CancelChunkTimingTests(unittest.TestCase):
                     group_runner=fake_group_runner,
                     group_kwargs={"target_ids": [1, 2, 3]},
                     timings=[],
+                    module_hint=agent,
                 )
         finally:
             agent._submit_cancel_tx_batch_async = saved_stub

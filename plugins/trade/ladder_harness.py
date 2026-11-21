@@ -99,6 +99,7 @@ def time_cancel_chunks(
     group_runner: Callable[..., Any],
     group_kwargs: Optional[Dict[str, Any]] = None,
     timings: Optional[List[Dict[str, Any]]] = None,
+    module_hint: Optional[Any] = None,
 ) -> Any:
     """Run a cancel group and capture REAL per-chunk elapsed times.
 
@@ -109,6 +110,12 @@ def time_cancel_chunks(
 
     ``group_runner`` is called with ``**group_kwargs`` (e.g.
     ``credentials=``, ``market_id=``, ``target_ids=``).
+
+    ``module_hint`` is the module object to patch. Pass it when the
+    agent under test is NOT ``plugins.trade.agents.x_lighter_agent``
+    -- for example when a test loaded its own copy from the repository
+    so an editable install cannot shadow it. The patch is applied to
+    whichever module actually owns the async core under test.
 
     Returns the group runner's result unchanged.
     """
@@ -135,14 +142,26 @@ def time_cancel_chunks(
 
     import plugins.trade.agents.x_lighter_agent as agent  # noqa: PLC0415
 
-    saved = agent._submit_cancel_tx_batch_async
-    agent._submit_cancel_tx_batch_async = _timed  # type: ignore[assignment]
+    # Patch the module the caller is actually testing. A test may load
+    # its OWN copy of the agent (from the repo, to avoid an editable
+    # install shadowing it), in which case patching the imported module
+    # would have no effect on the group runner under test.
+    target = agent
+    if module_hint is not None:
+        target = module_hint
+    saved = getattr(target, "_submit_cancel_tx_batch_async", None)
+    if saved is None:
+        raise RuntimeError(
+            "the module under test has no _submit_cancel_tx_batch_async; "
+            "the agent copy is too old (it predates the async cancel core)"
+        )
+    target._submit_cancel_tx_batch_async = _timed  # type: ignore[assignment]
     try:
         result = group_runner(**kwargs)
     finally:
         # Restore the ORIGINAL object, never the local reference, so a
         # re-entrant call cannot leave a wrapper installed.
-        agent._submit_cancel_tx_batch_async = saved  # type: ignore[assignment]
+        target._submit_cancel_tx_batch_async = saved  # type: ignore[assignment]
 
     # A group that ran chunks but produced NO timings means the patch
     # was on the wrong seam -- the exact defect the Phase 6 run hit
