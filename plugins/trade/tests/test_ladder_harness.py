@@ -34,6 +34,20 @@ from plugins.trade.ladder_harness import (  # noqa: E402
 )
 
 
+def _lighter_agent():
+    """Import the Lighter agent FRESH.
+
+    ``plugins/trade/tests/conftest.py`` drops every ``plugins.trade.*``
+    entry from ``sys.modules`` between test modules, so a module-scope
+    import would go stale and the agent would no longer expose
+    ``_submit_cancel_tx_batch_async``. Importing inside each test gets
+    the CURRENT module object.
+    """
+    import importlib
+
+    return importlib.import_module("plugins.trade.agents.x_lighter_agent")
+
+
 class EvidenceLogTests(unittest.TestCase):
     """Incremental evidence persistence."""
 
@@ -104,7 +118,7 @@ class CancelChunkTimingTests(unittest.TestCase):
         """
         import asyncio
 
-        import plugins.trade.agents.x_lighter_agent as agent
+        agent = _lighter_agent()
 
         async def fake_async_core(*, order_ids, **kwargs):
             return {
@@ -172,7 +186,7 @@ class CancelChunkTimingTests(unittest.TestCase):
         """
         import asyncio
 
-        import plugins.trade.agents.x_lighter_agent as agent
+        agent = _lighter_agent()
 
         async def fake_async_core(*, order_ids, **kwargs):
             return {"outcome": "success", "submitted_count": len(order_ids)}
@@ -200,7 +214,7 @@ class CancelChunkTimingTests(unittest.TestCase):
         self.assertIn("chunk timings", str(ctx.exception))
 
     def test_patch_is_restored_even_when_the_group_raises(self) -> None:
-        import plugins.trade.agents.x_lighter_agent as agent
+        agent = _lighter_agent()
 
         async def fake_async_core(*, order_ids, **kwargs):
             return {"outcome": "success"}
