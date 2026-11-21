@@ -209,10 +209,38 @@ class TestBulkSetTpSl(unittest.TestCase):
         with mock.patch.object(bulk, "_lookup_credentials", return_value=CREDS), \
              mock.patch.object(bulk, "_find_market", return_value=MARKET), \
              mock.patch.object(bulk, "_live_account", return_value=live), \
-             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"rejectedInvalid": {}}]}}}):
+             mock.patch.object(bulk, "_submit_order", return_value={"response": {"data": {"statuses": [{"rejectedInvalid": {"reason": "trigger price must be below mark price for a short take-profit"}}]}}}):
             resp = bulk.execute({"operation": "set_tp", "exchange": "bulk", "account": "bullet", "symbol": "ZEC", "price": "500"})
         self.assertFalse(resp.success)
         self.assertEqual(resp.error.code, "TP_REJECTED")
+        self.assertIn("trigger price must be below mark price", resp.error.message)
+        self.assertEqual(resp.data["reasons"], ["trigger price must be below mark price for a short take-profit"])
+
+    def test_set_tp_rejects_non_conforming_position_size(self) -> None:
+        # Market requires 7-decimal / 0.0000001 increments; a position size
+        # with finer precision than the market allows must never be sent.
+        live = _account(-121.63896519)
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=CREDS), \
+             mock.patch.object(bulk, "_find_market", return_value=MARKET), \
+             mock.patch.object(bulk, "_live_account", return_value=live), \
+             mock.patch.object(bulk, "_submit_order") as submit:
+            resp = bulk.execute({"operation": "set_tp", "exchange": "bulk", "account": "bullet", "symbol": "ZEC", "price": "500"})
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "POSITION_SIZE_INVALID")
+        submit.assert_not_called()
+
+    def test_set_tp_quantizes_price_to_market_tick_size(self) -> None:
+        market = dict(MARKET, tickSize=0.01, priceDecimals=2)
+        live = _account(-121.6389651)
+        after = _account(-121.6389651, price=500.12, order_type="takeProfit", order_side="sell")
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=CREDS), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", side_effect=[live, after]), \
+             mock.patch.object(bulk, "_submit_order", return_value={"status": "ok", "response": {"data": {"statuses": [{"resting": {}}]}}}) as submit:
+            resp = bulk.execute({"operation": "set_tp", "exchange": "bulk", "account": "bullet", "symbol": "ZEC", "price": "500.126"})
+        self.assertTrue(resp.success, msg=str(resp.error))
+        actions = submit.call_args.args[1]
+        self.assertEqual(actions[0]["tp"]["tr"], 500.12)
 
     def test_set_sl_rejected_by_exchange_uses_sl_code(self) -> None:
         live = _account(-121.6389651)

@@ -1711,13 +1711,18 @@ def _position_action_status(payload: Any) -> Dict[str, Any]:
         "renameSubAccountFailed": "unknown",
     }
     statuses: list[str] = []
+    reasons: list[str] = []
     ids = [str(x) for x in _bulk_order_ids_from_payload(payload)]
 
     def visit(value: Any) -> None:
         if isinstance(value, Mapping):
-            for key in value:
+            for key, inner in value.items():
                 if key in status_classes:
                     statuses.append(key)
+                    if isinstance(inner, Mapping):
+                        reason = inner.get("reason") or inner.get("message")
+                        if reason:
+                            reasons.append(str(reason))
             for child in value.values():
                 if isinstance(child, (Mapping, list)):
                     visit(child)
@@ -1728,7 +1733,7 @@ def _position_action_status(payload: Any) -> Dict[str, Any]:
     visit(payload)
     unique = list(dict.fromkeys(statuses))
     classification = status_classes[unique[0]] if len(unique) == 1 else "unknown"
-    return {"classification": classification, "statuses": unique, "order_ids": ids}
+    return {"classification": classification, "statuses": unique, "order_ids": ids, "reasons": list(dict.fromkeys(reasons))}
 
 
 def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
@@ -1789,7 +1794,35 @@ def _bulk_set_protection(credentials: Mapping[str, str], account: str, operation
         return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk position snapshot omitted its base/isolated routing flag.")
     isolated = position["iso"]
 
+    increment = _decimal(market.get("sizeIncrement", market.get("lotSize")), "0")
+    size_precision_raw = market.get("sizeDecimals")
+    if increment <= 0 or size_precision_raw is None:
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_MISSING", "Bulk market omitted valid size increment/precision metadata.")
+    try:
+        size_precision = int(size_precision_raw)
+    except (ValueError, TypeError):
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_INVALID", "Bulk market sizeDecimals is invalid.")
     abs_size = abs(size)
+    size_precision_step = Decimal(1).scaleb(-size_precision)
+    if size_precision < 0 or abs_size % increment != 0 or abs_size % size_precision_step != 0:
+        return make_failure(operation, name, account, "POSITION_SIZE_INVALID", "Live Bulk position size does not conform to market increment/precision.")
+
+    if price > 0:
+        price_tick = _decimal(market.get("tickSize", market.get("priceIncrement")), "0")
+        price_precision_raw = market.get("priceDecimals")
+        if price_tick > 0 and price_precision_raw is not None:
+            try:
+                price_precision = int(price_precision_raw)
+            except (ValueError, TypeError):
+                return make_failure(operation, name, account, "MARKET_PRICE_METADATA_INVALID", "Bulk market priceDecimals is invalid.")
+            price_precision_step = Decimal(1).scaleb(-price_precision)
+            quantized_price = _quantize_down(price, price_tick) if price_tick > 0 else price
+            if price_precision >= 0:
+                quantized_price = quantized_price.quantize(price_precision_step, rounding=ROUND_DOWN)
+            if quantized_price <= 0:
+                return make_failure(operation, name, account, "INVALID_PRICE", "Price rounds to zero at Bulk's tick size; choose a larger price.")
+            price = quantized_price
+
     # Protective order side is opposite the position side (closes it).
     protect_side = "buy" if size < 0 else "sell"
     classification = _protection_classification(operation)
@@ -1832,7 +1865,8 @@ def _bulk_set_protection(credentials: Mapping[str, str], account: str, operation
     if bulk_status == "rejected":
         with _protection_guard_lock:
             _protection_guard.discard(guard_key)
-        return make_failure(operation, name, account, "TP_REJECTED" if classification == "take_profit" else "SL_REJECTED", "Bulk rejected the protective order submission.", data={"protection_status": "rejected", "verified": True, "bulk_status": bulk_status, "order_ids": parsed["order_ids"]})
+        reason_text = "; ".join(parsed.get("reasons") or []) or "Bulk did not supply a reason."
+        return make_failure(operation, name, account, "TP_REJECTED" if classification == "take_profit" else "SL_REJECTED", f"Bulk rejected the protective order submission: {reason_text}", data={"protection_status": "rejected", "verified": True, "bulk_status": bulk_status, "order_ids": parsed["order_ids"], "reasons": parsed.get("reasons") or []})
 
     try:
         after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
