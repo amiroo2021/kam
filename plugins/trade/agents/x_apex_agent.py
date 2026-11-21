@@ -3341,6 +3341,7 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
                             ))
     position_side = _apex_position_side(position_row)
     position_size = _apex_position_size(position_row)
+    fetched_size_raw = position_row.get("size")
 
     # Fallback to explicit size from the wizard request if the freshly
     # fetched position reports zero size (common on short positions or
@@ -3354,6 +3355,35 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
                     position_size = fallback
             except Exception:
                 pass
+        logger.warning(
+            "apex set_tp: fetched position size was non-positive "
+            "(symbol=%s account=%s raw_fetched_size=%r request_size=%r "
+            "resolved_size_after_fallback=%s)",
+            symbol, credentials.get("account"), fetched_size_raw,
+            req_size, position_size,
+        )
+
+    # Hard guard: never submit a reduce-only order with a non-positive
+    # size — Apex would otherwise reject it with a generic "Order size
+    # must be greater than 0" error that gives no indication the size
+    # resolution (not the price/symbol) was the actual problem. Fail
+    # fast here with a diagnosable error instead.
+    if tp_price > 0 and position_size <= 0:
+        return make_failure(operation="set_tp", exchange=name,
+                            account=credentials["account"],
+                            code="POSITION_SIZE_UNRESOLVED",
+                            message=(
+                                f"Could not resolve a positive size for the {symbol} "
+                                f"position (fetched={fetched_size_raw!r}, "
+                                f"request={request.get('size')!r}). Refresh "
+                                "Positions & Orders and try again."
+                            ),
+                            position_action=_apex_position_action_result(
+                                operation="set_tp", symbol=symbol, verified=False,
+                                status="failed", price=str(tp_price),
+                                current_side=position_side,
+                                current_size=str(position_size),
+                            ))
 
     # Negative or zero price → remove existing TP.
     if tp_price <= 0:
@@ -3529,6 +3559,49 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
                             ))
     position_side = _apex_position_side(position_row)
     position_size = _apex_position_size(position_row)
+    fetched_size_raw = position_row.get("size")
+
+    # Fallback to explicit size from the wizard request if the freshly
+    # fetched position reports zero size (same quirk seen in set_tp —
+    # common on short positions or certain Apex account_group views).
+    if position_size <= 0:
+        req_size = request.get("size")
+        if req_size:
+            try:
+                fallback = __import__("decimal").Decimal(str(req_size)).copy_abs()
+                if fallback > 0:
+                    position_size = fallback
+            except Exception:
+                pass
+        logger.warning(
+            "apex set_sl: fetched position size was non-positive "
+            "(symbol=%s account=%s raw_fetched_size=%r request_size=%r "
+            "resolved_size_after_fallback=%s)",
+            symbol, credentials.get("account"), fetched_size_raw,
+            req_size, position_size,
+        )
+
+    # Hard guard: never submit a reduce-only order with a non-positive
+    # size — Apex would otherwise reject it with a generic "Order size
+    # must be greater than 0" error that gives no indication the size
+    # resolution (not the price/symbol) was the actual problem. Fail
+    # fast here with a diagnosable error instead.
+    if sl_price > 0 and position_size <= 0:
+        return make_failure(operation="set_sl", exchange=name,
+                            account=credentials["account"],
+                            code="POSITION_SIZE_UNRESOLVED",
+                            message=(
+                                f"Could not resolve a positive size for the {symbol} "
+                                f"position (fetched={fetched_size_raw!r}, "
+                                f"request={request.get('size')!r}). Refresh "
+                                "Positions & Orders and try again."
+                            ),
+                            position_action=_apex_position_action_result(
+                                operation="set_sl", symbol=symbol, verified=False,
+                                status="failed", price=str(sl_price),
+                                current_side=position_side,
+                                current_size=str(position_size),
+                            ))
 
     if sl_price <= 0:
         cancelled = _apex_remove_existing_tpsl(
