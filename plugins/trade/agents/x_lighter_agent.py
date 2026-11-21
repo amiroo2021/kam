@@ -2677,43 +2677,22 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             exchange_reason=sanitize_error_message(str(exc))[:160],
         )
     try:
-        # One SignerClient for the WHOLE group so the SDK's nonce
-        # counter continues across consecutive batches. Building a new
-        # client per batch would re-seed the counter from the server's
-        # nextNonce and hand out colliding nonces (Phase 3 safety
-        # review).
-        cancel_signer = _build_signer_client(credentials)
-        chunk_starts = list(range(0, len(target_ids), LIGHTER_CANCEL_TX_BATCH_SIZE))
-        for batch_index, start in enumerate(chunk_starts):
-            # Preventive pacing — only between batches, never before the
-            # first or after the last.
-            if batch_index > 0:
-                time.sleep(LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS)
-            chunk_ids = target_ids[start:start + LIGHTER_CANCEL_TX_BATCH_SIZE]
-            outcome = _submit_cancel_tx_batch(
-                credentials=credentials,
-                market_id=market_id,
-                order_ids=chunk_ids,
-                signer=cancel_signer,
-            )
-            submitted_count += int(outcome.get("submitted_count") or 0)
-            accepted_count += int(outcome.get("accepted_count") or 0)
-            batches.append({
-                "batch_index": batch_index,
-                "order_ids": list(chunk_ids),
-                "submitted": int(outcome.get("submitted_count") or 0),
-                "accepted": int(outcome.get("accepted_count") or 0),
-                "rejected": int(outcome.get("rejected_count") or 0),
-                "unknown": int(outcome.get("unknown_count") or 0),
-                "outcome": outcome.get("outcome"),
-                "api_code": outcome.get("api_code"),
-                "api_message": outcome.get("api_message"),
-                "per_tx": outcome.get("per_tx"),
-            })
-            # Continuation gate: continue ONLY if the batch fully succeeded.
-            if outcome.get("outcome") != _LADDER_BATCH_OUTCOME_SUCCESS:
-                stop_reason = outcome
-                break
+        # Phase 4.1: run EVERY batch of this group on ONE event loop,
+        # with ONE SignerClient built inside that loop. A client per
+        # batch would re-seed the nonce counter from the server and
+        # re-sign the same nonces; a client built in the caller's
+        # context would be bound to a different loop than the one that
+        # uses it (aiohttp needs a live loop at construction AND use).
+        group = _run_cancel_tx_group(
+            credentials=credentials,
+            market_id=market_id,
+            target_ids=list(target_ids),
+        )
+        batches = list(group.get("batches") or [])
+        stop_reason = group.get("stop_reason")
+        for row in batches:
+            accepted_count += int(row.get("accepted") or 0)
+            submitted_count += int(row.get("submitted") or 0)
     finally:
         try:
             if cancel_lease_cm is not None:
@@ -2781,6 +2760,10 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             error_code = "RATE_LIMITED"
         elif oc == _LADDER_BATCH_OUTCOME_AMBIGUOUS:
             error_code = "CANCEL_AMBIGUOUS"
+        elif oc == _LADDER_BATCH_OUTCOME_LOCAL_FAILURE:
+            # Nothing was signed and nothing was sent. This is a definite
+            # local failure, NOT an ambiguous cancellation.
+            error_code = "CANCEL_LOCAL_FAILURE"
         else:
             error_code = "CANCEL_REJECTED"
 
@@ -2846,6 +2829,10 @@ _LADDER_BATCH_OUTCOME_SUCCESS = "success"
 _LADDER_BATCH_OUTCOME_RATE_LIMITED = "rate_limited"
 _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED = "exchange_rejected"
 _LADDER_BATCH_OUTCOME_AMBIGUOUS = "ambiguous"
+# A DEFINITE LOCAL failure: nothing was signed and nothing was sent
+# (e.g. the SignerClient could not be constructed). Distinct from
+# AMBIGUOUS, which means a transaction MAY have reached the exchange.
+_LADDER_BATCH_OUTCOME_LOCAL_FAILURE = "local_failure"
 _LADDER_BATCH_OUTCOME_INSUFFICIENT_MARGIN = "insufficient_margin"
 _LADDER_BATCH_OUTCOME_INVALID_ORDER = "invalid_order"
 _LADDER_BATCH_OUTCOME_PRICE_TOO_FAR = "price_too_far_from_mark"
@@ -4006,15 +3993,24 @@ def _submit_send_tx_batch(
         }
 
 
-def _submit_cancel_tx_batch(
+async def _submit_cancel_tx_batch_async(
     *,
     credentials: Dict[str, Any],
     market_id: int,
     order_ids: List[int],
-    signer: Optional[Any] = None,
+    signer: Any,
 ) -> Dict[str, Any]:
     """Submit one ``send_tx_batch`` HTTP request carrying N independent
     L2CancelOrder transactions (tx_type=15). NO automatic retry.
+
+    ASYNC CORE — MUST be awaited on the event loop that owns ``signer``.
+
+    The SDK's ``SignerClient`` creates an ``aiohttp.ClientSession`` at
+    construction time, and aiohttp requires a live event loop at BOTH
+    construction and use. The client is therefore built by the CALLER,
+    inside the loop that will use it, and passed in here. One client
+    spans every batch of a cancel group, so the SDK's nonce counter
+    stays consecutive across batch boundaries (Phase 4.1).
 
     Mirrors ``_submit_send_tx_batch`` but for cancellations. Each
     target order is signed via ``signer.sign_cancel_order`` with an
@@ -4058,6 +4054,466 @@ def _submit_cancel_tx_batch(
       ``nonces``             per-target nonces used
       ``order_to_tx_hash``   zip(order_ids, response.tx_hash)
     """
+    last_send_tx_batch_exc_holder: List[Any] = [None]
+
+    # The client is ALWAYS supplied by the caller, which built it on
+    # THIS loop. Building one here would bind an aiohttp session to a
+    # different loop than the one that uses it (Phase 4.1).
+    batch_signer = signer
+    api_key_index = int(credentials["api_key_index"])
+    # ------------------------------------------------------------------
+    # 0. L2 transaction-budget check (shared L1-address quota).
+    # N L2CancelOrder transactions consume N against the same rolling
+    # 60s budget used by the ladder create path.
+    # ------------------------------------------------------------------
+    policy = _get_lighter_tier_policy(credentials)
+    budget = _get_lighter_tier_budget(credentials, policy, kind="cancel")
+    try:
+        budget.wait_for_capacity(len(order_ids))
+    except _LighterBudgetExhausted as exc:
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+            "tx_hashes": [],
+            "submitted_count": len(order_ids),
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "unknown_count": 0,
+            "api_code": 23000,
+            "api_message": sanitize_error_message(str(exc)),
+            "raw_response": None,
+            "nonces": [],
+            "order_to_tx_hash": {},
+            "per_tx": [],
+            "rate_limit_reason": sanitize_error_message(str(exc)),
+            "tier_policy": policy.describe(),
+        }
+    # ------------------------------------------------------------------
+    # 1. Reserve nonces for every cancel in this batch.
+    # ------------------------------------------------------------------
+    try:
+        nonces = await _reserve_ladder_nonces(
+            signer=batch_signer,
+            api_key_index=api_key_index,
+            count=len(order_ids),
+            credentials=credentials,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_AMBIGUOUS,
+            "tx_hashes": [],
+            "submitted_count": 0,
+            "api_code": None,
+            "api_message": sanitize_error_message(str(exc)),
+            "raw_response": None,
+            "nonces": [],
+            "order_to_tx_hash": {},
+            "per_tx": [],
+            "ambiguity_reason": "nonce reservation failed",
+        }
+
+    # ------------------------------------------------------------------
+    # 2. Sign each cancel independently via sign_cancel_order.
+    # ------------------------------------------------------------------
+    tx_types: List[int] = []
+    tx_infos: List[str] = []
+    signed_hashes: List[str] = []
+    sign_failed = False
+    sign_failure_msg = ""
+    try:
+        for order_id, nonce in zip(order_ids, nonces):
+            # sign_cancel_order is the sync method on SignerClient
+            # that returns (tx_type, tx_info, tx_hash, error)
+            # without going through the network. tx_type is 15
+            # (L2CancelOrder) per the native batch_signer.
+            tx_type, tx_info, tx_hash, error = batch_signer.sign_cancel_order(
+                int(market_id),
+                int(order_id),
+                batch_signer.SKIP_NONCE_OFF,
+                int(nonce),
+                api_key_index,
+            )
+            if error is not None:
+                sign_failed = True
+                sign_failure_msg = sanitize_error_message(str(error))
+                break
+            tx_types.append(int(tx_type))
+            tx_infos.append(tx_info)
+            signed_hashes.append(tx_hash)
+    except Exception as exc:  # noqa: BLE001
+        sign_failed = True
+        sign_failure_msg = sanitize_error_message(str(exc))
+
+    if sign_failed:
+        # Roll back ALL nonces reserved for this batch.
+        for _ in range(len(nonces)):
+            try:
+                batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
+            "tx_hashes": [],
+            "submitted_count": 0,
+            "api_code": None,
+            "api_message": sign_failure_msg or "Sign-time failure",
+            "raw_response": None,
+            "nonces": list(nonces),
+            "order_to_tx_hash": {},
+            "per_tx": [],
+            "ambiguity_reason": "sign failure",
+        }
+
+    # ------------------------------------------------------------------
+    # 3. Submit through send_tx_batch — one HTTP request.
+    # ------------------------------------------------------------------
+    api_response = None
+    submit_error: Optional[str] = None
+    try:
+        api_response = await batch_signer.send_tx_batch(
+            tx_types=tx_types, tx_infos=tx_infos
+        )
+    except Exception as exc:  # noqa: BLE001
+        submit_error = sanitize_error_message(str(exc))
+        last_send_tx_batch_exc_holder[0] = exc
+
+    if submit_error is not None:
+        envelope_failure = _classify_send_tx_batch_envelope_failure(
+            last_send_tx_batch_exc_holder[0]
+            if last_send_tx_batch_exc_holder[0] is not None
+            else RuntimeError(submit_error)
+        )
+        if not envelope_failure["ambiguity"]:
+            # Backend definitively rejected the batch envelope.
+            # Nonces were not consumed. Roll them back.
+            for _ in range(len(nonces)):
+                try:
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "outcome": envelope_failure["outcome"],
+                "tx_hashes": [],
+                "submitted_count": len(order_ids),
+                "accepted_count": 0,
+                "rejected_count": len(order_ids),
+                "unknown_count": 0,
+                "api_code": envelope_failure["code"],
+                "api_message": envelope_failure["reason"]
+                or "Backend rejected the batch",
+                "raw_response": None,
+                "nonces": list(nonces),
+                "order_to_tx_hash": {},
+                "per_tx": [
+                    {
+                        "index": i,
+                        "order_id": int(oid),
+                        "status": _LIGHTER_PER_TX_API_REJECTED,
+                        "tx_hash": None,
+                        "reason": envelope_failure["reason"]
+                        or "Backend rejected the batch",
+                    }
+                    for i, oid in enumerate(order_ids)
+                ],
+            }
+        # Genuine transport ambiguity. Promote definite rate-limit.
+        #
+        # NOTE: ``exc`` is deleted by Python when its ``except``
+        # block ends, so the original exception is read from
+        # ``last_send_tx_batch_exc_holder`` — never from ``exc``.
+        transport_exc = last_send_tx_batch_exc_holder[0]
+        if transport_exc is None:
+            transport_exc = RuntimeError(submit_error)
+        backend_code_from_exc = _extract_backend_code_from_exception(transport_exc)
+        exc_status = (
+            getattr(transport_exc, "status", None)
+            or getattr(transport_exc, "status_code", None)
+        )
+        is_rate_limit = (
+            backend_code_from_exc == 23000
+            or exc_status == 429
+            or "Too Many Requests" in submit_error
+        )
+        if is_rate_limit:
+            # Envelope never reached the sequencer. Roll back budget
+            # slots and nonces so a future batch can use them.
+            budget.rollback(len(order_ids))
+            for _ in range(len(nonces)):
+                try:
+                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                except Exception:  # noqa: BLE001
+                    pass
+            sanitized_exc_msg = sanitize_lighter_message(submit_error)
+            return {
+                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+                "tx_hashes": [],
+                "submitted_count": len(order_ids),
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "unknown_count": 0,
+                "api_code": 23000 if backend_code_from_exc == 23000 else None,
+                "api_message": sanitized_exc_msg
+                or "Too Many Requests: 40 requests per 60 second is allowed",
+                "raw_response": None,
+                "nonces": list(nonces),
+                "order_to_tx_hash": {},
+                "per_tx": [],
+                "rate_limit_reason": "Too Many Requests: 40 requests per 60 second is allowed",
+            }
+        # Genuine transport ambiguity. Do NOT rollback nonces.
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_AMBIGUOUS,
+            "tx_hashes": [],
+            "submitted_count": len(order_ids),
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "unknown_count": len(order_ids),
+            "api_code": None,
+            "api_message": sanitize_lighter_message(submit_error),
+            "raw_response": None,
+            "nonces": list(nonces),
+            "order_to_tx_hash": {},
+            "ambiguity_reason": "transport exception during send_tx_batch; "
+            "nonces NOT rolled back per Lighter nonce contract",
+            "per_tx": [
+                {
+                    "index": i,
+                    "order_id": int(oid),
+                    "status": _LIGHTER_PER_TX_UNKNOWN,
+                    "tx_hash": None,
+                    "reason": "transport exception",
+                }
+                for i, oid in enumerate(order_ids)
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # 4. Classify the envelope response (per-tx).
+    # ------------------------------------------------------------------
+    api_code = getattr(api_response, "code", None)
+    api_message = str(getattr(api_response, "message", "") or "").strip()
+    try:
+        code_int = int(api_code) if api_code is not None else 0
+    except (TypeError, ValueError):
+        code_int = 0
+
+    # Reuse the per-tx classifier, keyed on order_ids as the
+    # "client_order_indices" so each cancel maps 1:1 to a tx_hash.
+    per_tx = _classify_send_tx_batch_per_tx(
+        client_order_indices=list(order_ids),
+        api_response=api_response,
+        envelope_code=code_int,
+        envelope_message=api_message,
+    )
+    # Re-key per_tx entries from client_order_index -> order_id for
+    # the cancel canonical result.
+    for entry in per_tx:
+        entry["order_id"] = entry.pop("client_order_index")
+    response_tx_hashes = [
+        (entry.get("tx_hash") or "") for entry in per_tx
+    ]
+    accepted_count = sum(
+        1 for entry in per_tx
+        if entry.get("status") == _LIGHTER_PER_TX_API_ACCEPTED
+    )
+    rejected_count = sum(
+        1 for entry in per_tx
+        if entry.get("status") == _LIGHTER_PER_TX_API_REJECTED
+    )
+    unknown_count = sum(
+        1 for entry in per_tx
+        if entry.get("status") == _LIGHTER_PER_TX_UNKNOWN
+    )
+    order_to_tx_hash: Dict[int, Optional[str]] = {
+        int(entry["order_id"]): entry.get("tx_hash") for entry in per_tx
+    }
+    sanitized_msg = sanitize_lighter_message(api_message) if api_message else ""
+
+    if code_int == 23000:
+        for _ in range(len(nonces)):
+            try:
+                batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
+            "tx_hashes": response_tx_hashes,
+            "submitted_count": len(order_ids),
+            "accepted_count": 0,
+            "rejected_count": len(order_ids),
+            "unknown_count": 0,
+            "api_code": code_int,
+            "api_message": sanitized_msg or "Too Many Requests",
+            "raw_response": api_response,
+            "nonces": list(nonces),
+            "order_to_tx_hash": order_to_tx_hash,
+            "per_tx": per_tx,
+        }
+    if code_int != 200:
+        # Envelope-level rejection (non-200, non-23000). Roll back.
+        for _ in range(len(nonces)):
+            try:
+                batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "outcome": _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
+            "tx_hashes": response_tx_hashes,
+            "submitted_count": len(order_ids),
+            "accepted_count": 0,
+            "rejected_count": len(order_ids),
+            "unknown_count": 0,
+            "api_code": code_int,
+            "api_message": sanitized_msg or "Exchange rejected the batch",
+            "raw_response": api_response,
+            "nonces": list(nonces),
+            "order_to_tx_hash": order_to_tx_hash,
+            "per_tx": per_tx,
+        }
+
+    # code_int == 200 — envelope accepted. Pick batch outcome.
+    batch_outcome = (
+        _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED
+        if rejected_count > 0
+        else _LADDER_BATCH_OUTCOME_SUCCESS
+    )
+    return {
+        "outcome": batch_outcome,
+        "tx_hashes": response_tx_hashes,
+        "submitted_count": len(order_ids),
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "unknown_count": unknown_count,
+        "api_code": code_int,
+        "api_message": sanitized_msg,
+        "raw_response": api_response,
+        "nonces": list(nonces),
+        "order_to_tx_hash": order_to_tx_hash,
+        "per_tx": per_tx,
+    }
+
+
+def _run_cancel_tx_group(
+    *,
+    credentials: Dict[str, Any],
+    market_id: int,
+    target_ids: List[int],
+) -> Dict[str, Any]:
+    """Run EVERY cancel batch of one group on ONE event loop.
+
+    The SDK's ``SignerClient`` creates an ``aiohttp.ClientSession`` at
+    construction time, and aiohttp requires a live event loop at BOTH
+    construction and use. It must therefore be built AND used on the
+    same loop.
+
+    The whole group is bridged as a SINGLE coroutine so that:
+
+      * one client spans every batch, so the SDK's nonce counter stays
+        strictly consecutive across batch boundaries (a new client per
+        batch would re-seed from the server's ``nextNonce`` and
+        re-sign the same nonces);
+      * the client is built and closed on the loop that owns it;
+      * a synchronous CLI caller (no running loop) and the gateway
+        (a running loop) both work.
+
+    Returns ``{"batches": [...], "stop_reason": {...} | None}``.
+
+    The caller must already hold the per-account nonce lease.
+    """
+    chunk_size = max(1, int(LIGHTER_CANCEL_TX_BATCH_SIZE))
+    chunk_starts = list(range(0, len(target_ids), chunk_size))
+
+    async def _run_group() -> Dict[str, Any]:
+        client = _build_signer_client(credentials)
+        batch_rows: List[Dict[str, Any]] = []
+        stop_reason: Optional[Dict[str, Any]] = None
+        try:
+            for batch_index, start in enumerate(chunk_starts):
+                # Preventive pacing — only between batches, never
+                # before the first or after the last.
+                if batch_index > 0:
+                    await asyncio.sleep(LIGHTER_CANCEL_TX_BATCH_PAUSE_SECONDS)
+                chunk_ids = target_ids[start:start + chunk_size]
+                outcome = await _submit_cancel_tx_batch_async(
+                    credentials=credentials,
+                    market_id=market_id,
+                    order_ids=chunk_ids,
+                    signer=client,
+                )
+                batch_rows.append({
+                    "batch_index": batch_index,
+                    "order_ids": list(chunk_ids),
+                    "submitted": int(outcome.get("submitted_count") or 0),
+                    "accepted": int(outcome.get("accepted_count") or 0),
+                    "rejected": int(outcome.get("rejected_count") or 0),
+                    "unknown": int(outcome.get("unknown_count") or 0),
+                    "outcome": outcome.get("outcome"),
+                    "api_code": outcome.get("api_code"),
+                    "api_message": outcome.get("api_message"),
+                    "per_tx": outcome.get("per_tx"),
+                })
+                # Continuation gate: continue ONLY if the batch fully
+                # succeeded. No blind retries.
+                if outcome.get("outcome") != _LADDER_BATCH_OUTCOME_SUCCESS:
+                    stop_reason = outcome
+                    break
+        finally:
+            # Close the client on the loop that owns it.
+            closer = getattr(client, "close", None)
+            if closer is not None:
+                try:
+                    result = closer()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"batches": batch_rows, "stop_reason": stop_reason}
+
+    try:
+        return _run_lighter_coro_blocking(
+            credentials,
+            lambda: _run_group(),
+            thread_name="lighter-cancel-tx-group",
+            max_retries=0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The coroutine failed BEFORE any batch was attempted (e.g. the
+        # SignerClient could not be constructed). Nothing was signed and
+        # nothing was sent, so this is a DEFINITE local failure — NOT
+        # ambiguous. Report it as such.
+        return {
+            "batches": [],
+            "stop_reason": {
+                "outcome": _LADDER_BATCH_OUTCOME_LOCAL_FAILURE,
+                "api_code": None,
+                "api_message": sanitize_error_message(str(exc)),
+                "submitted_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "unknown_count": 0,
+                "batches_attempted": 0,
+                "local_failure_reason": "cancel group could not start",
+            },
+        }
+
+
+def _submit_cancel_tx_batch(
+    *,
+    credentials: Dict[str, Any],
+    market_id: int,
+    order_ids: List[int],
+    signer: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Submit ONE cancel batch from a synchronous caller.
+
+    Builds the SignerClient INSIDE the loop that will use it, and closes
+    it on that same loop. The SDK creates an aiohttp session at
+    construction time and aiohttp needs a live loop at BOTH construction
+    and use (Phase 4.1).
+
+    The multi-batch cancel GROUP must use ``_run_cancel_tx_group`` so
+    that ONE client — and therefore ONE consecutive nonce stream —
+    spans every batch.
+    """
     if len(order_ids) == 0:
         return {
             "outcome": _LADDER_BATCH_OUTCOME_SUCCESS,
@@ -4071,356 +4527,29 @@ def _submit_cancel_tx_batch(
             "per_tx": [],
         }
 
-    last_send_tx_batch_exc_holder: List[Any] = [None]
-
-    async def _run_batch() -> Dict[str, Any]:
-        # Reuse the caller's signer when supplied so the SDK's nonce
-        # counter continues across batches. Building a NEW client per
-        # batch would re-seed the counter from the server's nextNonce
-        # and hand out colliding nonces (Phase 3 safety review).
-        batch_signer = signer if signer is not None else _build_signer_client(credentials)
-        api_key_index = int(credentials["api_key_index"])
-        # ------------------------------------------------------------------
-        # 0. L2 transaction-budget check (shared L1-address quota).
-        # N L2CancelOrder transactions consume N against the same rolling
-        # 60s budget used by the ladder create path.
-        # ------------------------------------------------------------------
-        policy = _get_lighter_tier_policy(credentials)
-        budget = _get_lighter_tier_budget(credentials, policy, kind="cancel")
+    async def _run() -> Dict[str, Any]:
+        client = signer if signer is not None else _build_signer_client(credentials)
         try:
-            budget.wait_for_capacity(len(order_ids))
-        except _LighterBudgetExhausted as exc:
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
-                "tx_hashes": [],
-                "submitted_count": len(order_ids),
-                "accepted_count": 0,
-                "rejected_count": 0,
-                "unknown_count": 0,
-                "api_code": 23000,
-                "api_message": sanitize_error_message(str(exc)),
-                "raw_response": None,
-                "nonces": [],
-                "order_to_tx_hash": {},
-                "per_tx": [],
-                "rate_limit_reason": sanitize_error_message(str(exc)),
-                "tier_policy": policy.describe(),
-            }
-        # ------------------------------------------------------------------
-        # 1. Reserve nonces for every cancel in this batch.
-        # ------------------------------------------------------------------
-        try:
-            nonces = await _reserve_ladder_nonces(
-                signer=batch_signer,
-                api_key_index=api_key_index,
-                count=len(order_ids),
+            return await _submit_cancel_tx_batch_async(
                 credentials=credentials,
+                market_id=market_id,
+                order_ids=order_ids,
+                signer=client,
             )
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_AMBIGUOUS,
-                "tx_hashes": [],
-                "submitted_count": 0,
-                "api_code": None,
-                "api_message": sanitize_error_message(str(exc)),
-                "raw_response": None,
-                "nonces": [],
-                "order_to_tx_hash": {},
-                "per_tx": [],
-                "ambiguity_reason": "nonce reservation failed",
-            }
-
-        # ------------------------------------------------------------------
-        # 2. Sign each cancel independently via sign_cancel_order.
-        # ------------------------------------------------------------------
-        tx_types: List[int] = []
-        tx_infos: List[str] = []
-        signed_hashes: List[str] = []
-        sign_failed = False
-        sign_failure_msg = ""
-        try:
-            for order_id, nonce in zip(order_ids, nonces):
-                # sign_cancel_order is the sync method on SignerClient
-                # that returns (tx_type, tx_info, tx_hash, error)
-                # without going through the network. tx_type is 15
-                # (L2CancelOrder) per the native batch_signer.
-                tx_type, tx_info, tx_hash, error = batch_signer.sign_cancel_order(
-                    int(market_id),
-                    int(order_id),
-                    batch_signer.SKIP_NONCE_OFF,
-                    int(nonce),
-                    api_key_index,
-                )
-                if error is not None:
-                    sign_failed = True
-                    sign_failure_msg = sanitize_error_message(str(error))
-                    break
-                tx_types.append(int(tx_type))
-                tx_infos.append(tx_info)
-                signed_hashes.append(tx_hash)
-        except Exception as exc:  # noqa: BLE001
-            sign_failed = True
-            sign_failure_msg = sanitize_error_message(str(exc))
-
-        if sign_failed:
-            # Roll back ALL nonces reserved for this batch.
-            for _ in range(len(nonces)):
+        finally:
+            closer = getattr(client, "close", None)
+            if closer is not None:
                 try:
-                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
+                    result = closer()
+                    if hasattr(result, "__await__"):
+                        await result
                 except Exception:  # noqa: BLE001
                     pass
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
-                "tx_hashes": [],
-                "submitted_count": 0,
-                "api_code": None,
-                "api_message": sign_failure_msg or "Sign-time failure",
-                "raw_response": None,
-                "nonces": list(nonces),
-                "order_to_tx_hash": {},
-                "per_tx": [],
-                "ambiguity_reason": "sign failure",
-            }
 
-        # ------------------------------------------------------------------
-        # 3. Submit through send_tx_batch — one HTTP request.
-        # ------------------------------------------------------------------
-        api_response = None
-        submit_error: Optional[str] = None
-        try:
-            api_response = await batch_signer.send_tx_batch(
-                tx_types=tx_types, tx_infos=tx_infos
-            )
-        except Exception as exc:  # noqa: BLE001
-            submit_error = sanitize_error_message(str(exc))
-            last_send_tx_batch_exc_holder[0] = exc
-
-        if submit_error is not None:
-            envelope_failure = _classify_send_tx_batch_envelope_failure(
-                last_send_tx_batch_exc_holder[0]
-                if last_send_tx_batch_exc_holder[0] is not None
-                else RuntimeError(submit_error)
-            )
-            if not envelope_failure["ambiguity"]:
-                # Backend definitively rejected the batch envelope.
-                # Nonces were not consumed. Roll them back.
-                for _ in range(len(nonces)):
-                    try:
-                        batch_signer.nonce_manager.acknowledge_failure(api_key_index)
-                    except Exception:  # noqa: BLE001
-                        pass
-                return {
-                    "outcome": envelope_failure["outcome"],
-                    "tx_hashes": [],
-                    "submitted_count": len(order_ids),
-                    "accepted_count": 0,
-                    "rejected_count": len(order_ids),
-                    "unknown_count": 0,
-                    "api_code": envelope_failure["code"],
-                    "api_message": envelope_failure["reason"]
-                    or "Backend rejected the batch",
-                    "raw_response": None,
-                    "nonces": list(nonces),
-                    "order_to_tx_hash": {},
-                    "per_tx": [
-                        {
-                            "index": i,
-                            "order_id": int(oid),
-                            "status": _LIGHTER_PER_TX_API_REJECTED,
-                            "tx_hash": None,
-                            "reason": envelope_failure["reason"]
-                            or "Backend rejected the batch",
-                        }
-                        for i, oid in enumerate(order_ids)
-                    ],
-                }
-            # Genuine transport ambiguity. Promote definite rate-limit.
-            #
-            # NOTE: ``exc`` is deleted by Python when its ``except``
-            # block ends, so the original exception is read from
-            # ``last_send_tx_batch_exc_holder`` — never from ``exc``.
-            transport_exc = last_send_tx_batch_exc_holder[0]
-            if transport_exc is None:
-                transport_exc = RuntimeError(submit_error)
-            backend_code_from_exc = _extract_backend_code_from_exception(transport_exc)
-            exc_status = (
-                getattr(transport_exc, "status", None)
-                or getattr(transport_exc, "status_code", None)
-            )
-            is_rate_limit = (
-                backend_code_from_exc == 23000
-                or exc_status == 429
-                or "Too Many Requests" in submit_error
-            )
-            if is_rate_limit:
-                # Envelope never reached the sequencer. Roll back budget
-                # slots and nonces so a future batch can use them.
-                budget.rollback(len(order_ids))
-                for _ in range(len(nonces)):
-                    try:
-                        batch_signer.nonce_manager.acknowledge_failure(api_key_index)
-                    except Exception:  # noqa: BLE001
-                        pass
-                sanitized_exc_msg = sanitize_lighter_message(submit_error)
-                return {
-                    "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
-                    "tx_hashes": [],
-                    "submitted_count": len(order_ids),
-                    "accepted_count": 0,
-                    "rejected_count": 0,
-                    "unknown_count": 0,
-                    "api_code": 23000 if backend_code_from_exc == 23000 else None,
-                    "api_message": sanitized_exc_msg
-                    or "Too Many Requests: 40 requests per 60 second is allowed",
-                    "raw_response": None,
-                    "nonces": list(nonces),
-                    "order_to_tx_hash": {},
-                    "per_tx": [],
-                    "rate_limit_reason": "Too Many Requests: 40 requests per 60 second is allowed",
-                }
-            # Genuine transport ambiguity. Do NOT rollback nonces.
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_AMBIGUOUS,
-                "tx_hashes": [],
-                "submitted_count": len(order_ids),
-                "accepted_count": 0,
-                "rejected_count": 0,
-                "unknown_count": len(order_ids),
-                "api_code": None,
-                "api_message": sanitize_lighter_message(submit_error),
-                "raw_response": None,
-                "nonces": list(nonces),
-                "order_to_tx_hash": {},
-                "ambiguity_reason": "transport exception during send_tx_batch; "
-                "nonces NOT rolled back per Lighter nonce contract",
-                "per_tx": [
-                    {
-                        "index": i,
-                        "order_id": int(oid),
-                        "status": _LIGHTER_PER_TX_UNKNOWN,
-                        "tx_hash": None,
-                        "reason": "transport exception",
-                    }
-                    for i, oid in enumerate(order_ids)
-                ],
-            }
-
-        # ------------------------------------------------------------------
-        # 4. Classify the envelope response (per-tx).
-        # ------------------------------------------------------------------
-        api_code = getattr(api_response, "code", None)
-        api_message = str(getattr(api_response, "message", "") or "").strip()
-        try:
-            code_int = int(api_code) if api_code is not None else 0
-        except (TypeError, ValueError):
-            code_int = 0
-
-        # Reuse the per-tx classifier, keyed on order_ids as the
-        # "client_order_indices" so each cancel maps 1:1 to a tx_hash.
-        per_tx = _classify_send_tx_batch_per_tx(
-            client_order_indices=list(order_ids),
-            api_response=api_response,
-            envelope_code=code_int,
-            envelope_message=api_message,
-        )
-        # Re-key per_tx entries from client_order_index -> order_id for
-        # the cancel canonical result.
-        for entry in per_tx:
-            entry["order_id"] = entry.pop("client_order_index")
-        response_tx_hashes = [
-            (entry.get("tx_hash") or "") for entry in per_tx
-        ]
-        accepted_count = sum(
-            1 for entry in per_tx
-            if entry.get("status") == _LIGHTER_PER_TX_API_ACCEPTED
-        )
-        rejected_count = sum(
-            1 for entry in per_tx
-            if entry.get("status") == _LIGHTER_PER_TX_API_REJECTED
-        )
-        unknown_count = sum(
-            1 for entry in per_tx
-            if entry.get("status") == _LIGHTER_PER_TX_UNKNOWN
-        )
-        order_to_tx_hash: Dict[int, Optional[str]] = {
-            int(entry["order_id"]): entry.get("tx_hash") for entry in per_tx
-        }
-        sanitized_msg = sanitize_lighter_message(api_message) if api_message else ""
-
-        if code_int == 23000:
-            for _ in range(len(nonces)):
-                try:
-                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
-                except Exception:  # noqa: BLE001
-                    pass
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_RATE_LIMITED,
-                "tx_hashes": response_tx_hashes,
-                "submitted_count": len(order_ids),
-                "accepted_count": 0,
-                "rejected_count": len(order_ids),
-                "unknown_count": 0,
-                "api_code": code_int,
-                "api_message": sanitized_msg or "Too Many Requests",
-                "raw_response": api_response,
-                "nonces": list(nonces),
-                "order_to_tx_hash": order_to_tx_hash,
-                "per_tx": per_tx,
-            }
-        if code_int != 200:
-            # Envelope-level rejection (non-200, non-23000). Roll back.
-            for _ in range(len(nonces)):
-                try:
-                    batch_signer.nonce_manager.acknowledge_failure(api_key_index)
-                except Exception:  # noqa: BLE001
-                    pass
-            return {
-                "outcome": _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED,
-                "tx_hashes": response_tx_hashes,
-                "submitted_count": len(order_ids),
-                "accepted_count": 0,
-                "rejected_count": len(order_ids),
-                "unknown_count": 0,
-                "api_code": code_int,
-                "api_message": sanitized_msg or "Exchange rejected the batch",
-                "raw_response": api_response,
-                "nonces": list(nonces),
-                "order_to_tx_hash": order_to_tx_hash,
-                "per_tx": per_tx,
-            }
-
-        # code_int == 200 — envelope accepted. Pick batch outcome.
-        batch_outcome = (
-            _LADDER_BATCH_OUTCOME_EXCHANGE_REJECTED
-            if rejected_count > 0
-            else _LADDER_BATCH_OUTCOME_SUCCESS
-        )
-        return {
-            "outcome": batch_outcome,
-            "tx_hashes": response_tx_hashes,
-            "submitted_count": len(order_ids),
-            "accepted_count": accepted_count,
-            "rejected_count": rejected_count,
-            "unknown_count": unknown_count,
-            "api_code": code_int,
-            "api_message": sanitized_msg,
-            "raw_response": api_response,
-            "nonces": list(nonces),
-            "order_to_tx_hash": order_to_tx_hash,
-            "per_tx": per_tx,
-        }
-
-    # Wrap in the per-L1 sliding-window limiter (1 HTTP slot per
-    # send_tx_batch). No retry at this layer — KAM safety contract.
-    #
-    # ``_run_lighter_coro_blocking`` bridges the coroutine safely whether
-    # or not the calling thread already has a running event loop (the
-    # Hermes/Telegram gateway loop). It never calls ``asyncio.run`` on a
-    # thread that already has a running loop.
     try:
         return _run_lighter_coro_blocking(
             credentials,
-            lambda: _run_batch(),
+            lambda: _run(),
             thread_name="lighter-cancel-tx-batch",
             max_retries=0,
         )
