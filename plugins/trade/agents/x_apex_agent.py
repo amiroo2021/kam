@@ -2747,13 +2747,73 @@ def _apex_fetch_positions(client: Any) -> List[Mapping[str, Any]]:
 
 def _apex_find_position(positions: List[Mapping[str, Any]],
                         symbol: str,
+                        *,
+                        side: Optional[str] = None,
                         ) -> Optional[Mapping[str, Any]]:
-    """Find an open position matching ``symbol`` (case-insensitive)."""
+    """Find an open position matching ``symbol`` (case-insensitive).
+
+    Apex account snapshots can carry more than one row for the same
+    ``symbol`` — e.g. a residual zero-size row left over after a
+    close-and-reopen or a side flip, sitting alongside the real open
+    position. Returning the first match unconditionally (the original
+    behavior here) can hand the caller that stale zero-size row even
+    though a real, non-zero position exists elsewhere in the same
+    list — this is the actual root cause of the class of bug where the
+    Positions & Orders screen shows a real size (it filters zero-size
+    rows out in ``_normalize_positions``) while a TP/SL/close call
+    fetches a fresh snapshot and lands on the zero-size row instead.
+
+    Disambiguation order when more than one row matches ``symbol``:
+      1. Prefer rows with a strictly positive size
+         (``_apex_position_size(row) > 0``) — a flat/residual row is
+         never the position the caller wants to act on.
+      2. Among rows tied on (1), prefer the row whose side matches
+         ``side`` when the caller supplied a hint (``"long"``/``"short"``
+         — typically derived from the side already displayed to the
+         user before they confirmed the action).
+      3. Otherwise fall back to the first matching row (preserves the
+         previous behavior for the common single-row case and for any
+         exotic row shape that happens to defeat the two checks above).
+    """
     target = symbol.upper()
-    for row in positions:
-        row_symbol = str(row.get("symbol") or "").upper()
-        if row_symbol == target:
-            return row
+    candidates = [
+        row for row in positions
+        if str(row.get("symbol") or "").upper() == target
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    normalized_side = str(side or "").strip().lower() or None
+
+    def _rank(row: Mapping[str, Any]) -> Tuple[bool, bool]:
+        has_positive_size = _apex_position_size(row) > 0
+        side_matches = normalized_side is None or _apex_position_side(row) == normalized_side
+        return (has_positive_size, side_matches)
+
+    best = candidates[0]
+    best_rank = _rank(best)
+    for row in candidates[1:]:
+        row_rank = _rank(row)
+        if row_rank > best_rank:
+            best = row
+            best_rank = row_rank
+    return best
+
+
+def _apex_side_hint(request: Mapping[str, Any]) -> Optional[str]:
+    """Map the wizard's request-side convention (``buy``/``sell``, or the
+    ``long``/``short`` display convention) to the ``long``/``short`` form
+    ``_apex_position_side`` returns, for use as a position-disambiguation
+    hint. Returns ``None`` when the request carries no usable side —
+    callers must treat that as \"no hint available\", never as a signal to
+    guess or default a position.
+    """
+    raw = str(request.get("side") or "").strip().lower()
+    if raw in {"buy", "long"}:
+        return "long"
+    if raw in {"sell", "short"}:
+        return "short"
     return None
 
 
@@ -3327,9 +3387,12 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
                             code="APEX_ERROR",
                             message=sanitize_error_message(str(exc)))
 
-    # Find the open position
+    # Find the open position. Pass the side the wizard displayed as a
+    # disambiguation hint — when Apex's snapshot carries more than one
+    # row for this symbol (see _apex_find_position), this picks the
+    # real open position instead of a stale zero-size residual row.
     positions = _apex_fetch_positions(client)
-    position_row = _apex_find_position(positions, symbol)
+    position_row = _apex_find_position(positions, symbol, side=_apex_side_hint(request))
     if position_row is None:
         return make_failure(operation="set_tp", exchange=name,
                             account=credentials["account"],
@@ -3343,39 +3406,29 @@ def _apex_set_tp(request: Dict[str, Any]) -> CanonicalResponse:
     position_size = _apex_position_size(position_row)
     fetched_size_raw = position_row.get("size")
 
-    # Fallback to explicit size from the wizard request if the freshly
-    # fetched position reports zero size (common on short positions or
-    # certain Apex account_group views).
-    if position_size <= 0:
-        req_size = request.get("size")
-        if req_size:
-            try:
-                fallback = __import__("decimal").Decimal(str(req_size)).copy_abs()
-                if fallback > 0:
-                    position_size = fallback
-            except Exception:
-                pass
-        logger.warning(
-            "apex set_tp: fetched position size was non-positive "
-            "(symbol=%s account=%s raw_fetched_size=%r request_size=%r "
-            "resolved_size_after_fallback=%s)",
-            symbol, credentials.get("account"), fetched_size_raw,
-            req_size, position_size,
-        )
-
-    # Hard guard: never submit a reduce-only order with a non-positive
-    # size — Apex would otherwise reject it with a generic "Order size
-    # must be greater than 0" error that gives no indication the size
-    # resolution (not the price/symbol) was the actual problem. Fail
-    # fast here with a diagnosable error instead.
+    # Hard guard: never substitute a stale wizard-displayed size and
+    # never submit a reduce-only order with a non-positive size. If the
+    # freshly fetched, correctly-disambiguated position row still has no
+    # positive size, the position genuinely cannot be verified right
+    # now — fail loudly and diagnosably instead of guessing. (Apex would
+    # otherwise reject size=0 with a generic "Order size must be greater
+    # than 0" error that gives no indication size resolution failed.)
     if tp_price > 0 and position_size <= 0:
+        logger.warning(
+            "apex set_tp: fresh position size was non-positive after "
+            "disambiguation (symbol=%s account=%s side_hint=%r "
+            "raw_fetched_size=%r candidate_count=%d)",
+            symbol, credentials.get("account"), _apex_side_hint(request),
+            fetched_size_raw,
+            sum(1 for r in positions if str(r.get("symbol") or "").upper() == symbol.upper()),
+        )
         return make_failure(operation="set_tp", exchange=name,
                             account=credentials["account"],
                             code="POSITION_SIZE_UNRESOLVED",
                             message=(
-                                f"Could not resolve a positive size for the {symbol} "
-                                f"position (fetched={fetched_size_raw!r}, "
-                                f"request={request.get('size')!r}). Refresh "
+                                f"Could not verify a positive size for the {symbol} "
+                                f"position from Apex's live snapshot "
+                                f"(fetched={fetched_size_raw!r}). Refresh "
                                 "Positions & Orders and try again."
                             ),
                             position_action=_apex_position_action_result(
@@ -3545,9 +3598,12 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
                             code="APEX_ERROR",
                             message=sanitize_error_message(str(exc)))
 
-    # Find the open position
+    # Find the open position. Pass the side the wizard displayed as a
+    # disambiguation hint — when Apex's snapshot carries more than one
+    # row for this symbol (see _apex_find_position), this picks the
+    # real open position instead of a stale zero-size residual row.
     positions = _apex_fetch_positions(client)
-    position_row = _apex_find_position(positions, symbol)
+    position_row = _apex_find_position(positions, symbol, side=_apex_side_hint(request))
     if position_row is None:
         return make_failure(operation="set_sl", exchange=name,
                             account=credentials["account"],
@@ -3561,39 +3617,29 @@ def _apex_set_sl(request: Dict[str, Any]) -> CanonicalResponse:
     position_size = _apex_position_size(position_row)
     fetched_size_raw = position_row.get("size")
 
-    # Fallback to explicit size from the wizard request if the freshly
-    # fetched position reports zero size (same quirk seen in set_tp —
-    # common on short positions or certain Apex account_group views).
-    if position_size <= 0:
-        req_size = request.get("size")
-        if req_size:
-            try:
-                fallback = __import__("decimal").Decimal(str(req_size)).copy_abs()
-                if fallback > 0:
-                    position_size = fallback
-            except Exception:
-                pass
-        logger.warning(
-            "apex set_sl: fetched position size was non-positive "
-            "(symbol=%s account=%s raw_fetched_size=%r request_size=%r "
-            "resolved_size_after_fallback=%s)",
-            symbol, credentials.get("account"), fetched_size_raw,
-            req_size, position_size,
-        )
-
-    # Hard guard: never submit a reduce-only order with a non-positive
-    # size — Apex would otherwise reject it with a generic "Order size
-    # must be greater than 0" error that gives no indication the size
-    # resolution (not the price/symbol) was the actual problem. Fail
-    # fast here with a diagnosable error instead.
+    # Hard guard: never substitute a stale wizard-displayed size and
+    # never submit a reduce-only order with a non-positive size. If the
+    # freshly fetched, correctly-disambiguated position row still has no
+    # positive size, the position genuinely cannot be verified right
+    # now — fail loudly and diagnosably instead of guessing. (Apex would
+    # otherwise reject size=0 with a generic "Order size must be greater
+    # than 0" error that gives no indication size resolution failed.)
     if sl_price > 0 and position_size <= 0:
+        logger.warning(
+            "apex set_sl: fresh position size was non-positive after "
+            "disambiguation (symbol=%s account=%s side_hint=%r "
+            "raw_fetched_size=%r candidate_count=%d)",
+            symbol, credentials.get("account"), _apex_side_hint(request),
+            fetched_size_raw,
+            sum(1 for r in positions if str(r.get("symbol") or "").upper() == symbol.upper()),
+        )
         return make_failure(operation="set_sl", exchange=name,
                             account=credentials["account"],
                             code="POSITION_SIZE_UNRESOLVED",
                             message=(
-                                f"Could not resolve a positive size for the {symbol} "
-                                f"position (fetched={fetched_size_raw!r}, "
-                                f"request={request.get('size')!r}). Refresh "
+                                f"Could not verify a positive size for the {symbol} "
+                                f"position from Apex's live snapshot "
+                                f"(fetched={fetched_size_raw!r}). Refresh "
                                 "Positions & Orders and try again."
                             ),
                             position_action=_apex_position_action_result(
@@ -3757,7 +3803,7 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
                                 operation="close_position", symbol=symbol,
                                 verified=False, status="failed",
                             ))
-    position_row = _apex_find_position(positions, symbol)
+    position_row = _apex_find_position(positions, symbol, side=_apex_side_hint(request))
     if position_row is None:
         return make_failure(operation="close_position", exchange=name,
                             account=credentials["account"],
@@ -3769,6 +3815,33 @@ def _apex_close_position(request: Dict[str, Any]) -> CanonicalResponse:
                             ))
     position_side = _apex_position_side(position_row)
     position_size = _apex_position_size(position_row)
+
+    # Never submit a reduce-only close order with a non-positive size —
+    # same guard as set_tp/set_sl. If the disambiguated position row
+    # still has no positive size, it cannot be verified; fail loudly
+    # instead of guessing or defaulting.
+    if position_size <= 0:
+        logger.warning(
+            "apex close_position: fresh position size was non-positive "
+            "after disambiguation (symbol=%s account=%s side_hint=%r "
+            "candidate_count=%d)",
+            symbol, credentials.get("account"), _apex_side_hint(request),
+            sum(1 for r in positions if str(r.get("symbol") or "").upper() == symbol.upper()),
+        )
+        return make_failure(operation="close_position", exchange=name,
+                            account=credentials["account"],
+                            code="POSITION_SIZE_UNRESOLVED",
+                            message=(
+                                f"Could not verify a positive size for the {symbol} "
+                                "position from Apex's live snapshot. Refresh "
+                                "Positions & Orders and try again."
+                            ),
+                            position_action=_apex_position_action_result(
+                                operation="close_position", symbol=symbol,
+                                verified=False, status="failed",
+                                current_side=position_side,
+                                current_size=str(position_size),
+                            ))
 
     # Fetch the live mark price from the ticker endpoint. Apex position
     # rows do NOT carry the mark, only entryPrice/fee/fundingFee — so
