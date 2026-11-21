@@ -349,6 +349,24 @@ def _patch_lighter_for_test(
     if sign_failure_at_index is not None:
         stub_signer.set_sign_failure(*sign_failure_at_index)
 
+    # Phase 5.1: the read-after-write pass has a real 10 s deadline
+    # with 0.25/0.5/1.0 s backoff. Tests must not wait it out, so the
+    # deadline and backoff are shrunk to keep the suite fast. The
+    # LOGIC (accumulate across snapshots, bounded attempts) is
+    # unchanged — only the wall-clock budget differs.
+    test.addCleanup(
+        mock.patch.object(
+            lighter, "LIGHTER_RECONCILE_DEADLINE_SECONDS", 0.05
+        ).stop
+    )
+    lighter.LIGHTER_RECONCILE_DEADLINE_SECONDS = 0.05
+    test.addCleanup(
+        mock.patch.object(
+            lighter, "LIGHTER_RECONCILE_BACKOFF_SECONDS", (0.001, 0.002, 0.004)
+        ).stop
+    )
+    lighter.LIGHTER_RECONCILE_BACKOFF_SECONDS = (0.001, 0.002, 0.004)
+
     recorded_ids: Dict[str, List[int]] = {}
 
     def fake_build_signer(creds):  # noqa: ARG001
@@ -922,11 +940,12 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
         self.assertEqual(ladder.batch_count, 1)
         self.assertTrue(ladder.partial)
         self.assertEqual(len(ladder.child_order_ids or []), 7)
-        # The reconciler may retry up to 3 times to absorb a brief
-        # indexer lag. 7/10 only matches the 7 children claimed.
-        # We are not retrying the write — only the read.
+        # Phase 5.1: the reconciler is a BOUNDED read-after-write pass
+        # (10 s deadline, backoff 0.25/0.5/1.0). It only READS — the
+        # write is never retried. The children that never appear stay
+        # unresolved: 7/10 only matches the 7 children claimed.
         self.assertGreaterEqual(reconcile_calls["n"], 1)
-        self.assertLessEqual(reconcile_calls["n"], 3)
+        self.assertLessEqual(reconcile_calls["n"], 20)
 
     # ------------------------------------------------------------------
     # L. non-rate-limit rejection
@@ -1050,11 +1069,12 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
         self.assertGreaterEqual(len(call_log), 1,
                                 f"expected at least 1 reconcile, got {len(call_log)}")
         # All reconciles must happen AFTER all 1 batch submit.
-        # The number of accountsActiveOrders reads is bounded by 3
-        # (our retry cap). We do NOT do per-batch reconciliation,
-        # so this is well below batch_count * 1.
-        self.assertLessEqual(len(call_log), 3,
-                              f"expected ≤3 retries, got {len(call_log)}")
+        # Phase 5.1: the reconciler is a bounded read-after-write pass
+        # (10 s deadline). We do NOT do per-batch reconciliation, so
+        # the read count is bounded by the deadline and far below
+        # batch_count * (something proportional to the batch size).
+        self.assertLessEqual(len(call_log), 20,
+                              f"expected a bounded read-after-write pass, got {len(call_log)}")
 
     # ------------------------------------------------------------------
     # 4. Abnormal batch stops subsequent submissions immediately
@@ -1104,8 +1124,14 @@ class LighterSendTxBatchLadderTests(unittest.TestCase):
              mock.patch.object(lighter, "_fetch_active_orders", side_effect=active_for_token):
             resp = lighter.execute(_ladder_request(order_count=200))
         self.assertFalse(resp.success)
-        self.assertEqual(reconcile_calls["n"], 1,
-                          f"expected 1 reconcile on abnormal exit, got {reconcile_calls['n']}")
+        # Phase 5.1: even on an abnormal exit the reconciler runs the
+        # full bounded read-after-write pass — a rate limit tells us
+        # the batch did not land, but a STALE SNAPSHOT tells us
+        # nothing, and the cleanup must cancel every child that
+        # actually landed. It only reads; it never resends a write.
+        self.assertGreaterEqual(reconcile_calls["n"], 1)
+        self.assertLessEqual(reconcile_calls["n"], 20,
+                             f"expected a bounded read-after-write pass, got {reconcile_calls['n']}")
         # First 150 children (5 success batches × 30) counted as accepted.
         self.assertEqual(resp.ladder.accepted_child_count, 150)
 

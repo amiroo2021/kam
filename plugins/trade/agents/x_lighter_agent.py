@@ -2544,6 +2544,30 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             except Exception:  # noqa: BLE001
                 return make_failure(operation="cancel_order_group", exchange=name, account=account_name, code="INVALID_ORDER_IDS", message=f"order_ids contains a non-integer value: {raw!r}")
 
+    # Phase 5.1: exact-identity targeting by ``client_order_index``.
+    #
+    # When a submission's reconciliation did not confirm every child,
+    # the unresolved children are known by their client_order_index but
+    # may not yet have a known exchange order_id. Cancelling by
+    # client_order_index resolves that order_id from the book, so the
+    # cleanup still reaches every positively identified test order.
+    #
+    # This is STILL exact identity: only orders whose
+    # client_order_index is in the explicit set AND which match
+    # symbol+side are cancelled. Every other active order is
+    # baseline and is preserved.
+    explicit_cois_raw = request.get("client_order_indices")
+    explicit_cois: Optional[set[int]] = None
+    if explicit_cois_raw is not None:
+        if not isinstance(explicit_cois_raw, (list, tuple, set)):
+            return make_failure(operation="cancel_order_group", exchange=name, account=account_name, code="INVALID_ORDER_IDS", message="client_order_indices must be a list of integer client order indices.")
+        explicit_cois = set()
+        for raw in explicit_cois_raw:
+            try:
+                explicit_cois.add(int(raw))
+            except Exception:  # noqa: BLE001
+                return make_failure(operation="cancel_order_group", exchange=name, account=account_name, code="INVALID_ORDER_IDS", message=f"client_order_indices contains a non-integer value: {raw!r}")
+
     # Classification scope (same contract as Hyperliquid): when the UI
     # cancels TAKE PROFIT / STOP LOSS, only those types are eligible.
     # Default with no classification and no order_ids: entry_limit only —
@@ -2565,8 +2589,8 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
     }
     if requested_classification:
         scope_classification = aliases.get(requested_classification, requested_classification)
-    elif explicit_ids is not None:
-        scope_classification = None  # exact OIDs only
+    elif explicit_ids is not None or explicit_cois is not None:
+        scope_classification = None  # exact identity only
     else:
         scope_classification = "entry_limit"
 
@@ -2609,6 +2633,17 @@ def _execute_cancel_order_group(request: Dict[str, Any]) -> CanonicalResponse:
             # Exact-identity mode: only an OID in the explicit set AND
             # matching the symbol+side(+class) scope is a target.
             if matches_scope and parsed_order_id in explicit_ids:
+                target_orders.append(order)
+                target_ids.append(parsed_order_id)
+            else:
+                non_target_ids.append(parsed_order_id)
+        elif explicit_cois is not None:
+            # Exact-identity mode by client_order_index (Phase 5.1).
+            try:
+                entry_coi = int(order.get("client_order_index") or 0)
+            except Exception:  # noqa: BLE001
+                entry_coi = 0
+            if matches_scope and entry_coi in explicit_cois:
                 target_orders.append(order)
                 target_ids.append(parsed_order_id)
             else:
@@ -4580,6 +4615,106 @@ def _submit_cancel_tx_batch(
         }
 
 
+# ---------------------------------------------------------------------------
+# Reconciliation after a WebSocket batch (Phase 5.1).
+#
+# The exchange's ``accountActiveOrders`` indexer can lag an accepted
+# batch by a few hundred milliseconds. A single read taken right after
+# the ack can therefore return ZERO matches for children the exchange
+# has already accepted. Measured on Phase 5 (100 orders, two WS
+# batches): batch 1's read took 374 ms and returned 50/50; batch 2's
+# took 146 ms and returned 0/50 — while the WS ack carried
+# ``api_code=200`` and 50 tx hashes for every child, and a later read
+# found all 50 on the book.
+#
+# Treating that stale snapshot as "the orders did not land" is wrong
+# (it would trigger a duplicate submission of live orders) and
+# treating it as an exchange REJECTION is worse (the exchange
+# accepted them).
+#
+# The reconciliation is therefore a bounded read-after-write loop:
+#   * fresh snapshot per attempt, read-only;
+#   * matches ACCUMULATE across snapshots — a child confirmed by any
+#     snapshot stays confirmed;
+#   * backoff 250 ms, then 500 ms, then 1 s, under a 10 s deadline;
+#   * a child that is absent from every snapshot is genuinely
+#     unconfirmed, and is reported as unresolved — never as accepted;
+#   * a child is confirmed by its unique ``client_order_index`` plus
+#     identity checks (symbol, side, price, quantity, status);
+#   * a child does NOT have to still be OPEN to be confirmed — a
+#     filled or otherwise non-open order still proves it landed.
+#
+# This NEVER resends a CreateOrder. It only reads.
+# ---------------------------------------------------------------------------
+
+LIGHTER_RECONCILE_DEADLINE_SECONDS = 10.0
+LIGHTER_RECONCILE_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
+# Hard cap on read attempts, so a caller-supplied no-op sleep (or a
+# pathological clock) can never turn the pass into an unbounded loop.
+LIGHTER_RECONCILE_MAX_ATTEMPTS = 40
+
+# Stats from the most recent reconciliation, for the caller to read.
+_LIGHTER_LAST_RECONCILE_STATS: Dict[str, Any] = {}
+
+_LIGHTER_RECONCILE_OUTCOME_CONFIRMED = "confirmed"
+_LIGHTER_RECONCILE_OUTCOME_PENDING = "pending"
+_LIGHTER_RECONCILE_OUTCOME_TIMEOUT = "timeout"
+_LIGHTER_RECONCILE_OUTCOME_ERROR = "error"
+
+
+def _lighter_order_matches_child(
+    entry: Dict[str, Any],
+    *,
+    market_id: int,
+    side: str,
+    price: Optional[Decimal],
+    size: Optional[Decimal],
+) -> Tuple[bool, str]:
+    """Check that an order entry really is the child we submitted.
+
+    Returns ``(ok, reason)``. ``reason`` is empty when the entry
+    matches. Identity is checked on the fields the exchange echoes
+    back: market, side, limit price, initial size and order type.
+
+    The order does NOT have to be open — a filled child still proves
+    the order landed.
+    """
+    try:
+        entry_market_id = int(entry.get("market_index") or 0)
+    except Exception:  # noqa: BLE001
+        return False, "unparseable market_index"
+    if entry_market_id != market_id:
+        return False, f"market {entry_market_id} != {market_id}"
+
+    entry_side = "sell" if bool(entry.get("is_ask")) else "buy"
+    if entry_side != side:
+        return False, f"side {entry_side} != {side}"
+
+    order_type = str(entry.get("type") or "").lower()
+    if order_type and order_type not in ("limit", "market"):
+        return False, f"order type {order_type} is not a limit/market order"
+
+    if price is not None:
+        raw_price = entry.get("price")
+        if raw_price is not None and str(raw_price) != "":
+            try:
+                if Decimal(str(raw_price)) != price:
+                    return False, f"price {raw_price} != {price}"
+            except Exception:  # noqa: BLE001
+                return False, "unparseable price"
+
+    if size is not None:
+        raw_size = entry.get("initial_base_amount")
+        if raw_size is not None and str(raw_size) != "":
+            try:
+                if Decimal(str(raw_size)) != size:
+                    return False, f"size {raw_size} != {size}"
+            except Exception:  # noqa: BLE001
+                return False, "unparseable size"
+
+    return True, ""
+
+
 def _reconcile_batch_by_client_order_index(
     *,
     credentials: Dict[str, Any],
@@ -4587,44 +4722,131 @@ def _reconcile_batch_by_client_order_index(
     side: str,
     expected_client_order_indices: List[int],
     auth_token: str,
+    deadline_seconds: Optional[float] = None,
+    backoff_seconds: Optional[Tuple[float, ...]] = None,
+    expected_prices: Optional[Dict[int, Decimal]] = None,
+    expected_sizes: Optional[Dict[int, Decimal]] = None,
+    sleep: Optional[Any] = None,
 ) -> Dict[int, int]:
     """Map ``client_order_index -> order_id`` for the expected children.
 
-    Reads ``accountActiveOrders`` once and returns a dict containing
-    only the children this batch expected to land. Anything missing
-    is genuinely absent — atomicity guarantees either all children
-    in a successful batch land or none do, so a partial match is
-    itself a defect signal.
+    Read-only, bounded read-after-write. Returns a dict containing
+    only the children this batch CONFIRMED landed. Matches accumulate
+    across snapshots: a child seen in any snapshot is confirmed and is
+    never forgotten.
+
+    A child that is absent from every snapshot before the deadline is
+    NOT confirmed and is simply absent from the returned mapping — the
+    caller must treat that as unresolved, not as rejected and not as
+    accepted.
+
+    This never resends a CreateOrder; it only reads the book.
     """
     expected = {int(idx) for idx in expected_client_order_indices}
     if not expected:
         return {}
-    orders = _fetch_active_orders(credentials, auth_token)
-    out: Dict[int, int] = {}
-    for entry in orders:
-        if not isinstance(entry, dict):
-            continue
+    delays = tuple(backoff_seconds or LIGHTER_RECONCILE_BACKOFF_SECONDS)
+    napper = sleep if sleep is not None else time.sleep
+    budget = (
+        LIGHTER_RECONCILE_DEADLINE_SECONDS
+        if deadline_seconds is None
+        else float(deadline_seconds)
+    )
+
+    confirmed: Dict[int, int] = {}
+    seen_indices: Dict[int, int] = {}
+    duplicates: List[int] = []
+    conflicts: List[Dict[str, Any]] = []
+    attempts = 0
+    deadline = time.monotonic() + max(0.0, budget)
+
+    while True:
+        attempts += 1
+        # The deadline is checked BEFORE the read as well as after it.
+        # A single read can itself block, and the backoff may be a
+        # no-op (tests, or a caller-supplied sleep), so the loop must
+        # not rely on wall-clock advancing to terminate.
+        if attempts > 1 and time.monotonic() >= deadline:
+            break
         try:
-            entry_market_id = int(entry.get("market_index") or 0)
+            orders = _fetch_active_orders(credentials, auth_token)
         except Exception:  # noqa: BLE001
+            # A read failure is not evidence the children did not land.
+            # Retry until the deadline; the caller sees the error only
+            # if we never manage a successful read.
+            if time.monotonic() >= deadline:
+                raise
+            napper(delays[min(attempts - 1, len(delays) - 1)])
             continue
-        if entry_market_id != market_id:
-            continue
-        entry_side = "sell" if bool(entry.get("is_ask")) else "buy"
-        if entry_side != side:
-            continue
-        try:
-            client_order_index = int(entry.get("client_order_index") or 0)
-        except Exception:  # noqa: BLE001
-            continue
-        if client_order_index not in expected:
-            continue
-        raw_order_id = str(entry.get("order_id") or "").strip()
-        try:
-            out[client_order_index] = int(raw_order_id)
-        except Exception:  # noqa: BLE001
-            continue
-    return out
+
+        for entry in orders:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                client_order_index = int(entry.get("client_order_index") or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            if client_order_index not in expected:
+                continue
+            raw_order_id = str(entry.get("order_id") or "").strip()
+            try:
+                order_id = int(raw_order_id)
+            except Exception:  # noqa: BLE001
+                continue
+
+            # Duplicate / conflicting client_order_index detection.
+            previous = seen_indices.get(client_order_index)
+            if previous is not None and previous != order_id:
+                conflicts.append({
+                    "client_order_index": client_order_index,
+                    "order_ids": [previous, order_id],
+                })
+                continue
+            seen_indices[client_order_index] = order_id
+
+            ok, reason = _lighter_order_matches_child(
+                entry,
+                market_id=market_id,
+                side=side,
+                price=(expected_prices or {}).get(client_order_index),
+                size=(expected_sizes or {}).get(client_order_index),
+            )
+            if not ok:
+                conflicts.append({
+                    "client_order_index": client_order_index,
+                    "order_id": order_id,
+                    "reason": reason,
+                })
+                continue
+
+            # Accumulate: a child confirmed in ANY snapshot stays
+            # confirmed, even if a later snapshot no longer lists it
+            # (it may have filled and moved out of the active feed).
+            confirmed[client_order_index] = order_id
+
+        if len(confirmed) >= len(expected):
+            break
+        if time.monotonic() >= deadline:
+            break
+        if attempts >= LIGHTER_RECONCILE_MAX_ATTEMPTS:
+            break
+        napper(delays[min(attempts - 1, len(delays) - 1)])
+
+    _LIGHTER_LAST_RECONCILE_STATS.clear()
+    _LIGHTER_LAST_RECONCILE_STATS.update({
+        "attempts": attempts,
+        "confirmed": len(confirmed),
+        "expected": len(expected),
+        "unresolved": sorted(expected - set(confirmed)),
+        "duplicates": duplicates,
+        "conflicts": conflicts,
+        "outcome": (
+            _LIGHTER_RECONCILE_OUTCOME_CONFIRMED
+            if len(confirmed) >= len(expected)
+            else _LIGHTER_RECONCILE_OUTCOME_TIMEOUT
+        ),
+    })
+    return confirmed
 
 
 def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
@@ -4934,6 +5156,19 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             or api_rejected_count > 0
             or unknown_count > 0
         )
+        # Phase 5.1: children the exchange explicitly REJECTED cannot
+        # land, so they are excluded from the reconciliation expected
+        # set. Including them would make the read-after-write pass wait
+        # out its full deadline for children that will never appear —
+        # turning a definite rejection into a false "pending" verdict.
+        rejected_indices = [
+            int(idx)
+            for idx, status in zip(chunk_indices, per_tx_statuses)
+            if status == _LIGHTER_PER_TX_API_REJECTED
+        ]
+        batch_records[-1]["api_rejected_client_order_indices"] = rejected_indices
+        if rejected_indices:
+            batch_records[-1]["ok"] = False
         # Always set the batch-level reason to the per-tx outcome
         # (so the canonical ledger tells the user what happened).
         batch_records[-1]["reason"] = outcome_kind.upper()
@@ -5058,21 +5293,25 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     # ------------------------------------------------------------------
     # ONE authoritative reconciliation pass.
     #
-    # Normal path: we run a single accountActiveOrders read after the
-    # last batch has been submitted. The HTTP request budget for the
-    # entire 200-child ladder is then:
+    # Normal path: a bounded read-after-write pass after the last batch
+    # has been submitted. The HTTP request budget for the entire
+    # 200-child ladder is then:
     #   preflight + token-mint + nonce-fetch    =  3 requests
     #   20 sendTxBatch writes                    = 20 requests
-    #   1 final accountActiveOrders read         =  1 request
-    #                                            = 24 requests over ~60s
-    # which sits comfortably below the observed 40/60s L1 cap.
+    #   N accountActiveOrders reads              =  N requests
+    #                                            = 23 + N over ~60s
+    # which sits comfortably below the observed 40/60s L1 cap. N is 1
+    # in the common case (the indexer keeps up) and grows only while
+    # children are still unconfirmed, under a 10 s deadline.
     #
     # Abnormal path: if the loop exited early because of a 429 /
     # non-200 envelope / transport exception / parse error / ambiguous
-    # outcome, we still do ONE reconciliation over every client_order_index
-    # submitted so far. That tells us which batches landed before the
-    # stop. We never reconcile per-batch — the cadence is "one final
-    # read either way".
+    # outcome, we still run the SAME read-after-write pass over every
+    # client_order_index submitted so far. A rate limit tells us the
+    # batch did not land, but a stale snapshot tells us NOTHING, and
+    # the cleanup must cancel every child that actually landed. We
+    # never reconcile per-batch — the cadence is "one final
+    # read-after-write pass either way".
     # ------------------------------------------------------------------
     successful_batch_records = [
         rec for rec in batch_records if rec.get("ok")
@@ -5080,6 +5319,20 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
     all_submitted_client_order_indices: List[int] = []
     for rec in successful_batch_records:
         all_submitted_client_order_indices.extend(rec.get("client_order_indices") or [])
+    # Phase 5.1: children the exchange explicitly REJECTED provably
+    # did not land, so they are excluded from the expected set. They
+    # would otherwise make the read-after-write pass wait out its full
+    # deadline and report a false "pending".
+    api_rejected_client_order_indices: List[int] = []
+    for rec in batch_records:
+        api_rejected_client_order_indices.extend(
+            rec.get("api_rejected_client_order_indices") or []
+        )
+    reconcile_expected = [
+        int(idx)
+        for idx in all_submitted_client_order_indices
+        if int(idx) not in set(api_rejected_client_order_indices)
+    ]
 
     if all_submitted_client_order_indices:
         # Resolve the auth token FIRST. If minting fails we MUST
@@ -5120,53 +5373,52 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
                 f"{mid_reconcile_error or 'empty token'}"
             )
         else:
-            # The accountActiveOrders indexer can occasionally lag the
-            # sequence by a few hundred milliseconds. We retry the
-            # read a few times (with a small linear backoff) before
-            # declaring any child unfindable. This is purely read-only
-            # — no side effects on the exchange state.
+            # Bounded read-after-write reconciliation (Phase 5.1).
             #
-            # The retry ONLY makes sense when we are not already in a
-            # stop_reason situation. If the ladder stopped because of a
-            # rate-limit / rejection / unknown outcome, we already know
-            # that not every child landed. Retrying would not change
-            # that answer and would just consume rate-limit slots.
+            # The accountActiveOrders indexer can lag an accepted batch
+            # by a few hundred milliseconds, so a single read taken
+            # right after the ack can return ZERO matches for children
+            # the exchange already accepted. The reconciler therefore
+            # takes fresh read-only snapshots under a 10 s deadline and
+            # ACCUMULATES matches across them.
+            #
+            # When a stop_reason already exists we still run the full
+            # read-after-write pass: a rate-limit or rejection tells us
+            # the batch did not land, but a stale snapshot tells us
+            # NOTHING, and the cleanup must cancel every child that
+            # actually landed. This is purely read-only — no side
+            # effects on the exchange state, and never a resend.
             landed_all: Dict[int, int] = {}
             reconciliation_error = None
-            if stop_reason is None:
-                target_set = set(all_submitted_client_order_indices)
-                for retry_idx in range(3):
-                    try:
-                        landed_all = _reconcile_batch_by_client_order_index(
-                            credentials=credentials,
-                            market_id=market_id_int,
-                            side=requested_side,
-                            expected_client_order_indices=all_submitted_client_order_indices,
-                            auth_token=reconcile_token,
-                        )
-                        reconciliation_error = None
-                    except Exception as exc:  # noqa: BLE001
-                        landed_all = {}
-                        reconciliation_error = exc
-                        break
-                    if len(landed_all) == len(target_set):
-                        break
-                    if retry_idx < 2:
-                        time.sleep(0.5)
-            else:
-                # Stop reason exists — run ONE reconcile without retrying.
-                try:
-                    landed_all = _reconcile_batch_by_client_order_index(
-                        credentials=credentials,
-                        market_id=market_id_int,
-                        side=requested_side,
-                        expected_client_order_indices=all_submitted_client_order_indices,
-                        auth_token=reconcile_token,
-                    )
-                    reconciliation_error = None
-                except Exception as exc:  # noqa: BLE001
-                    landed_all = {}
-                    reconciliation_error = exc
+            try:
+                landed_all = _reconcile_batch_by_client_order_index(
+                    credentials=credentials,
+                    market_id=market_id_int,
+                    side=requested_side,
+                    expected_client_order_indices=reconcile_expected,
+                    auth_token=reconcile_token,
+                )
+                reconciliation_error = None
+            except Exception as exc:  # noqa: BLE001
+                landed_all = {}
+                reconciliation_error = exc
+            reconcile_stats = dict(_LIGHTER_LAST_RECONCILE_STATS)
+            if reconcile_stats.get("unresolved"):
+                # Unresolved children are preserved for the caller and
+                # stop further placement. They are NOT converted to
+                # accepted just because the envelope returned 200.
+                unresolved_indices = list(reconcile_stats["unresolved"])
+                stop_reason = stop_reason or {
+                    "code": "LADDER_RECONCILIATION_PENDING",
+                    "outcome": _LIGHTER_RECONCILE_OUTCOME_PENDING,
+                    "message": (
+                        f"{len(unresolved_indices)} of "
+                        f"{reconcile_stats.get('expected')} children unconfirmed "
+                        f"after {reconcile_stats.get('attempts')} reads; "
+                        f"stopping for reconciliation"
+                    ),
+                    "raw_code": None,
+                }
         if reconciliation_error is not None and landed_all == {}:
             # Only the token-mint path fills this branch. The retry
             # loop above sets landed_all={} only on exception, in which
@@ -5190,6 +5442,19 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
                     if int(ci) in landed_all
                 ]
                 rec["verified_landed"] = batch_landed_oids
+                # Children this batch expected but which NO snapshot
+                # confirmed. They are preserved explicitly: the caller
+                # must stop placing and must include them in cleanup
+                # discovery, and they must NOT be counted as accepted
+                # merely because the envelope returned 200.
+                #
+                # Children the exchange explicitly REJECTED are not
+                # "unresolved" — they provably did not land.
+                rejected_here = set(rec.get("api_rejected_client_order_indices") or [])
+                rec["unresolved_client_order_indices"] = [
+                    int(ci) for ci in expected
+                    if int(ci) not in landed_all and int(ci) not in rejected_here
+                ]
                 # The API-level accepted count is what Lighter's sendTxBatch
                 # envelope told us. It may exceed the OID-reconciled count
                 # when the accountActiveOrders indexer lags the
@@ -5269,6 +5534,15 @@ def _execute_ladder(request: Dict[str, Any]) -> CanonicalResponse:
             # — reconciliation is authoritative.
             status = "partial" if accepted_child_count > 0 else "failed"
             canonical_code = "LADDER_BATCH_PER_TX_UNKNOWN"
+        elif canonical_code_raw == "LADDER_RECONCILIATION_PENDING":
+            # The exchange ACCEPTED the batch (envelope 200) but the
+            # read-after-write pass could not confirm every child
+            # within its deadline. This is NOT an exchange rejection
+            # and NOT an ambiguity about the write — it is a pending
+            # reconciliation. Unresolved children are preserved and
+            # placement stops; they are never counted as accepted.
+            status = "partial" if accepted_child_count > 0 else "failed"
+            canonical_code = "LADDER_RECONCILIATION_PENDING"
         elif outcome_kind == _LADDER_BATCH_OUTCOME_INSUFFICIENT_MARGIN:
             status = "partial" if accepted_child_count > 0 else "failed"
             canonical_code = "INSUFFICIENT_MARGIN"
