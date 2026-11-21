@@ -2550,6 +2550,95 @@ def _submit_native_sl_tp(
     }
 
 
+def _build_native_edit_stop_orders(
+    credentials: Dict[str, str],
+    stop_orders: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Ask Aftermath for the native edit-stop-orders transaction kind.
+
+    ``edit-stop-orders`` replaces the on-chain details of EXISTING stop
+    order tickets. Each ticket's ``slTp`` payload carries ``takeProfitPrice``
+    and ``stopLossPrice`` independently, so a single protection type can be
+    cleared by sending ``null`` for that field while the other is preserved.
+
+    Aftermath rejects an edit where BOTH prices are missing
+    ("both stop_loss_price and take_profit_price are missing"), so a ticket
+    that would end up with no protection at all must be CANCELLED instead.
+    """
+    rows = [dict(row) for row in stop_orders if isinstance(row, Mapping)]
+    if not rows:
+        raise ValueError("edit_stop_orders requires at least one stop order")
+    response = _post_json(
+        credentials,
+        "/api/perpetuals/account/transactions/edit-stop-orders",
+        {
+            "accountId": _numeric_account_id(credentials),
+            "accountCapId": _resolve_cap_id(credentials),
+            "walletAddress": credentials["address"],
+            "stopOrders": rows,
+        },
+    )
+    if not isinstance(response, Mapping):
+        raise RuntimeError("Aftermath native edit-stop-orders returned a non-object response")
+    tx_kind = str(response.get("txKind") or "").strip()
+    if not tx_kind:
+        raise RuntimeError("Aftermath native edit-stop-orders did not include a txKind")
+    return {"tx_kind": tx_kind}
+
+
+def _native_stop_order_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    market_id: str,
+    position_side: str,
+) -> List[Dict[str, Any]]:
+    """The native stop-order tickets that protect this position.
+
+    Only active tickets on the market, on the closing side of the position,
+    with an ``slTp`` payload qualify. Ordinary limit orders never appear
+    here: they are not stop-order tickets at all.
+    """
+    closing_side = 1 if position_side == "long" else 0
+    selected: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("marketId") or "") != market_id:
+            continue
+        state = row.get("orderState")
+        if not isinstance(state, Mapping) or "active" not in state:
+            continue
+        try:
+            side = int(row.get("side"))
+        except (TypeError, ValueError):
+            continue
+        if side != closing_side:
+            continue
+        details = row.get("slTp")
+        if not isinstance(details, Mapping):
+            continue
+        selected.append(dict(row))
+    return sorted(selected, key=lambda row: str(row.get("objectId") or ""))
+
+
+def _stop_order_protection(row: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """The (take-profit, stop-loss) prices carried by one native ticket."""
+    details = row.get("slTp")
+    if not isinstance(details, Mapping):
+        return (None, None)
+    tp = details.get("takeProfitPrice")
+    sl = details.get("stopLossPrice")
+    return (
+        _display_decimal(_decimal(tp)) if tp is not None else None,
+        _display_decimal(_decimal(sl)) if sl is not None else None,
+    )
+
+
+def _protection_field_for(operation: str) -> str:
+    """The ``slTp`` field that carries the protection this operation owns."""
+    return "takeProfitPrice" if operation == "set_tp" else "stopLossPrice"
+
+
 def _build_native_cancel_stop_orders(
     credentials: Dict[str, str],
     stop_order_ids: Sequence[str],
@@ -2715,6 +2804,186 @@ def _cancel_native_stop_orders(
     )
 
 
+def _remove_native_protection(
+    credentials: Dict[str, str],
+    request: Mapping[str, Any],
+    operation: str,
+) -> CanonicalResponse:
+    """Remove ONE protection type (TP or SL) from a position's native ticket.
+
+    ``price == 0`` is the wizard's "remove this protection" intent, the same
+    contract the other agents use. Zero must never be sent to
+    ``place-sl-tp-orders``: the native route rejects it ("take_profit_price
+    must be positive and finite, got 0").
+
+    A native ticket carries ``takeProfitPrice`` and ``stopLossPrice``
+    independently, so the requested type is cleared with
+    ``edit-stop-orders`` (send ``null`` for that field only) and the
+    opposite protection is preserved on the SAME ticket. When the ticket
+    would be left with NO protection at all, Aftermath rejects the edit
+    ("both stop_loss_price and take_profit_price are missing") and the
+    ticket is cancelled instead.
+
+    Cancellation is verified with a FRESH authoritative read of
+    ``stop-order-datas``; a submitted transaction is never reported as
+    success on its own.
+    """
+    symbol = str(request.get("symbol") or "").strip()
+    pos = _find_position(credentials, symbol, str(request.get("side") or ""))
+    market_id = str(pos.get("marketId") or "")
+    if not market_id:
+        market = _find_market(credentials, symbol)
+        market_id = _ch_id(market) or _market_id(market)
+    position_side = _position_side(_decimal(pos.get("baseAssetAmount"), "0"))
+    field = _protection_field_for(operation)
+    other_field = "stopLossPrice" if field == "takeProfitPrice" else "takeProfitPrice"
+    label = "TP" if field == "takeProfitPrice" else "SL"
+
+    rows = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    tickets = _native_stop_order_rows(
+        rows, market_id=market_id, position_side=position_side,
+    )
+    # Only tickets that actually carry the requested protection are targets.
+    targets = []
+    for ticket in tickets:
+        details = ticket.get("slTp")
+        if not isinstance(details, Mapping):
+            continue
+        if details.get(field) is not None:
+            targets.append(ticket)
+
+    action_base: Dict[str, Any] = {
+        "operation": operation,
+        "symbol": symbol,
+        "price": "0",
+        "current_side": position_side,
+        "current_size": _display_decimal(abs(_decimal(pos.get("baseAssetAmount"), "0"))),
+    }
+    base_data: Dict[str, Any] = {
+        "operation": operation,
+        "symbol": symbol,
+        "removal_target": label,
+        "verified_via": "/api/perpetuals/account/stop-order-datas",
+        "matched_object_ids": [str(row.get("objectId") or "") for row in targets],
+    }
+
+    if not targets:
+        # Nothing to remove: report "already removed" rather than a failure.
+        action = CanonicalPositionActionResult(
+            **action_base, verified=True, status="already_absent",
+        )
+        return make_success(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            data={**base_data, "status": "already_absent", "removed": False},
+            position_action=action,
+        )
+
+    dry_run = _is_dry_run(request)
+    # Split targets: a ticket that keeps the OTHER protection can be edited
+    # in place; a ticket that would lose its only protection must be
+    # cancelled outright.
+    editable: List[Dict[str, Any]] = []
+    cancel_ids: List[str] = []
+    for ticket in targets:
+        details = ticket.get("slTp")
+        other_value = details.get(other_field) if isinstance(details, Mapping) else None
+        if other_value is None:
+            cancel_ids.append(str(ticket.get("objectId") or ""))
+        else:
+            edited = dict(ticket)
+            edited_details = dict(details)
+            edited_details[field] = None
+            edited["slTp"] = edited_details
+            editable.append(edited)
+
+    if dry_run:
+        action = CanonicalPositionActionResult(
+            **action_base, verified=False, status="dry_run",
+        )
+        return _dryrun_success(
+            operation,
+            credentials,
+            {"tx_kind": ""},
+            data={
+                **base_data,
+                "status": "dry_run",
+                "dry_run": True,
+                "edit_object_ids": [str(row.get("objectId") or "") for row in editable],
+                "cancel_object_ids": cancel_ids,
+                "build_paths": [
+                    "/api/perpetuals/account/transactions/edit-stop-orders",
+                    "/api/perpetuals/account/transactions/cancel-stop-orders",
+                ],
+            },
+            position_action=action,
+        )
+
+    tx_digest = ""
+    if editable:
+        build = _build_native_edit_stop_orders(credentials, editable)
+        submit = _submit_native_sl_tp(credentials, build["tx_kind"])
+        tx_digest = str(submit.get("effects_digest") or "")
+    if cancel_ids:
+        build = _build_native_cancel_stop_orders(credentials, cancel_ids)
+        submit = _submit_native_sl_tp(credentials, build["tx_kind"])
+        tx_digest = tx_digest or str(submit.get("effects_digest") or "")
+
+    # Authoritative verification: re-read the native stop-order state.
+    after = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    after_tickets = _native_stop_order_rows(
+        after, market_id=market_id, position_side=position_side,
+    )
+    remaining = []
+    for ticket in after_tickets:
+        details = ticket.get("slTp")
+        if isinstance(details, Mapping) and details.get(field) is not None:
+            remaining.append(str(ticket.get("objectId") or ""))
+    verified = not remaining
+
+    action = CanonicalPositionActionResult(
+        **action_base,
+        verified=verified,
+        status="cancelled" if verified else "unverified",
+    )
+    data = {
+        **base_data,
+        "status": "cancelled" if verified else "unverified",
+        "removed": verified,
+        "verified": verified,
+        "remaining_object_ids": remaining,
+        "edit_object_ids": [str(row.get("objectId") or "") for row in editable],
+        "cancel_object_ids": cancel_ids,
+        "transaction_digest": tx_digest,
+        "build_paths": [
+            "/api/perpetuals/account/transactions/edit-stop-orders",
+            "/api/perpetuals/account/transactions/cancel-stop-orders",
+        ],
+    }
+    if not verified:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code=f"{operation.upper()}_REMOVAL_UNVERIFIED",
+            message=(
+                f"Native {label} removal was submitted for {symbol}, but a fresh "
+                f"read of stop-order state still shows {label} protection on "
+                f"{len(remaining)} ticket(s)."
+            ),
+            position_action=action,
+            data=data,
+        )
+    return make_success(
+        operation=operation,
+        exchange=name,
+        account=credentials["account"],
+        data=data,
+        position_action=action,
+    )
+
+
 def _set_tp_sl(credentials: Dict[str, str], request: Mapping[str, Any], operation: str) -> CanonicalResponse:
     """Set a native take-profit / stop-loss for an open position.
 
@@ -2744,6 +3013,14 @@ def _set_tp_sl(credentials: Dict[str, str], request: Mapping[str, Any], operatio
         raise ValueError(f"{operation} requires price")
     current_side = _position_side(_decimal(pos.get("baseAssetAmount"), "0"))
     requested_price = _decimal(price)
+
+    # ``price == 0`` is the wizard's "remove this protection" intent (the same
+    # contract the other agents use). Zero must never reach
+    # ``place-sl-tp-orders``: the native route rejects it with "take_profit_
+    # price must be positive and finite, got 0". Route it to the native
+    # removal path instead.
+    if requested_price == 0:
+        return _remove_native_protection(credentials, request, operation)
 
     build_payload = _native_sl_tp_payload(
         credentials,

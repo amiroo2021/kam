@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, Dict, Optional
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -1618,6 +1619,338 @@ class NativeTPSafetyTests(unittest.TestCase):
         # Nothing was built, so no cancel was issued at all in dry-run.
         self.assertFalse(builder.called)
 
+
+
+# --- Native TP/SL removal (price == 0) ----------------------------------
+# Regression coverage for the "TP = 0 removes the take-profit" contract.
+# `price == 0` must NEVER reach `place-sl-tp-orders` (the native route
+# rejects zero: "take_profit_price must be positive and finite, got 0").
+
+_REMOVE_ZEC = "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f"
+_REMOVE_OTHER_MARKET = "0x1111111111111111111111111111111111111111111111111111111111111111"
+_REMOVE_OBJECT = "0xbc1f1e45440484eeebc107a6da3d7113a4664f4a539055c52042bc3b1849b453"
+
+
+def _remove_ticket(
+    *,
+    market_id: str = _REMOVE_ZEC,
+    take_profit: Optional[float] = 500.0,
+    stop_loss: Optional[float] = None,
+    side: int = 0,
+    object_id: str = _REMOVE_OBJECT,
+    active: bool = True,
+) -> Dict[str, Any]:
+    """One native stop-order ticket as `stop-order-datas` reports it."""
+    return {
+        "objectId": object_id,
+        "marketId": market_id,
+        "side": side,
+        "size": "24476854000n",
+        "orderState": {"active": {}} if active else {"cancelled": {}},
+        "limitOrder": None,
+        "nonSlTp": None,
+        "expiryTimestamp": None,
+        "builderCode": None,
+        "slTp": {
+            "stopLossPrice": stop_loss,
+            "takeProfitPrice": take_profit,
+            "triggerPriceType": 0,
+            "limitOrderId": None,
+        },
+    }
+
+
+class NativeTPRemovalTests(unittest.TestCase):
+    """`price == 0` removes exactly one protection type, safely."""
+
+    def setUp(self) -> None:
+        self.credentials = {
+            "account": "bitget", "address": _NATIVE_TP_WALLET,
+            "account_id": "672", "private_key": _native_tp_privkey(),
+        }
+        self.position = {
+            "marketId": _REMOVE_ZEC,
+            "baseAssetAmount": "-24.476854",
+            "entryPrice": 1460.85,
+        }
+
+    def _run(self, tickets, operation="set_tp", price="0", after=None, **request):
+        """Run set_tp/set_sl with the network fully mocked.
+
+        ``dry_run=False`` is passed explicitly: the live path is what these
+        tests assert on, and the agent's default is a dry run.
+
+        ``tickets`` is the state read BEFORE the removal; ``after`` is the
+        state read afterwards for verification. It defaults to empty, i.e. a
+        successful removal.
+        """
+        req = {"symbol": "ZEC", "side": "sell", "price": price, "dry_run": False}
+        req.update(request)
+        after = [] if after is None else after
+        place_calls = []
+        edit_bodies = []
+        cancel_bodies = []
+
+        def fake_post(creds, path, body):
+            if "place-sl-tp-orders" in path:
+                place_calls.append(path)
+            if "edit-stop-orders" in path:
+                edit_bodies.append(body)
+            if "cancel-stop-orders" in path:
+                cancel_bodies.append(body)
+            return {"txKind": _NATIVE_TP_KIND_B64}
+
+        with mock.patch.object(aftermath, "_find_position", return_value=self.position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _REMOVE_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_post_json", side_effect=fake_post), \
+             mock.patch.object(
+                 aftermath, "_stop_orders_for_markets", side_effect=[tickets, after]
+             ) as reader, \
+             mock.patch.object(
+                 aftermath, "_submit_native_sl_tp",
+                 return_value={"effects_digest": "digest123"},
+             ) as submit, \
+             mock.patch.object(aftermath, "_execute_sui_transaction") as executor:
+            response = aftermath._set_tp_sl(self.credentials, req, operation)
+        return response, place_calls, edit_bodies, cancel_bodies, submit, executor
+
+    # --- TP = 0 -----------------------------------------------------------
+
+    def test_tp_zero_never_reaches_place_sl_tp_orders(self) -> None:
+        """Zero must never be sent to the native placement route."""
+        response, place_calls, edit_bodies, cancel_bodies, submit, executor = self._run(
+            [_remove_ticket()], operation="set_tp", price="0",
+        )
+        self.assertEqual(place_calls, [], "place-sl-tp-orders was called with price 0")
+        self.assertFalse(executor.called, "executeTransaction reached the chain")
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "cancelled")
+        self.assertTrue(response.data.get("verified"))
+
+    def test_tp_zero_cancels_a_tp_only_ticket(self) -> None:
+        """A ticket with no SL left must be CANCELLED, not edited."""
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(stop_loss=None)], operation="set_tp", price="0",
+        )
+        self.assertEqual(edit_bodies, [], "an empty ticket must not be edited")
+        self.assertEqual(len(cancel_bodies), 1)
+        self.assertEqual(cancel_bodies[0]["stopOrderIds"], [_REMOVE_OBJECT])
+        self.assertEqual(cancel_bodies[0]["accountCapId"], _NATIVE_TP_CAP)
+        self.assertTrue(submit.called)
+
+    # --- SL = 0 -----------------------------------------------------------
+
+    def test_sl_zero_cancels_an_sl_only_ticket(self) -> None:
+        response, place_calls, edit_bodies, cancel_bodies, submit, executor = self._run(
+            [_remove_ticket(take_profit=None, stop_loss=1200.0)],
+            operation="set_sl", price="0",
+        )
+        self.assertEqual(place_calls, [])
+        self.assertFalse(executor.called)
+        self.assertEqual(edit_bodies, [])
+        self.assertEqual(cancel_bodies[0]["stopOrderIds"], [_REMOVE_OBJECT])
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("removal_target"), "SL")
+
+    # --- TP removal while SL exists --------------------------------------
+
+    def test_tp_removal_preserves_sl_on_the_same_ticket(self) -> None:
+        """Selective removal: clear TP, keep SL, do not cancel the ticket."""
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(take_profit=500.0, stop_loss=1200.0)],
+            operation="set_tp", price="0",
+            after=[_remove_ticket(take_profit=None, stop_loss=1200.0)],
+        )
+        self.assertEqual(cancel_bodies, [], "the ticket must NOT be cancelled")
+        self.assertEqual(len(edit_bodies), 1)
+        row = edit_bodies[0]["stopOrders"][0]
+        self.assertIsNone(row["slTp"]["takeProfitPrice"], "TP was not cleared")
+        self.assertEqual(row["slTp"]["stopLossPrice"], 1200.0, "SL was not preserved")
+        self.assertEqual(row["objectId"], _REMOVE_OBJECT)
+        self.assertTrue(response.success)
+        self.assertTrue(response.data.get("verified"))
+
+    # --- SL removal while TP exists --------------------------------------
+
+    def test_sl_removal_preserves_tp_on_the_same_ticket(self) -> None:
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(take_profit=500.0, stop_loss=1200.0)],
+            operation="set_sl", price="0",
+            after=[_remove_ticket(take_profit=500.0, stop_loss=None)],
+        )
+        self.assertEqual(cancel_bodies, [])
+        self.assertEqual(len(edit_bodies), 1)
+        row = edit_bodies[0]["stopOrders"][0]
+        self.assertIsNone(row["slTp"]["stopLossPrice"], "SL was not cleared")
+        self.assertEqual(row["slTp"]["takeProfitPrice"], 500.0, "TP was not preserved")
+        self.assertTrue(response.success)
+        self.assertTrue(response.data.get("verified"))
+
+    # --- No matching protection order ------------------------------------
+
+    def test_no_matching_protection_reports_already_removed(self) -> None:
+        response, _, edit_bodies, cancel_bodies, submit, executor = self._run(
+            [], operation="set_tp", price="0",
+        )
+        self.assertTrue(response.success, "removing an absent TP must not fail")
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(response.data.get("removed"))
+        self.assertFalse(submit.called, "nothing should be submitted")
+        self.assertFalse(executor.called)
+
+    def test_ticket_without_the_requested_protection_is_not_a_target(self) -> None:
+        """A ticket holding only SL must not be touched by a TP removal."""
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(take_profit=None, stop_loss=1200.0)],
+            operation="set_tp", price="0",
+        )
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(submit.called)
+        self.assertEqual(cancel_bodies, [])
+
+    # --- Cancellation verification failure --------------------------------
+
+    def test_removal_is_unverified_when_a_fresh_read_still_shows_the_tp(self) -> None:
+        """A submitted transaction is NOT success on its own."""
+        tickets = [_remove_ticket()]
+        with mock.patch.object(aftermath, "_find_position", return_value=self.position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _REMOVE_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(
+                 aftermath, "_post_json",
+                 return_value={"txKind": _NATIVE_TP_KIND_B64},
+             ), \
+             mock.patch.object(
+                 aftermath, "_stop_orders_for_markets",
+                 side_effect=[tickets, tickets],
+             ), \
+             mock.patch.object(
+                 aftermath, "_submit_native_sl_tp",
+                 return_value={"effects_digest": "digest123"},
+             ), \
+             mock.patch.object(aftermath, "_execute_sui_transaction"):
+            response = aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "ZEC", "side": "sell", "price": "0", "dry_run": False},
+                "set_tp",
+            )
+        self.assertFalse(response.success, "success was reported without verification")
+        self.assertEqual(response.error.code, "SET_TP_REMOVAL_UNVERIFIED")
+        self.assertFalse(response.data.get("verified"))
+        self.assertEqual(response.data.get("remaining_object_ids"), [_REMOVE_OBJECT])
+
+    # --- Wrong market / position protection -------------------------------
+
+    def test_protection_of_another_market_is_never_touched(self) -> None:
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(market_id=_REMOVE_OTHER_MARKET)],
+            operation="set_tp", price="0",
+        )
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(submit.called, "another market's protection was targeted")
+        self.assertEqual(cancel_bodies, [])
+        self.assertEqual(edit_bodies, [])
+
+    def test_protection_on_the_wrong_side_is_never_touched(self) -> None:
+        """A ticket on the position's opening side does not protect it."""
+        response, _, edit_bodies, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(side=1)],
+            operation="set_tp", price="0",
+        )
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(submit.called)
+        self.assertEqual(cancel_bodies, [])
+
+    def test_inactive_ticket_is_never_touched(self) -> None:
+        response, _, _, cancel_bodies, submit, _ = self._run(
+            [_remove_ticket(active=False)],
+            operation="set_tp", price="0",
+        )
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(submit.called)
+        self.assertEqual(cancel_bodies, [])
+
+    def test_ordinary_limit_order_is_never_a_removal_target(self) -> None:
+        """Limit orders are not stop-order tickets at all."""
+        limit_order = {
+            "id": "340282357697566426590152055358084731487",
+            "marketId": _REMOVE_ZEC,
+            "side": "buy",
+            "type": "limit",
+            "price": 500.0,
+        }
+        with mock.patch.object(aftermath, "_find_position", return_value=self.position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _REMOVE_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(
+                 aftermath, "_stop_orders_for_markets", return_value=[]
+             ), \
+             mock.patch.object(aftermath, "_pending_orders_for_market", return_value=[limit_order]), \
+             mock.patch.object(
+                 aftermath, "_submit_native_sl_tp", return_value={"effects_digest": "d"}
+             ) as submit, \
+             mock.patch.object(aftermath, "_execute_sui_transaction") as executor:
+            response = aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "ZEC", "side": "sell", "price": "0", "dry_run": False},
+                "set_tp",
+            )
+        self.assertTrue(response.success)
+        self.assertEqual(response.data.get("status"), "already_absent")
+        self.assertFalse(submit.called)
+        self.assertFalse(executor.called)
+
+    # --- Dry run ----------------------------------------------------------
+
+    def test_dry_run_removal_never_submits(self) -> None:
+        response, place_calls, edit_bodies, cancel_bodies, submit, executor = self._run(
+            [_remove_ticket(take_profit=500.0, stop_loss=1200.0)],
+            operation="set_tp", price="0", dry_run=True,
+        )
+        self.assertEqual(place_calls, [])
+        self.assertFalse(submit.called, "dry run submitted a transaction")
+        self.assertFalse(executor.called, "dry run reached executeTransaction")
+        self.assertTrue(response.success)
+        self.assertTrue(response.data.get("dry_run"))
+        self.assertEqual(response.data.get("edit_object_ids"), [_REMOVE_OBJECT])
+
+    # --- A positive price still places ------------------------------------
+
+    def test_positive_price_still_places_via_place_sl_tp_orders(self) -> None:
+        """The removal path must not change the positive-price behaviour."""
+        with mock.patch.object(aftermath, "_find_position", return_value=self.position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _REMOVE_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(
+                 aftermath, "_post_json",
+                 return_value={"txKind": _NATIVE_TP_KIND_B64},
+             ) as poster, \
+             mock.patch.object(
+                 aftermath, "_stop_orders_for_markets",
+                 side_effect=[[], [_remove_ticket()]],
+             ), \
+             mock.patch.object(
+                 aftermath, "_submit_native_sl_tp",
+                 return_value={"effects_digest": "digest123"},
+             ) as submit, \
+             mock.patch.object(aftermath, "_execute_sui_transaction"):
+            response = aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "ZEC", "side": "sell", "price": "500", "dry_run": False},
+                "set_tp",
+            )
+        placed = [c for c in poster.call_args_list if "place-sl-tp-orders" in c.args[1]]
+        self.assertEqual(len(placed), 1, "place-sl-tp-orders was not used")
+        body = placed[0].args[2]
+        self.assertEqual(body["takeProfitPrice"], 500.0)
+        self.assertNotIn("stopLossPrice", body)
+        self.assertTrue(submit.called)
+        self.assertTrue(response.success)
 
 if __name__ == "__main__":
     unittest.main()
