@@ -11,7 +11,11 @@ Writes use signed POST /order (new_order, ladder, cancel_order_group, close_posi
 
 Wizard Positions Management lists via operation ``positions_management``,
 which is an alias of the same fullAccount snapshot as ``positions_orders``.
-Bulk-native ``close_position`` is supported; ``set_tp`` / ``set_sl`` are not.
+Bulk-native ``close_position``, ``set_tp``, and ``set_sl`` are supported.
+``set_tp``/``set_sl`` place native Bulk conditional orders (`tp`/`st` action
+tags; see docs.bulk.trade/bulk-exchange/conditional-orders). A requested
+price of 0 removes the existing protective order instead of placing one,
+matching the other exchange agents' convention.
 """
 
 from __future__ import annotations
@@ -174,7 +178,6 @@ def list_accounts() -> list[str]:
 
 def capabilities() -> list[str]:
     # positions_management is the wizard list op (alias of positions_orders).
-    # set_tp / set_sl / close_position are intentionally absent until implemented.
     return [
         "balance",
         "positions_orders",
@@ -186,6 +189,8 @@ def capabilities() -> list[str]:
         "list_instruments",
         "market_price",
         "close_position",
+        "set_tp",
+        "set_sl",
     ]
 
 
@@ -1596,6 +1601,190 @@ def _positions_orders(
 _close_guard_lock = threading.Lock()
 _close_guard: set[tuple[str, str, bool]] = set()
 
+_protection_guard_lock = threading.Lock()
+_protection_guard: set[tuple[str, str, bool, str]] = set()
+
+
+def _bulk_protection_direction(kind: str, position_side: str) -> bool:
+    """Trigger direction `d` for a Bulk tp/st conditional action.
+
+    Per docs.bulk.trade/bulk-exchange/conditional-orders: Take-Profit triggers
+    above for longs / below for shorts; Stop triggers below for longs / above
+    for shorts. `d=true` means "above/equal".
+    """
+    if kind == "tp":
+        return position_side == "long"
+    return position_side == "short"
+
+
+def _bulk_classify_protection(row: Mapping[str, Any]) -> Optional[str]:
+    classification = _classification(str(row.get("orderType") or ""), bool(row.get("reduceOnly")))
+    if classification == "take_profit":
+        return "tp"
+    if classification == "stop_loss":
+        return "stop"
+    return None
+
+
+def _bulk_find_protection_order(orders: Iterable[Mapping[str, Any]], kind: str, isolated: bool) -> Mapping[str, Any]:
+    """Return the single resting protective order of ``kind`` for this lane.
+
+    Raises ValueError if more than one matches; never guesses between them.
+    """
+    matches = [o for o in orders if _bulk_classify_protection(o) == kind and bool(o.get("iso", False)) == isolated]
+    if len(matches) > 1:
+        raise ValueError(f"AMBIGUOUS_{kind.upper()}_ORDER")
+    return matches[0] if matches else None  # type: ignore[return-value]
+
+
+def _bulk_protection_order_price(row: Mapping[str, Any]) -> str:
+    trigger = row.get("trigger") if isinstance(row.get("trigger"), Mapping) else {}
+    raw = row.get("price")
+    if raw is None:
+        raw = row.get("triggerPrice")
+    if raw is None and isinstance(trigger, Mapping):
+        raw = trigger.get("px")
+    return _plain_decimal(raw)
+
+
+def _bulk_set_protection(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any], *, kind: str) -> CanonicalResponse:
+    """Set, replace, or remove a native Bulk take-profit (`tp`) / stop (`st`) order.
+
+    Mirrors the resolution/verification rigor of ``_bulk_position_action``'s
+    close_position path. A requested price of 0 removes the existing
+    protective order (if any) and is treated as success either way -- never
+    an error -- matching the other exchange agents' "0 clears TP/SL" UX.
+    Never substitutes a stale size: if the live position size cannot be
+    verified as a strictly positive number, the operation fails loudly.
+    """
+    action_tag = "tp" if kind == "tp" else "st"
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+    try:
+        market = _find_market(credentials, requested)
+    except Exception:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Bulk market {requested!r} was not found.")
+    symbol = str(market.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", "Bulk market row has no symbol.")
+
+    raw_price = request.get("price")
+    try:
+        price = _decimal(raw_price)
+    except Exception:
+        return make_failure(operation, name, account, "INVALID_PRICE", "Price is required and must be numeric.")
+    if price < 0:
+        return make_failure(operation, name, account, "INVALID_PRICE", "Price cannot be negative.")
+
+    try:
+        before_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+    except PermissionError as exc:
+        return make_failure(operation, name, account, "ACCOUNT_IDENTITY_INVALID", sanitize_error_message(str(exc)))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "ACCOUNT_SNAPSHOT_INVALID", sanitize_error_message(str(exc)))
+
+    positions = _position_rows(before_account, symbol)
+    if not positions:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if len(positions) != 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_POSITION", f"Multiple open Bulk rows match {symbol}; refusing to choose a lane.")
+    position = positions[0]
+    size = _decimal(position.get("size"))
+    if size == 0:
+        # Never fall back to a wizard-displayed size: a fresh, verified,
+        # strictly positive position size is required before any
+        # protective order can be sized correctly.
+        return make_failure(operation, name, account, "POSITION_SIZE_UNRESOLVED", f"Live Bulk position size for {symbol} resolved to 0.00; refusing to submit a {kind} order against an unverified size.", data={"fetched_size": _plain_decimal(size)})
+    if not isinstance(position.get("iso"), bool):
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk position snapshot omitted its base/isolated routing flag.")
+    isolated = position["iso"]
+    if isolated and not str(position.get("isoPubkey") or "").strip():
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk isolated position omitted isoPubkey; refusing to route a protective order.")
+
+    increment = _decimal(market.get("sizeIncrement", market.get("lotSize")), "0")
+    precision_raw = market.get("sizeDecimals")
+    if increment <= 0 or precision_raw is None:
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_MISSING", "Bulk market omitted valid size increment/precision metadata.")
+    try:
+        precision = int(precision_raw)
+    except (ValueError, TypeError):
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_INVALID", "Bulk market sizeDecimals is invalid.")
+    abs_size = abs(size)
+    precision_step = Decimal(1).scaleb(-precision)
+    if precision < 0 or abs_size % increment != 0 or abs_size % precision_step != 0:
+        return make_failure(operation, name, account, "POSITION_SIZE_INVALID", "Live Bulk position size does not conform to market increment/precision.")
+
+    position_side = "long" if size > 0 else "short"
+    removing = price == 0
+
+    guard_key = (str(credentials.get("account_pubkey") or ""), symbol.upper(), isolated, kind)
+    with _protection_guard_lock:
+        if guard_key in _protection_guard:
+            return make_failure(operation, name, account, f"{kind.upper()}_OUTCOME_UNKNOWN", "A prior Bulk protective-order change for this account/market/lane is unresolved; reconcile state before another submission.", data={"retry_safe": False})
+        _protection_guard.add(guard_key)
+
+    try:
+        existing = _bulk_find_protection_order(_orders_for(before_account, symbol), kind, isolated)
+    except ValueError as exc:
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_failure(operation, name, account, str(exc), f"Multiple resting Bulk {kind} orders match {symbol}; refusing to choose one to replace.")
+
+    if removing and existing is None:
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_success(operation, name, account, data={"protection_status": "already_removed"})
+
+    actions: list[Mapping[str, Any]] = []
+    if existing is not None:
+        existing_oid = str(existing.get("orderId") or existing.get("oid") or "").strip()
+        if not existing_oid:
+            with _protection_guard_lock:
+                _protection_guard.discard(guard_key)
+            return make_failure(operation, name, account, "PROTECTIVE_ORDER_ID_MISSING", f"Existing Bulk {kind} order for {symbol} has no orderId; refusing to cancel/replace blind.")
+        actions.append({"cx": {"c": symbol, "oid": existing_oid}})
+    if not removing:
+        direction = _bulk_protection_direction(kind, position_side)
+        actions.append({action_tag: {"c": symbol, "d": direction, "sz": float(abs_size), "tr": float(price), "lim": None, "i": isolated}})
+
+    try:
+        response = _submit_order(credentials, actions)
+    except Exception as exc:  # noqa: BLE001 - submission may have reached Bulk
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        failure_code = f"{kind.upper()}_REMOVAL_FAILED" if removing else f"{kind.upper()}_PLACEMENT_FAILED"
+        return make_failure(operation, name, account, failure_code, "Bulk submission outcome is uncertain. No automatic retry was made.", data={"verified": False, "retry_safe": False, "error_type": type(exc).__name__})
+
+    parsed = _position_action_status(response)
+    classification = parsed["classification"]
+
+    try:
+        after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+        after_existing = _bulk_find_protection_order(_orders_for(after_account, symbol), kind, isolated)
+    except Exception as exc:  # noqa: BLE001
+        with _protection_guard_lock:
+            _protection_guard.discard(guard_key)
+        return make_failure(operation, name, account, f"{kind.upper()}_VERIFICATION_UNAVAILABLE", "Bulk returned a response but a valid, account-bound snapshot could not verify the result; no retry was made.", data={"verified": False, "retry_safe": False, "order_ids": parsed["order_ids"], "bulk_status": classification, "verification_error": sanitize_error_message(str(exc))})
+
+    with _protection_guard_lock:
+        _protection_guard.discard(guard_key)
+
+    common = {"order_ids": parsed["order_ids"], "bulk_status": classification, "native_statuses": parsed["statuses"]}
+    if classification == "rejected":
+        return make_failure(operation, name, account, f"{kind.upper()}_REJECTED", f"Bulk rejected the {kind} order change.", data=common)
+
+    if removing:
+        if after_existing is None:
+            return make_success(operation, name, account, data={**common, "protection_status": "removed"})
+        return make_failure(operation, name, account, f"{kind.upper()}_REMOVAL_UNCONFIRMED", f"Bulk accepted the cancel but a matching {kind} order is still resting; the removal is not confirmed.", data={**common, "protection_status": "unknown"})
+
+    if after_existing is not None:
+        return make_success(operation, name, account, data={**common, "protection_status": "set", "price": _bulk_protection_order_price(after_existing)})
+    if classification in ("pending", "unknown") and _payload_ok(response):
+        return make_failure(operation, name, account, f"{kind.upper()}_PLACEMENT_UNCONFIRMED", f"Bulk accepted the {kind} order but it is not yet visible in a verified snapshot; no retry was made.", data=common)
+    return make_failure(operation, name, account, f"{kind.upper()}_PLACEMENT_FAILED", f"Bulk response and verified snapshot do not establish the {kind} order was placed.", data=common)
+
 
 def _position_rows(full_account: Mapping[str, Any], symbol: str) -> list[Dict[str, Any]]:
     rows = full_account.get("positions")
@@ -1705,7 +1894,11 @@ def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
 
 
 def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
-    """Close a Bulk position natively; TP/SL remain intentionally unsupported."""
+    """Close, or set/replace/remove TP or SL on, a Bulk position natively."""
+    if operation == "set_tp":
+        return _bulk_set_protection(credentials, account, operation, request, kind="tp")
+    if operation == "set_sl":
+        return _bulk_set_protection(credentials, account, operation, request, kind="stop")
     if operation != "close_position":
         return make_failure(operation, name, account, "NOT_IMPLEMENTED", f"Bulk {operation} is not implemented.")
     requested = str(request.get("symbol") or "").strip()
@@ -1831,8 +2024,6 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _positions_orders(credentials, account, operation="positions_orders")
         if operation == "positions_management":
             # Wizard list op — same fullAccount snapshot as positions_orders.
-            # Mutation actions (set_tp/set_sl/close_position) are separate ops
-            # and remain NOT_IMPLEMENTED until explicitly wired.
             return _positions_orders(credentials, account, operation="positions_management")
         if operation == "list_instruments":
             return _list_instruments(credentials, account)

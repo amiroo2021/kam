@@ -18,6 +18,8 @@ class TestBulkAgent(unittest.TestCase):
     def setUp(self) -> None:
         with bulk._close_guard_lock:
             bulk._close_guard.clear()
+        with bulk._protection_guard_lock:
+            bulk._protection_guard.clear()
 
     def test_discovers_complete_env_pairs_only(self) -> None:
         env = {
@@ -141,18 +143,19 @@ class TestBulkAgent(unittest.TestCase):
                 self.assertEqual((p.symbol, p.side, p.size, p.entry_price, p.mark, p.pnl), single)
 
         self.assertIn("positions_management", bulk.capabilities())
-        self.assertNotIn("set_tp", bulk.capabilities())
-        self.assertNotIn("set_sl", bulk.capabilities())
+        self.assertIn("set_tp", bulk.capabilities())
+        self.assertIn("set_sl", bulk.capabilities())
         self.assertIn("close_position", bulk.capabilities())
 
-        # TP/SL remain NOT_IMPLEMENTED and must not enter the write path.
+        # set_tp/set_sl are now implemented and reach the real write path
+        # (unknown symbol -> UNKNOWN_SYMBOL, not NOT_IMPLEMENTED).
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", side_effect=ValueError("no such market")), \
              mock.patch.object(bulk, "_submit_order") as submit:
             for op in ("set_tp", "set_sl"):
-                bad = bulk.execute({"operation": op, "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "long", "price": "1"})
+                bad = bulk.execute({"operation": op, "exchange": "bulk", "account": "main", "symbol": "NOPE", "side": "long", "price": "1"})
                 self.assertFalse(bad.success)
-                self.assertEqual(bad.error.code, "NOT_IMPLEMENTED")
-                self.assertNotIn("read-only adapter", bad.error.message)
+                self.assertEqual(bad.error.code, "UNKNOWN_SYMBOL")
         submit.assert_not_called()
 
     def test_close_position_uses_bulk_native_reduce_only_market_order_for_short(self) -> None:
@@ -388,15 +391,27 @@ class TestBulkAgent(unittest.TestCase):
         self.assertNotEqual(result.data.get("close_status"), "fully_closed")
         submit.assert_called_once()
 
-    def test_close_position_returns_not_implemented_for_tp_sl(self) -> None:
+    def test_set_tp_and_set_sl_are_no_longer_not_implemented(self) -> None:
         creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
-        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
-             mock.patch.object(bulk, "_submit_order") as submit:
-            for operation in ("set_tp", "set_sl"):
-                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC"})
-                self.assertFalse(resp.success)
-                self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
-        submit.assert_not_called()
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.01, "sizeDecimals": 2}
+        live = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}], "openOrders": []}
+        resting = {"response": {"data": {"statuses": [{"resting": {"oid": "tp-1"}}]}}}
+        for operation in ("set_tp", "set_sl"):
+            with bulk._protection_guard_lock:
+                bulk._protection_guard.clear()
+            after = {"positions": [{"symbol": "BTC-USD", "size": 0.5, "iso": False}],
+                     "openOrders": [{"symbol": "BTC-USD", "orderId": "tp-1", "size": 0.5, "price": 70000.0,
+                                      "reduceOnly": True, "orderType": "takeProfit" if operation == "set_tp" else "stop", "iso": False}]}
+            with self.subTest(operation=operation), \
+                 mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+                 mock.patch.object(bulk, "_find_market", return_value=market), \
+                 mock.patch.object(bulk, "_live_account", side_effect=[live, after]), \
+                 mock.patch.object(bulk, "_submit_order", return_value=resting) as submit:
+                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC", "price": "70000"})
+            self.assertTrue(resp.success, msg=str(resp))
+            self.assertNotEqual(getattr(resp.error, "code", None), "NOT_IMPLEMENTED")
+            submit.assert_called_once()
+
 
     def test_positions_management_attaches_tp_sl_from_open_orders(self) -> None:
         creds = {
