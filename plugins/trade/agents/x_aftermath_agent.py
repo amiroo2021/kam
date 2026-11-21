@@ -24,6 +24,7 @@ import math
 import os
 import re
 import secrets
+import time
 import urllib.error
 import urllib.request
 from base64 import b64decode, b64encode
@@ -1228,6 +1229,11 @@ _BUILD_ROUTES: Dict[str, str] = {
     "cancelOrders": "/api/ccxt/build/cancelOrders",
     "setLeverage": "/api/ccxt/build/setLeverage",
 }
+# Aftermath's stop-order index lags the consensus commit by a short while, so
+# the first read after a successful native cancel can still show the ticket.
+# Retry the authoritative verification a few times before declaring failure.
+_REMOVAL_VERIFY_ATTEMPTS = 4
+_REMOVAL_VERIFY_DELAY_SECONDS = 1.5
 _SUBMIT_ROUTES: Dict[str, str] = {
     "createOrders": "/api/ccxt/submit/createOrders",
     "cancelOrders": "/api/ccxt/submit/cancelOrders",
@@ -2931,15 +2937,29 @@ def _remove_native_protection(
         tx_digest = tx_digest or str(submit.get("effects_digest") or "")
 
     # Authoritative verification: re-read the native stop-order state.
-    after = _stop_orders_for_markets(credentials, [market_id], strict=True)
-    after_tickets = _native_stop_order_rows(
-        after, market_id=market_id, position_side=position_side,
-    )
-    remaining = []
-    for ticket in after_tickets:
-        details = ticket.get("slTp")
-        if isinstance(details, Mapping) and details.get(field) is not None:
-            remaining.append(str(ticket.get("objectId") or ""))
+    #
+    # The Aftermath stop-order index is served from a node that lags the
+    # consensus commit by a short while, so the FIRST read after a successful
+    # submit can still show the cancelled ticket. A single stale read must not
+    # be reported as a failure: retry a few times, and only report
+    # "unverified" when every read still shows the protection.
+    after_tickets: List[Dict[str, Any]] = []
+    remaining: List[str] = []
+    attempts = 0
+    for attempts in range(1, _REMOVAL_VERIFY_ATTEMPTS + 1):
+        after = _stop_orders_for_markets(credentials, [market_id], strict=True)
+        after_tickets = _native_stop_order_rows(
+            after, market_id=market_id, position_side=position_side,
+        )
+        remaining = []
+        for ticket in after_tickets:
+            details = ticket.get("slTp")
+            if isinstance(details, Mapping) and details.get(field) is not None:
+                remaining.append(str(ticket.get("objectId") or ""))
+        if not remaining:
+            break
+        if attempts < _REMOVAL_VERIFY_ATTEMPTS:
+            time.sleep(_REMOVAL_VERIFY_DELAY_SECONDS)
     verified = not remaining
 
     action = CanonicalPositionActionResult(
@@ -2953,6 +2973,7 @@ def _remove_native_protection(
         "removed": verified,
         "verified": verified,
         "remaining_object_ids": remaining,
+        "verify_attempts": attempts,
         "edit_object_ids": [str(row.get("objectId") or "") for row in editable],
         "cancel_object_ids": cancel_ids,
         "transaction_digest": tx_digest,

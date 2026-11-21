@@ -1824,8 +1824,9 @@ class NativeTPRemovalTests(unittest.TestCase):
              ), \
              mock.patch.object(
                  aftermath, "_stop_orders_for_markets",
-                 side_effect=[tickets, tickets],
+                 side_effect=[tickets] * (aftermath._REMOVAL_VERIFY_ATTEMPTS + 1),
              ), \
+             mock.patch.object(aftermath, "time") as clock, \
              mock.patch.object(
                  aftermath, "_submit_native_sl_tp",
                  return_value={"effects_digest": "digest123"},
@@ -1840,6 +1841,42 @@ class NativeTPRemovalTests(unittest.TestCase):
         self.assertEqual(response.error.code, "SET_TP_REMOVAL_UNVERIFIED")
         self.assertFalse(response.data.get("verified"))
         self.assertEqual(response.data.get("remaining_object_ids"), [_REMOVE_OBJECT])
+
+    def test_stale_index_read_is_retried_before_reporting_failure(self) -> None:
+        """A lagging index must not turn a successful removal into a failure.
+
+        The Aftermath stop-order index can still show the cancelled ticket on
+        the first read after the transaction lands. The verification retries,
+        so a removal that is really gone is reported as verified.
+        """
+        ticket = _remove_ticket()
+        with mock.patch.object(aftermath, "_find_position", return_value=self.position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _REMOVE_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(
+                 aftermath, "_post_json",
+                 return_value={"txKind": _NATIVE_TP_KIND_B64},
+             ), \
+             mock.patch.object(
+                 aftermath, "_stop_orders_for_markets",
+                 side_effect=[[ticket], [ticket], [ticket], []],
+             ) as reader, \
+             mock.patch.object(aftermath, "time") as clock, \
+             mock.patch.object(
+                 aftermath, "_submit_native_sl_tp",
+                 return_value={"effects_digest": "digest123"},
+             ), \
+             mock.patch.object(aftermath, "_execute_sui_transaction"):
+            response = aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "ZEC", "side": "sell", "price": "0", "dry_run": False},
+                "set_tp",
+            )
+        self.assertTrue(response.success, "a stale index caused a false failure")
+        self.assertTrue(response.data.get("verified"))
+        self.assertEqual(response.data.get("verify_attempts"), 3)
+        self.assertGreaterEqual(reader.call_count, 4)
+        self.assertTrue(clock.sleep.called, "the retry must wait between reads")
 
     # --- Wrong market / position protection -------------------------------
 
