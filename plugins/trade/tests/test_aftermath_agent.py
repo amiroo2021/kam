@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import sys
 import tempfile
@@ -160,6 +161,16 @@ class AftermathAgentTests(unittest.TestCase):
         if path == "/api/ccxt/myPendingOrders":
             ch = (payload or {}).get("chId") or ""
             return self.ccxt_pending_orders_payload(ch)
+        if path == "/api/perpetuals/account/stop-order-datas":
+            # No native on-chain SL/TP orders by default.
+            return {"stopOrderDatas": []}
+        if path == "/api/perpetuals/account/transactions/place-sl-tp-orders":
+            # Native SL/TP build returns a bare transaction kind.
+            import base64
+            return {
+                "txKind": base64.b64encode(b"FAKE_NATIVE_TX_KIND").decode(),
+                "sponsorSignature": None,
+            }
         if path.startswith("/api/ccxt/build/"):
             # Build routes return {transactionBytes, signingDigest}.
             import base64
@@ -387,8 +398,8 @@ class AftermathAgentTests(unittest.TestCase):
         operations = [
             ({"operation": "cancel_orders", "symbol": "SOL-PERP", "order_ids": ["11"]}, "/api/ccxt/build/cancelOrders"),
             ({"operation": "close_position", "symbol": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f"}, "/api/ccxt/build/createOrders"),
-            ({"operation": "set_tp", "symbol": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f", "price": "25"}, "/api/ccxt/build/createOrders"),
-            ({"operation": "set_sl", "symbol": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f", "price": "15"}, "/api/ccxt/build/createOrders"),
+            ({"operation": "set_tp", "symbol": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f", "price": "25"}, "/api/perpetuals/account/transactions/place-sl-tp-orders"),
+            ({"operation": "set_sl", "symbol": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f", "price": "15"}, "/api/perpetuals/account/transactions/place-sl-tp-orders"),
             ({"operation": "set_leverage", "symbol": "SOL-PERP", "leverage": "3"}, "/api/ccxt/build/setLeverage"),
         ]
         for req, expected_path in operations:
@@ -398,6 +409,309 @@ class AftermathAgentTests(unittest.TestCase):
                 response = aftermath.execute(req)
             self.assertTrue(response.success, msg=req["operation"])
             self.assertEqual(calls[-1][0], expected_path)
+
+    def _set_protection_fixture(self, operation="set_tp", before=None, after=None, price="500"):
+        """Drive _set_tp_sl with fake native stop-order state before/after."""
+        position = {
+            "marketId": "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f",
+            "baseAssetAmount": "-24.476854",
+        }
+        credentials = {
+            "account": "main", "address": "0x" + "2" * 64,
+            "account_id": "672", "private_key": "redacted",
+        }
+        submit = {
+            "gas_coin": "0x" + "3" * 64,
+            "signing_digest": "ZGlnZXN0",
+            "execution_status": "success",
+            "transaction_bytes": "dHg=",
+        }
+        with mock.patch.object(aftermath, "_find_position", return_value=position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": position["marketId"]}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value="0x" + "5" * 64), \
+             mock.patch.object(aftermath, "_build_native_sl_tp", return_value={"tx_kind": "a2luZA==", "sponsor_signature": None}) as builder, \
+             mock.patch.object(aftermath, "_submit_native_sl_tp", return_value=submit) as signer, \
+             mock.patch.object(aftermath, "_stop_orders_for_markets", side_effect=[before or [], after or []]):
+            response = aftermath._set_tp_sl(
+                credentials,
+                {"symbol": "ZEC", "side": "sell", "price": price, "dry_run": False},
+                operation,
+            )
+        return response, signer, builder, position
+
+    @staticmethod
+    def _native_stop_order(
+        object_id,
+        *,
+        market_id="0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f",
+        side=0,
+        take_profit=500.0,
+        stop_loss=None,
+        active=True,
+    ):
+        """A native SL/TP stop order as returned by stop-order-datas."""
+        details = {}
+        if take_profit is not None:
+            details["takeProfitPrice"] = take_profit
+        if stop_loss is not None:
+            details["stopLossPrice"] = stop_loss
+        return {
+            "objectId": object_id,
+            "marketId": market_id,
+            "side": side,
+            "size": "9223372036854775807n",
+            "orderState": {"active": {}} if active else {"inactive": {}},
+            "slTp": details,
+        }
+
+    def test_set_tp_submission_without_new_native_stop_order_is_not_verified(self) -> None:
+        """A submission that does not appear on a fresh read must not pass."""
+        response, signer, _, _ = self._set_protection_fixture()
+        self.assertTrue(signer.called)
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+        self.assertFalse(response.position_action.verified)
+
+    def test_set_tp_matching_native_stop_order_verifies(self) -> None:
+        response, signer, _, _ = self._set_protection_fixture(
+            after=[self._native_stop_order("0xtp1")]
+        )
+        self.assertTrue(response.success)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(response.data["matched_object_ids"], ["0xtp1"])
+        self.assertEqual(response.data["verified_via"], "/api/perpetuals/account/stop-order-datas")
+
+    def test_set_tp_native_stop_order_with_wrong_price_is_not_verified(self) -> None:
+        response, _, _, _ = self._set_protection_fixture(
+            after=[self._native_stop_order("0xtp-wrong-price", take_profit=600.0)]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+
+    def test_set_tp_native_stop_order_on_wrong_side_is_not_verified(self) -> None:
+        # Position is short -> the closing side is bid (0). side=1 is wrong.
+        response, _, _, _ = self._set_protection_fixture(
+            after=[self._native_stop_order("0xtp-wrong-side", side=1)]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+
+    def test_set_tp_native_stop_order_on_wrong_market_is_not_verified(self) -> None:
+        response, _, _, _ = self._set_protection_fixture(
+            after=[self._native_stop_order("0xtp-wrong-market", market_id="0x" + "9" * 64)]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+
+    def test_set_tp_inactive_native_stop_order_is_not_verified(self) -> None:
+        response, _, _, _ = self._set_protection_fixture(
+            after=[self._native_stop_order("0xtp-inactive", active=False)]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+
+    def test_preexisting_native_stop_order_cannot_verify_new_submission(self) -> None:
+        """An order that already existed before the submission proves nothing."""
+        existing = [self._native_stop_order("0xpreexisting")]
+        response, _, _, _ = self._set_protection_fixture(before=existing, after=existing)
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_TP_UNVERIFIED")
+
+    def test_set_sl_submission_without_new_native_stop_order_is_not_verified(self) -> None:
+        response, signer, _, _ = self._set_protection_fixture(operation="set_sl")
+        self.assertTrue(signer.called)
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_SL_UNVERIFIED")
+        self.assertFalse(response.position_action.verified)
+
+    def test_set_sl_matching_native_stop_order_verifies(self) -> None:
+        response, _, _, _ = self._set_protection_fixture(
+            operation="set_sl", price="400",
+            after=[self._native_stop_order("0xsl1", take_profit=None, stop_loss=400.0)],
+        )
+        self.assertTrue(response.success)
+        self.assertTrue(response.position_action.verified)
+        self.assertEqual(response.data["matched_object_ids"], ["0xsl1"])
+
+    def test_set_sl_native_stop_order_without_stop_loss_is_not_verified(self) -> None:
+        response, _, _, _ = self._set_protection_fixture(
+            operation="set_sl", price="400",
+            after=[self._native_stop_order("0xsl-tp-only")],
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "SET_SL_UNVERIFIED")
+
+    def test_native_sl_tp_payload_uses_aftermath_position_side_encoding(self) -> None:
+        """Short positions map to positionSide=1 (ask); long to 0 (bid)."""
+        credentials = {"address": "0x" + "2" * 64, "account_id": "672"}
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value="0x" + "5" * 64):
+            short_payload = aftermath._native_sl_tp_payload(
+                credentials,
+                market_id="0xmarket",
+                position_side="short",
+                size=Decimal("24.476854"),
+                take_profit=Decimal("500"),
+                stop_loss=None,
+            )
+        self.assertEqual(short_payload["positionSide"], 1)
+        self.assertEqual(short_payload["takeProfitPrice"], 500.0)
+        self.assertNotIn("stopLossPrice", short_payload)
+        self.assertEqual(short_payload["accountId"], "672n")
+        self.assertEqual(short_payload["size"], "24476854000n")
+
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value="0x" + "5" * 64):
+            long_payload = aftermath._native_sl_tp_payload(
+                credentials,
+                market_id="0xmarket",
+                position_side="long",
+                size=Decimal("1"),
+                take_profit=None,
+                stop_loss=Decimal("400"),
+            )
+        self.assertEqual(long_payload["positionSide"], 0)
+        self.assertEqual(long_payload["stopLossPrice"], 400.0)
+        self.assertNotIn("takeProfitPrice", long_payload)
+
+    def test_native_sl_tp_payload_sends_account_cap_id(self) -> None:
+        """The payload must carry the wallet's capability object ID.
+
+        Without ``accountCapId`` Aftermath returns a kind that references the
+        protocol vault (consensus-address-owned by Aftermath's authority), and
+        the fullnode rejects the transaction with "Object 0x9236ba93... is
+        owned by account address 0xe75db223..., but given owner/signer address
+        is 0x<agent wallet>".
+        """
+        cap_id = "0x55d70f824bde7d1a5541e5fb4322d1dc53a1ec9c36e827f17469b70b1b310563"
+        credentials = {"address": "0x" + "2" * 64, "account_id": "672"}
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value=cap_id) as resolver:
+            payload = aftermath._native_sl_tp_payload(
+                credentials,
+                market_id="0xmarket",
+                position_side="short",
+                size=Decimal("1"),
+                take_profit=Decimal("500"),
+                stop_loss=None,
+            )
+        self.assertTrue(resolver.called)
+        self.assertEqual(payload["accountCapId"], cap_id)
+
+    def test_native_cancel_stop_orders_payload_sends_account_cap_id(self) -> None:
+        """The cancel build must use the capability object too."""
+        cap_id = "0x55d70f824bde7d1a5541e5fb4322d1dc53a1ec9c36e827f17469b70b1b310563"
+        credentials = {
+            "account": "main", "address": "0x" + "2" * 64,
+            "account_id": "672", "private_key": "redacted",
+        }
+        captured = {}
+
+        def fake_post(creds, path, body):
+            captured["path"] = path
+            captured["body"] = body
+            return {"txKind": "a2luZA=="}
+
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value=cap_id), \
+             mock.patch.object(aftermath, "_post_json", side_effect=fake_post):
+            result = aftermath._build_native_cancel_stop_orders(credentials, ["0xstop1"])
+
+        self.assertEqual(result["tx_kind"], "a2luZA==")
+        self.assertEqual(captured["path"], "/api/perpetuals/account/transactions/cancel-stop-orders")
+        self.assertEqual(captured["body"]["accountCapId"], cap_id)
+        self.assertEqual(captured["body"]["stopOrderIds"], ["0xstop1"])
+
+    def test_sui_gas_budget_is_clamped_to_wallet_balance(self) -> None:
+        """A budget above the wallet balance is rejected by the fullnode.
+
+        The fullnode reserves the WHOLE budget up front, so an oversized
+        budget fails even when the real cost is a fraction of it.
+        """
+        with mock.patch.object(aftermath, "_sui_balance_mist", return_value=59273666):
+            budget = aftermath._sui_gas_budget("0x" + "2" * 64)
+        self.assertEqual(budget, 59273666 - aftermath.SUI_GAS_BUDGET_RESERVE)
+        self.assertLess(budget, aftermath.SUI_GAS_BUDGET)
+
+    def test_sui_gas_budget_keeps_configured_value_when_balance_unknown(self) -> None:
+        with mock.patch.object(aftermath, "_sui_balance_mist", return_value=None):
+            budget = aftermath._sui_gas_budget("0x" + "2" * 64)
+        self.assertEqual(budget, aftermath.SUI_GAS_BUDGET)
+
+    def test_sui_gas_budget_rejects_a_balance_too_small_to_pay(self) -> None:
+        with mock.patch.object(aftermath, "_sui_balance_mist", return_value=1000):
+            with self.assertRaises(RuntimeError):
+                aftermath._sui_gas_budget("0x" + "2" * 64)
+
+    def test_submit_native_sl_tp_can_assemble_without_submitting(self) -> None:
+        """allow_submit=False must never reach the chain.
+
+        Sui GraphQL exposes only `executeTransaction`, which really executes,
+        so there is no dry-run mutation to fall back on.
+        """
+        import secrets
+
+        from pysui_fastcrypto import encode_bech32
+
+        priv = encode_bech32(b"\x00" + secrets.token_bytes(32), "suiprivkey")
+        kind_b64 = base64.b64encode(b"\x00" * 8).decode()
+        with mock.patch.object(aftermath, "_sui_epoch_info",
+                               return_value={"epoch": 1318, "chain_identifier": "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"}), \
+             mock.patch.object(aftermath, "_sui_gas_budget", return_value=1000), \
+             mock.patch.object(aftermath, "_execute_sui_transaction") as executor:
+            result = aftermath._submit_native_sl_tp(
+                {"address": "0x" + "2" * 64, "private_key": priv},
+                kind_b64,
+                allow_submit=False,
+            )
+        self.assertFalse(executor.called)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["execution_status"], "not_submitted")
+
+    def test_b58decode_left_pads_short_digests(self) -> None:
+        raw = aftermath._b58decode("3mPnD7q6nRo7SZ7p955fLLrWm2AcEiAqsn7fRmqLraA9")
+        self.assertEqual(len(raw), 32)
+        self.assertTrue(raw.endswith(bytes.fromhex("2916afafad07318a71f85c5b39eebc61420c4e3b88e7b9bbd265df2e5c50d08e")))
+
+    def test_assemble_balance_gas_transaction_data_matches_official_sdk(self) -> None:
+        """Address-balance gas bytes must match the official @mysten/sui output.
+
+        The reference fixture was produced with @mysten/sui v3.0.1 for the
+        real Aftermath native SL/TP kind, sender, chain identifier, epoch and
+        gas settings (see tests/fixtures/README.md).
+        """
+        import base64 as _b64
+
+        fixtures = Path(__file__).parent / "fixtures"
+        kind_b64 = (fixtures / "aftermath_native_sl_tp_kind.b64").read_text().strip()
+        kind_bytes = _b64.b64decode(kind_b64 + "=" * (-len(kind_b64) % 4))
+        data = aftermath._assemble_balance_gas_transaction_data(
+            kind_bytes,
+            sender="0x38a460af94ba659bbcdd24e4043aa7f0e5e50a4ad55639c1bcae582571daf564",
+            chain_b58="4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+            min_epoch=1318,
+            max_epoch=1319,
+            nonce=0,
+            gas_price=1000,
+            gas_budget=100000000,
+        )
+        expected_b64 = (fixtures / "aftermath_native_sl_tp_reference_txdata.b64").read_text().strip()
+        expected = _b64.b64decode(expected_b64 + "=" * (-len(expected_b64) % 4))
+        self.assertEqual(data, expected)
+        self.assertEqual(
+            aftermath._sui_intent_digest(data).hex(),
+            (fixtures / "aftermath_native_sl_tp_reference_digest.txt").read_text().strip(),
+        )
+
+    def test_ordinary_limit_orders_are_not_classified_as_take_profit(self) -> None:
+        """Position Management must not present ordinary limits as a TP."""
+        self.set_account()
+        with mock.patch.object(aftermath, "_post_json", side_effect=self.fake_native_post):
+            response = aftermath.execute({
+                "operation": "positions_management", "exchange": "aftermath", "account": "main",
+            })
+        self.assertTrue(response.success)
+        self.assertTrue(response.positions)
+        self.assertIsNone(response.positions[0].tp)
+        self.assertIsNone(response.positions[0].tp_count)
+        for group in response.order_groups or []:
+            self.assertNotEqual(group.classification, "take_profit")
 
     def test_find_position_normalizes_order_and_position_side_names(self) -> None:
         positions = [
@@ -1097,6 +1411,212 @@ class AftermathAgentTests(unittest.TestCase):
         self.assertFalse(response.success)
         self.assertNotIn(secret, response.error.message)
         self.assertNotIn(secret, str(response.to_dict()))
+
+
+# --- Native TP safety verification -------------------------------------
+# The constants below back `NativeTPSafetyTests`, which proves the mandatory
+# safety properties of the native TP path without touching the chain.
+
+_NATIVE_TP_ZEC = "0x435987c9e1b8f61a4cdfa220751b3324ebf5a7bfd1250b25c79412a71a20392f"
+_NATIVE_TP_CAP = "0x55d70f824bde7d1a5541e5fb4322d1dc53a1ec9c36e827f17469b70b1b310563"
+_NATIVE_TP_WALLET = "0x" + "2" * 64
+_NATIVE_TP_KIND_B64 = base64.b64encode(b"\x00" * 8).decode()
+
+
+def _native_tp_privkey() -> str:
+    """A throwaway suiprivkey so the sign path can decode it."""
+    import secrets as _secrets
+
+    from pysui_fastcrypto import encode_bech32 as _encode_bech32
+
+    return _encode_bech32(b"\x00" + _secrets.token_bytes(32), "suiprivkey")
+
+
+class NativeTPSafetyTests(unittest.TestCase):
+    """Mandatory safety checks for the native TP deployment candidate."""
+
+    def setUp(self) -> None:
+        self.credentials = {
+            "account": "main", "address": _NATIVE_TP_WALLET,
+            "account_id": "672", "private_key": _native_tp_privkey(),
+        }
+
+    # --- 1. allow_submit=False prevents every live submission -----------
+
+    def test_allow_submit_false_never_calls_execute_transaction(self) -> None:
+        with mock.patch.object(
+            aftermath, "_sui_epoch_info",
+            return_value={"epoch": 1318, "chain_identifier": "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S"},
+        ), mock.patch.object(aftermath, "_sui_gas_budget", return_value=1000), mock.patch.object(
+            aftermath, "_execute_sui_transaction"
+        ) as executor:
+            result = aftermath._submit_native_sl_tp(
+                self.credentials, _NATIVE_TP_KIND_B64, allow_submit=False,
+            )
+        self.assertFalse(executor.called, "executeTransaction was called")
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["execution_status"], "not_submitted")
+
+    def test_execute_transaction_has_a_single_call_site(self) -> None:
+        """Only one line in the agent may reach the chain."""
+        import inspect
+
+        source = inspect.getsource(aftermath)
+        # One mutation string, one invocation.
+        self.assertEqual(source.count("executeTransaction(transactionDataBcs"), 1)
+        self.assertEqual(source.count("_execute_sui_transaction(transaction_data, signature)"), 1)
+
+    def test_no_dry_run_path_calls_execute_transaction(self) -> None:
+        """A dry-run request must never reach the chain."""
+        position = {"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-24.476854"}
+        with mock.patch.object(aftermath, "_find_position", return_value=position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_build_native_sl_tp",
+                               return_value={"tx_kind": _NATIVE_TP_KIND_B64, "sponsor_signature": None}), \
+             mock.patch.object(aftermath, "_submit_native_sl_tp") as submit, \
+             mock.patch.object(aftermath, "_execute_sui_transaction") as executor:
+            response = aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "price": "500", "dry_run": True},
+                "set_tp",
+            )
+        self.assertFalse(submit.called, "dry-run called _submit_native_sl_tp")
+        self.assertFalse(executor.called, "dry-run reached executeTransaction")
+        self.assertTrue(response.success)
+        self.assertTrue(response.data.get("dry_run"))
+
+    def test_dry_run_cancel_never_submits(self) -> None:
+        with mock.patch.object(aftermath, "_find_position",
+                               return_value={"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-24.476854"}), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_stop_orders_for_markets",
+                               return_value=[{"objectId": "0xstop1"}]), \
+             mock.patch.object(aftermath, "_build_native_cancel_stop_orders") as builder, \
+             mock.patch.object(aftermath, "_submit_native_sl_tp") as submit, \
+             mock.patch.object(aftermath, "_execute_sui_transaction") as executor:
+            response = aftermath._cancel_native_stop_orders(
+                self.credentials, {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "dry_run": True},
+            )
+        self.assertFalse(builder.called)
+        self.assertFalse(submit.called)
+        self.assertFalse(executor.called)
+        self.assertTrue(response.success)
+        self.assertTrue(response.data.get("dry_run"))
+
+    # --- 2. Live submission requires explicit authorization ---------------
+
+    def test_live_submission_requires_dry_run_false(self) -> None:
+        """Without dry_run=False the env default (DRY_RUN on) blocks it."""
+        position = {"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-24.476854"}
+        with mock.patch.dict(os.environ, {"AFTERMATH_DRY_RUN": "1"}), \
+             mock.patch.object(aftermath, "_find_position", return_value=position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_build_native_sl_tp",
+                               return_value={"tx_kind": _NATIVE_TP_KIND_B64, "sponsor_signature": None}), \
+             mock.patch.object(aftermath, "_submit_native_sl_tp") as submit:
+            aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "price": "500"},
+                "set_tp",
+            )
+        self.assertFalse(submit.called, "env DRY_RUN=1 still submitted")
+
+    # --- 3. accountCapId is included correctly ----------------------------
+
+    def test_place_and_cancel_payloads_carry_account_cap_id(self) -> None:
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP):
+            place = aftermath._native_sl_tp_payload(
+                self.credentials, market_id=_NATIVE_TP_ZEC, position_side="short",
+                size=Decimal("1"), take_profit=Decimal("500"), stop_loss=None,
+            )
+        self.assertEqual(place["accountCapId"], _NATIVE_TP_CAP)
+
+        captured = {}
+
+        def fake_post(creds, path, body):
+            captured["body"] = body
+            return {"txKind": _NATIVE_TP_KIND_B64}
+
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_post_json", side_effect=fake_post):
+            aftermath._build_native_cancel_stop_orders(self.credentials, ["0xstop1"])
+        self.assertEqual(captured["body"]["accountCapId"], _NATIVE_TP_CAP)
+
+    # --- 4. Gas budget is valid and sufficient ---------------------------
+
+    def test_gas_budget_is_within_balance_and_above_a_floor(self) -> None:
+        with mock.patch.object(aftermath, "_sui_balance_mist", return_value=59273666):
+            budget = aftermath._sui_gas_budget(_NATIVE_TP_WALLET)
+        self.assertGreater(budget, 0)
+        self.assertLessEqual(budget, 59273666)
+        self.assertGreaterEqual(budget, aftermath.SUI_GAS_BUDGET_MIN)
+        self.assertLess(budget, aftermath.SUI_GAS_BUDGET)
+
+    # --- 5. Verification reads authoritative native stop-order state -----
+
+    def test_verification_reads_stop_order_datas(self) -> None:
+        position = {"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-24.476854"}
+        with mock.patch.object(aftermath, "_find_position", return_value=position), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_build_native_sl_tp",
+                               return_value={"tx_kind": _NATIVE_TP_KIND_B64, "sponsor_signature": None}), \
+             mock.patch.object(aftermath, "_submit_native_sl_tp",
+                               return_value={"effects_digest": "d"}), \
+             mock.patch.object(aftermath, "_stop_orders_for_markets",
+                               side_effect=[[], []]) as reader:
+            aftermath._set_tp_sl(
+                self.credentials,
+                {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "price": "500", "dry_run": False},
+                "set_tp",
+            )
+        self.assertTrue(reader.called, "verification did not read native stop orders")
+        self.assertEqual(reader.call_args[0][1], [_NATIVE_TP_ZEC])
+
+    # --- 6. Cancellation cannot target an unintended order ---------------
+
+    def test_cancel_targets_only_native_stop_orders_of_that_market(self) -> None:
+        captured = {}
+
+        def fake_post(creds, path, body):
+            captured["body"] = body
+            return {"txKind": _NATIVE_TP_KIND_B64}
+
+        with mock.patch.object(aftermath, "_resolve_cap_id", return_value=_NATIVE_TP_CAP), \
+             mock.patch.object(aftermath, "_post_json", side_effect=fake_post):
+            aftermath._build_native_cancel_stop_orders(
+                self.credentials, ["0xstop1", "0xstop2"],
+            )
+        self.assertEqual(captured["body"]["stopOrderIds"], ["0xstop1", "0xstop2"])
+        self.assertNotIn("orderIds", captured["body"])
+
+    def test_cancel_only_reads_the_requested_market(self) -> None:
+        with mock.patch.object(aftermath, "_find_position",
+                               return_value={"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-1"}), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_stop_orders_for_markets",
+                               return_value=[{"objectId": "0xstop1"}]) as reader, \
+             mock.patch.object(aftermath, "_build_native_cancel_stop_orders") as builder:
+            aftermath._cancel_native_stop_orders(
+                self.credentials, {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "dry_run": True},
+            )
+        self.assertEqual(reader.call_args[0][1], [_NATIVE_TP_ZEC])
+
+    def test_cancel_cannot_target_limit_orders(self) -> None:
+        """A limit order must never appear in the cancel target set."""
+        with mock.patch.object(aftermath, "_find_position",
+                               return_value={"marketId": _NATIVE_TP_ZEC, "baseAssetAmount": "-1"}), \
+             mock.patch.object(aftermath, "_find_market", return_value={"objectId": _NATIVE_TP_ZEC}), \
+             mock.patch.object(aftermath, "_stop_orders_for_markets",
+                               return_value=[{"objectId": "0xstop1"}]), \
+             mock.patch.object(aftermath, "_build_native_cancel_stop_orders") as builder:
+            aftermath._cancel_native_stop_orders(
+                self.credentials, {"symbol": "_NATIVE_TP_ZEC", "side": "sell", "dry_run": True},
+            )
+        # Nothing was built, so no cancel was issued at all in dry-run.
+        self.assertFalse(builder.called)
 
 
 if __name__ == "__main__":

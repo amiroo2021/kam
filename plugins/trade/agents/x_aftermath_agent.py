@@ -17,11 +17,13 @@ not attempted without a verified Sui signing stack in this runtime.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import urllib.error
 import urllib.request
 from base64 import b64decode, b64encode
@@ -59,6 +61,20 @@ _REQUIRED_SUFFIXES = ("_AGENT_ADDRESS", "_AGENT_PRIVATEKEY", "_ACCOUNT_ID")
 _PRICE_SCALE = Decimal("1000000000")
 _SIZE_SCALE = Decimal("1000000000")
 _USDC_COLLATERAL_COIN_TYPE = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+# Sui GraphQL is the only supported submission path: the public JSON-RPC
+# endpoint on fullnode.mainnet.sui.io now answers -32601 ("JSON-RPC on
+# public fullnodes has been deprecated. Please migrate to gRPC or GraphQL").
+SUI_GRAPHQL_URL = "https://graphql.mainnet.sui.io/graphql"
+# Gas payment for a self-funded native transaction.
+SUI_GAS_PRICE = 1000
+SUI_GAS_BUDGET = 100000000
+# The budget can never exceed the wallet's SUI balance: the fullnode reserves
+# the FULL budget up front ("the transaction requires X but only Y is
+# available"), so an oversized budget is rejected even when the real cost is
+# a fraction of it. The balance is read at submit time and the budget is
+# clamped to it.
+SUI_GAS_BUDGET_MIN = 1000000
+SUI_GAS_BUDGET_RESERVE = 1000000
 _KNOWN_MARKET_SYMBOLS: Dict[str, str] = {
     "0x05b5c3bea84c4b8f33cf592d899008336dcbae8c9c6c75b2f8e7b8f7878744c1": "BTC",
     "0x143b0900a15a11af9764119ea7b72a25756484a60ad21024ed79325231ed7a9c": "DRAM",
@@ -190,6 +206,7 @@ def capabilities() -> List[str]:
         "close_position",
         "set_tp",
         "set_sl",
+        "cancel_stop_orders",
         "set_leverage",
         "resolve_instrument",
         "list_instruments",
@@ -497,7 +514,354 @@ def _position_side(size: Decimal) -> str:
     return "long" if size >= 0 else "short"
 
 
-def _canonical_positions(account_obj: Mapping[str, Any]) -> List[CanonicalPosition]:
+def _uleb128(value: int) -> bytes:
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        encoded.append(byte | 0x80 if value else byte)
+        if not value:
+            return bytes(encoded)
+
+
+def _terms_auth(credentials: Mapping[str, str]) -> Dict[str, str]:
+    message = b"Aftermath Terms and Conditions"
+    digest = hashlib.blake2b(
+        bytes((3, 0, 0)) + _uleb128(len(message)) + message,
+        digest_size=32,
+    ).digest()
+    signature = SuiSigner(credentials["private_key"]).serialized_user_signature(digest)
+    return {
+        "walletAddress": credentials["address"],
+        "bytes": b64encode(message).decode(),
+        "signature": signature,
+    }
+
+
+def _numeric_account_id(credentials: Mapping[str, str]) -> str:
+    value = str(credentials["account_id"]).rstrip("n")
+    if not value.isdigit():
+        raise ValueError("Aftermath account_id must be numeric")
+    return f"{value}n"
+
+
+# --------------------------------------------------------------------------
+# Sui transaction assembly for NATIVE Aftermath transactions.
+#
+# Aftermath's native `/api/perpetuals/account/transactions/*` routes return a
+# bare base64 `TransactionKind`; the official SDK turns that into a full
+# Sui `Transaction` locally (`Transaction.fromKind`), adds gas, and submits
+# it to a fullnode itself. There is no Aftermath endpoint that wraps or
+# relays a signed native transaction, so the client has to do the Sui side.
+#
+# The BCS layout below was validated byte-for-byte against @mysten/sui
+# v3.0.1 (the official SDK): the assembled TransactionData bytes and the
+# resulting signing digest are identical.
+#
+#   TransactionData (enum, variant 0 = V1)
+#     kind:       TransactionKind  (raw bytes from Aftermath)
+#     sender:     Address           (32 bytes)
+#     gasData:    GasData { payment: Vec<ObjectRef>, owner: Address,
+#                          price: u64, budget: u64 }
+#     expiration: TransactionExpiration (0 = None)
+#
+#   ObjectRef { objectId: Address(32), version: u64, digest: ObjectDigest }
+#   ObjectDigest is a BCS byteVector, so it carries a ULEB128 length prefix.
+# --------------------------------------------------------------------------
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58decode(text: str) -> bytes:
+    """Decode a Sui base58 string into its raw bytes.
+
+    Sui encodes object digests as base58 of 32 raw bytes; the encoding drops
+    leading zero bytes, so the decoded length can be shorter than 32 and must
+    be left-padded back to 32 bytes.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("empty base58 value")
+    number = 0
+    for char in raw:
+        index = _B58_ALPHABET.find(char)
+        if index < 0:
+            raise ValueError(f"invalid base58 character {char!r}")
+        number = number * 58 + index
+    body = b"" if number == 0 else number.to_bytes((number.bit_length() + 7) // 8, "big")
+    leading = 0
+    for char in raw:
+        if char == "1":
+            leading += 1
+        else:
+            break
+    decoded = b"\x00" * leading + body
+    if len(decoded) > 32:
+        raise ValueError("base58 value is longer than 32 bytes")
+    return b"\x00" * (32 - len(decoded)) + decoded
+
+
+def _sui_address_bytes(address: str) -> bytes:
+    text = str(address or "").strip()
+    if not text.startswith("0x") or len(text) != 66:
+        raise ValueError(f"invalid Sui address {text!r}")
+    try:
+        return bytes.fromhex(text[2:])
+    except ValueError as exc:
+        raise ValueError(f"invalid Sui address {text!r}") from exc
+
+
+def _bcs_option_u64(value: Optional[int]) -> bytes:
+    """BCS Option<u64>: 0 = None, 1 = Some(value)."""
+    if value is None:
+        return b"\x00"
+    return b"\x01" + int(value).to_bytes(8, "little")
+
+
+def _sui_valid_during(
+    min_epoch: int,
+    max_epoch: int,
+    chain_b58: str,
+    nonce: int,
+) -> bytes:
+    """BCS ValidDuring expiration.
+
+    ``ValidDuring { minEpoch: Option<u64>, maxEpoch: Option<u64>,
+    minTimestamp: Option<u64>, maxTimestamp: Option<u64>,
+    chain: ObjectDigest, nonce: u32 }``
+    """
+    digest = _b58decode(chain_b58)
+    return (
+        _bcs_option_u64(min_epoch)
+        + _bcs_option_u64(max_epoch)
+        + _bcs_option_u64(None)
+        + _bcs_option_u64(None)
+        + _uleb128(len(digest))
+        + digest
+        + int(nonce).to_bytes(4, "little")
+    )
+
+
+def _assemble_balance_gas_transaction_data(
+    kind_bytes: bytes,
+    *,
+    sender: str,
+    chain_b58: str,
+    min_epoch: int,
+    max_epoch: int,
+    nonce: int,
+    gas_price: int,
+    gas_budget: int,
+) -> bytes:
+    """Build BCS TransactionData using Sui's ADDRESS-BALANCE gas mode.
+
+    The native Aftermath SL/TP transaction calls ``0x2::coin::redeem_funds``,
+    which pays gas from the sender's Sui *balance* rather than from a coin
+    object. Sui requires that mode to use an empty gas payment list plus a
+    ``ValidDuring`` expiration (the official SDK enforces the same rule in
+    ``src/transactions/resolve.ts``).
+
+    Validated byte-for-byte against @mysten/sui v3.0.1.
+    """
+    gas_data = (
+        _uleb128(0)  # payment: Vec<ObjectRef>, empty (address-balance gas)
+        + _sui_address_bytes(sender)
+        + int(gas_price).to_bytes(8, "little")
+        + int(gas_budget).to_bytes(8, "little")
+    )
+    # TransactionExpiration enum: 0=None, 1=Epoch, 2=ValidDuring, 3=Validity
+    expiration = b"\x02" + _sui_valid_during(
+        min_epoch, max_epoch, chain_b58, nonce
+    )
+    data_v1 = kind_bytes + _sui_address_bytes(sender) + gas_data + expiration
+    return b"\x00" + data_v1  # TransactionData enum variant index 0 = V1
+
+
+def _sui_intent_digest(transaction_data: bytes) -> bytes:
+    """Sui signing digest: blake2b-256 over intent(0,0,0) || bcs(TransactionData)."""
+    return hashlib.blake2b(
+        bytes((0, 0, 0)) + transaction_data, digest_size=32
+    ).digest()
+
+
+def _sui_balance_mist(address: str) -> Optional[int]:
+    """Read the wallet's SUI balance in MIST from the Sui GraphQL endpoint.
+
+    Returns ``None`` when the balance cannot be read, so callers can fall back
+    to the configured budget rather than failing the submission outright.
+    """
+    query = (
+        'query($a: SuiAddress!) { address(address: $a) { '
+        'balance(coinType: "0x2::sui::SUI") { totalBalance } } }'
+    )
+    try:
+        body = _sui_graphql(query, {"a": address})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Sui SUI balance read failed: %s", type(exc).__name__)
+        return None
+    balance = ((body.get("data") or {}).get("address") or {}).get("balance") or {}
+    try:
+        return int(str(balance.get("totalBalance") or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sui_gas_budget(address: str) -> int:
+    """Return a gas budget the wallet can actually cover.
+
+    The fullnode reserves the whole budget before execution, so a budget above
+    the wallet's balance is rejected outright. Clamp to the balance less a
+    small reserve, and keep a sane floor for very small balances.
+    """
+    budget = int(SUI_GAS_BUDGET)
+    balance = _sui_balance_mist(address)
+    if balance is None:
+        return budget
+    available = balance - SUI_GAS_BUDGET_RESERVE
+    if available < SUI_GAS_BUDGET_MIN:
+        raise RuntimeError(
+            "wallet SUI balance is too low to cover a native transaction "
+            f"({balance} MIST available, {SUI_GAS_BUDGET_MIN} MIST minimum)"
+        )
+    return min(budget, available)
+
+
+def _sui_graphql(query: str, variables: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Run a query/mutation against the Sui GraphQL endpoint."""
+    payload = {"query": query, "variables": dict(variables or {})}
+    request = urllib.request.Request(
+        SUI_GRAPHQL_URL,
+        method="POST",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        raise RuntimeError(f"Sui GraphQL HTTP {exc.code}: {detail[:300]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Sui GraphQL request failed: {exc.reason}") from exc
+    if isinstance(body, dict) and body.get("errors"):
+        raise RuntimeError(f"Sui GraphQL error: {json.dumps(body['errors'])[:300]}")
+    return body if isinstance(body, dict) else {}
+
+
+def _sui_epoch_info() -> Dict[str, Any]:
+    """Read the current epoch and chain identifier (needed for ValidDuring)."""
+    query = "{ chainIdentifier epoch { epochId } }"
+    body = _sui_graphql(query)
+    data = body.get("data") or {}
+    chain = str(data.get("chainIdentifier") or "")
+    epoch = ((data.get("epoch") or {}) or {}).get("epochId")
+    if not chain or epoch is None:
+        raise RuntimeError("Sui GraphQL did not return epoch/chain information")
+    return {"chain_identifier": chain, "epoch": int(epoch)}
+
+
+def _execute_sui_transaction(transaction_data: bytes, signature_b64: str) -> Dict[str, Any]:
+    """Submit a signed Sui transaction via GraphQL executeTransaction.
+
+    The schema's ``effects.status`` is the ``ExecutionStatus`` enum, so it is
+    selected without a sub-selection.
+    """
+    mutation = """
+    mutation($tx: Base64!, $sigs: [Base64!]!) {
+      executeTransaction(transactionDataBcs: $tx, signatures: $sigs) {
+        effects {
+          status
+          digest
+          executionError { message }
+        }
+      }
+    }
+    """
+    body = _sui_graphql(
+        mutation,
+        {"tx": b64encode(transaction_data).decode(), "sigs": [signature_b64]},
+    )
+    return body.get("data") or {}
+
+
+def _stop_orders_for_markets(
+    credentials: Dict[str, str],
+    market_ids: Sequence[str],
+    *,
+    strict: bool = False,
+) -> List[Dict[str, Any]]:
+    """Read authenticated on-chain SL/TP orders for the requested markets."""
+    selected = sorted({str(value).strip() for value in market_ids if str(value).strip()})
+    if not selected:
+        return []
+    try:
+        response = _post_json(
+            credentials,
+            "/api/perpetuals/account/stop-order-datas",
+            {
+                "accountId": _numeric_account_id(credentials),
+                **_terms_auth(credentials),
+                "marketIds": selected,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Aftermath stop-order read failed: %s", _redact_credentials(str(exc), credentials))
+        if strict:
+            raise
+        return []
+    rows = response.get("stopOrderDatas") if isinstance(response, Mapping) else None
+    if not isinstance(rows, list):
+        if strict:
+            raise RuntimeError("Aftermath stop-order read returned an unexpected payload")
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _active_protection_orders(
+    stop_orders: Sequence[Mapping[str, Any]],
+    *,
+    market_id: str,
+    position_side: str,
+) -> List[Mapping[str, Any]]:
+    closing_side = 1 if position_side == "long" else 0
+    matched = []
+    for order in stop_orders:
+        if str(order.get("marketId") or "") != market_id:
+            continue
+        state = order.get("orderState")
+        if not isinstance(state, Mapping) or "active" not in state:
+            continue
+        try:
+            side = int(order.get("side"))
+        except (TypeError, ValueError):
+            continue
+        if side != closing_side or not isinstance(order.get("slTp"), Mapping):
+            continue
+        matched.append(order)
+    return sorted(matched, key=lambda row: str(row.get("objectId") or ""))
+
+
+def _protection_price(
+    orders: Sequence[Mapping[str, Any]],
+    field: str,
+) -> Tuple[Optional[str], Optional[int]]:
+    values = []
+    for order in orders:
+        details = order.get("slTp")
+        value = details.get(field) if isinstance(details, Mapping) else None
+        if value is not None:
+            values.append(_display_decimal(_decimal(value)))
+    return (values[0], len(values)) if values else (None, None)
+
+
+def _canonical_positions(
+    account_obj: Mapping[str, Any],
+    *,
+    stop_orders: Sequence[Mapping[str, Any]] = (),
+) -> List[CanonicalPosition]:
     positions: List[CanonicalPosition] = []
     for row in account_obj.get("positions") or []:
         if not isinstance(row, dict):
@@ -505,14 +869,27 @@ def _canonical_positions(account_obj: Mapping[str, Any]) -> List[CanonicalPositi
         size = _decimal(row.get("baseAssetAmount"), "0")
         if size == 0:
             continue
+        market_id = str(row.get("marketId") or "")
+        side = _position_side(size)
+        protection = _active_protection_orders(
+            stop_orders,
+            market_id=market_id,
+            position_side=side,
+        )
+        tp, tp_count = _protection_price(protection, "takeProfitPrice")
+        sl, sl_count = _protection_price(protection, "stopLossPrice")
         positions.append(
             CanonicalPosition(
                 symbol=_position_symbol(row),
-                side=_position_side(size),
+                side=side,
                 size=_display_2(abs(size)),
                 entry_price=_display_2(row.get("entryPrice")),
                 pnl=_money(row.get("unrealizedPnlUsd")),
-                exchange_instrument=str(row.get("marketId") or ""),
+                tp=tp,
+                sl=sl,
+                tp_count=tp_count,
+                sl_count=sl_count,
+                exchange_instrument=market_id,
                 mark=None,
             )
         )
@@ -652,10 +1029,12 @@ def _canonical_order_groups(
 
 def _balance(credentials: Dict[str, str]) -> CanonicalResponse:
     obj = _account_positions(credentials)
+    market_ids = [str(row.get("marketId") or "") for row in obj.get("positions") or [] if isinstance(row, Mapping)]
+    stop_orders = _stop_orders_for_markets(credentials, market_ids, strict=True)
     equity = _decimal(obj.get("totalEquityUsd"), "0")
     available = _decimal(obj.get("availableCollateralUsd", obj.get("availableCollateral")), "0")
     used = max(Decimal("0"), equity - available)
-    positions = _canonical_positions(obj)
+    positions = _canonical_positions(obj, stop_orders=stop_orders)
     order_groups = _canonical_order_groups(obj, credentials)
     return make_success(
         operation="balance",
@@ -678,12 +1057,14 @@ def _balance(credentials: Dict[str, str]) -> CanonicalResponse:
 
 def _positions_orders(credentials: Dict[str, str], operation: str = "positions_orders") -> CanonicalResponse:
     obj = _account_positions(credentials)
+    market_ids = [str(row.get("marketId") or "") for row in obj.get("positions") or [] if isinstance(row, Mapping)]
+    stop_orders = _stop_orders_for_markets(credentials, market_ids, strict=True)
     order_groups = _canonical_order_groups(obj, credentials)
     return make_success(
         operation=operation,
         exchange=name,
         account=credentials["account"],
-        positions=_canonical_positions(obj),
+        positions=_canonical_positions(obj, stop_orders=stop_orders),
         open_order_count=sum(g.order_count for g in order_groups),
         order_groups=order_groups,
         data={"account_id": credentials["account_id"], "source": "native_perpetuals"},
@@ -2035,16 +2416,326 @@ def _close_position(credentials: Dict[str, str], request: Mapping[str, Any]) -> 
     return response
 
 
-def _set_tp_sl(credentials: Dict[str, str], request: Mapping[str, Any], operation: str) -> CanonicalResponse:
-    """TP/SL are not in Aftermath's public CCXT spec; we model them as additional
-    limit orders in the same PTB: a take-profit limit (opposite side, at ``price``)
-    or a stop-loss limit. The order is ``reduceOnly`` and ``goodTillCancelled`` —
-    Aftermath's CCXT build paths accept these via OrderRequest.
+def _native_sl_tp_payload(
+    credentials: Dict[str, str],
+    *,
+    market_id: str,
+    position_side: str,
+    size: Decimal,
+    take_profit: Optional[Decimal],
+    stop_loss: Optional[Decimal],
+) -> Dict[str, Any]:
+    """Build the request body for Aftermath's native SL/TP transaction route."""
+    payload: Dict[str, Any] = {
+        "accountId": _numeric_account_id(credentials),
+        # ``accountCapId`` selects the wallet's OWN capability object
+        # (``/api/ccxt/accounts`` -> type "capability") instead of the protocol
+        # vault. Without it the returned kind references the protocol vault,
+        # which is consensus-address-owned by Aftermath's authority, so the
+        # fullnode rejects the transaction: "Object 0x9236ba93... is owned by
+        # account address 0xe75db223..., but given owner/signer address is
+        # 0x<agent wallet>". With it the kind references the capability object
+        # the agent wallet actually owns and the transaction executes.
+        "accountCapId": _resolve_cap_id(credentials),
+        "walletAddress": credentials["address"],
+        "marketId": market_id,
+        # Aftermath encodes the position side as 0 = bid (long), 1 = ask (short).
+        "positionSide": 1 if position_side == "short" else 0,
+        # Native BigInt fields require a decimal string with a trailing "n".
+        "size": f"{_native_size(size)}n",
+        "triggerPriceType": 0,  # index price
+    }
+    if take_profit is not None:
+        payload["takeProfitPrice"] = float(take_profit)
+    if stop_loss is not None:
+        payload["stopLossPrice"] = float(stop_loss)
+    return payload
+
+
+def _build_native_sl_tp(
+    credentials: Dict[str, str],
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Ask Aftermath for the native SL/TP transaction kind."""
+    response = _post_json(
+        credentials,
+        "/api/perpetuals/account/transactions/place-sl-tp-orders",
+        dict(payload),
+    )
+    if not isinstance(response, Mapping):
+        raise RuntimeError("Aftermath native SL/TP build returned a non-object response")
+    tx_kind = str(response.get("txKind") or "").strip()
+    if not tx_kind:
+        raise RuntimeError("Aftermath native SL/TP build did not include a txKind")
+    return {"tx_kind": tx_kind, "sponsor_signature": response.get("sponsorSignature")}
+
+
+def _submit_native_sl_tp(
+    credentials: Dict[str, str],
+    tx_kind_b64: str,
+    *,
+    allow_submit: bool = True,
+) -> Dict[str, Any]:
+    """Sign and submit a native Aftermath transaction on Sui.
+
+    Aftermath returns a bare ``TransactionKind``; there is no Aftermath
+    endpoint that wraps or relays a signed native transaction, so the client
+    assembles the Sui ``TransactionData`` locally (byte-identical to the
+    official ``@mysten/sui`` SDK), signs the Sui intent digest with the
+    existing Ed25519 signer, and submits through Sui GraphQL.
+
+    ``allow_submit=False`` assembles and signs the transaction but NEVER sends
+    it to the chain. Sui GraphQL exposes no dry-run/simulate mutation — the
+    only mutation is ``executeTransaction``, which really executes — so
+    callers that only want to validate the transaction must pass this flag.
+    """
+    try:
+        kind_bytes = b64decode(tx_kind_b64, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"native txKind was not valid base64: {type(exc).__name__}") from exc
+    if not kind_bytes:
+        raise RuntimeError("native txKind was empty")
+
+    sender = credentials["address"]
+    epoch_info = _sui_epoch_info()
+    gas_budget = _sui_gas_budget(sender)
+    transaction_data = _assemble_balance_gas_transaction_data(
+        kind_bytes,
+        sender=sender,
+        chain_b58=epoch_info["chain_identifier"],
+        min_epoch=epoch_info["epoch"],
+        max_epoch=epoch_info["epoch"] + 1,
+        nonce=secrets.randbits(32),
+        gas_price=SUI_GAS_PRICE,
+        gas_budget=gas_budget,
+    )
+    digest = _sui_intent_digest(transaction_data)
+    try:
+        signer = SuiSigner(credentials["private_key"])
+    except SuiSigningError as exc:
+        raise RuntimeError(f"failed to initialize Sui signer: {exc}") from exc
+    signature = signer.serialized_user_signature(digest)
+    if not allow_submit:
+        # Assemble + sign only. NEVER reach the chain: the Sui GraphQL schema
+        # exposes only `executeTransaction`, which really executes.
+        return {
+            "epoch": epoch_info["epoch"],
+            "gas_mode": "address_balance",
+            "gas_budget": gas_budget,
+            "signing_digest": b64encode(digest).decode(),
+            "execution_status": "not_submitted",
+            "effects_digest": "",
+            "transaction_bytes": b64encode(transaction_data).decode(),
+            "submitted": False,
+        }
+    result = _execute_sui_transaction(transaction_data, signature)
+    effects = (result.get("executeTransaction") or {}).get("effects") or {}
+    status = str(effects.get("status") or "")
+    error = effects.get("executionError") or {}
+    message = str(error.get("message") or "") if isinstance(error, Mapping) else ""
+    if status and status.upper() != "SUCCESS":
+        raise RuntimeError(
+            "native SL/TP transaction did not succeed "
+            f"(status={status}{': ' + message if message else ''})"
+        )
+    return {
+        "epoch": epoch_info["epoch"],
+        "gas_mode": "address_balance",
+        "gas_budget": gas_budget,
+        "signing_digest": b64encode(digest).decode(),
+        "execution_status": status,
+        "effects_digest": str(effects.get("digest") or ""),
+        "transaction_bytes": b64encode(transaction_data).decode(),
+        "submitted": True,
+    }
+
+
+def _build_native_cancel_stop_orders(
+    credentials: Dict[str, str],
+    stop_order_ids: Sequence[str],
+) -> Dict[str, Any]:
+    """Ask Aftermath for the native cancel-stop-orders transaction kind."""
+    ids = [str(value).strip() for value in stop_order_ids if str(value).strip()]
+    if not ids:
+        raise ValueError("cancel_stop_orders requires at least one stop order id")
+    response = _post_json(
+        credentials,
+        "/api/perpetuals/account/transactions/cancel-stop-orders",
+        {
+            "accountId": _numeric_account_id(credentials),
+            # Same reason as place-sl-tp-orders: the capability object is the one
+            # the agent wallet owns, so the fullnode accepts the signer.
+            "accountCapId": _resolve_cap_id(credentials),
+            "walletAddress": credentials["address"],
+            "stopOrderIds": ids,
+        },
+    )
+    if not isinstance(response, Mapping):
+        raise RuntimeError("Aftermath native cancel-stop-orders returned a non-object response")
+    tx_kind = str(response.get("txKind") or "").strip()
+    if not tx_kind:
+        raise RuntimeError("Aftermath native cancel-stop-orders did not include a txKind")
+    return {"tx_kind": tx_kind}
+
+
+def _cancel_native_stop_orders(
+    credentials: Dict[str, str],
+    request: Mapping[str, Any],
+) -> CanonicalResponse:
+    """Cancel native SL/TP stop orders on Aftermath.
+
+    Only native on-chain stop orders (the rows reported by
+    ``/api/perpetuals/account/stop-order-datas``) are targeted; ordinary
+    limit orders are never touched by this operation.
     """
     symbol = str(request.get("symbol") or "").strip()
     pos = _find_position(credentials, symbol, str(request.get("side") or ""))
-    market = _find_market(credentials, symbol)
-    ch_id = _ch_id(market) or str(pos.get("marketId") or symbol)
+    market_id = str(pos.get("marketId") or "")
+    if not market_id:
+        market = _find_market(credentials, symbol)
+        market_id = _ch_id(market) or _market_id(market)
+    before = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    target_ids = [
+        str(row.get("objectId") or "")
+        for row in before
+        if isinstance(row, Mapping) and str(row.get("objectId") or "")
+    ]
+    dry_run = _is_dry_run(request)
+    side_text = _side_text(request.get("side")) if request.get("side") else ""
+    if not target_ids:
+        cancel = CanonicalCancelGroupResult(
+            symbol=symbol,
+            side=side_text,
+            targeted_order_count=0,
+            cancelled_order_count=0,
+            confirmed_absent_count=0,
+            remaining_target_count=0,
+            verified=True,
+            partial=False,
+            status="already_absent",
+            batch_count=0,
+            requested_cancel_count=0,
+            verified_cancel_count=0,
+        )
+        return CanonicalResponse(
+            success=True,
+            operation="cancel_stop_orders",
+            exchange=name,
+            account=credentials["account"],
+            cancel_group=cancel,
+            data={
+                "status": "already_absent",
+                "symbol": symbol,
+                "requested_cancel_count": 0,
+                "cancelled_order_count": 0,
+                "remaining_count": 0,
+                "verified": True,
+                "verified_via": "/api/perpetuals/account/stop-order-datas",
+                "dry_run": dry_run,
+            },
+        )
+    if dry_run:
+        cancel = CanonicalCancelGroupResult(
+            symbol=symbol,
+            side=side_text,
+            targeted_order_count=len(target_ids),
+            cancelled_order_count=0,
+            confirmed_absent_count=0,
+            remaining_target_count=len(target_ids),
+            verified=False,
+            partial=False,
+            status="dry_run",
+            batch_count=0,
+            requested_cancel_count=len(target_ids),
+            verified_cancel_count=0,
+        )
+        return CanonicalResponse(
+            success=True,
+            operation="cancel_stop_orders",
+            exchange=name,
+            account=credentials["account"],
+            cancel_group=cancel,
+            data={
+                "status": "dry_run",
+                "symbol": symbol,
+                "requested_cancel_count": len(target_ids),
+                "cancelled_order_count": 0,
+                "remaining_count": len(target_ids),
+                "verified": False,
+                "verified_via": "/api/perpetuals/account/stop-order-datas",
+                "dry_run": True,
+                "target_stop_order_ids": target_ids,
+                "build_path": "/api/perpetuals/account/transactions/cancel-stop-orders",
+            },
+        )
+    build = _build_native_cancel_stop_orders(credentials, target_ids)
+    submit = _submit_native_sl_tp(credentials, build["tx_kind"])
+    after = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    remaining_ids = [
+        str(row.get("objectId") or "")
+        for row in after
+        if isinstance(row, Mapping)
+        and str(row.get("objectId") or "") in set(target_ids)
+    ]
+    cancelled = len(target_ids) - len(remaining_ids)
+    verified = not remaining_ids
+    cancel = CanonicalCancelGroupResult(
+        symbol=symbol,
+        side=side_text,
+        targeted_order_count=len(target_ids),
+        cancelled_order_count=cancelled,
+        confirmed_absent_count=cancelled,
+        remaining_target_count=len(remaining_ids),
+        verified=verified,
+        partial=bool(remaining_ids) and cancelled > 0,
+        status="cancelled" if verified else "partial",
+        batch_count=1,
+        requested_cancel_count=len(target_ids),
+        verified_cancel_count=cancelled if verified else 0,
+    )
+    return CanonicalResponse(
+        success=verified,
+        operation="cancel_stop_orders",
+        exchange=name,
+        account=credentials["account"],
+        cancel_group=cancel,
+        data={
+            "status": "cancelled" if verified else "partial",
+            "symbol": symbol,
+            "requested_cancel_count": len(target_ids),
+            "cancelled_order_count": cancelled,
+            "remaining_count": len(remaining_ids),
+            "remaining_ids": remaining_ids,
+            "verified": verified,
+            "verified_via": "/api/perpetuals/account/stop-order-datas",
+            "dry_run": False,
+            "transaction_digest": str(submit.get("effects_digest") or ""),
+            "build_path": "/api/perpetuals/account/transactions/cancel-stop-orders",
+        },
+    )
+
+
+def _set_tp_sl(credentials: Dict[str, str], request: Mapping[str, Any], operation: str) -> CanonicalResponse:
+    """Set a native take-profit / stop-loss for an open position.
+
+    Aftermath's CCXT layer exposes no SL/TP order type, so the protective
+    order is created through the native route
+    ``/api/perpetuals/account/transactions/place-sl-tp-orders``. That route
+    returns a bare Sui ``TransactionKind``; the client wraps it into a full
+    transaction, signs it and submits it (see ``_submit_native_sl_tp``).
+
+    Verification is authoritative: the agent re-reads the signed native
+    stop-order source (``/api/perpetuals/account/stop-order-datas``) and only
+    reports success when a NEW active SL/TP object for this market, on the
+    closing side, with the requested trigger price, is present. Ordinary
+    limit orders are never treated as a TP.
+    """
+    symbol = str(request.get("symbol") or "").strip()
+    pos = _find_position(credentials, symbol, str(request.get("side") or ""))
+    market_id = str(pos.get("marketId") or "")
+    if not market_id:
+        market = _find_market(credentials, symbol)
+        market_id = _ch_id(market) or _market_id(market)
     size = abs(_decimal(pos.get("baseAssetAmount"), "0"))
     if size == 0:
         raise ValueError("matching position has zero size")
@@ -2052,54 +2743,114 @@ def _set_tp_sl(credentials: Dict[str, str], request: Mapping[str, Any], operatio
     if price is None:
         raise ValueError(f"{operation} requires price")
     current_side = _position_side(_decimal(pos.get("baseAssetAmount"), "0"))
-    close_side = "sell" if current_side == "long" else "buy"
-    order = {
-        "chId": ch_id,
-        "type": "limit",
-        "side": close_side,
-        "amount": float(size),
-        "price": _native_price_float(price),
-        "reduceOnly": True,
-    }
-    build_payload: Dict[str, Any] = {
-        "accountId": _resolve_cap_id(credentials),
-        "deallocateFreeCollateral": False,
-        "metadata": _build_metadata(credentials),
-        "orders": [order],
+    requested_price = _decimal(price)
+
+    build_payload = _native_sl_tp_payload(
+        credentials,
+        market_id=market_id,
+        position_side=current_side,
+        size=size,
+        take_profit=requested_price if operation == "set_tp" else None,
+        stop_loss=requested_price if operation == "set_sl" else None,
+    )
+    action_base: Dict[str, Any] = {
+        "operation": operation,
+        "symbol": symbol,
+        "price": str(price),
+        "current_side": current_side,
+        "current_size": _display_decimal(size),
     }
     if _is_dry_run(request):
-        build_response = _post_json(credentials, _BUILD_ROUTES["createOrders"], build_payload)
+        build = _build_native_sl_tp(credentials, build_payload)
         action = CanonicalPositionActionResult(
-            operation=operation,
-            symbol=symbol,
-            price=str(price),
+            **action_base,
             verified=False,
             status="dry_run",
-            current_side=current_side,
-            current_size=_display_decimal(size),
         )
         return _dryrun_success(
             operation,
             credentials,
-            build_response,
-            data={"build_path": _BUILD_ROUTES["createOrders"], "payload": _safe_payload(build_payload)},
+            {"tx_kind": build["tx_kind"]},
+            data={
+                "build_path": "/api/perpetuals/account/transactions/place-sl-tp-orders",
+                "payload": _safe_payload(build_payload),
+            },
             position_action=action,
         )
-    submit = _sign_and_submit(credentials, "createOrders", build_payload)
+
+    before = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    previous_ids = {
+        str(row.get("objectId") or "")
+        for row in before
+        if isinstance(row, Mapping)
+    }
+    build = _build_native_sl_tp(credentials, build_payload)
+    submit = _submit_native_sl_tp(credentials, build["tx_kind"])
+
+    after = _stop_orders_for_markets(credentials, [market_id], strict=True)
+    closing_side = 1 if current_side == "long" else 0
+    matching = []
+    for row in after:
+        if not isinstance(row, Mapping):
+            continue
+        object_id = str(row.get("objectId") or "")
+        if not object_id or object_id in previous_ids:
+            continue
+        if str(row.get("marketId") or "") != market_id:
+            continue
+        state = row.get("orderState")
+        if not isinstance(state, Mapping) or "active" not in state:
+            continue
+        try:
+            side = int(row.get("side"))
+        except (TypeError, ValueError):
+            continue
+        if side != closing_side:
+            continue
+        details = row.get("slTp")
+        if not isinstance(details, Mapping):
+            continue
+        field = "takeProfitPrice" if operation == "set_tp" else "stopLossPrice"
+        value = details.get(field)
+        if value is None:
+            continue
+        if _decimal(value) != requested_price:
+            continue
+        matching.append(row)
+
     action = CanonicalPositionActionResult(
-        operation=operation,
-        symbol=symbol,
-        price=str(price),
-        verified=True,
-        status="submitted",
-        current_side=current_side,
-        current_size=_display_decimal(size),
+        **action_base,
+        verified=bool(matching),
+        status="submitted" if matching else "unverified",
     )
-    return _live_success(
-        operation,
-        credentials,
-        submit,
-        data={"build_path": _BUILD_ROUTES["createOrders"], "payload": _safe_payload(build_payload), "operation": operation},
+    verification_data: Dict[str, Any] = {
+        "build_path": "/api/perpetuals/account/transactions/place-sl-tp-orders",
+        "payload": _safe_payload(build_payload),
+        "operation": operation,
+        "verified_via": "/api/perpetuals/account/stop-order-datas",
+        "matched_object_ids": [str(row.get("objectId") or "") for row in matching],
+        "execution_status": submit.get("execution_status", ""),
+    }
+    if not matching:
+        return make_failure(
+            operation=operation,
+            exchange=name,
+            account=credentials["account"],
+            code=f"{operation.upper()}_UNVERIFIED",
+            message=(
+                "Native SL/TP transaction submitted, but no new active native "
+                f"{operation.upper()} object for {symbol} was found on a fresh read "
+                f"of stop-order state. The exchange did not confirm a "
+                f"{operation.upper()} at {price}."
+            ),
+            position_action=action,
+            data=verification_data,
+        )
+    return make_success(
+        operation=operation,
+        exchange=name,
+        account=credentials["account"],
+        data=verification_data,
         position_action=action,
     )
 
@@ -2258,6 +3009,8 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _set_tp_sl(credentials, request, "set_tp")
         if operation == "set_sl":
             return _set_tp_sl(credentials, request, "set_sl")
+        if operation == "cancel_stop_orders":
+            return _cancel_native_stop_orders(credentials, request)
         if operation == "set_leverage":
             return _set_leverage(credentials, request)
         if operation == "list_instruments":
