@@ -2436,7 +2436,22 @@ class TradeWizard:
             succeeded = response.ladder.submitted_order_count
             if failed is None and response.ladder.requested_order_count is not None:
                 failed = max(0, int(response.ladder.requested_order_count) - int(response.ladder.submitted_order_count or 0))
-        if response.success and (response.ladder is not None or requested is not None or succeeded is not None):
+        ladder_obj = getattr(response, "ladder", None)
+        if response.exchange == "pacifica" and ladder_obj is not None:
+            lines.extend([
+                "",
+                f"Status: {ladder_obj.status}",
+                f"Requested: {ladder_obj.requested_order_count}",
+                f"Accepted: {ladder_obj.accepted_child_count or 0}",
+                f"Rejected: {ladder_obj.rejected_child_count or 0}",
+                f"Uncertain: {ladder_obj.uncertain_child_count or 0}",
+                f"Not attempted: {ladder_obj.not_attempted_child_count or 0}",
+            ])
+            if not ladder_obj.verified or ladder_obj.uncertain_child_count:
+                lines.append("Note: Some orders were not verified or remain uncertain; check history before any retry.")
+            if ladder_obj.exchange_reason:
+                lines.append(f"Exchange errors: {ladder_obj.exchange_reason}")
+        elif response.success and (response.ladder is not None or requested is not None or succeeded is not None):
             lines.extend(["", "Submitted."])
             if requested is not None:
                 lines.append(f"Requested: {requested}")
