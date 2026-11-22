@@ -64,6 +64,8 @@ _RETIRED_EXCHANGE_NAMES = frozenset(
     {
         "metatrader",
         "mt5linux",
+        "mt5",
+        "mt4",
     }
 )
 

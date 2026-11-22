@@ -55,7 +55,12 @@ def test_stale_deployed_agent_files_are_never_discovered() -> None:
 
     with tempfile.TemporaryDirectory(prefix="stale-agent-") as tmp:
         agents_dir = Path(tmp)
-        for name in ("x_metatrader_agent.py", "x_mt5linux_agent.py"):
+        for name in (
+            "x_metatrader_agent.py",
+            "x_mt5linux_agent.py",
+            "x_mt5_agent.py",
+            "x_mt4_agent.py",
+        ):
             (agents_dir / name).write_text("# stale\n", encoding="utf-8")
         # A live agent must still be discovered.
         (agents_dir / "x_apex_agent.py").write_text("# live\n", encoding="utf-8")
@@ -64,6 +69,8 @@ def test_stale_deployed_agent_files_are_never_discovered() -> None:
 
     assert "x_metatrader_agent.py" not in found
     assert "x_mt5linux_agent.py" not in found
+    assert "x_mt5_agent.py" not in found
+    assert "x_mt4_agent.py" not in found
     assert "x_apex_agent.py" in found
 
 
@@ -82,6 +89,63 @@ def test_trade_menu_is_dynamic_and_stale_metatrader_callbacks_fail_closed() -> N
     assert stale.state == "select_exchange"
     assert _callback_values(stale) == callbacks
     assert desk.account_lookups == []
+
+
+def test_stale_mt5_callback_is_rejected_without_touching_account_lookup() -> None:
+    """A stale ``exchange:mt5`` callback must fail closed.
+
+    The MT5 venue was removed from the repository, but a deployment that
+    still carries ``x_mt5_agent.py`` could otherwise be addressed by a
+    callback left over from an earlier session.
+    """
+    desk = _Desk()
+    wizard = TradeWizard(cast(TradeDesk, desk))
+    chat_key = (456,)
+
+    first = wizard.open(chat_key)
+    callbacks = _callback_values(first)
+
+    stale = wizard.handle_callback(chat_key, "exchange:mt5")
+    assert stale.state == "select_exchange"
+    assert _callback_values(stale) == callbacks
+    assert desk.account_lookups == []
+
+
+def test_mt5_agent_and_bridge_are_absent_from_the_repository() -> None:
+    """The MT5 venue must leave no agent module or bridge payload behind."""
+    assert not (ROOT / "plugins" / "trade" / "agents" / "x_mt5_agent.py").exists()
+    assert not (ROOT / "plugins" / "trade" / "mt5_bridge").exists()
+
+
+def test_installer_prunes_the_mt5_agent_and_bridge_on_upgrade() -> None:
+    """The install path must remove a stale MT5 agent and bridge payload."""
+    import sys
+
+    installer_dir_path = str(ROOT / "installer")
+    if installer_dir_path not in sys.path:
+        sys.path.insert(0, installer_dir_path)
+    from retired_payload import RETIRED_PAYLOAD_DIRS, RETIRED_PAYLOAD_FILES, prune_retired_payload
+
+    assert Path("agents/x_mt5_agent.py") in RETIRED_PAYLOAD_FILES
+    assert Path("mt5_bridge") in RETIRED_PAYLOAD_DIRS
+
+    with tempfile.TemporaryDirectory(prefix="mt5-prune-") as tmp:
+        plugin_root = Path(tmp)
+        (plugin_root / "agents").mkdir()
+        (plugin_root / "agents" / "x_mt5_agent.py").write_text("# stale\n", encoding="utf-8")
+        live_agent = plugin_root / "agents" / "x_apex_agent.py"
+        live_agent.write_text("# live\n", encoding="utf-8")
+        (plugin_root / "mt5_bridge").mkdir()
+        (plugin_root / "mt5_bridge" / "HermesBridge.mq5").write_text("// ea\n", encoding="utf-8")
+
+        actions = {entry["path"]: entry["action"] for entry in prune_retired_payload(plugin_root)}
+
+        # Only retired paths are reported; a live agent is never touched.
+        assert "agents/x_apex_agent.py" not in actions
+        assert live_agent.exists()
+
+    assert actions["agents/x_mt5_agent.py"] == "removed"
+    assert actions["mt5_bridge"] == "removed"
 
 
 def test_installer_has_no_metatrader_or_mt4_capability_surface() -> None:
