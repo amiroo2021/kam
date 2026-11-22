@@ -48,24 +48,44 @@ def _callbacks(screen: Any) -> List[str]:
 
 class SpotDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._spot_agent_modules_before = {
+            name: module
+            for name, module in sys.modules.items()
+            if name.startswith("plugins.trade.agents.x_") and name.endswith("_agent_spot")
+        }
         self.tmp = tempfile.TemporaryDirectory(prefix="spot_agents_")
         self.agents = Path(self.tmp.name)
 
     def tearDown(self) -> None:
+        prefix = "plugins.trade.agents.x_"
         for name in list(sys.modules):
-            if name.startswith("plugins.trade.agents.x_") and name.endswith("_agent_spot"):
-                sys.modules.pop(name, None)
+            if name.startswith(prefix) and name.endswith("_agent_spot"):
+                if name not in self._spot_agent_modules_before:
+                    sys.modules.pop(name, None)
+        sys.modules.update(self._spot_agent_modules_before)
         self.tmp.cleanup()
 
-    def _write_agent(self, filename: str, name: str, caps: List[str] | None = None) -> None:
+    def _write_agent(
+        self,
+        filename: str,
+        name: str,
+        caps: List[str] | None = None,
+        *,
+        response_operation: str | None = None,
+        response_exchange: str | None = None,
+        response_account: str | None = None,
+    ) -> None:
         caps = caps or ["balance"]
+        response_operation_expr = "request.get('operation', '')" if response_operation is None else repr(response_operation)
+        response_exchange_expr = "name" if response_exchange is None else repr(response_exchange)
+        response_account_expr = "request.get('account', '')" if response_account is None else repr(response_account)
         Path(self.agents, filename).write_text(
             "from plugins.trade.canonical import CanonicalBalance, make_success\n"
             f"name = {name!r}\n"
             "def list_accounts(): return ['amiroo', {'account': 'bitget', 'label': 'bitget'}]\n"
             f"def capabilities(): return {caps!r}\n"
             "def execute(request):\n"
-            "    return make_success(request.get('operation',''), name, request.get('account',''), balance=CanonicalBalance('1.00', 'USDC'))\n",
+            f"    return make_success({response_operation_expr}, {response_exchange_expr}, {response_account_expr}, balance=CanonicalBalance('1.00', 'USDC'))\n",
             encoding="utf-8",
         )
 
@@ -88,6 +108,68 @@ class SpotDiscoveryTests(unittest.TestCase):
         Path(self.agents, "x_42bad_agent_spot.py").write_text("name='bad'\n", encoding="utf-8")
         desk = SpotDesk(agents_dir=self.agents)
         self.assertEqual(desk.list_exchanges(), ["aftermath", "raydium"])
+
+    def test_spotdesk_routes_canonical_plan_ladder_operation(self) -> None:
+        self._write_agent("x_mexc_agent_spot.py", "mexc", ["plan_ladder"])
+        desk = SpotDesk(agents_dir=self.agents)
+        response = desk.plan_ladder(
+            {"exchange": "mexc", "account": "amiroo", "symbol": "SOLUSDC"}
+        )
+        self.assertTrue(response.success)
+        self.assertEqual(response.operation, "plan_ladder")
+
+    def test_spotdesk_rejects_each_response_identity_mismatch(self) -> None:
+        request = {"operation": "cancel_orders", "exchange": "mexc", "account": "amiroo"}
+        for field, value in (
+            ("operation", "orders"),
+            ("exchange", "other_exchange"),
+            ("account", "other_account"),
+        ):
+            kwargs = {f"response_{field}": value}
+            self._write_agent("x_mexc_agent_spot.py", "mexc", ["cancel_orders"], **kwargs)
+            desk = SpotDesk(agents_dir=self.agents)
+            response = desk.execute(request)
+            self.assertFalse(response.success, field)
+            self.assertEqual(response.error.code, "INVALID_AGENT_RESPONSE", field)
+            self.assertIn("identity", response.error.message, field)
+            self.tmp.cleanup()
+            self.tmp = tempfile.TemporaryDirectory(prefix="spot_agents_")
+            self.agents = Path(self.tmp.name)
+
+    def test_spotdesk_rejects_orders_response_for_open_orders(self) -> None:
+        self._write_agent("x_mexc_agent_spot.py", "mexc", ["open_orders"], response_operation="orders")
+        response = SpotDesk(agents_dir=self.agents).execute(
+            {"operation": "open_orders", "exchange": "mexc", "account": "amiroo"}
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "INVALID_AGENT_RESPONSE")
+
+    def test_spotdesk_accepts_matching_cancel_identity(self) -> None:
+        self._write_agent("x_mexc_agent_spot.py", "mexc", ["cancel_orders"])
+        response = SpotDesk(agents_dir=self.agents).execute(
+            {"operation": "cancel_orders", "exchange": "mexc", "account": "amiroo"}
+        )
+        self.assertTrue(response.success)
+        self.assertEqual((response.operation, response.exchange, response.account), ("cancel_orders", "mexc", "amiroo"))
+
+    def test_identity_mismatch_emits_sanitized_boundary_diagnostics(self) -> None:
+        self._write_agent(
+            "x_mexc_agent_spot.py",
+            "mexc",
+            ["cancel_orders"],
+            response_account="other_account",
+        )
+        with self.assertLogs("plugins.trade.spotdesk", level="WARNING") as captured:
+            response = SpotDesk(agents_dir=self.agents).execute(
+                {"operation": "cancel_orders", "exchange": "mexc", "account": "amiroo"}
+            )
+        self.assertFalse(response.success)
+        line = "\n".join(captured.output)
+        self.assertIn("spotdesk_identity_validation_failure", line)
+        self.assertIn('"mismatched_fields":["account"]', line)
+        self.assertIn('"correlation_id":', line)
+        self.assertIn('"agent_path":', line)
+        self.assertNotIn("secret", line.lower())
 
     def test_iter_agent_files_ignores_normal_agents_tests_helpers_and_malformed(self) -> None:
         for filename in [
@@ -131,7 +213,7 @@ class FakeSpotDesk:
         if op == "balance":
             return make_success(op, ex, acct, balance=CanonicalBalance("12.34", "USDC"), data={"assets": [{"asset": "SOL", "amount": "2"}]})
         if op == "orders":
-            return make_success(op, ex, acct, open_order_count=1, order_groups=[CanonicalOrderGroup(symbol="SOL/USDC", side="buy", order_count=1, total_size="2", vwap="10", min_price="10", max_price="10")])
+            return make_success(op, ex, acct, open_order_count=1, order_groups=[CanonicalOrderGroup(symbol="SOL/USDC", side="buy", order_count=1, total_size="2", vwap="10", min_price="10", max_price="10")], data={"orders": [{"display_symbol": "SOL/USDC", "base_asset": "SOL", "quote_asset": "USDC"}]})
         if op == "positions_orders":
             return make_success(op, ex, acct, open_order_count=0, order_groups=[])
         return make_success(op, ex, acct, data={"ok": True})
@@ -145,6 +227,7 @@ class FakeMexcSpotDesk:
         self.reject_message = "exchange rejected order"
         self.timeout_new_order = False
         self.open_orders: List[Dict[str, Any]] = []
+        self.open_orders_error = False
         self.fail_cancel_ids: set[str] = set()
         self.timeout_cancel = False
         self.balances: Dict[str, str] = {"USDT": "10000", "USDC": "10000", "SOL": "100", "SUI": "100"}
@@ -273,6 +356,8 @@ class FakeMexcSpotDesk:
             assets = [{"asset": k, "total": v} for k, v in self.balances.items()]
             return make_success(op, "mexc", "amiroo", data={"assets": assets})
         if op in {"orders", "open_orders"}:
+            if self.open_orders_error:
+                return make_failure(op, "mexc", "amiroo", code="MEXC_SPOT_ORDERS_FAILED", message="MEXC openOrders unavailable")
             return make_success(
                 op,
                 "mexc",
@@ -404,7 +489,7 @@ class TradeSpotWizardNavigationTests(unittest.TestCase):
         self.assertIn("💰 Balance", labels)
         self.assertNotIn("📋 Orders", labels)
         self.assertNotIn("➕ New Order", labels)
-        self.assertNotIn("🪜 Ladder", labels)
+        self.assertNotIn("📊 Ladder Orders", labels)
         self.assertNotIn("❌ Cancel Orders", labels)
 
     def test_balance_and_orders_route_to_spotdesk(self) -> None:
@@ -418,6 +503,8 @@ class TradeSpotWizardNavigationTests(unittest.TestCase):
         self.assertEqual(orders.state, "action")
         orders = self.wizard.handle_callback(self.key, "action:orders")
         self.assertIn("Open orders: 1", orders.text)
+        self.assertIn("2 SOL", orders.text)
+        self.assertIn("VWAP: 10 USDC", orders.text)
         self.assertEqual(self.desk.requests[-1]["operation"], "orders")
 
     def test_callback_namespace_does_not_collide_with_trade(self) -> None:
@@ -447,6 +534,19 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         labels = _labels(screen)
         for label in ["SOL", "ETH", "HYPE", "SUI", "Other"]:
             self.assertIn(label, labels)
+
+    def test_ladder_buy_requests_quote_budget_and_sell_requests_base_quantity(self) -> None:
+        ladder = self.wizard.handle_callback(self.key, "action:ladder")
+        self.assertEqual(ladder.state, "ladder_asset")
+        pairs = self.wizard.handle_callback(self.key, "asset:SOL")
+        sol_usdc = next(
+            callback
+            for callback, label in zip(_callbacks(pairs), _labels(pairs))
+            if "SOL/USDC" in label
+        )
+        self.wizard.handle_callback(self.key, sol_usdc)
+        buy_side = self.wizard.handle_callback(self.key, "side:buy")
+        self.assertIn("total quote budget in USDC", buy_side.text)
 
     def test_clicking_sol_discovers_quote_markets_and_prices_dynamically(self) -> None:
         self._open_new_order()
@@ -570,7 +670,7 @@ class TradeSpotMexcNewOrderTests(unittest.TestCase):
         self.assertEqual(cancelled.state, "action")
         self.assertFalse(any(r.get("operation") == "new_order" for r in self.desk.requests))
         # Phase 5: ladder button is now present in the action menu.
-        self.assertIn("🪜 Ladder", _labels(cancelled))
+        self.assertIn("📊 Ladder Orders", _labels(cancelled))
         self.assertIn("❌ Cancel Orders", _labels(cancelled))
 
 
@@ -720,7 +820,7 @@ class TradeSpotMexcLiveSubmitTests(unittest.TestCase):
         screen = self.wizard.handle_callback(self.key, "account:amiroo")
         labels = _labels(screen)
         # Phase 5: ladder is an advertised capability.
-        self.assertIn("🪜 Ladder", labels)
+        self.assertIn("📊 Ladder Orders", labels)
         self.assertIn("➕ New Order", labels)
         self.assertIn("❌ Cancel Orders", labels)
 
@@ -976,6 +1076,36 @@ class TradeSpotMexcCancelOrdersTests(unittest.TestCase):
         self.assertFalse(any("SOL/USDC" in label for label in _labels(screen)))
         self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
 
+    def test_100_plus_open_orders_are_all_grouped_and_symbol_is_supplied(self) -> None:
+        self.desk.open_orders = [
+            _spot_open(str(i), "SUIUSDT", "SUI/USDT", "BUY", "0.4", "1")
+            for i in range(101)
+        ]
+        screen = self._open_cancel()
+        self.assertIn("101 Orders", screen.text)
+        read = next(r for r in self.desk.requests if r.get("operation") == "open_orders")
+        self.assertEqual(read.get("account"), "amiroo")
+        self.assertEqual(read.get("symbol"), "")
+
+    def test_open_orders_api_error_is_not_rendered_as_empty(self) -> None:
+        self.desk.open_orders_error = True
+        screen = self._open_cancel()
+        self.assertIn("MEXC openOrders unavailable", screen.text)
+        self.assertNotIn("No open LIMIT orders", screen.text)
+        self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
+
+    def test_cancel_confirm_has_no_diagnostic_preflight_button_or_callback(self) -> None:
+        self.desk.open_orders = [_spot_open(str(i), "SUIUSDT", "SUI/USDT", "BUY", "0.4", "1") for i in range(100)]
+        screen = self._open_cancel()
+        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
+        confirm = self.wizard.handle_callback(self.key, group_cb)
+        labels = _labels(confirm)
+        callbacks = _callbacks(confirm)
+        self.assertNotIn("🔍 READ-ONLY PREFLIGHT", labels)
+        self.assertFalse(any(str(cb).startswith("pf:") for cb in callbacks))
+        self.assertIn("❌ Cancel 100 Orders", labels)
+        self.assertNotIn("cancel_preflight", [r.get("operation") for r in self.desk.requests])
+
     def test_group_selection_performs_no_cancellation(self) -> None:
         self.desk.open_orders = [
             _spot_open("1", "SOLUSDC", "SOL/USDC", "BUY", "73", "3"),
@@ -989,21 +1119,6 @@ class TradeSpotMexcCancelOrdersTests(unittest.TestCase):
         self.assertIn("❌ Cancel 3 Orders", _labels(confirm))
         self.assertFalse(any(r.get("operation") == "cancel_orders" for r in self.desk.requests))
         self.assertEqual(len(self.desk.open_orders), 3)
-
-    def test_cancel_confirm_has_no_diagnostic_preflight_button_or_callback(self) -> None:
-        self.desk.open_orders = [
-            _spot_open(str(i), "SUIUSDT", "SUI/USDT", "BUY", "0.4", "1")
-            for i in range(100)
-        ]
-        screen = self._open_cancel()
-        group_cb = next(cb for cb in _callbacks(screen) if str(cb).startswith("cg:"))
-        confirm = self.wizard.handle_callback(self.key, group_cb)
-        labels = _labels(confirm)
-        callbacks = _callbacks(confirm)
-        self.assertNotIn("🔍 READ-ONLY PREFLIGHT", labels)
-        self.assertFalse(any(str(cb).startswith("pf:") for cb in callbacks))
-        self.assertIn("❌ Cancel 100 Orders", labels)
-        self.assertNotIn("cancel_preflight", [r.get("operation") for r in self.desk.requests])
 
     def test_confirmation_screen_refreshes_live_orders(self) -> None:
         self.desk.open_orders = [
@@ -1198,7 +1313,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         pair_screen = self._select_pair(screen, "SOL/USDC")
         side = self.wizard.handle_callback(self.key, "side:buy")
         # enter total qty
-        after_qty = self.wizard.handle_text(self.key, "10")
+        after_qty = self.wizard.handle_text(self.key, "1000")
         # enter start price
         after_start = self.wizard.handle_text(self.key, "100")
         # enter end price
@@ -1212,7 +1327,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         self.assertIn("LIMIT Ladder Preview", dist.text)
         self.assertIn("Distribution: Uniform", dist.text)
         self.assertIn("Orders: 10", dist.text)
-        self.assertIn("Total Quantity: 10 SOL", dist.text)
+        self.assertIn("Quote Budget: 1000 USDC", dist.text)
         self.assertIn("Price Range: 73 → 100 USDC", dist.text)
         self.assertIn("Required:", dist.text)
         # Show first/last child
@@ -1223,7 +1338,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._open_ladder()
         self._select_pair(screen, "SOL/USDC")
         self.wizard.handle_callback(self.key, "side:buy")
-        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "1000")
         self.wizard.handle_text(self.key, "100")
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "10")
@@ -1239,7 +1354,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._open_ladder()
         self._select_pair(screen, "SOL/USDC")
         self.wizard.handle_callback(self.key, "side:buy")
-        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "1000")
         self.wizard.handle_text(self.key, "100")
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "10")
@@ -1263,7 +1378,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._open_ladder()
         self._select_pair(screen, "SOL/USDC")
         self.wizard.handle_callback(self.key, "side:buy")
-        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "1000")
         self.wizard.handle_text(self.key, "100")
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "10")
@@ -1290,7 +1405,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._open_ladder()
         self._select_pair(screen, "SOL/USDC")
         self.wizard.handle_callback(self.key, "side:buy")
-        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "1000")
         self.wizard.handle_text(self.key, "100")
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "10")
@@ -1301,7 +1416,7 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         screen = self._open_ladder()
         self._select_pair(screen, "SOL/USDC")
         self.wizard.handle_callback(self.key, "side:buy")
-        self.wizard.handle_text(self.key, "10")
+        self.wizard.handle_text(self.key, "1000")
         self.wizard.handle_text(self.key, "100")
         self.wizard.handle_text(self.key, "73")
         self.wizard.handle_text(self.key, "50")
@@ -1315,6 +1430,23 @@ class TradeSpotMexcLadderTests(unittest.TestCase):
         self.wizard.handle_callback(self.key, "back")
         cancel = self.wizard.handle_callback(self.key, "action:cancel_orders")
         self.assertIn("Cancel Orders", cancel.text)
+    def test_ladder_back_stays_in_ladder_namespace(self) -> None:
+        screen = self._open_ladder()
+        self._select_pair(screen, "SOL/USDC")
+        self.wizard.handle_callback(self.key, "side:buy")
+        back = self.wizard.handle_callback(self.key, "back")
+        self.assertEqual(back.state, "ladder_side")
+        self.assertIn("Select Side", back.text)
+
+    def test_clear_order_state_resets_ladder_submission_guard(self) -> None:
+        state = self.wizard._state_for(self.key)
+        state.ladder_confirm_consumed = True
+        state.ladder_confirm_token = "lad:old"
+        state.ladder_execution_id = "oldexec"
+        self.wizard._clear_order_state(state)
+        self.assertFalse(state.ladder_confirm_consumed)
+        self.assertIsNone(state.ladder_confirm_token)
+        self.assertIsNone(state.ladder_execution_id)
 
 
 class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
@@ -1329,6 +1461,9 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
 
         self._mock = _mock
         self._spot = spot
+        self._prev_hermes = os.environ.get("HERMES_HOME")
+        self._hermes_tmp = tempfile.TemporaryDirectory(prefix="tradespot_wizard_ladder_")
+        os.environ["HERMES_HOME"] = self._hermes_tmp.name
         self.desk = FakeMexcSpotDesk()
         self.wizard = TradeSpotWizard(spotdesk=self.desk)  # type: ignore[arg-type]
         self.key = ("chat-ladder-live",)
@@ -1348,12 +1483,29 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         self._get_calls: list = []
         self._install_patch(self._fake_signed)
 
+    def tearDown(self) -> None:
+        patcher = getattr(self, "_patcher", None)
+        if patcher is not None:
+            patcher.stop()
+        if self._prev_hermes is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._prev_hermes
+        self._hermes_tmp.cleanup()
+
     def _install_patch(self, side_effect) -> None:
         # Stop any previously installed patcher (e.g. from setUp or an earlier test).
         prev = getattr(self, "_patcher", None)
         if prev is not None:
             prev.stop()
-        patcher = self._mock.patch.object(self._spot, "_signed_request", side_effect=side_effect)
+        def wrapped_signed(client, method, path, params=None):
+            if method.upper() == "GET" and path == "/api/v3/account":
+                return {"balances": [
+                    {"asset": "USDC", "free": "1000000", "locked": "0"},
+                    {"asset": "SOL", "free": "1000000", "locked": "0"},
+                ]}
+            return side_effect(client, method, path, params)
+        patcher = self._mock.patch.object(self._spot, "_signed_request", side_effect=wrapped_signed)
         patcher.start()
         self._patcher = patcher
         self.addCleanup(patcher.stop)
@@ -1366,6 +1518,11 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
                 {"orderId": f"x{i}", "clientOrderId": b.get("newClientOrderId"), "symbol": "SOLUSDC", "price": b.get("price"), "origQty": b.get("quantity"), "status": "NEW"}
                 for i, b in enumerate(batch)
             ]
+        if method.upper() == "GET" and path == "/api/v3/account":
+            return {"balances": [
+                {"asset": "USDC", "free": "1000000", "locked": "0"},
+                {"asset": "SOL", "free": "1000000", "locked": "0"},
+            ]}
         if method.upper() == "GET" and path == "/api/v3/openOrders":
             self._get_calls.append({"params": dict(params or {})})
             return []
@@ -1387,7 +1544,7 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         cb = _callbacks(pair_picker)[idx]
         w.handle_callback(self.key, cb or "")
         w.handle_callback(self.key, "side:buy")
-        w.handle_text(self.key, "10")
+        w.handle_text(self.key, "1000")
         w.handle_text(self.key, "100")
         w.handle_text(self.key, "73")
         w.handle_text(self.key, str(n_orders))
@@ -1710,7 +1867,7 @@ class TradeSpotMexcLadderLiveSubmitTests(unittest.TestCase):
         preview = self._walk_sui_uniform_preview(qty="20", n_orders=10)
         confirm_cb = next(cb for cb in _callbacks(preview) if str(cb).startswith("ladder_confirm:"))
         state = self.wizard._state_for(self.key)
-        state.ladder_order_count = 11
+        state.ladder_order_count = 0
         result = self.wizard.handle_callback(self.key, confirm_cb)
         self.assertIn("Unable to submit ladder", result.text)
         self.assertEqual(len(self._post_calls), 0)
@@ -1968,7 +2125,7 @@ class TradeSpotMexcLadderEditingTests(unittest.TestCase):
         back = self.wizard.handle_callback(self.key, "back")
         self.assertIn("Edit", back.text)
         labels = self._labels(back)
-        for needed in ("Quantity", "Orders", "START", "END", "Distribution", "Preview", "Back"):
+        for needed in ("Budget", "Orders", "START", "END", "Distribution", "Preview", "Back"):
             self.assertTrue(any(needed in l for l in labels), f"missing label: {needed}")
         after = self.wizard._state_for(self.key)
         self.assertEqual(after.exchange, snapshot["exchange"])
@@ -2005,10 +2162,10 @@ class TradeSpotMexcLadderEditingTests(unittest.TestCase):
         # The new screen has the qty prompt; type a new value.
         screen = self.wizard.handle_callback(self.key, edit_cb)
         self.assertEqual(screen.state, "ladder_total_qty")
-        self.assertIn("Enter total quantity", screen.text)
+        self.assertIn("Enter total quote budget", screen.text)
         self.wizard.handle_text(self.key, "30")
         new_preview = self.wizard._render_ladder_preview(self.key)
-        self.assertIn("Total Quantity: 30 SUI", new_preview.text)
+        self.assertIn("Quote Budget: 30 USDC", new_preview.text)
 
     def test_back_causes_zero_agent_ladder_executes(self) -> None:
         self._walk_valid_preview(qty="20", n_orders=10)
@@ -2064,7 +2221,7 @@ class TradeSpotMexcLadderEditingTests(unittest.TestCase):
         self.wizard.handle_text(self.key, "15")
         preview = self.wizard._render_ladder_preview(self.key)
         self.assertIn("Orders: 15", preview.text)
-        self.assertIn("Total Quantity: 30 SUI", preview.text)
+        self.assertIn("Quote Budget: 30 USDC", preview.text)
 
     def test_edit_start_then_preview_uses_new_start(self) -> None:
         self._walk_valid_preview(qty="20", n_orders=10)

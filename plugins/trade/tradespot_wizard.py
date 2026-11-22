@@ -38,14 +38,14 @@ _SPOT_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("orders", "📋 Orders", "orders"),
     ("positions_orders", "📋 Orders", "orders"),
     ("new_order", "➕ New Order", "new_order"),
-    ("ladder", "🪜 Ladder", "ladder"),
+    ("ladder", "📊 Ladder Orders", "ladder"),
     ("cancel_orders", "❌ Cancel Orders", "cancel_orders"),
 )
 _READ_ONLY_ORDER_CAPS = {"orders", "positions_orders"}
 _MUTATING_ACTIONS = {"ladder", "cancel_orders"}
 _QUICK_PICK_BASE_ASSETS = ("SOL", "ETH", "HYPE", "SUI")
 _PAIR_PAGE_SIZE = 8
-_MEXC_QUOTE_ASSETS = ("USDT", "USDC")
+_QUOTE_ASSETS = ("USDT", "USDC")
 _QUOTE_CENTS = Decimal("0.01")
 _OPEN_LIMIT_STATUSES = {"", "NEW", "PARTIALLY_FILLED", "LIVE", "PENDING"}
 _LIMIT_ORDER_TYPES = {"", "LIMIT", "LIMIT_MAKER"}
@@ -75,6 +75,35 @@ def _to_amount(value: Any) -> Decimal:
         return Decimal(text)
     except (InvalidOperation, ValueError):
         return Decimal("0")
+
+
+def _count_from(data: Any, *keys: str) -> int:
+    """Return the first present, non-None count among ``keys``.
+
+    Spot agents publish their child counts under different names: the
+    MEXC agent uses ``rejected`` / ``unknown`` / ``not_attempted`` while
+    the Hyperliquid ladder agent uses ``rejected_count`` /
+    ``unknown_count`` / ``not_attempted_count``. Reading only one
+    spelling silently turns a real, classified ladder into an
+    all-zero report.
+
+    A key that is PRESENT but 0 is a legitimate value and must win over
+    a missing sibling: ``0`` means "none of these happened", not
+    "unknown".
+    """
+    if not isinstance(data, dict):
+        return 0
+    for key in keys:
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def _asset_total_decimal(item: Mapping[str, Any]) -> Decimal:
@@ -114,7 +143,7 @@ def _format_inventory_amount(value: Decimal, *, quote: bool) -> str:
     return _thousands(text)
 
 
-def _mexc_inventory_lines(assets: List[Any]) -> List[str]:
+def _inventory_lines(assets: List[Any]) -> List[str]:
     totals: Dict[str, Decimal] = {}
     for item in assets:
         if not isinstance(item, Mapping):
@@ -125,12 +154,12 @@ def _mexc_inventory_lines(assets: List[Any]) -> List[str]:
         totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(item)
     lines = [
         f"{symbol}: {_format_inventory_amount(totals.get(symbol, Decimal('0')), quote=True)}"
-        for symbol in _MEXC_QUOTE_ASSETS
+        for symbol in _QUOTE_ASSETS
     ]
     others = sorted(
         (symbol, amount)
         for symbol, amount in totals.items()
-        if symbol not in _MEXC_QUOTE_ASSETS and amount > 0
+        if symbol not in _QUOTE_ASSETS and amount > 0
     )
     lines.extend(
         f"{symbol}: {_format_inventory_amount(amount, quote=False)}"
@@ -340,22 +369,36 @@ class TradeSpotWizard:
                 state.state = "ladder_pairs"
             return screen
         if state.state == "ladder_pairs":
+            if suffix == "back":
+                return self._render_ladder_assets(chat_key)
             screen = self._handle_ladder_pair_selection(chat_key, suffix)
             if screen.state == "new_order_side":
                 state.state = "ladder_side"
                 return self._render_ladder_side(chat_key)
+            if screen.state == "new_order_pairs":
+                return Screen(screen.text, screen.buttons, "ladder_pairs")
             return screen
         if state.state == "ladder_side":
             return self._handle_ladder_side_selection(chat_key, suffix)
         if state.state == "ladder_total_qty":
+            if suffix == "back":
+                return self._render_ladder_side(chat_key)
             return self._render_ladder_total_qty(chat_key)
         if state.state == "ladder_start_price":
+            if suffix == "back":
+                return self._render_ladder_total_qty(chat_key)
             return self._render_ladder_start_price(chat_key)
         if state.state == "ladder_end_price":
+            if suffix == "back":
+                return self._render_ladder_start_price(chat_key)
             return self._render_ladder_end_price(chat_key)
         if state.state == "ladder_order_count":
+            if suffix == "back":
+                return self._render_ladder_end_price(chat_key)
             return self._render_ladder_order_count(chat_key)
         if state.state == "ladder_distribution":
+            if suffix == "back":
+                return self._render_ladder_order_count(chat_key)
             if suffix in {"distribution:uniform", "distribution:half_gaussian"}:
                 state.ladder_distribution = suffix[len("distribution:") :].strip()
                 return self._render_ladder_preview(chat_key)
@@ -568,6 +611,8 @@ class TradeSpotWizard:
         state.ladder_distribution = None
         state.ladder_plan = None
         state.ladder_confirm_token = None
+        state.ladder_confirm_consumed = False
+        state.ladder_execution_id = None
 
     # ------------------------------------------------------------------
     # Ladder preview flow (Phase 1, source-only)
@@ -599,11 +644,15 @@ class TradeSpotWizard:
         state = self._state_for(chat_key)
         state.state = "ladder_total_qty"
         pair = self._selected_pair_name(state)
-        base = ((state.selected_instrument or {}).get("base")
-                or (state.selected_instrument or {}).get("baseAsset")
-                or "BASE").upper()
+        item = state.selected_instrument or {}
+        base = str(item.get("base") or item.get("baseAsset") or "BASE").upper()
+        quote = str(item.get("quote") or item.get("quoteAsset") or "QUOTE").upper()
+        if (state.ladder_side or "").upper() == "BUY":
+            prompt = f"Enter total quote budget in {quote}:"
+        else:
+            prompt = f"Enter total quantity in {base}:"
         return Screen(
-            f"🟦 {pair} — Ladder\n\nEnter total quantity in {base}:",
+            f"🟦 {pair} — Ladder\n\n{prompt}",
             [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
             "ladder_total_qty",
         )
@@ -669,16 +718,41 @@ class TradeSpotWizard:
         except (InvalidOperation, ValueError, TypeError) as exc:
             return {"_error": f"Invalid ladder inputs: {exc}"}
         if total <= 0:
-            return {"_error": "Total quantity must be greater than zero."}
+            return {"_error": "Total amount must be greater than zero."}
         if start <= 0 or end <= 0:
             return {"_error": "START and END prices must be greater than zero."}
         if count <= 0:
             return {"_error": "Order count must be greater than zero."}
+        planner = getattr(self._desk, "plan_ladder", None)
+        if callable(planner):
+            response = planner(
+                {
+                    "exchange": state.exchange or "",
+                    "account": state.account or "",
+                    "side": state.ladder_side or "BUY",
+                    "distribution": state.ladder_distribution or "uniform",
+                    "start_price": start,
+                    "end_price": end,
+                    "order_count": count,
+                    "instrument": item,
+                    "total_volume": None if (state.ladder_side or "").upper() == "BUY" else total,
+                    "total_quote_budget": total if (state.ladder_side or "").upper() == "BUY" else None,
+                }
+            )
+            if not getattr(response, "success", False):
+                error = getattr(response, "error", None)
+                return {"_error": str(getattr(error, "message", None) or "Ladder planning failed.")}
+            data = getattr(response, "data", None)
+            remote_plan = data.get("plan") if isinstance(data, Mapping) else None
+            if isinstance(remote_plan, dict):
+                return remote_plan
+            return {"_error": "Spot agent returned no ladder plan."}
         try:
             plan = compute_ladder(
                 side=state.ladder_side or "BUY",
                 distribution=state.ladder_distribution or "uniform",
-                total_volume=total,
+                total_volume=(None if (state.ladder_side or "").upper() == "BUY" else total),
+                total_quote_budget=(total if (state.ladder_side or "").upper() == "BUY" else None),
                 start_price=start,
                 end_price=end,
                 order_count=count,
@@ -732,8 +806,9 @@ class TradeSpotWizard:
         pair = self._selected_pair_name(state)
         body = (
             f"🟦 {pair} — LIMIT Ladder Preview\n\n"
+            f"Distribution: {('Half-Gaussian' if (state.ladder_distribution or '') == 'half_gaussian' else 'Uniform')}\n\n"
             f"Unable to build ladder.\n\n{message}\n\n"
-            "No orders were submitted. Adjust total quantity, order count, or price range and try again."
+            "No orders were submitted. Adjust total amount, order count, or price range and try again."
         )
         return Screen(body, [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]], "ladder_preview")
 
@@ -756,8 +831,23 @@ class TradeSpotWizard:
         if plan_error:
             return self._render_ladder_plan_error(chat_key, plan_error)
         plan = plan or {}
-        base = ((item.get("base") or item.get("baseAsset") or "BASE")).upper()
-        quote = ((item.get("quote") or item.get("quoteAsset") or "QUOTE")).upper()
+        # Prefer the validated DISPLAY alias over the native base token.
+        # Hyperliquid spot lists USOL as the native token but the
+        # official frontend shows SOL; the agent publishes both, so a
+        # user who picked SOL/USDC must not see USOL/USDC in the preview.
+        # The native base is still what routes the order.
+        base = (
+            item.get("display_base")
+            or item.get("base")
+            or item.get("baseAsset")
+            or "BASE"
+        ).upper()
+        quote = (
+            item.get("display_quote")
+            or item.get("quote")
+            or item.get("quoteAsset")
+            or "QUOTE"
+        ).upper()
         side = (state.ladder_side or "").upper()
         distribution_label = (
             "Half-Gaussian" if plan.get("distribution") == "half_gaussian" else "Uniform"
@@ -772,6 +862,9 @@ class TradeSpotWizard:
             available = self._holding_for(state, required_asset)
             required = _to_amount(plan.get("total_size"))
             after = available - required
+        required_display = required
+        available_display = available
+        after_display = after
 
         children = plan.get("children") or []
         total_children = len(children)
@@ -802,9 +895,10 @@ class TradeSpotWizard:
             f"Total Quantity: {plan.get('total_size','0')} {base}\n"
             f"Price Range: {state.ladder_end_price or ''} → {state.ladder_start_price or ''} {quote}\n"
             f"VWAP: {plan.get('vwap','0')} {quote}\n"
-            f"\nRequired: {plan.get('total_notional','0')} {quote}\n"
-            f"Available: {available.normalize():f} {quote}\n"
-            f"After ladder: {after.normalize():f} {quote}"
+            + (f"Quote Budget: {state.ladder_total_qty or '0'} {quote}\n" if side == "BUY" else "")
+            + f"\nRequired: {required_display.normalize():f} {required_asset}\n"
+            f"Available: {available_display.normalize():f} {required_asset}\n"
+            f"After ladder: {after_display.normalize():f} {required_asset}"
             f"{notes_block}\n\nChildren:\n"
             + ("\n".join(child_rows) if child_rows else "  (none)")
         )
@@ -1014,16 +1108,64 @@ class TradeSpotWizard:
         if planned_vwap_disp in (None, "", "None"):
             planned_vwap_disp = "—"
 
-        rejected = (data.get("rejected") if isinstance(data, dict) else 0) or 0
-        unknown = (data.get("unknown") if isinstance(data, dict) else 0) or 0
-        not_attempted = (data.get("not_attempted") if isinstance(data, dict) else 0) or 0
+        # Counts are published under two spellings: the MEXC spot agent
+        # uses the bare names, the Hyperliquid ladder agent uses the
+        # ``*_count`` names. Read BOTH so a ladder can never render as
+        # all-zero just because the agent chose the other spelling.
+        rejected = _count_from(data, "rejected", "rejected_count")
+        unknown = _count_from(data, "unknown", "unknown_count")
+        not_attempted = _count_from(data, "not_attempted", "not_attempted_count")
+        rejection_reason = ""
+        if rejected:
+            reason = getattr(ladder, "exchange_reason", None)
+            code = None
+            batches = getattr(ladder, "batches", None) or []
+            if isinstance(batches, list):
+                for batch in batches:
+                    if not isinstance(batch, Mapping):
+                        continue
+                    response_data = batch.get("response")
+                    resp = response_data if isinstance(response_data, Mapping) else {}
+                    if not reason:
+                        reason = batch.get("exchange_reason") or resp.get("mexc_message")
+                    if code is None:
+                        code = batch.get("error_code") or resp.get("mexc_code")
+                    if reason or code is not None:
+                        break
+            if isinstance(data, dict) and not reason:
+                for child in data.get("child_results") or []:
+                    if isinstance(child, Mapping) and child.get("message"):
+                        reason = child.get("message")
+                        code = child.get("error_code") if code is None else code
+                        break
+            if reason:
+                reason_text = str(reason).strip()
+                if code is not None and str(code).strip() and str(code).strip() not in reason_text:
+                    rejection_reason = f"\nReason: {reason_text} (code {code})"
+                else:
+                    rejection_reason = f"\nReason: {reason_text}"
         warn = ""
+        exchange_name = str(getattr(response, "exchange", "exchange") or "exchange").upper()
         if unknown:
             warn = "\n\n⚠️ Submission status is uncertain for some children.\nDo not retry the ladder until open orders are reconciled."
         elif rejected and not_attempted:
-            warn = f"\n\n⚠️ MEXC rejected {rejected} orders. The remaining {not_attempted} orders were not submitted."
+            warn = f"\n\n⚠️ {exchange_name} rejected {rejected} orders. The remaining {not_attempted} orders were not submitted."
         elif rejected:
-            warn = "\n\n⚠️ MEXC rejected one or more orders."
+            warn = f"\n\n⚠️ {exchange_name} rejected one or more orders."
+        # A request for N children must never be reported as a silent
+        # all-zero success: that is the shape of a swallowed error. If the
+        # agent classified nothing while children were requested, say so
+        # explicitly instead of showing four zeros.
+        classified = accepted + rejected + unknown + not_attempted
+        if requested > 0 and classified == 0:
+            warn = (
+                f"\n\n❌ No child orders were classified by {exchange_name}. "
+                "The ladder result did not carry per-child outcomes, so the "
+                "submission status is UNKNOWN.\nDo not retry the ladder until "
+                "open orders are reconciled."
+            )
+        if warn and rejection_reason:
+            warn = f"{warn}{rejection_reason}"
         body = (
             f"🟦 Ladder submission result\n\n"
             f"{base}/{quote} {side}\n"
@@ -1078,18 +1220,23 @@ class TradeSpotWizard:
         distribution_disp = (
             "Half-Gaussian" if (state.ladder_distribution or "") == "half_gaussian" else "Uniform"
         )
+        amount_label = (
+            f"Budget: {state.ladder_total_qty or '—'} {quote}"
+            if side_disp == "BUY"
+            else f"Quantity: {state.ladder_total_qty or '—'} {base}"
+        )
         body = (
             f"🟦 {pair} — Edit LIMIT Ladder\n\n"
             f"Side: {side_disp}\n"
             f"Distribution: {distribution_disp}\n"
-            f"Total Quantity: {state.ladder_total_qty or '—'} {base}\n"
+            f"{amount_label}\n"
             f"Orders: {state.ladder_order_count or '—'}\n"
             f"START: {state.ladder_start_price or '—'} {quote}\n"
             f"END: {state.ladder_end_price or '—'} {quote}\n"
         )
         rows: List[List[Dict[str, str]]] = []
         rows.append([_button_row(
-            f"Quantity: {state.ladder_total_qty or '—'} {base}",
+            amount_label,
             "ladder_edit:qty",
         )])
         rows.append([_button_row(
@@ -1129,10 +1276,10 @@ class TradeSpotWizard:
         desk = getattr(self, "_spotdesk", None) or getattr(self, "spotdesk", None)
         try:
             if which == "open_orders":
-                rows = self._reconcile_open_orders(symbol)
+                rows = self._reconcile_open_orders(state.exchange or "", symbol)
                 body = self._format_reconcile_open_orders(symbol, rows)
             elif which == "all_orders":
-                rows = self._reconcile_all_orders(symbol)
+                rows = self._reconcile_all_orders(state.exchange or "", symbol)
                 body = self._format_reconcile_all_orders(symbol, rows, state)
             elif which == "by_execution_id":
                 body = self._reconcile_by_execution_id(state, symbol)
@@ -1168,13 +1315,16 @@ class TradeSpotWizard:
         # Read the durable record directly so we know the EXACT original
         # expected client_order_ids (not derived from the current state).
         try:
-            from plugins.trade.agents.x_mexc_agent_spot import _ladder_load_record
+            agent = self._spot_agent_instance(getattr(state, "exchange", ""))
+            loader = getattr(agent, "_ladder_load_record", None)
+            if not callable(loader):
+                return "🟦 Reconcile Ladder\n\nThis exchange does not expose ladder reconciliation."
         except Exception as exc:  # noqa: BLE001
             return f"🟦 Reconcile Ladder\n\nagent not importable: {exc}"
         rec = None
         load_err = None
         try:
-            rec = _ladder_load_record(state.account, execution_id)
+            rec = loader(state.account, execution_id)
         except Exception as exc:  # noqa: BLE001
             load_err = str(exc)
         if rec is None:
@@ -1231,34 +1381,32 @@ class TradeSpotWizard:
             )
         return head
 
-    def _reconcile_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+    def _reconcile_open_orders(self, exchange: str, symbol: str) -> List[Dict[str, Any]]:
         """GET /api/v3/openOrders?symbol=<sym> via the spot agent's read path.
         Returns a list of dicts (possibly empty). No POST/DELETE ever issued.
         """
-        agent = self._spot_agent_instance()
+        agent = self._spot_agent_instance(exchange)
         if agent is None:
             return []
         return agent.open_orders(symbol=symbol)
 
-    def _reconcile_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+    def _reconcile_all_orders(self, exchange: str, symbol: str) -> List[Dict[str, Any]]:
         """GET /api/v3/allOrders?symbol=<sym> via the spot agent's read path."""
-        agent = self._spot_agent_instance()
+        agent = self._spot_agent_instance(exchange)
         if agent is None:
             return []
         return agent.all_orders(symbol=symbol)
 
-    def _spot_agent_instance(self):
-        """Best-effort lookup of the MEXC spot agent bound to this wizard."""
-        desk = getattr(self, "_spotdesk", None) or getattr(self, "spotdesk", None)
-        if desk is None:
+    def _spot_agent_instance(self, exchange: str):
+        """Best-effort lookup of the selected generic spot adapter."""
+        getter = getattr(self._desk, "agent_for", None)
+        if callable(getter):
+            return getter(exchange)
+        try:
+            import importlib
+            return importlib.import_module(f"plugins.trade.agents.x_{exchange}_agent_spot")
+        except Exception:
             return None
-        agent = getattr(desk, "x_mexc_agent_spot", None)
-        if agent is None and hasattr(desk, "agents"):
-            try:
-                agent = desk.agents.get("x_mexc_agent_spot")  # type: ignore[attr-defined]
-            except Exception:
-                agent = None
-        return agent
 
     def _format_reconcile_open_orders(self, symbol: str, rows: List[Dict[str, Any]]) -> str:
         if not rows:
@@ -1360,7 +1508,7 @@ class TradeSpotWizard:
                     raise InvalidOperation
             except InvalidOperation:
                 return Screen(
-                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nInvalid total quantity.\nEnter a positive decimal in {((state.selected_instrument or {}).get('base') or 'BASE')}:",
+                    f"🟦 {self._selected_pair_name(state)} — Ladder\n\nInvalid total amount.\nEnter a positive decimal in {((state.selected_instrument or {}).get('quote') if (state.ladder_side or '').upper() == 'BUY' else (state.selected_instrument or {}).get('base') or 'BASE')}:",
                     [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
                     "ladder_total_qty",
                 )
@@ -1422,6 +1570,9 @@ class TradeSpotWizard:
         return self._handle_pair_selection(chat_key, suffix)
 
     def _handle_ladder_side_selection(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        if suffix == "back":
+            state = self._state_for(chat_key)
+            return self._render_pair_picker(chat_key)
         # The new_order side handler sets `state.order_side` and renders the qty
         # prompt; for ladder we want the ladder total-qty prompt next.
         self._handle_side_selection(chat_key, suffix)
@@ -1455,8 +1606,9 @@ class TradeSpotWizard:
     def _render_other_prompt(self, chat_key: Tuple[Any, ...], message: str = "") -> Screen:
         state = self._state_for(chat_key)
         state.state = "new_order_other"
+        exchange = state.exchange or "Spot"
         body = (
-            "🟦 MEXC Spot — New Order\n\n"
+            f"🟦 {exchange.upper()} Spot — New Order\n\n"
             "Enter a spot symbol or pair.\n\n"
             "Examples:\n"
             "BTC\n"
@@ -1473,12 +1625,13 @@ class TradeSpotWizard:
         return self._render_other_prompt(chat_key)
 
     def _handle_other_symbol_text(self, chat_key: Tuple[Any, ...], text: str) -> Screen:
+        state = self._state_for(chat_key)
         query = self._normalize_symbol_query(text)
         if not query:
             return self._render_other_prompt(chat_key, "Please enter a base asset or spot pair.")
         pairs = self._find_pairs(chat_key, query)
         if not pairs:
-            return self._render_other_prompt(chat_key, f"No API-enabled tradable MEXC spot pair found for {query}.")
+            return self._render_other_prompt(chat_key, f"No API-enabled tradable {(state.exchange or 'spot').upper()} spot pair found for {query}.")
         state = self._state_for(chat_key)
         state.selected_base = str(pairs[0].get("baseAsset") or query).upper()
         state.pair_candidates = pairs
@@ -1513,7 +1666,7 @@ class TradeSpotWizard:
         state.pair_page = 0
         if not state.pair_candidates:
             return Screen(
-                f"🟦 MEXC Spot — {base.upper()}\n\nNo API-enabled tradable spot pairs found.",
+                f"🟦 {(state.exchange or 'Spot').upper()} Spot — {base.upper()}\n\nNo API-enabled tradable spot pairs found.",
                 [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
                 "new_order_pairs",
             )
@@ -1608,7 +1761,7 @@ class TradeSpotWizard:
                 nav.append(_button_row("▶️", "page:next"))
             rows.append(nav)
         rows.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)])
-        return Screen(f"🟦 MEXC Spot — {base}\n\nSelect Pair:", rows, "new_order_pairs")
+        return Screen(f"🟦 {(state.exchange or 'Spot').upper()} Spot — {base}\n\nSelect Pair:", rows, "new_order_pairs")
 
     def _handle_pair_selection(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
         state = self._state_for(chat_key)
@@ -1648,7 +1801,7 @@ class TradeSpotWizard:
         quote = str(item.get("quoteAsset") or "").upper()
         price = str(item.get("market_price") or "price unavailable")
         rows = [[_button_row("🟢 BUY", "side:buy"), _button_row("🔴 SELL", "side:sell")], [_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]]
-        return Screen(f"🟦 MEXC Spot — {pair}\nMarket: {price} {quote}\n\nSelect Side:", rows, "new_order_side")
+        return Screen(f"🟦 {(state.exchange or 'Spot').upper()} Spot — {pair}\nMarket: {price} {quote}\n\nSelect Side:", rows, "new_order_side")
 
     def _handle_side_selection(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
         if suffix == "back":
@@ -1819,14 +1972,24 @@ class TradeSpotWizard:
             }
         )
         totals: Dict[str, Decimal] = {}
+        aliases: Dict[str, Decimal] = {}
         for row in _balance_assets(response):
             if not isinstance(row, Mapping):
                 continue
             symbol = _asset_symbol(row)
             if not symbol:
                 continue
-            totals[symbol] = totals.get(symbol, Decimal("0")) + _asset_total_decimal(row)
-        return totals.get(str(asset).upper(), Decimal("0"))
+            total = _asset_total_decimal(row)
+            totals[symbol] = totals.get(symbol, Decimal("0")) + total
+            # A venue may report a balance under the native token name while
+            # the instrument is presented under a display alias (native USOL
+            # shown as SOL). Index the alias so a display-named requirement can
+            # still find its native balance.
+            display = str(row.get("display_asset") or "").strip().upper()
+            if display:
+                aliases[display] = aliases.get(display, Decimal("0")) + total
+        wanted = str(asset).upper()
+        return totals.get(wanted, aliases.get(wanted, Decimal("0")))
 
     def _instrument_tradable(self, item: Mapping[str, Any]) -> Optional[str]:
         if item.get("api_enabled_for_key") is False or item.get("api_eligible") is False:
@@ -1845,6 +2008,60 @@ class TradeSpotWizard:
         state.last_submit_screen = None
         item = self._re_resolve_instrument(state) or {}
         item = dict(item)
+        exchange = state.exchange or "Spot"
+        preview_caps = set(self._desk.capabilities(exchange) or [])
+        if "preview_order" in preview_caps:
+            response = self._desk.execute({
+                "operation": "preview_order", "exchange": exchange,
+                "account": state.account or "", "symbol": str(item.get("symbol") or ""),
+                "side": str(state.order_side or "").upper(),
+                "quantity": str(state.order_quantity or ""),
+                "price": str(state.order_limit_price or ""),
+            })
+            if not response.success:
+                error = getattr(response, "error", None)
+                message = getattr(error, "message", "Order preview failed.")
+                state.confirm_token = None
+                return Screen(
+                    f"🟦 {exchange.upper()} Spot\n\n{message}\nNo order was placed.",
+                    [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                    "new_order_preview",
+                )
+            data = response.data if isinstance(response.data, dict) else {}
+            validation = str(data.get("validation_status") or "valid").lower()
+            if validation not in {"valid", "ok", "accepted"}:
+                state.confirm_token = None
+                return Screen(
+                    f"🟦 {exchange.upper()} Spot\n\nOrder preview is not valid.\nNo order was placed.",
+                    [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                    "new_order_preview",
+                )
+            pair = self._selected_pair_name(state)
+            side = str(state.order_side or "").upper()
+            base = str(item.get("base") or item.get("baseAsset") or "BASE").upper()
+            quote = str(item.get("quote") or item.get("quoteAsset") or "QUOTE").upper()
+            qty = str(data.get("quantity") or state.order_quantity or "")
+            price = str(data.get("limit_price") or state.order_limit_price or "")
+            notional = str(data.get("estimated_notional") or "—")
+            required = str(data.get("required") or notional)
+            available = str(data.get("available") or "—")
+            minimum = str(data.get("minimum_notional") or "—")
+            lines = [
+                f"🟦 {exchange.upper()} Spot — {pair}", "LIMIT order preview", "",
+                f"Side: {side}", f"Quantity: {qty} {base}",
+                f"Limit price: {price} {quote}", f"Estimated value: {notional} {quote}",
+                f"Required: {required} {quote if side == 'BUY' else base}",
+                f"Available: {available} {quote if side == 'BUY' else base}",
+                f"Minimum notional: {minimum} {quote}",
+            ]
+            state.order_quantity = qty
+            state.order_limit_price = price
+            state.confirm_token = secrets.token_hex(8)
+            return Screen(
+                "\n".join(lines),
+                [[_button_row("Confirm & Place Order", f"place:{state.confirm_token}")], [_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                "new_order_preview",
+            )
         size_step = self._size_increment(item)
         price_step = self._price_increment(item)
         pair = self._selected_pair_name(state)
@@ -1861,7 +2078,7 @@ class TradeSpotWizard:
         price = self._quantize_down(price, price_step)
         state.order_quantity = self._format_decimal(qty)
         state.order_limit_price = self._format_decimal(price)
-        quote_like = quote in _MEXC_QUOTE_ASSETS
+        quote_like = quote in _QUOTE_ASSETS
         required = (qty * price) if side == "BUY" else qty
         required_asset = quote if side == "BUY" else base
         available = self._holding_for(state, required_asset)
@@ -1869,7 +2086,7 @@ class TradeSpotWizard:
         tradable_error = self._instrument_tradable(item)
         constraint_error = self._constraint_error(item, qty, price, side, base, quote)
         lines = [
-            f"🟦 MEXC Spot — {pair}",
+            f"🟦 {exchange.upper()} Spot — {pair}",
             "LIMIT order preview",
             "",
             f"Side: {side}",
@@ -1930,25 +2147,47 @@ class TradeSpotWizard:
 
     def _submit_limit_order(self, chat_key: Tuple[Any, ...], token: str) -> Screen:
         state = self._state_for(chat_key)
+        exchange = state.exchange or "Spot"
         if not token or token != (state.confirm_token or ""):
             return self._render_order_preview(chat_key)
         if state.confirm_consumed:
             if state.last_submit_screen is not None:
                 return state.last_submit_screen
             return Screen(
-                "🟦 MEXC Spot\n\nThis confirmation was already used. No additional order was submitted.",
+                f"🟦 {exchange.upper()} Spot\n\nThis confirmation was already used. No additional order was submitted.",
                 [[_button_row(*BUTTON_BACK), _button_row(*BUTTON_CLOSE)]],
                 "order_result",
             )
-        state.confirm_consumed = True
         item = self._re_resolve_instrument(state) or {}
         item = dict(item)
+        exchange = state.exchange or "Spot"
+        if "preview_order" in set(self._desk.capabilities(exchange) or []):
+            preview = self._desk.execute({
+                "operation": "preview_order", "exchange": exchange,
+                "account": state.account or "", "symbol": str(item.get("symbol") or ""),
+                "side": str(state.order_side or "").upper(),
+                "quantity": str(state.order_quantity or ""),
+                "price": str(state.order_limit_price or ""),
+            })
+            if not preview.success:
+                error = getattr(preview, "error", None)
+                message = getattr(error, "message", "Order preview failed.")
+                state.confirm_consumed = True
+                screen = Screen(
+                    f"🟦 {exchange.upper()} Spot\n\n{message}\nNo order was placed.",
+                    [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
+                    "order_result",
+                )
+                state.last_submit_screen = screen
+                state.state = "order_result"
+                return screen
+        state.confirm_consumed = True
         size_step = self._size_increment(item)
         price_step = self._price_increment(item)
         tradable_error = self._instrument_tradable(item)
         if tradable_error:
             screen = Screen(
-                f"🟦 MEXC Spot\n\n{tradable_error}\nNo order was placed.",
+                f"🟦 {exchange.upper()} Spot\n\n{tradable_error}\nNo order was placed.",
                 [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
                 "order_result",
             )
@@ -1968,7 +2207,7 @@ class TradeSpotWizard:
         price = self._quantize_down(price, price_step)
         if size_step <= 0 or price_step <= 0:
             screen = Screen(
-                "🟦 MEXC Spot\n\nInstrument trading constraints are unavailable.\nNo order was placed.",
+                f"🟦 {exchange.upper()} Spot\n\nInstrument trading constraints are unavailable.\nNo order was placed.",
                 [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
                 "order_result",
             )
@@ -1977,7 +2216,7 @@ class TradeSpotWizard:
             return screen
         if qty <= 0 or price <= 0:
             screen = Screen(
-                "🟦 MEXC Spot\n\nInvalid quantity or price.\nNo order was placed.",
+                f"🟦 {exchange.upper()} Spot\n\nInvalid quantity or price.\nNo order was placed.",
                 [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
                 "order_result",
             )
@@ -1989,7 +2228,7 @@ class TradeSpotWizard:
         available = self._holding_for(state, required_asset)
         if available < required:
             screen = Screen(
-                f"🟦 MEXC Spot\n\nInsufficient {required_asset}.\nNo order was placed.",
+                f"🟦 {exchange.upper()} Spot\n\nInsufficient {required_asset}.\nNo order was placed.",
                 [[_button_row(*BUTTON_BACK), _button_row("Cancel", "cancel")]],
                 "order_result",
             )
@@ -2036,13 +2275,13 @@ class TradeSpotWizard:
             if isinstance(data, dict):
                 status = data.get("status")
         notional = qty * price
-        quote_like = quote in _MEXC_QUOTE_ASSETS
+        quote_like = quote in _QUOTE_ASSETS
         screen = Screen(
             "\n".join(
                 [
                     "✅ LIMIT order submitted",
                     "",
-                    f"MEXC — {state.account or ''}",
+                    f"{exchange.upper()} — {state.account or ''}",
                     f"{side} {self._format_decimal(qty)} {pair}",
                     f"Price: {self._format_decimal(price)} {quote}",
                     f"Estimated value: {_format_inventory_amount(notional, quote=quote_like)} {quote}",
@@ -2096,21 +2335,10 @@ class TradeSpotWizard:
                 "",
             ]
             assets = _balance_assets(response)
-            if str(exchange).lower() == "mexc":
-                lines.extend(["Assets", *_mexc_inventory_lines(assets)])
-            else:
-                if response.balance is not None:
-                    lines.append(f"Balance: {response.balance.value} {response.balance.unit}")
-                extra_lines = []
-                for item in assets[:20]:
-                    if not isinstance(item, Mapping):
-                        continue
-                    symbol = _asset_symbol(item)
-                    amount = _asset_total_decimal(item)
-                    if symbol and amount > 0:
-                        extra_lines.append(f"• {symbol}: {_format_inventory_amount(amount, quote=False)}")
-                if extra_lines:
-                    lines.extend(["", "Assets", *extra_lines])
+            asset_symbols = {_asset_symbol(item) for item in assets if isinstance(item, Mapping)}
+            if response.balance is not None and str(response.balance.unit).upper() not in asset_symbols:
+                lines.append(f"Balance: {response.balance.value} {response.balance.unit}")
+            lines.extend(["", "Assets", *_inventory_lines(assets)])
         else:
             lines = ["🟦 Spot Trading", "💰 Balance"]
             lines.extend(_render_error_lines(response.error, "Balance unavailable."))
@@ -2129,14 +2357,31 @@ class TradeSpotWizard:
             groups = list(response.order_groups or [])
             count = response.open_order_count if response.open_order_count is not None else len(groups)
             lines.extend(["", f"Open orders: {count}"])
+            data = getattr(response, "data", None)
+            raw_orders = data.get("orders") if isinstance(data, dict) else None
+            units_by_symbol: Dict[str, Tuple[str, str]] = {}
+            if isinstance(raw_orders, list):
+                for item in raw_orders:
+                    if not isinstance(item, Mapping):
+                        continue
+                    display_symbol = str(item.get("display_symbol") or item.get("symbol") or item.get("pair") or "").upper().replace("/", "")
+                    if display_symbol:
+                        units_by_symbol[display_symbol] = (
+                            str(item.get("base_asset") or item.get("quantity_unit") or ""),
+                            str(item.get("quote_asset") or item.get("price_unit") or ""),
+                        )
             for group in groups[:20]:
                 symbol = str(getattr(group, "symbol", "") or "?")
                 side = str(getattr(group, "side", "") or "?")
                 order_count = getattr(group, "order_count", "?")
                 total_size = getattr(group, "total_size", "")
-                lines.append(f"• {symbol} {side}: {order_count} orders {total_size}".rstrip())
-            data = getattr(response, "data", None)
-            raw_orders = data.get("orders") if isinstance(data, dict) else None
+                base_asset, quote_asset = units_by_symbol.get(symbol.upper().replace("/", ""), ("", ""))
+                volume = f"{total_size} {base_asset}".rstrip() if base_asset else str(total_size)
+                line = f"• {symbol} {side}: {order_count} orders {volume}".rstrip()
+                vwap = str(getattr(group, "vwap", "") or "")
+                if vwap and quote_asset:
+                    line += f" | VWAP: {vwap} {quote_asset}"
+                lines.append(line)
             if isinstance(raw_orders, list) and not groups:
                 for item in raw_orders[:20]:
                     lines.append(f"• {item}")
@@ -2144,17 +2389,32 @@ class TradeSpotWizard:
             lines.extend(_render_error_lines(response.error, "Orders unavailable."))
         return Screen("\n".join(lines).rstrip(), self._result_buttons(), "orders")
 
-    def _fetch_open_order_rows(self, state: SpotWizardState) -> List[Any]:
+    def _fetch_open_order_rows(self, state: SpotWizardState) -> Optional[List[Any]]:
         exchange = state.exchange or ""
         account = state.account or ""
         caps = set(self._desk.capabilities(exchange) or [])
         operation = "open_orders" if "open_orders" in caps else "orders"
-        response = self._desk.execute({"operation": operation, "exchange": exchange, "account": account})
+        response = self._desk.execute({
+            "operation": operation,
+            "exchange": exchange,
+            "account": account,
+            "symbol": str(state.cancel_symbol or ""),
+        })
         if not response.success:
-            return []
+            self._last_open_orders_error = getattr(response, "error", None)
+            return None
         data = getattr(response, "data", None)
         rows = data.get("orders") if isinstance(data, dict) else None
         return list(rows) if isinstance(rows, list) else []
+
+    def _open_orders_error_screen(self, state: SpotWizardState, *, confirm: bool = False) -> Screen:
+        error = getattr(self, "_last_open_orders_error", None)
+        message = getattr(error, "message", None) or "Open orders are temporarily unavailable."
+        return Screen(
+            f"🟦 {(state.exchange or 'Spot').upper()} Spot — Cancel Orders\n\n{message}\nNo cancellation was sent.",
+            [[_button_row(*BUTTON_BACK_RETURN)]],
+            "cancel_confirm" if confirm else "cancel_orders",
+        )
 
     def _side_dot(self, side: str) -> str:
         return "🔵" if str(side).upper() == "BUY" else "🔴"
@@ -2194,7 +2454,10 @@ class TradeSpotWizard:
         state.confirm_consumed = False
         exchange = state.exchange or ""
         account = state.account or ""
-        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        rows = self._fetch_open_order_rows(state)
+        if rows is None:
+            return self._open_orders_error_screen(state)
+        groups = _group_open_limit_orders(rows)
         lines = [
             "🟦 Spot Trading",
             "❌ Cancel Orders",
@@ -2230,12 +2493,16 @@ class TradeSpotWizard:
         state.state = "cancel_confirm"
         side_u = str(side or "").upper()
         compact = str(symbol or "").upper().replace("/", "")
-        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        rows = self._fetch_open_order_rows(state)
+        if rows is None:
+            state.confirm_token = None
+            return self._open_orders_error_screen(state, confirm=True)
+        groups = _group_open_limit_orders(rows)
         group = self._find_group(groups, side_u, compact)
         if group is None:
             state.confirm_token = None
             return Screen(
-                "🟦 MEXC Spot — Cancel Orders\n\nNo matching open LIMIT orders remain.",
+                f"🟦 {(state.exchange or 'Spot').upper()} Spot — Cancel Orders\n\nNo matching open LIMIT orders remain.",
                 [[_button_row(*BUTTON_BACK_RETURN)]],
                 "cancel_confirm",
             )
@@ -2247,7 +2514,7 @@ class TradeSpotWizard:
         state.confirm_consumed = False
         count = int(group["order_count"])
         lines = [
-            "🟦 MEXC Spot — Cancel Orders",
+            f"🟦 {(state.exchange or 'Spot').upper()} Spot — Cancel Orders",
             "",
             *self._group_body_lines(group, confirm=True),
             "",
@@ -2275,7 +2542,7 @@ class TradeSpotWizard:
             if state.last_submit_screen is not None:
                 return state.last_submit_screen
             return Screen(
-                "🟦 MEXC Spot — Cancel Orders\n\nThis confirmation was already used. No additional cancellation was sent.",
+                f"🟦 {(state.exchange or 'Spot').upper()} Spot — Cancel Orders\n\nThis confirmation was already used. No additional cancellation was sent.",
                 [[_button_row(*BUTTON_BACK_RETURN)]],
                 "cancel_result",
             )
@@ -2283,7 +2550,13 @@ class TradeSpotWizard:
         side = str(state.cancel_side or "").upper()
         symbol = str(state.cancel_symbol or "").upper().replace("/", "")
         pair = str(state.cancel_pair or _display_pair_from_symbol(symbol))
-        groups = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        rows = self._fetch_open_order_rows(state)
+        if rows is None:
+            screen = self._open_orders_error_screen(state, confirm=True)
+            state.last_submit_screen = screen
+            state.state = "cancel_result"
+            return screen
+        groups = _group_open_limit_orders(rows)
         group = self._find_group(groups, side, symbol)
         order_ids = list(group.get("order_ids") or []) if group else []
         if not order_ids:
@@ -2308,17 +2581,20 @@ class TradeSpotWizard:
             state.last_submit_screen = screen
             state.state = "cancel_result"
             return screen
-        refreshed = _group_open_limit_orders(self._fetch_open_order_rows(state))
+        refreshed_rows = self._fetch_open_order_rows(state)
+        refreshed = _group_open_limit_orders(refreshed_rows or [])
         remaining_group = self._find_group(refreshed, side, symbol)
         remaining = int(remaining_group["order_count"]) if remaining_group else 0
         still = set(remaining_group.get("order_ids") or []) if remaining_group else set()
         cancelled = len(set(order_ids) - still)
         data = getattr(response, "data", None) if response.success else None
         if isinstance(data, dict):
+            # A legitimate zero must survive: `value or fallback` would treat
+            # remaining=0 as "missing" and report a stale non-zero count.
             if data.get("cancelled") is not None:
-                cancelled = int(data.get("cancelled") or cancelled)
+                cancelled = int(data["cancelled"])
             if data.get("remaining") is not None:
-                remaining = int(data.get("remaining") or remaining)
+                remaining = int(data["remaining"])
         screen = self._cancel_result_screen(
             state,
             pair,

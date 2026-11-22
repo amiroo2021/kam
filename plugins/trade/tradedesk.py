@@ -155,7 +155,7 @@ def _load_agent_module(path: Path) -> Optional[Any]:
         return None
 
 
-def _validate_agent(module: Any) -> Optional[str]:
+def _validate_agent(module: Any, expected_exchange: Optional[str] = None) -> Optional[str]:
     """Verify that the loaded module exposes the required contract.
 
     Returns None if valid, or a human-readable reason string if not.
@@ -168,6 +168,8 @@ def _validate_agent(module: Any) -> Optional[str]:
     name = getattr(module, "name", None)
     if not isinstance(name, str) or not name.strip():
         return "name must be a non-empty string"
+    if expected_exchange and name.strip() != expected_exchange:
+        return f"name {name!r} does not match filename exchange {expected_exchange!r}"
     return None
 
 
@@ -196,16 +198,15 @@ class TradeDesk:
         for path in _iter_agent_files(_agents_dir()):
             exchange = _exchange_name_from_filename(path.name)
             module = _load_agent_module(path)
-            reason = _validate_agent(module)
+            reason = _validate_agent(module, expected_exchange=exchange)
             if reason is not None:
                 logger.warning(
                     "Skipping agent %s: %s", path.name, reason
                 )
                 continue
-            # Trust the module's self-declared name as the canonical
-            # exchange identifier. The filename pattern only constrains
-            # which files we consider; the agent's own ``name`` is what
-            # the rest of the system addresses it by.
+            # The filename-derived and self-declared exchange identities
+            # must agree, preventing a misnamed module from replacing an
+            # already registered canonical agent.
             self._agents[module.name] = module
             logger.debug(
                 "TradeDesk registered agent: %s (from %s)",

@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 import socket
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -47,6 +47,7 @@ from ..canonical import (
 logger = logging.getLogger(__name__)
 
 name = "mexc"
+
 
 # MEXC spot enforces a per-child minimum notional of 1 USDT/USDC (cost.min
 # in CCXT markets for every spot pair tested; minNotional is not always
@@ -190,6 +191,7 @@ def capabilities() -> List[str]:
         "ladder",
         "ladder_reconcile",
         "ladder_list_unresolved",
+        "plan_ladder",
     ]
 
 
@@ -223,8 +225,14 @@ def _redact(text: Any, credentials: Optional[Mapping[str, str]] = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _json_request(method: str, url: str, headers: Mapping[str, str]) -> Any:
-    req = urllib.request.Request(url, method=method.upper(), headers=dict(headers))
+def _json_request(
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    request_body: Optional[str] = None,
+) -> Any:
+    data = request_body.encode("utf-8") if request_body is not None else None
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=dict(headers))
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8")
@@ -257,20 +265,32 @@ def _signed_request(
     params: Optional[Mapping[str, Any]] = None,
 ) -> Any:
     base = str(credentials.get("spot_base") or DEFAULT_SPOT_BASE).rstrip("/")
+    method_u = method.upper()
     payload = dict(params or {})
     payload["timestamp"] = str(int(time.time() * 1000))
     payload.setdefault("recvWindow", "5000")
-    qs = urllib.parse.urlencode(payload)
+    qs = urllib.parse.urlencode(payload, quote_via=urllib.parse.quote)
     signature = hmac.new(credentials["secret_key"].encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"{base}{path}?{qs}&signature={signature}"
+    signed = f"{qs}&signature={signature}"
+    headers = {
+        "X-MEXC-APIKEY": credentials["access_key"],
+        "Accept": "application/json",
+        "User-Agent": _USER_AGENT,
+    }
+    if method_u == "POST" and path != "/api/v3/batchOrders":
+        # MEXC's signed POST examples send signed totalParams in the form
+        # body. Keep the signed string and transmitted body identical.
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        return _json_request(method_u, f"{base}{path}", headers, request_body=signed)
+    # MEXC batchOrders is stricter than single-order POSTs: form-body
+    # transport can be parsed as an empty batchOrders parameter even when the
+    # signature is valid. Send the signed totalParams in the query string for
+    # batchOrders, using the exact uppercase-percent-encoded string we signed.
+    url = f"{base}{path}?{signed}"
     return _json_request(
-        method,
+        method_u,
         url,
-        {
-            "X-MEXC-APIKEY": credentials["access_key"],
-            "Accept": "application/json",
-            "User-Agent": _USER_AGENT,
-        },
+        headers,
     )
 
 
@@ -315,7 +335,7 @@ def _submit_batch_orders(
     * ``LOCAL_ERROR``         → mark the entire batch UNKNOWN (the request
                                  may have reached MEXC; we lost visibility).
     """
-    body = json.dumps(batch_payload)
+    body = json.dumps(batch_payload, separators=(",", ":"))
     params = {
         "batchOrders": body,
         "recvWindow": "5000",
@@ -703,16 +723,18 @@ def _balance(account: str) -> CanonicalResponse:
         )
 
 
-def _orders(account: str) -> CanonicalResponse:
+def _orders(account: str, symbol: str = "", operation: str = "orders") -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
-        return _missing_account("orders", account)
+        return _missing_account(operation, account)
     try:
-        payload = _signed_request(credentials, "GET", "/api/v3/openOrders")
+        normalized_symbol = str(symbol or "").strip().upper().replace("/", "")
+        params = {"symbol": normalized_symbol} if normalized_symbol else None
+        payload = _signed_request(credentials, "GET", "/api/v3/openOrders", params)
         err = _response_error(payload, "openOrders failed")
         if err:
             return make_failure(
-                operation="orders",
+                operation=operation,
                 exchange=name,
                 account=credentials["account"],
                 code="MEXC_SPOT_ORDERS_FAILED",
@@ -723,16 +745,16 @@ def _orders(account: str) -> CanonicalResponse:
         parsed = [_parse_order(row) for row in rows if isinstance(row, Mapping)]
         groups = _group_orders(parsed)
         return make_success(
-            operation="orders",
+            operation=operation,
             exchange=name,
             account=credentials["account"],
             open_order_count=len(parsed),
             order_groups=groups,
-            data={"source": "mexc_spot_openOrders", "orders": parsed[:100]},
+            data={"source": "mexc_spot_openOrders", "orders": parsed},
         )
     except Exception as exc:  # noqa: BLE001
         return make_failure(
-            operation="orders",
+            operation=operation,
             exchange=name,
             account=credentials["account"],
             code="MEXC_SPOT_ERROR",
@@ -829,9 +851,15 @@ def _resolve_instrument(account: str, request: Mapping[str, Any]) -> CanonicalRe
         requested_symbol=requested,
         symbol=str(info["symbol"]),
         display_name=str(info.get("display_name") or info["symbol"]),
+        native_symbol=str(info.get("symbol") or ""),
+        display_symbol=str(info.get("display_symbol") or info.get("symbol") or ""),
+        base=str(info.get("base") or info.get("baseAsset") or "") or None,
+        quote=str(info.get("quote") or info.get("quoteAsset") or "") or None,
+        market_type="spot",
         price_increment=str(info.get("price_tick") or ""),
         size_increment=str(info.get("size_step") or ""),
         minimum_size=str(info.get("min_qty") or ""),
+        minimum_notional=str(info.get("min_notional") or "") or None,
     )
     return make_success(
         operation="resolve_instrument",
@@ -889,19 +917,53 @@ def _unsupported(operation: str, account: str) -> CanonicalResponse:
     )
 
 
-def _ladder_validate_child(child: Mapping[str, Any]) -> Optional[str]:
+def _ladder_validate_child(
+    child: Mapping[str, Any],
+    *,
+    expected_symbol: Optional[str] = None,
+    expected_side: Optional[str] = None,
+    instrument: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
     if not isinstance(child, Mapping):
         return "CHILD_NOT_MAPPING"
     required = ("symbol", "side", "quantity", "price", "client_order_id")
     for key in required:
         if not str(child.get(key) or "").strip():
             return f"MISSING_{key.upper()}"
+    symbol = str(child.get("symbol") or "").strip().upper().replace("/", "")
+    if expected_symbol and symbol != expected_symbol:
+        return "MIXED_SYMBOLS"
     side = str(child.get("side") or "").strip().upper()
+    if expected_side and side != expected_side:
+        return "MIXED_SIDES"
     if side not in {"BUY", "SELL"}:
         return "INVALID_SIDE"
     order_type = str(child.get("type") or child.get("order_type") or "LIMIT").strip().upper()
     if order_type != "LIMIT":
         return "MARKET_NOT_ALLOWED"  # surfaced as LIMIT_ONLY
+    try:
+        quantity = Decimal(str(child.get("quantity")))
+        price = Decimal(str(child.get("price")))
+    except (InvalidOperation, ValueError, TypeError):
+        return "INVALID_NUMERIC_VALUE"
+    if not quantity.is_finite() or not price.is_finite() or quantity <= 0 or price <= 0:
+        return "NON_POSITIVE_NUMERIC_VALUE"
+    constraints = instrument or {}
+    size_step = _decimal_step(constraints.get("size_step") or constraints.get("size_increment"))
+    price_tick = _decimal_step(constraints.get("price_tick") or constraints.get("price_increment"))
+    min_qty = _decimal_step(constraints.get("min_qty") or constraints.get("minimum_size"))
+    max_qty = _decimal_step(constraints.get("max_qty"))
+    min_notional = _decimal_step(constraints.get("min_notional") or constraints.get("minimum_notional"))
+    if size_step and quantity % size_step != 0:
+        return "QUANTITY_PRECISION_INVALID"
+    if price_tick and price % price_tick != 0:
+        return "PRICE_PRECISION_INVALID"
+    if min_qty and quantity < min_qty:
+        return "QUANTITY_BELOW_MINIMUM"
+    if max_qty and quantity > max_qty:
+        return "QUANTITY_ABOVE_MAXIMUM"
+    if min_notional and quantity * price < min_notional:
+        return "NOTIONAL_BELOW_MINIMUM"
     return None
 
 
@@ -1346,9 +1408,17 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             code="LADDER_TOO_LARGE",
             message=f"Ladder of {len(children_in)} children exceeds the 500-child safety cap.",
         )
+    expected_symbol = str(children_in[0].get("symbol") or "").strip().upper().replace("/", "")
+    expected_side = str(children_in[0].get("side") or "").strip().upper()
+    instrument = request.get("instrument") if isinstance(request.get("instrument"), Mapping) else {}
     # Validate every child BEFORE any network write.
     for idx, child in enumerate(children_in):
-        err = _ladder_validate_child(child)
+        err = _ladder_validate_child(
+            child,
+            expected_symbol=expected_symbol,
+            expected_side=expected_side,
+            instrument=instrument,
+        )
         if err == "MARKET_NOT_ALLOWED":
             return make_failure(
                 operation="ladder",
@@ -1368,6 +1438,64 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
 
     symbol = str(children_in[0].get("symbol") or "").strip().upper().replace("/", "")
     side = str(children_in[0].get("side") or "").strip().upper()
+    # Re-read the exact selected account immediately before any write. The
+    # wizard's earlier balance check is advisory; the agent must enforce the
+    # account-bound free-balance invariant itself.
+    balance_response = _balance(account)
+    if not balance_response.success:
+        error = balance_response.error
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=str(account or ""),
+            code="BALANCE_UNAVAILABLE",
+            message=str(getattr(error, "message", None) or "Fresh MEXC Spot balance is unavailable."),
+        )
+    instrument = children_in[0].get("instrument") if isinstance(children_in[0].get("instrument"), Mapping) else {}
+    base_asset = str(instrument.get("base") or instrument.get("baseAsset") or "").strip().upper()
+    quote_asset = str(instrument.get("quote") or instrument.get("quoteAsset") or "").strip().upper()
+    if not base_asset or not quote_asset:
+        for candidate in sorted(_STABLE_ASSETS, key=len, reverse=True):
+            if symbol.endswith(candidate) and len(symbol) > len(candidate):
+                quote_asset = candidate
+                base_asset = symbol[: -len(candidate)]
+                break
+    if not base_asset or not quote_asset:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=str(account or ""),
+            code="INSTRUMENT_METADATA_REQUIRED",
+            message="MEXC Spot ladder requires base and quote metadata for balance validation.",
+        )
+    assets = ((balance_response.data or {}).get("assets") if isinstance(balance_response.data, dict) else []) or []
+    free_by_asset = {
+        str(row.get("asset") or "").upper(): _to_decimal(row.get("free"))
+        for row in assets
+        if isinstance(row, Mapping)
+    }
+    required = sum(
+        (
+            _to_decimal(child.get("quantity")) * _to_decimal(child.get("price"))
+            if side == "BUY"
+            else _to_decimal(child.get("quantity"))
+        for child in children_in),
+        Decimal("0"),
+    )
+    required_asset = quote_asset if side == "BUY" else base_asset
+    available = free_by_asset.get(required_asset, Decimal("0"))
+    if available < required:
+        return make_failure(
+            operation="ladder",
+            exchange=name,
+            account=str(account or ""),
+            code="INSUFFICIENT_BALANCE",
+            message=(
+                f"Insufficient free {required_asset} for ladder: "
+                f"need {_format_decimal(required)}, have {_format_decimal(available)}."
+            ),
+        )
+
     requested_order_count = len(children_in)
     requested_volume = sum(
         (Decimal(str(c.get("quantity") or "0")) for c in children_in),
@@ -1664,8 +1792,8 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     # final per-child submission_classification so a gateway restart
     # can still load the execution and reconcile the exact original
     # client IDs.
+    final_submission_state = str(durable_record.get("submission_state") or "PREPARED")
     try:
-        # Build a {client_order_id: classification} map from the run.
         cid_class: Dict[str, str] = {}
         for rec in batch_records:
             for child_res in rec.get("child_results", []) or []:
@@ -1695,6 +1823,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
             persisted["submission_state"] = "PARTIAL_REJECTED"
         else:
             persisted["submission_state"] = "PARTIAL_UNKNOWN"
+        final_submission_state = str(persisted["submission_state"])
         _ladder_persist_atomic(
             _ladder_record_path(credentials["account"], execution_id), persisted,
         )
@@ -1801,7 +1930,7 @@ def _ladder(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
         "unknown": unknown_count,
         "not_attempted": not_attempted_count,
         "execution_id": execution_id,
-        "submission_state": durable_record.get("submission_state"),
+        "submission_state": final_submission_state,
         "child_results": [
             dict(child)
             for batch in batch_records
@@ -2086,6 +2215,91 @@ def _open_order_rows(credentials: Mapping[str, str]) -> Tuple[Optional[List[Dict
         return None, _redact(sanitize_error_message(str(exc)), credentials), False
 
 
+def _cancel_preflight(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
+    """Build a read-only cancellation preflight; never dispatches cancellation."""
+    credentials = _lookup_credentials(account)
+    if credentials is None:
+        return make_failure("cancel_preflight", name, account, "ACCOUNT_NOT_FOUND", "MEXC account is unavailable.")
+    symbol = str(request.get("symbol") or "").strip().upper().replace("/", "")
+    side = str(request.get("side") or "").strip().upper()
+    execution_id = str(request.get("execution_id") or "").strip()
+    if not symbol or side not in {"BUY", "SELL"}:
+        return make_failure("cancel_preflight", name, credentials["account"], "INVALID_PREFLIGHT_SCOPE", "Preflight requires a symbol and BUY or SELL side.")
+
+    record = _ladder_load_record(account, execution_id) if execution_id else None
+    if record is None and not execution_id:
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
+        base = _ladder_record_dir(account)
+        for path in sorted(base.glob("*.json")) if base.exists() else []:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    candidate = json.load(f)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            candidate_symbol = str(candidate.get("exchange_symbol") or candidate.get("instrument") or "").upper().replace("/", "")
+            if candidate_symbol == symbol and str(candidate.get("side") or "").upper() == side:
+                candidates.append((float(candidate.get("updated_at") or candidate.get("created_at") or path.stat().st_mtime), candidate))
+        if candidates:
+            record = max(candidates, key=lambda item: item[0])[1]
+            execution_id = str(record.get("execution_id") or "")
+    if record is None:
+        return make_failure("cancel_preflight", name, credentials["account"], "PREFLIGHT_RECORD_NOT_FOUND", "No durable ladder record matches this preflight scope.")
+
+    record_account = str(record.get("account") or "").strip().lower()
+    record_symbol = str(record.get("exchange_symbol") or record.get("instrument") or "").strip().upper().replace("/", "")
+    record_side = str(record.get("side") or "").strip().upper()
+    children = record.get("children")
+    expected_ids = [str(child.get("exchange_order_id") or "").strip() for child in children if isinstance(child, Mapping)] if isinstance(children, list) else []
+    duplicate_expected = sorted({oid for oid in expected_ids if oid and expected_ids.count(oid) > 1})
+    expected_ids = [oid for oid in expected_ids if oid]
+    if record_account != credentials["account"].lower() or record_symbol != symbol or record_side != side or not expected_ids or duplicate_expected:
+        return make_failure("cancel_preflight", name, credentials["account"], "PREFLIGHT_IDENTITY_MISMATCH", "Durable preflight identity or order IDs do not match the request.", data={"execution_id": execution_id, "record_account": record_account, "record_symbol": record_symbol, "record_side": record_side, "expected_order_count": len(expected_ids), "duplicate_ids": duplicate_expected})
+
+    live_response = _orders(account, symbol)
+    if not live_response.success:
+        err = live_response.error
+        return make_failure("cancel_preflight", name, credentials["account"], getattr(err, "code", "OPEN_ORDERS_FAILED"), getattr(err, "message", "MEXC open-order query failed."), data={"execution_id": execution_id})
+    rows = list((live_response.data or {}).get("orders", []))
+    unrelated_instrument_count = sum(1 for row in rows if str(row.get("symbol") or "").upper().replace("/", "") != symbol)
+    opposite_side_count = sum(1 for row in rows if str(row.get("symbol") or "").upper().replace("/", "") == symbol and str(row.get("side") or "").upper() != side)
+    non_limit_count = sum(1 for row in rows if str(row.get("symbol") or "").upper().replace("/", "") == symbol and str(row.get("side") or "").upper() == side and str(row.get("type") or "").upper() not in {"LIMIT", "LIMIT_MAKER"})
+    open_statuses = {"NEW", "PARTIALLY_FILLED", "PENDING_NEW", "LIVE"}
+    matching = [row for row in rows if str(row.get("symbol") or "").upper().replace("/", "") == symbol and str(row.get("side") or "").upper() == side and str(row.get("type") or "").upper() in {"LIMIT", "LIMIT_MAKER"} and str(row.get("status") or "").upper() in open_statuses and _to_decimal(row.get("remaining_qty")) > 0]
+    live_ids = [str(row.get("order_id") or "").strip() for row in matching if str(row.get("order_id") or "").strip()]
+    status_counts: Dict[str, int] = {}
+    for row in matching:
+        status = str(row.get("status") or "UNKNOWN").upper()
+        status_counts[status] = status_counts.get(status, 0) + 1
+    duplicate_live = sorted({oid for oid in live_ids if oid and live_ids.count(oid) > 1})
+    missing = sorted(set(expected_ids) - set(live_ids))
+    unexpected = sorted(set(live_ids) - set(expected_ids))
+    quantity = sum((_to_decimal(row.get("remaining_qty")) for row in matching), Decimal("0"))
+    notional = sum((_to_decimal(row.get("remaining_qty")) * _to_decimal(row.get("price")) for row in matching), Decimal("0"))
+    data = {
+        "execution_id": execution_id,
+        "expected_order_count": len(expected_ids),
+        "selected_order_ids": expected_ids,
+        "live_matching_order_count": len(matching),
+        "status_counts": status_counts,
+        "live_matching_order_ids": live_ids,
+        "missing_order_ids": missing,
+        "unexpected_order_ids": unexpected,
+        "duplicate_order_ids": sorted(set(duplicate_expected + duplicate_live)),
+        "unrelated_instrument_count": unrelated_instrument_count,
+        "opposite_side_count": opposite_side_count,
+        "non_limit_count": non_limit_count,
+        "remaining_quantity": _format_decimal(quantity),
+        "remaining_quote_notional": _format_decimal(notional),
+        "identity": {"operation": "cancel_orders", "exchange": name, "account": credentials["account"], "symbol": symbol, "side": side},
+        "agent_module": __name__,
+        "agent_path": __file__,
+        "pass": not (duplicate_expected or duplicate_live or missing or unexpected or unrelated_instrument_count or opposite_side_count or non_limit_count or record_account != credentials["account"].lower() or record_symbol != symbol or record_side != side or len(matching) != len(expected_ids)),
+    }
+    return make_success("cancel_preflight", name, credentials["account"], data=data)
+
+
 def _cancel_orders(account: str, request: Mapping[str, Any]) -> CanonicalResponse:
     credentials = _lookup_credentials(account)
     if credentials is None:
@@ -2220,13 +2434,52 @@ def _cancel_orders(account: str, request: Mapping[str, Any]) -> CanonicalRespons
     )
 
 
+def plan_ladder(request: Mapping[str, Any]) -> CanonicalResponse:
+    """Validate and plan a MEXC Spot ladder without placing orders."""
+    from ..spot_ladder import compute_ladder, plan_as_dict
+
+    account = str(request.get("account") or "")
+    try:
+        instrument = request.get("instrument")
+        if not isinstance(instrument, Mapping):
+            raise ValueError("MISSING_INSTRUMENT")
+        total_volume_raw = request.get("total_volume")
+        budget_raw = request.get("total_quote_budget")
+        total_volume = Decimal(str(total_volume_raw)) if total_volume_raw is not None else None
+        budget = Decimal(str(budget_raw)) if budget_raw is not None else None
+        plan = compute_ladder(
+            side=str(request.get("side") or ""),
+            distribution=str(request.get("distribution") or ""),
+            start_price=Decimal(str(request.get("start_price"))),
+            end_price=Decimal(str(request.get("end_price"))),
+            order_count=int(request.get("order_count") or 0),
+            instrument=instrument,
+            total_volume=total_volume,
+            total_quote_budget=budget,
+        )
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        return make_failure(
+            operation="plan_ladder",
+            exchange=name,
+            account=account,
+            code="INVALID_LADDER_PLAN",
+            message=sanitize_error_message(str(exc)),
+        )
+    return make_success(
+        operation="plan_ladder",
+        exchange=name,
+        account=account,
+        data={"plan": plan_as_dict(plan)},
+    )
+
+
 def execute(request: Mapping[str, Any]) -> CanonicalResponse:
     op = str(request.get("operation") or "").strip()
     account = str(request.get("account") or "").strip()
     if op == "balance":
         return _balance(account)
     if op in {"orders", "open_orders", "positions_orders"}:
-        return _orders(account)
+        return _orders(account, str(request.get("symbol") or ""), operation=op)
     if op == "list_instruments":
         return _list_instruments(account, request)
     if op == "resolve_instrument":
@@ -2235,8 +2488,12 @@ def execute(request: Mapping[str, Any]) -> CanonicalResponse:
         return _market_price(account, request)
     if op == "new_order":
         return _new_order(account, request)
+    if op == "cancel_preflight":
+        return _cancel_preflight(account, request)
     if op == "cancel_orders":
         return _cancel_orders(account, request)
+    if op == "plan_ladder":
+        return plan_ladder(request)
     if op == "ladder":
         return _ladder(account, request)
     if op == "ladder_reconcile":

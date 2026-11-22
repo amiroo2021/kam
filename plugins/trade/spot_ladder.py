@@ -26,6 +26,14 @@ INVARIANTS
 5. The planner never increases total volume beyond the user's request;
    it may redistribute within it.
 6. Per-child notional >= min_notional for every child that survives.
+7. For a BUY planned against a quote budget, the total notional never
+   exceeds the budget. The per-child min-notional correction moves BASE
+   SIZE between children priced at different levels, so quote value is
+   NOT conserved by that move; when the correction pushes the plan over
+   the budget, the excess quote is redistributed back out of the
+   children that still hold surplus (see
+   ``_redistribute_quote_surplus``). The budget is never raised and no
+   order is ever dropped to fit.
 """
 from __future__ import annotations
 
@@ -55,6 +63,7 @@ class LadderPlan:
     total_size: Decimal = Decimal("0")
     total_notional: Decimal = Decimal("0")
     vwap: Decimal = Decimal("0")
+    requested_quote_budget: Decimal | None = None
     notes: List[str] = field(default_factory=list)
 
 
@@ -142,14 +151,28 @@ def _price_grid(
     """Generate N inclusive prices quantized to price_tick with monotonicity."""
     if order_count <= 0:
         return []
+    lower_bound = min(start_price, end_price)
+    upper_bound = max(start_price, end_price)
     if order_count == 1:
-        mid = (start_price + end_price) / Decimal("2")
-        return [_quantize_down(mid, price_tick) if price_tick > 0 else mid]
-    step = (end_price - start_price) / Decimal(order_count - 1)
-    raw = [start_price + step * Decimal(i) for i in range(order_count)]
-    prices = [
-        _quantize_down(value, price_tick) if price_tick > 0 else value for value in raw
-    ]
+        raw = [start_price]
+    else:
+        step = (end_price - start_price) / Decimal(order_count - 1)
+        raw = [start_price + step * Decimal(i) for i in range(order_count)]
+    prices: List[Decimal] = []
+    for value in raw:
+        if price_tick > 0:
+            price = _quantize_down(value, price_tick)
+            # Flooring may place the final price just below a non-tick-aligned
+            # requested boundary. Clamp to the first tick inside the range.
+            if price < lower_bound:
+                price = _quantize_up(lower_bound, price_tick)
+            if price > upper_bound:
+                price = _quantize_down(upper_bound, price_tick)
+        else:
+            price = value
+        if price < lower_bound or price > upper_bound:
+            raise ValueError("PRICE_TICK_HAS_NO_LEVEL_INSIDE_RANGE")
+        prices.append(price)
     if start_price <= end_price:
         for i in range(1, len(prices)):
             if prices[i] < prices[i - 1]:
@@ -283,6 +306,161 @@ def _enforce_min_notional(
     return final
 
 
+def _redistribute_quote_surplus(
+    children: List[LadderChild],
+    *,
+    size_step: Decimal,
+    min_notional: Decimal,
+    excess_quote: Decimal,
+) -> List[LadderChild]:
+    """Remove ``excess_quote`` of quote value from children that hold surplus.
+
+    ``_enforce_min_notional`` moves BASE SIZE between children priced at
+    different levels, so quote value is not conserved: pulling ``0.050``
+    base from a 33.10-priced sibling into a 60.00-priced child adds
+    3.00 USDC of quote while removing only 1.655 USDC. The plan's total
+    notional can therefore end up above the user's quote budget.
+
+    This function takes the excess back out, deterministically, by
+    shrinking children that still hold quote above ``min_notional``.
+    Removal is ordered by the largest surplus first, ties toward the END
+    (the largest children), and each removal is bounded so that
+
+    * the child keeps ``size_step`` granularity,
+    * the child stays at or above ``min_notional``,
+    * the child stays at or above the size of its predecessor (so the
+      Half-Gaussian monotonic invariant survives), and
+    * the child's own size never drops below ``min_qty``.
+
+    Children whose price is the smallest keep more base value per quote
+    unit, so removing base from them releases the most quote per step.
+    """
+    if excess_quote <= 0 or size_step <= 0 or not children:
+        return children
+
+    out: List[LadderChild] = [child for child in children]
+    remaining = excess_quote
+
+    for _ in range(len(out) * 4):
+        if remaining <= 0:
+            break
+        # Candidate: children that can still give up base while keeping
+        # their notional at or above the minimum.
+        candidates: List[tuple] = []
+        for index, child in enumerate(out):
+            if child.price <= 0 or child.size <= 0:
+                continue
+            surplus = child.notional - min_notional
+            if surplus <= 0:
+                continue
+            # Never shrink below the predecessor: monotonicity.
+            floor = Decimal("0")
+            if index > 0:
+                floor = out[index - 1].size
+            # Never shrink below min_qty or one size step.
+            floor = max(floor, min_notional / child.price if child.price > 0 else Decimal("0"))
+            floor = _quantize_up(floor, size_step)
+            removable_units = int(
+                ((child.size - floor) / size_step).to_integral_value(rounding=ROUND_DOWN)
+            )
+            if removable_units <= 0:
+                continue
+            candidates.append((surplus, index, removable_units, child.price))
+
+        if not candidates:
+            break
+
+        # Largest surplus first; ties toward the END (higher index) and
+        # then the richer per-step quote release.
+        candidates.sort(key=lambda item: (item[0], item[1], item[3]), reverse=True)
+        surplus, index, removable_units, price = candidates[0]
+        child = out[index]
+
+        # Quote released by removing one size step from this child.
+        quote_per_step = price * size_step
+        if quote_per_step <= 0:
+            break
+        steps_needed = int(
+            (remaining / quote_per_step).to_integral_value(rounding=ROUND_HALF_UP)
+        )
+        if steps_needed <= 0:
+            steps_needed = 1
+        steps = min(steps_needed, removable_units)
+
+        new_size = child.size - Decimal(steps) * size_step
+        if new_size <= 0:
+            break
+        out[index] = LadderChild(price=child.price, size=new_size)
+        remaining -= Decimal(steps) * quote_per_step
+
+    return out
+
+
+def _min_notional_floors(
+    prices: List[Decimal],
+    size_step: Decimal,
+    min_notional: Decimal,
+) -> List[Decimal]:
+    """Smallest on-step size at each price that clears ``min_notional``."""
+    if size_step <= 0:
+        return [Decimal("0") for _ in prices]
+    return [_quantize_up(min_notional / price, size_step) for price in prices if price > 0]
+
+
+def _repair_monotonic_sizes(
+    children: List[LadderChild],
+    *,
+    prices: List[Decimal],
+    original_sizes: List[Decimal],
+    size_step: Decimal,
+    min_notional: Decimal,
+) -> List[LadderChild]:
+    """Rebuild a monotone ladder when the min-notional correction inverted it.
+
+    The per-child minimum-notional correction moves base size between
+    children priced at DIFFERENT levels, so it can invert the ordering
+    that the distribution asked for: a child that should be small gets
+    lifted above a later, larger child.
+
+    A monotone ladder honouring the minimum notional still exists when
+    the per-price FLOORS are themselves monotone in the required
+    direction: ``floor_i = ceil(min_notional / price_i)``. Each price
+    then has a floor, and the smallest monotone sequence that dominates
+    every floor is the running maximum of the floors.
+
+    The repair takes the larger of (a) the size the distribution
+    originally asked for and (b) the floor, then applies that running
+    maximum. The result is monotone, every child still clears the
+    minimum notional, and the distribution's shape survives because the
+    original sizes are preserved wherever they were already valid.
+
+    When the floors are NOT monotone in the required direction, the
+    minimum-notional requirement directly contradicts the distribution
+    and no monotone ladder can honour both. That case must be REJECTED
+    by the caller rather than silently reshaped.
+    """
+    if not children:
+        return children
+    floors = _min_notional_floors(prices, size_step, min_notional)
+    if not floors:
+        return children
+
+    # Sizes the distribution originally asked for, keyed by price.
+    original_by_price = {price: size for price, size in zip(prices, original_sizes)}
+
+    repaired: List[LadderChild] = []
+    running = Decimal("0")
+    for price, floor in zip(prices, floors):
+        target = original_by_price.get(price, Decimal("0"))
+        if target < floor:
+            target = floor
+        if target < running:
+            target = running
+        running = target
+        repaired.append(LadderChild(price=price, size=target))
+    return repaired
+
+
 def _uniform_variance_ok(children: List[LadderChild], size_step: Decimal) -> bool:
     if not children or size_step <= 0:
         return True
@@ -334,12 +512,13 @@ def compute_ladder_with_min_notional(
     *,
     side: str,
     distribution: str,
-    total_volume: Decimal,
     start_price: Decimal,
     end_price: Decimal,
     order_count: int,
     instrument: Mapping[str, Any],
     min_notional: Decimal,
+    total_volume: Decimal | None = None,
+    total_quote_budget: Decimal | None = None,
 ) -> LadderPlan:
     """Build a deterministic ladder plan. Produces exactly ``order_count``
     children or raises ValueError with a max-valid-child-count message.
@@ -352,8 +531,17 @@ def compute_ladder_with_min_notional(
         raise ValueError(f"INVALID_DISTRIBUTION:{distribution}")
     if order_count <= 0:
         raise ValueError("INVALID_ORDER_COUNT")
-    if total_volume <= 0:
+    if total_volume is not None and total_volume <= 0:
         raise ValueError("INVALID_TOTAL_VOLUME")
+    if total_quote_budget is not None:
+        if side != "BUY":
+            raise ValueError("QUOTE_BUDGET_ONLY_FOR_BUY")
+        if total_quote_budget <= 0:
+            raise ValueError("INVALID_QUOTE_BUDGET")
+        if total_volume is not None:
+            raise ValueError("CHOOSE_VOLUME_OR_QUOTE_BUDGET")
+    if total_volume is None and total_quote_budget is None:
+        raise ValueError("MISSING_TOTAL_VOLUME_OR_QUOTE_BUDGET")
 
     size_step, price_tick = _resolve_steps(instrument)
 
@@ -384,15 +572,25 @@ def compute_ladder_with_min_notional(
     if total_weight <= 0:
         raise ValueError("INVALID_DISTRIBUTION_WEIGHTS")
 
-    total_units = int((total_volume / size_step).to_integral_value(rounding=ROUND_DOWN))
-    if total_units <= 0:
-        raise ValueError(
-            f"INSUFFICIENT_VOLUME_FOR_SIZE_STEP: {total_volume} at {size_step} yields 0 size_steps."
-        )
+    if total_volume is not None:
+        total_units = int((total_volume / size_step).to_integral_value(rounding=ROUND_DOWN))
+        if total_units <= 0:
+            raise ValueError(
+                f"INSUFFICIENT_VOLUME_FOR_SIZE_STEP: {total_volume} at {size_step} yields 0 size_steps."
+            )
+        capacity_volume = total_volume
+    else:
+        assert total_quote_budget is not None
+        capacity_volume = total_quote_budget / min(prices)
+        total_units = int((capacity_volume / size_step).to_integral_value(rounding=ROUND_DOWN))
+        if total_units <= 0:
+            raise ValueError(
+                f"INSUFFICIENT_QUOTE_BUDGET_FOR_SIZE_STEP: {total_quote_budget} at {size_step} yields 0 size_steps."
+            )
 
     max_valid = _max_valid_children(
         size_step=size_step,
-        total_volume=total_volume,
+        total_volume=capacity_volume,
         min_qty=min_qty,
         max_qty=max_qty,
         prices=prices,
@@ -400,10 +598,17 @@ def compute_ladder_with_min_notional(
     if max_valid < order_count:
         raise _too_few_children_error(order_count, max_valid, instrument=instrument)
 
-    raw_units = [Decimal(total_units) * w / total_weight for w in weights]
+    if total_quote_budget is not None:
+        quote_weight_total = sum((price * weight for price, weight in zip(prices, weights)), Decimal("0"))
+        raw_units = [
+            (total_quote_budget * weight / quote_weight_total) / size_step
+            for weight in weights
+        ]
+    else:
+        raw_units = [Decimal(total_units) * w / total_weight for w in weights]
     base_units = [int(u.to_integral_value(rounding=ROUND_DOWN)) for u in raw_units]
     remainders = [raw_units[i] - Decimal(base_units[i]) for i in range(len(raw_units))]
-    residual = total_units - sum(base_units)
+    residual = total_units - sum(base_units) if total_quote_budget is None else 0
     if residual > 0:
         order_indices = sorted(
             range(len(prices)),
@@ -442,10 +647,34 @@ def compute_ladder_with_min_notional(
 
     if distribution == "half_gaussian":
         if not _monotonic_non_decreasing(children):
-            raise ValueError(
-                "Half-Gaussian correction violated the monotonic sizing "
-                "invariant (smallest at START, largest at END)."
+            # The min-notional correction can invert the ordering the
+            # distribution asked for. A monotone ladder honouring the
+            # minimum notional still exists when the per-price floors are
+            # themselves monotone; in that case repair the ladder instead
+            # of rejecting it. When the floors contradict the
+            # distribution, no monotone ladder can honour both and the
+            # planner must REJECT (the MEXC SUI contract).
+            floors = _min_notional_floors(prices, size_step, min_notional)
+            floors_monotone = _monotonic_non_decreasing(
+                [LadderChild(price=p, size=f) for p, f in zip(prices, floors)]
             )
+            if floors_monotone:
+                children = _repair_monotonic_sizes(
+                    children,
+                    prices=prices,
+                    original_sizes=sizes,
+                    size_step=size_step,
+                    min_notional=min_notional,
+                )
+            if not _monotonic_non_decreasing(children):
+                raise ValueError(
+                    "Half-Gaussian correction violated the monotonic sizing "
+                    "invariant (smallest at START, largest at END): the "
+                    "per-child minimum-notional floor requires a larger size "
+                    "at a lower price than the Half-Gaussian shape allows, so "
+                    "no ladder can honour both the minimum notional and the "
+                    "requested distribution."
+                )
     else:
         if not _uniform_variance_ok(children, size_step):
             raise ValueError(
@@ -460,9 +689,46 @@ def compute_ladder_with_min_notional(
         )
 
     total_size = sum((c.size for c in children), Decimal("0"))
-    if total_size > total_volume:
+    if total_volume is not None and total_size > total_volume:
         total_size = total_volume
     total_notional = sum((c.notional for c in children), Decimal("0"))
+
+    if total_quote_budget is not None and total_notional > total_quote_budget:
+        # The min-notional correction moves BASE SIZE between children at
+        # different prices, so quote value is not conserved and the plan can
+        # land above the user's budget. Take the excess back out of the
+        # children that still hold quote surplus instead of raising the
+        # budget or dropping orders.
+        excess = total_notional - total_quote_budget
+        children = _redistribute_quote_surplus(
+            children,
+            size_step=size_step,
+            min_notional=min_notional,
+            excess_quote=excess,
+        )
+        total_size = sum((c.size for c in children), Decimal("0"))
+        total_notional = sum((c.notional for c in children), Decimal("0"))
+        if total_notional > total_quote_budget:
+            raise ValueError(
+                "BUY_QUOTE_BUDGET_EXCEEDED_AFTER_MIN_NOTIONAL_CORRECTION: "
+                f"required {total_notional} exceeds budget {total_quote_budget} "
+                "and the remaining children cannot give up enough quote while "
+                "keeping every child at or above the minimum notional."
+            )
+        # Redistribution changed the sizes; re-check the distribution shape.
+        if distribution == "half_gaussian":
+            if not _monotonic_non_decreasing(children):
+                raise ValueError(
+                    "Half-Gaussian correction violated the monotonic sizing "
+                    "invariant (smallest at START, largest at END)."
+                )
+        else:
+            if not _uniform_variance_ok(children, size_step):
+                raise ValueError(
+                    f"Uniform correction violated the equal-sizing invariant "
+                    f"(max variance > size_step {size_step})."
+                )
+
     vwap = total_notional / total_size if total_size > 0 else Decimal("0")
 
     return LadderPlan(
@@ -472,6 +738,7 @@ def compute_ladder_with_min_notional(
         total_size=total_size,
         total_notional=total_notional,
         vwap=vwap,
+        requested_quote_budget=total_quote_budget,
         notes=[],
     )
 
@@ -480,11 +747,12 @@ def compute_ladder(
     *,
     side: str,
     distribution: str,
-    total_volume: Decimal,
     start_price: Decimal,
     end_price: Decimal,
     order_count: int,
     instrument: Mapping[str, Any],
+    total_volume: Decimal | None = None,
+    total_quote_budget: Decimal | None = None,
 ) -> LadderPlan:
     """Backwards-compatible wrapper. Reads ``min_notional`` from the
     resolved instrument dict and forwards to
@@ -506,6 +774,7 @@ def compute_ladder(
         order_count=order_count,
         instrument=instrument,
         min_notional=mn,
+        total_quote_budget=total_quote_budget,
     )
 
 
@@ -517,6 +786,11 @@ def plan_as_dict(plan: LadderPlan) -> Dict[str, Any]:
         "total_size": _format_decimal(plan.total_size),
         "total_notional": _format_decimal(plan.total_notional),
         "vwap": _format_decimal(plan.vwap),
+        "requested_quote_budget": (
+            _format_decimal(plan.requested_quote_budget)
+            if plan.requested_quote_budget is not None
+            else None
+        ),
         "notes": list(plan.notes),
         "children": [
             {

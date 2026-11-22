@@ -1,16 +1,20 @@
 """SpotDesk — spot-agent dispatcher for the /tradespot wizard.
 
 Spot agents are deliberately separate from the existing /trade agents.
-Only files named ``x_<exchange>_agent_spot.py`` are considered here;
-normal ``x_<exchange>_agent.py`` files are ignored.
+Only files named ``x_<exchange>_agent_spot.py`` or
+``x_<exchange>_spot_agent.py`` are considered here; normal
+``x_<exchange>_agent.py`` files are ignored.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import re
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,8 +22,43 @@ from .canonical import CanonicalResponse, make_failure, sanitize_error_message
 
 logger = logging.getLogger(__name__)
 
-_SPOT_AGENT_FILENAME_PATTERN = re.compile(
-    r"^x_(?P<exchange>[a-z][a-z0-9_]*)_agent_spot\.py$"
+
+def _log_identity_boundary(
+    request: Dict[str, Any],
+    response: Any,
+    agent: Any,
+    mismatched_fields: List[str],
+    *,
+    reason: str,
+) -> None:
+    error = getattr(response, "error", None)
+    record = {
+        "event": "spotdesk_identity_validation_failure",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": uuid.uuid4().hex[:16],
+        "reason": reason,
+        "request": {
+            "operation": request.get("operation"),
+            "exchange": request.get("exchange"),
+            "account": request.get("account"),
+        },
+        "response": {
+            "operation": getattr(response, "operation", None),
+            "exchange": getattr(response, "exchange", None),
+            "account": getattr(response, "account", None),
+            "success": getattr(response, "success", None),
+            "error_code": getattr(error, "code", None),
+        },
+        "mismatched_fields": list(mismatched_fields),
+        "response_type": f"{type(response).__module__}.{type(response).__qualname__}",
+        "agent_module": getattr(agent, "__name__", None),
+        "agent_path": str(getattr(agent, "__file__", "") or ""),
+    }
+    logger.warning("%s", json.dumps(record, sort_keys=True, separators=(",", ":")))
+
+_SPOT_AGENT_FILENAME_PATTERNS = (
+    re.compile(r"^x_(?P<exchange>[a-z][a-z0-9_]*)_agent_spot\.py$"),
+    re.compile(r"^x_(?P<exchange>[a-z][a-z0-9_]*)_spot_agent\.py$"),
 )
 _EXCLUDED_PATTERNS = (
     re.compile(r"^__init__\.py$"),
@@ -33,10 +72,11 @@ def _agents_dir() -> Path:
 
 
 def _exchange_name_from_filename(filename: str) -> Optional[str]:
-    match = _SPOT_AGENT_FILENAME_PATTERN.match(filename)
-    if not match:
-        return None
-    return match.group("exchange")
+    for pattern in _SPOT_AGENT_FILENAME_PATTERNS:
+        match = pattern.match(filename)
+        if match:
+            return match.group("exchange")
+    return None
 
 
 def _iter_agent_files(directory: Path) -> List[Path]:
@@ -48,7 +88,7 @@ def _iter_agent_files(directory: Path) -> List[Path]:
             continue
         if any(pattern.match(path.name) for pattern in _EXCLUDED_PATTERNS):
             continue
-        if not _SPOT_AGENT_FILENAME_PATTERN.match(path.name):
+        if _exchange_name_from_filename(path.name) is None:
             continue
         out.append(path)
     return out
@@ -81,6 +121,8 @@ def _validate_agent(module: Any, expected_exchange: Optional[str] = None) -> Opt
     for attr in _REQUIRED_AGENT_ATTRS:
         if not hasattr(module, attr):
             return f"missing required attribute {attr!r}"
+        if attr != "name" and not callable(getattr(module, attr)):
+            return f"required attribute {attr!r} must be callable"
     name = getattr(module, "name", None)
     if not isinstance(name, str) or not name.strip():
         return "name must be a non-empty string"
@@ -181,6 +223,24 @@ class SpotDesk:
             return []
         return [c for c in caps if isinstance(c, str)]
 
+    def agent_for(self, exchange: str) -> Optional[Any]:
+        """Return a discovered agent for generic read-only adapter bridges."""
+        self._ensure_loaded()
+        return self._agents.get(exchange)
+
+    def plan_ladder(self, request: Dict[str, Any]) -> CanonicalResponse:
+        """Canonical exchange-neutral ladder-planning seam.
+
+        The selected Spot agent owns precision, limits, and balance-policy
+        validation. SpotDesk only routes the plan request and normalizes the
+        operation name; it never embeds exchange-specific rules.
+        """
+        if not isinstance(request, dict):
+            return make_failure("plan_ladder", "", "", "INVALID_REQUEST", "Ladder request must be a mapping.")
+        routed = dict(request)
+        routed["operation"] = "plan_ladder"
+        return self.execute(routed)
+
     def execute(self, request: Dict[str, Any]) -> CanonicalResponse:
         operation = request.get("operation") if isinstance(request, dict) else None
         exchange = request.get("exchange") if isinstance(request, dict) else None
@@ -212,12 +272,39 @@ class SpotDesk:
                 sanitize_error_message(str(exc)),
             )
         if not isinstance(response, CanonicalResponse):
+            _log_identity_boundary(
+                request,
+                response,
+                agent,
+                ["response_type"],
+                reason="malformed_response",
+            )
             return make_failure(
                 operation,
                 exchange,
                 account,
                 "INVALID_AGENT_RESPONSE",
                 "Spot agent returned a malformed response.",
+            )
+        mismatched_fields = [
+            field
+            for field in ("operation", "exchange", "account")
+            if getattr(response, field, None) != request.get(field)
+        ]
+        if mismatched_fields:
+            _log_identity_boundary(
+                request,
+                response,
+                agent,
+                mismatched_fields,
+                reason="identity_mismatch",
+            )
+            return make_failure(
+                operation,
+                exchange,
+                account,
+                "INVALID_AGENT_RESPONSE",
+                "Spot agent response identity does not match the request.",
             )
         return response
 

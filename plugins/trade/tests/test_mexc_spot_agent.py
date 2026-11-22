@@ -62,8 +62,40 @@ class MexcSpotEnvTests(unittest.TestCase):
         self.assertIn("cancel_orders", caps)
         # Phase 5: ladder is now an advertised capability.
         self.assertIn("ladder", caps)
+        self.assertIn("plan_ladder", caps)
         # MARKET + cancel_order_group + cancel_order remain NOT_IMPLEMENTED.
         self.assertNotIn("market_order", caps)
+
+    def test_plan_ladder_uses_agent_owned_quote_budget_validation(self) -> None:
+        instrument = {
+            "symbol": "SOLUSDC",
+            "base": "SOL",
+            "quote": "USDC",
+            "size_step": "0.01",
+            "price_tick": "0.01",
+            "min_notional": "1",
+        }
+        response = spot.execute(
+            {
+                "operation": "plan_ladder",
+                "exchange": "mexc",
+                "account": "amiroo",
+                "side": "BUY",
+                "distribution": "uniform",
+                "start_price": "100",
+                "end_price": "70",
+                "order_count": 4,
+                "instrument": instrument,
+                "total_quote_budget": "100",
+            }
+        )
+        self.assertTrue(response.success)
+        plan = (response.data or {}).get("plan")
+        self.assertEqual(plan["requested_quote_budget"], "100")
+        self.assertEqual(len(plan["children"]), 4)
+        self.assertLessEqual(
+            Decimal(plan["total_notional"]), Decimal("100")
+        )
 
     def test_signed_request_uses_mexc_spot_signature_without_exposing_secret(self) -> None:
         captured: Dict[str, Any] = {}
@@ -108,6 +140,46 @@ class MexcSpotParsingTests(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    def test_open_orders_preserves_operation_and_all_rows(self) -> None:
+        orders = [
+            {
+                "symbol": "SUIUSDT",
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.4",
+                "origQty": "100",
+                "executedQty": "0",
+                "status": "NEW",
+                "orderId": str(index),
+            }
+            for index in range(100)
+        ]
+        with mock.patch.object(spot, "_signed_request", return_value=orders):
+            response = spot.execute({"operation": "open_orders", "exchange": "mexc", "account": "amiroo", "symbol": "SUI/USDT"})
+        self.assertTrue(response.success)
+        self.assertEqual(response.operation, "open_orders")
+        self.assertEqual(response.exchange, "mexc")
+        self.assertEqual(response.account, "amiroo")
+        self.assertEqual(response.open_order_count, 100)
+        self.assertEqual(len(response.data["orders"]), 100)
+        self.assertEqual(response.data["orders"][0]["symbol"], "SUIUSDT")
+        self.assertEqual(response.data["orders"][0]["side"], "BUY")
+
+    def test_failed_open_orders_preserves_operation_and_identity(self) -> None:
+        with mock.patch.object(spot, "_signed_request", return_value={"code": 700001, "msg": "rejected"}):
+            response = spot.execute({"operation": "open_orders", "exchange": "mexc", "account": "amiroo"})
+        self.assertFalse(response.success)
+        self.assertEqual(response.operation, "open_orders")
+        self.assertEqual(response.exchange, "mexc")
+        self.assertEqual(response.account, "amiroo")
+        self.assertEqual(response.error.code, "MEXC_SPOT_ORDERS_FAILED")
+
+    def test_orders_alias_remains_orders_operation(self) -> None:
+        with mock.patch.object(spot, "_signed_request", return_value=[]):
+            response = spot.execute({"operation": "orders", "exchange": "mexc", "account": "amiroo"})
+        self.assertTrue(response.success)
+        self.assertEqual(response.operation, "orders")
 
     def test_spot_balance_filters_zero_and_handles_locked(self) -> None:
         account_payload = {
@@ -605,6 +677,85 @@ class MexcSpotCancelOrdersTests(unittest.TestCase):
         self.assertEqual(calls["get"], 1)
 
 
+    def test_cancel_preflight_is_get_only_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mexc_preflight_") as td:
+            os.environ["HERMES_HOME"] = td
+            record_path = Path(td) / "cache" / "tradespot" / "mexc-spot" / "amiroo" / "e4947406.json"
+            record_path.parent.mkdir(parents=True)
+            ids = [f"oid-{i}" for i in range(100)]
+            record_path.write_text(json.dumps({
+                "account": "amiroo", "exchange": "mexc", "exchange_symbol": "SUIUSDT",
+                "instrument": "SUIUSDT", "side": "BUY", "execution_id": "e4947406",
+                "updated_at": 1, "children": [{"exchange_order_id": oid} for oid in ids],
+            }), encoding="utf-8")
+            rows = [{"symbol": "SUIUSDT", "side": "BUY", "type": "LIMIT", "price": "0.4", "origQty": "1", "executedQty": "0", "status": "NEW", "orderId": oid} for oid in ids]
+            calls: List[Dict[str, Any]] = []
+
+            def fake_signed(_credentials, method, path, params=None):
+                calls.append({"method": method, "path": path, "params": dict(params or {})})
+                if method == "GET" and path == "/api/v3/openOrders":
+                    return list(rows)
+                raise AssertionError("preflight must not issue writes")
+
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+                    response = spot.execute({"operation": "cancel_preflight", "exchange": "mexc", "account": "amiroo", "symbol": "SUI/USDT", "side": "BUY", "execution_id": "e4947406"})
+            self.assertTrue(response.success)
+            self.assertTrue(response.data["pass"])
+            self.assertEqual(response.data["expected_order_count"], 100)
+            self.assertEqual(response.data["live_matching_order_count"], 100)
+            self.assertEqual(response.data["missing_order_ids"], [])
+            self.assertEqual(response.data["unexpected_order_ids"], [])
+            self.assertEqual(response.data["duplicate_order_ids"], [])
+            self.assertEqual(response.data["remaining_quantity"], "100")
+            self.assertTrue(calls)
+            self.assertTrue(all(call["method"] == "GET" for call in calls))
+            self.assertNotIn("DELETE", [call["method"] for call in calls])
+
+            cases = [
+                ("wrong_account", {"account": "other", "symbol": "SUIUSDT", "side": "BUY"}, "ACCOUNT_NOT_FOUND"),
+                ("wrong_instrument", {"account": "amiroo", "symbol": "BTCUSDT", "side": "BUY"}, "PREFLIGHT_IDENTITY_MISMATCH"),
+                ("wrong_side", {"account": "amiroo", "symbol": "SUIUSDT", "side": "SELL"}, "PREFLIGHT_IDENTITY_MISMATCH"),
+            ]
+            for _label, override, code in cases:
+                req = {"operation": "cancel_preflight", "exchange": "mexc", "execution_id": "e4947406", **override}
+                with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                    with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("scope failure must stop before GET")):
+                        failed = spot.execute(req)
+                self.assertFalse(failed.success)
+                self.assertEqual(failed.error.code, code)
+
+            rows.pop()
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", return_value=list(rows)):
+                    missing = spot.execute({"operation": "cancel_preflight", "exchange": "mexc", "account": "amiroo", "symbol": "SUIUSDT", "side": "BUY", "execution_id": "e4947406"})
+            self.assertTrue(missing.success)
+            self.assertFalse(missing.data["pass"])
+            self.assertEqual(len(missing.data["missing_order_ids"]), 1)
+
+            partial_rows = list(rows) + [{"symbol": "SUIUSDT", "side": "BUY", "type": "LIMIT", "price": "0.4", "origQty": "1", "executedQty": "0.5", "status": "PARTIALLY_FILLED", "orderId": "oid-99"}]
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", return_value=partial_rows):
+                    partial = spot.execute({"operation": "cancel_preflight", "exchange": "mexc", "account": "amiroo", "symbol": "SUIUSDT", "side": "BUY", "execution_id": "e4947406"})
+            self.assertTrue(partial.success)
+            self.assertTrue(partial.data["pass"])
+            self.assertEqual(partial.data["remaining_quantity"], "99.5")
+
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", side_effect=RuntimeError("GET failed")):
+                    failed = spot.execute({"operation": "cancel_preflight", "exchange": "mexc", "account": "amiroo", "symbol": "SUIUSDT", "side": "BUY", "execution_id": "e4947406"})
+            self.assertFalse(failed.success)
+            self.assertEqual(failed.error.code, "MEXC_SPOT_ERROR")
+
+            duplicate_record = {"account": "amiroo", "exchange": "mexc", "exchange_symbol": "SUIUSDT", "instrument": "SUIUSDT", "side": "BUY", "execution_id": "e4947406", "children": [{"exchange_order_id": oid} for oid in ids[:-1]] + [{"exchange_order_id": ids[-2]}]}
+            record_path.write_text(json.dumps(duplicate_record), encoding="utf-8")
+            with mock.patch.object(spot, "_load_dotenv_values", return_value={}):
+                with mock.patch.object(spot, "_signed_request", side_effect=AssertionError("duplicate IDs must stop before GET")):
+                    duplicate = spot.execute({"operation": "cancel_preflight", "exchange": "mexc", "account": "amiroo", "symbol": "SUIUSDT", "side": "BUY", "execution_id": "e4947406"})
+            self.assertFalse(duplicate.success)
+            self.assertEqual(duplicate.error.code, "PREFLIGHT_IDENTITY_MISMATCH")
+
+
 class MexcSpotLadderTests(unittest.TestCase):
     """Phase 5: live ladder submission via MEXC batchOrders.
 
@@ -620,7 +771,20 @@ class MexcSpotLadderTests(unittest.TestCase):
         os.environ["HERMES_HOME"] = "/tmp/no-such-hermes-mexc-ladder"
         os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
         os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
-        # Reset the in-memory cache so setUp order is deterministic.
+        self._balance_patcher = mock.patch.object(
+            spot,
+            "_balance",
+            return_value=mock.Mock(
+                success=True,
+                error=None,
+                data={"assets": [
+                    {"asset": "USDC", "free": "1000000", "locked": "0"},
+                    {"asset": "SOL", "free": "1000000", "locked": "0"},
+                ]},
+            ),
+        )
+        self._balance_patcher.start()
+        self.addCleanup(self._balance_patcher.stop)
         spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
 
     def tearDown(self) -> None:
@@ -1103,6 +1267,18 @@ class MexcSpotLadderBatchAndReconciliationTests(unittest.TestCase):
         os.environ["HERMES_HOME"] = "/tmp/no-such-hermes-mexc-hardening"
         os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
         os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
+        self._balance_patcher = mock.patch.object(
+            spot, "_balance",
+            return_value=mock.Mock(
+                success=True, error=None,
+                data={"assets": [
+                    {"asset": "USDC", "free": "1000000", "locked": "0"},
+                    {"asset": "SOL", "free": "1000000", "locked": "0"},
+                ]},
+            ),
+        )
+        self._balance_patcher.start()
+        self.addCleanup(self._balance_patcher.stop)
         spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
 
     def tearDown(self) -> None:
@@ -1478,7 +1654,18 @@ class MexcSpotLadderPersistenceAndReconcileTests(unittest.TestCase):
         # Pre-set account env so _lookup_credentials succeeds.
         os.environ["MEXC_AMIROO_ACCESSKEY"] = "test_access"
         os.environ["MEXC_AMIROO_SECRETKEY"] = "test_secret"
-        spot._MARKET_CACHE.update({"ts": 0.0, "symbols": [], "by_symbol": {}})
+        self._balance_patcher = mock.patch.object(
+            spot, "_balance",
+            return_value=mock.Mock(
+                success=True, error=None,
+                data={"assets": [
+                    {"asset": "USDC", "free": "1000000", "locked": "0"},
+                    {"asset": "SOL", "free": "1000000", "locked": "0"},
+                ]},
+            ),
+        )
+        self._balance_patcher.start()
+        self.addCleanup(self._balance_patcher.stop)
         self.children = [
             {
                 "symbol": "SOLUSDC", "side": "BUY",
@@ -1491,7 +1678,10 @@ class MexcSpotLadderPersistenceAndReconcileTests(unittest.TestCase):
         ]
 
     def tearDown(self) -> None:
-        os.environ["HERMES_HOME"] = self._prev_hermes or ""
+        if self._prev_hermes is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._prev_hermes
         import shutil
         shutil.rmtree(self._tmp_hermes, ignore_errors=True)
 
@@ -1834,6 +2024,111 @@ class MexcSpotLadderPersistenceAndReconcileTests(unittest.TestCase):
         # does not internally retry on AMBIGUOUS outcome.
         self.assertTrue(resp1.success)
         self.assertTrue(resp2.success)
+
+
+class MexcSpotLadderPreflightTests(unittest.TestCase):
+    def test_child_preflight_rejects_mixed_symbol_and_bad_precision(self) -> None:
+        constraints = {"size_step": "0.1", "price_tick": "0.01", "min_notional": "5"}
+        child = {
+            "symbol": "BTCUSDC",
+            "side": "BUY",
+            "quantity": "0.15",
+            "price": "100.00",
+            "client_order_id": "cid-1",
+        }
+        self.assertEqual(
+            spot._ladder_validate_child(
+                child,
+                expected_symbol="ETHUSDC",
+                expected_side="BUY",
+                instrument=constraints,
+            ),
+            "MIXED_SYMBOLS",
+        )
+        child["symbol"] = "ETHUSDC"
+        self.assertEqual(
+            spot._ladder_validate_child(child, expected_symbol="ETHUSDC", instrument=constraints),
+            "QUANTITY_PRECISION_INVALID",
+        )
+
+    def test_child_preflight_rejects_minimum_notional(self) -> None:
+        child = {
+            "symbol": "ETHUSDC",
+            "side": "SELL",
+            "quantity": "0.1",
+            "price": "10",
+            "client_order_id": "cid-2",
+        }
+        self.assertEqual(
+            spot._ladder_validate_child(
+                child,
+                expected_symbol="ETHUSDC",
+                expected_side="SELL",
+                instrument={"min_notional": "5"},
+            ),
+            "NOTIONAL_BELOW_MINIMUM",
+        )
+
+
+class MexcSpotLadderBalanceSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("MEXC_")}
+        for key in list(os.environ):
+            if key.startswith("MEXC_"):
+                os.environ.pop(key, None)
+        os.environ["MEXC_AMIROO_ACCESSKEY"] = "key"
+        os.environ["MEXC_AMIROO_SECRETKEY"] = "secret"
+
+    def tearDown(self) -> None:
+        for key in list(os.environ):
+            if key.startswith("MEXC_"):
+                os.environ.pop(key, None)
+        for key, value in self.saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+    def _request(self, side: str) -> dict[str, Any]:
+        return {
+            "operation": "ladder",
+            "exchange": "mexc",
+            "account": "amiroo",
+            "children": [{
+                "symbol": "SOLUSDC",
+                "side": side,
+                "quantity": "1",
+                "price": "100",
+                "client_order_id": "cid-1",
+            }],
+        }
+
+    def _run_with_balance(self, side: str, balances: list[dict[str, str]]) -> tuple[Any, list[str]]:
+        writes: list[str] = []
+        def fake_signed(_credentials, method, path, params=None):
+            if method.upper() == "GET" and path == "/api/v3/account":
+                return {"accountType": "SPOT", "balances": balances}
+            if method.upper() == "POST":
+                writes.append(path)
+                raise AssertionError("exchange write reached despite insufficient balance")
+            return []
+        with mock.patch.object(spot, "_signed_request", side_effect=fake_signed):
+            response = spot.execute(self._request(side))
+        return response, writes
+
+    def test_buy_checks_fresh_quote_free_balance_before_write(self) -> None:
+        response, writes = self._run_with_balance(
+            "BUY", [{"asset": "USDC", "free": "10", "locked": "0"}]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "INSUFFICIENT_BALANCE")
+        self.assertEqual(writes, [])
+
+    def test_sell_checks_fresh_base_free_balance_before_write(self) -> None:
+        response, writes = self._run_with_balance(
+            "SELL", [{"asset": "SOL", "free": "0.1", "locked": "0"}]
+        )
+        self.assertFalse(response.success)
+        self.assertEqual(response.error.code, "INSUFFICIENT_BALANCE")
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
