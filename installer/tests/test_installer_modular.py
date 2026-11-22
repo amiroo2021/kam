@@ -196,7 +196,11 @@ class TestCapabilityAwareRegistration(unittest.TestCase):
     def test_trade_only_registers_trade_only(self):
         mod = self._load_plugin()
         registered = self._register_against(mod, {"trade": True})
-        self.assertEqual(registered, ["trade"])
+        # The trade capability owns the whole /trade wizard family:
+        # /trade, /tradespot, /backtest and the read-only /fibolearn
+        # research command. The retired "fibo" capability is gone.
+        self.assertEqual(registered, ["trade", "tradespot", "backtest", "fibolearn"])
+        self.assertNotIn("fibo", registered)
 
     def test_no_capabilities_registers_nothing(self):
         mod = self._load_plugin()
@@ -234,8 +238,8 @@ class TestManifestSchema(unittest.TestCase):
         _do_install(["trade"], self.env["hermes_root"], self.env["hermes_home"])
         m = C.load_manifest(self.env["hermes_home"])
         self.assertEqual(m["schema_version"], C.SCHEMA_VERSION)
-        # /trade-only install: trade=True, fibo=False (the unused peer capability).
-        self.assertEqual(m["capabilities"], {"trade": True, "fibo": False})
+        # /trade-only install: trade=True is the only capability.
+        self.assertEqual(m["capabilities"], {"trade": True})
         self.assertIn("by_capability", m)
 
     def test_atomic_write_no_leftover(self):

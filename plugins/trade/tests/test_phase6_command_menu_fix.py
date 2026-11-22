@@ -306,7 +306,7 @@ class TelegramMenuIncludesTradeTests(unittest.TestCase):
 
         # Verify the plugin registered the Telegram-menu commands exposed by the trade capability.
         names = {call["name"] for call in ctx.calls}
-        self.assertEqual(names, {"trade", "tradespot", "backtest"})
+        self.assertEqual(names, {"trade", "tradespot", "backtest", "fibolearn"})
         trade_call = next(call for call in ctx.calls if call["name"] == "trade")
         self.assertEqual(trade_call["description"], "Open the trading wizard")
         self.assertIs(trade_call["handler"], _handle_trade_slash)
@@ -437,7 +437,9 @@ class TradeRegistrationIsIdempotentTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = old
 
-        self.assertEqual(set(ctx.entries.keys()), {"trade", "tradespot", "backtest"})
+        self.assertEqual(
+            set(ctx.entries.keys()), {"trade", "tradespot", "backtest", "fibolearn"}
+        )
         self.assertEqual(ctx.entries["trade"]["description"],
                          "Open the trading wizard")
         self.assertEqual(ctx.entries["tradespot"]["description"],

@@ -407,7 +407,7 @@ def _format_arcus_error(status_code: int, payload: Any) -> str:
 class _ArcusGetGate:
     """Process-wide Arcus GET coalescing + 429 backoff (Arcus-only).
 
-    - Coalesce identical GETs within a short TTL (one fibo poll window).
+    - Coalesce identical GETs within a short TTL (one polling window).
     - On HTTP 429: honor Retry-After when present, else exponential backoff.
     - Stale cache may be returned for non-critical reads while backing off.
     """
@@ -417,7 +417,7 @@ class _ArcusGetGate:
         self._cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
         self._backoff_until = 0.0
         self._backoff_seconds = 0.0
-        self._ttl_seconds = 1.25  # >= one default fibo poll (2s) half-window
+        self._ttl_seconds = 1.25  # >= one default poll (2s) half-window
         self._max_backoff = 60.0
         self._min_backoff = 1.5
 
@@ -1149,7 +1149,7 @@ def _good_til_time_us(market_id: int) -> int:
 
 
 def _normalize_arcus_market(market: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a single Arcus ``/v1/markets`` entry to the Fibo
+    """Normalize a single Arcus ``/v1/markets`` entry to the
     common schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if

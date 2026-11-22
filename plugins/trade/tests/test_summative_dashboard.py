@@ -27,7 +27,7 @@ class _Desk:
         self.calls: List[Dict[str, Any]] = []
         self.accounts = {
             "bulk": ["main"],
-            "metatrader": ["cents"],
+            "hedgedvenue": ["cents"],
             "hyperliquid": ["flex"],
         }
 
@@ -41,14 +41,14 @@ class _Desk:
         self.calls.append(dict(request))
         op, ex, ac = request["operation"], request["exchange"], request["account"]
         if op == "balance":
-            if ex == "metatrader":
+            if ex == "hedgedvenue":
                 return make_success(op, ex, ac,
                     balance=CanonicalBalance("12345", "USC"),
                     portfolio_summary=CanonicalPortfolioSummary("23456", "10000", "1200", "30000", "USC"))
             return make_success(op, ex, ac,
                 balance=CanonicalBalance("1000.00", "USDC"),
                 portfolio_summary=CanonicalPortfolioSummary("1200", "800", "200", "2000", "USDC"))
-        if ex == "metatrader":
+        if ex == "hedgedvenue":
             rows = [
                 CanonicalPosition("BTC", "long", "1.5", "50000", "250", mark="50250"),
                 CanonicalPosition("BTC", "short", "0.5", "50000", "-50", mark="50250"),

@@ -590,7 +590,7 @@ def _fetch_markets_payload() -> Dict[str, Any]:
 
 
 def _normalize_rise_market(market: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a single Rise ``/v1/markets`` entry to the Fibo
+    """Normalize a single Rise ``/v1/markets`` entry to the
     common schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if
@@ -780,8 +780,8 @@ def _execute_list_instruments(
 ) -> CanonicalResponse:
     """Phase 2.4: read-only catalog enumeration for Rise.
 
-    Returns the normalized Fibo schema (see
-    ``plugins/trade/fibo/discovery.py``) inside
+    Returns the normalized schema (see
+    the shared instrument discovery layer) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id and (when available) the
     last_price from the catalog payload.

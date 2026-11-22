@@ -20,7 +20,6 @@ EXPECTED_LADDER_AGENTS = {
     "x_hibachi_agent.py",  # Hibachi
     "x_hyperliquid_agent.py",  # Hyperliquid
     "x_lighter_agent.py",  # Lighter
-    "x_metatrader_agent.py",  # MetaTrader
     "x_mexc_agent.py",  # MEXC perp
     "x_mexc_agent_spot.py",  # MEXC spot
     "x_nado_agent.py",  # Nado

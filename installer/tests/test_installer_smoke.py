@@ -196,7 +196,13 @@ class TestATradeOnly(_FreshRoot):
         for n in SHARED_AGENT_NAMES:
             matches = [p for p in paths if p.endswith(f"agents/{n}")]
             self.assertEqual(len(matches), 1, f"duplicate shared agent {n}")
-        self.assertEqual(_registered_commands(self.hermes_home), ["trade"])
+        # The trade capability registers the whole /trade wizard family
+        # plus the read-only /fibolearn command. The retired "fibo"
+        # capability no longer exists.
+        self.assertEqual(
+            _registered_commands(self.hermes_home),
+            ["trade", "tradespot", "backtest", "fibolearn"],
+        )
         # verify
         rc, _, _ = _run_script(VERIFY_SH, ["--trade"], self.hermes_root, self.hermes_home)
         self.assertEqual(rc, 0)

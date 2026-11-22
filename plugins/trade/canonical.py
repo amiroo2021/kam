@@ -113,9 +113,8 @@ class CanonicalPosition:
     # agents remain valid; WebTrade must not invent mark=entry when absent.
     mark: Optional[str] = None
     # Number of position tickets that compose this canonical row. ``None``
-    # means the provider did not report it (older agents, non-MetaTrader
-    # exchanges); the UI must never derive this from size or from pending
-    # orders, and must never fabricate ``count=1`` when unavailable.
+    # means the provider did not report it; the UI must never derive this from
+    # size or pending orders, and must never fabricate ``count=1`` when unavailable.
     count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:

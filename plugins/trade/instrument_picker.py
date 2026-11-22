@@ -139,6 +139,9 @@ def list_instruments(
         sym = str(
             item.get("symbol")
             or item.get("native_symbol")
+            or item.get("instrument")
+            or item.get("market")
+            or item.get("route_symbol")
             or item.get("display_symbol")
             or item.get("name")
             or ""
@@ -317,8 +320,7 @@ def rank_catalog_candidates(catalog: List[Dict[str, Any]], requested: str) -> Li
             keep = scored[: min(3, len(scored))]
         return [t[3] for t in keep]
 
-    # Prefer local exact/prefix ranking for short ticker queries. Fibo ranker
-    # historically elevated SO / USOUSD.pc over SOLUSD for "SOL".
+    # Prefer local exact/prefix ranking for short ticker queries.
     local = _local_rank()
     if local:
         top = int(local[0].get("score") or 0)
@@ -326,46 +328,6 @@ def rank_catalog_candidates(catalog: List[Dict[str, Any]], requested: str) -> Li
             str(e.get("symbol") or "").upper().startswith(req) for e in local if req
         ):
             return local
-
-    try:
-        from plugins.trade.fibo.candidates import rank_candidates
-
-        ranked = rank_candidates(catalog, requested)
-        out: List[Dict[str, Any]] = []
-        for cand in ranked:
-            if int(getattr(cand, "score", 0) or 0) <= 0:
-                continue
-            sym = str(getattr(cand, "instrument", "") or "").strip()
-            if not sym:
-                continue
-            price = getattr(cand, "price", None)
-            entry: Dict[str, Any] = {
-                "symbol": sym,
-                "display_name": str(getattr(cand, "display_name", "") or "").strip(),
-                "score": int(getattr(cand, "score", 0) or 0),
-            }
-            if price is not None:
-                entry["price"] = (
-                    format(price.normalize(), "f") if hasattr(price, "normalize") else str(price)
-                )
-            out.append(entry)
-        if out:
-            # Merge: if local found a prefix match missing from fibo top, prepend it.
-            if local:
-                seen = {str(e.get("symbol") or "").upper() for e in out}
-                for e in local:
-                    su = str(e.get("symbol") or "").upper()
-                    if su and su not in seen and (
-                        su == req or (req and su.startswith(req)) or int(e.get("score") or 0) >= 130
-                    ):
-                        out.insert(0, e)
-                        seen.add(su)
-            best = max(int(e.get("score") or 0) for e in out)
-            floor = 40 if best >= 40 else max(15, int(best * 0.5))
-            strong = [e for e in out if int(e.get("score") or 0) >= floor]
-            return strong or out[: min(3, len(out))]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("rank_candidates fallback: %s", exc)
 
     return local
 

@@ -7146,7 +7146,7 @@ def _fetch_lighter_public_market_price(
 
 def _normalize_lighter_market(entry: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a single Lighter order_book_details entry to the
-    Fibo common schema.
+    shared normalized schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if
     the upstream payload doesn't supply them. The Lighter catalog
@@ -7208,8 +7208,8 @@ def _execute_list_instruments(
 ) -> CanonicalResponse:
     """Phase 2.4: read-only catalog enumeration for Lighter.
 
-    Returns the normalized Fibo schema (see
-    ``plugins/trade/fibo/discovery.py``) inside
+    Returns the normalized schema (see
+    the shared instrument discovery layer) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id.
     """

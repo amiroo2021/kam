@@ -976,7 +976,7 @@ class WebTrade2Phase2Tests(unittest.TestCase):
 
 
 class HedgingPositionDesk(FakeDesk):
-    """Simulate MetaTrader positions_orders with two independent BUY/SELL groups."""
+    """Simulate Hedged venue positions_orders with two independent BUY/SELL groups."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -1009,7 +1009,7 @@ class HedgingPositionDesk(FakeDesk):
             from plugins.trade.canonical import make_success
             return make_success(
                 operation="positions_orders",
-                exchange="metatrader",
+                exchange="hedgedvenue",
                 account=str(request.get("account") or ""),
                 data={"positions": self.account_state_payload["positions"],
                       "order_groups": self.account_state_payload["order_groups"],
@@ -1039,7 +1039,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         app = app_mod.create_app(config=cfg, service=svc)
         client = TestClient(app)
         csrf = _login(client)
-        r = client.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf))
+        r = client.get("/api/account/state?exchange=hedgedvenue&account=LITE7486706HEDGE", headers=_hdr(csrf))
         self.assertEqual(r.status_code, 200, r.text)
         positions = r.json().get("positions") or []
         sides = [(p.get("symbol"), p.get("side")) for p in positions]
@@ -1072,7 +1072,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         app = app_mod.create_app(config=cfg, service=svc)
         client = TestClient(app)
         csrf = _login(client)
-        r = client.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf))
+        r = client.get("/api/account/state?exchange=hedgedvenue&account=LITE7486706HEDGE", headers=_hdr(csrf))
         self.assertEqual(r.status_code, 200, r.text)
         positions = r.json().get("positions") or []
         buy = next(p for p in positions if p.get("side") == "BUY")
@@ -1095,7 +1095,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         app2 = app_mod.create_app(config=cfg, service=svc2)
         client2 = TestClient(app2)
         csrf2 = _login(client2)
-        r2 = client2.get("/api/account/state?exchange=metatrader&account=LITE7486706MT5", headers=_hdr(csrf2))
+        r2 = client2.get("/api/account/state?exchange=hedgedvenue&account=LITE7486706HEDGE", headers=_hdr(csrf2))
         self.assertEqual(r2.status_code, 200, r2.text)
         out_positions = r2.json().get("positions") or []
         out_buy = next(p for p in out_positions if p.get("side") == "BUY")
@@ -1115,7 +1115,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         for side in ("BUY", "SELL"):
             r = client.post(
                 "/api/position/set_tp",
-                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                json={"exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
                       "symbol": "BTCUSD", "side": side, "price": "70000"},
                 headers=_hdr(csrf),
             )
@@ -1141,7 +1141,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         for side in ("BUY", "SELL"):
             r = client.post(
                 "/api/position/set_sl",
-                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                json={"exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
                       "symbol": "BTCUSD", "side": side, "price": "70000"},
                 headers=_hdr(csrf),
             )
@@ -1166,7 +1166,7 @@ class HedgingHTTPMutationDesk(HedgingPositionDesk):
         for side in ("BUY", "SELL"):
             r = client.post(
                 "/api/position/close",
-                json={"exchange": "metatrader", "account": "LITE7486706MT5",
+                json={"exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
                       "symbol": "BTCUSD", "side": side},
                 headers=_hdr(csrf),
             )

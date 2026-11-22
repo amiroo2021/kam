@@ -28,8 +28,13 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from capabilities import RETIRED_CAPABILITIES  # noqa: E402
 
 try:
     import yaml
@@ -386,7 +391,7 @@ DEFAULT_TELEGRAM_MENU_MAX = 60
 # is not the failure mode; pair with priority so /trade stays visible.
 MINIMUM_TELEGRAM_MENU_MAX = 100
 TELEGRAM_BOT_API_MAX_COMMANDS = 100
-KAM_TELEGRAM_MENU_PRIORITY = ("trade", "fibo")
+KAM_TELEGRAM_MENU_PRIORITY = ("trade",)
 
 
 def get_telegram_menu_max_commands(config: Dict[str, Any]) -> int:
@@ -425,12 +430,16 @@ def _telegram_menu_section(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _menu_needs_kam_priority(menu: Dict[str, Any]) -> bool:
-    """True when trade/fibo are not guaranteed near the front of the menu."""
+    """True when trade is not guaranteed near the front of the menu."""
     mode = str(menu.get("priority_mode") or "prepend").strip().lower()
     raw = menu.get("priority")
     names: list[str] = []
     if isinstance(raw, list):
         names = [str(item).strip().lower() for item in raw if str(item).strip()]
+    # A retired capability name still pinned in the priority list must be
+    # dropped, otherwise the stale entry survives every upgrade.
+    if any(name in RETIRED_CAPABILITIES for name in names):
+        return True
     # prepend + trade first is the durable shape for the Telegram `/` picker.
     if mode not in {"prepend", "replace"}:
         return True
@@ -446,15 +455,15 @@ def ensure_telegram_menu_capacity(
     dry_run: bool = False,
     minimum: int = MINIMUM_TELEGRAM_MENU_MAX,
 ) -> Dict[str, Any]:
-    """Ensure Telegram BotCommand menu publishes /trade (and /fibo).
+    """Ensure Telegram BotCommand menu publishes /trade.
 
     Hermes defaults to 60 slots. Core commands alone can exceed that, so
     plugin commands at the end of the menu are trimmed from ``setMyCommands``
     even though typing ``/trade`` still dispatches. This helper:
 
     1. Raises ``max_commands`` to at least *minimum* (default 100).
-    2. Prepends ``trade`` / ``fibo`` on ``command_menu.priority`` so they
-       survive the cap and appear at the top of the Telegram `/` picker.
+    2. Prepends ``trade`` on ``command_menu.priority`` so it
+       survives the cap and appears at the top of the Telegram `/` picker.
     """
     if yaml is None:
         raise ConfigError("PyYAML unavailable; cannot adjust Telegram menu capacity")
@@ -497,6 +506,11 @@ def ensure_telegram_menu_capacity(
         raw_priority = menu.get("priority")
         if isinstance(raw_priority, list):
             existing = [str(item).strip() for item in raw_priority if str(item).strip()]
+        # Drop retired capability names: a config written by an older KAM can
+        # still pin a retired command in the Telegram menu, and Hermes only
+        # reorders by name, so the stale entry would survive every upgrade.
+        retired = set(RETIRED_CAPABILITIES)
+        existing = [name for name in existing if name.lower() not in retired]
         # Keep operator extras, but force KAM commands to the front.
         merged: list[str] = []
         seen: set[str] = set()

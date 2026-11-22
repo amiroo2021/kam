@@ -133,30 +133,6 @@ class TestPortfolioAggregation(unittest.TestCase):
         self.assertIn("Floating PnL (USDT): -30.00 USDT", total.text)
         self.assertNotIn("TOTAL FLOATING PnL: $", total.text)
 
-    def test_metatrader_usc_is_converted_once_and_native_is_retained(self) -> None:
-        class USCDesk(ReportDesk):
-            def __init__(self):
-                super().__init__()
-                self.accounts = {"metatrader": ["cents"]}
-            def execute(self, request):
-                op = request["operation"]
-                self.calls.append(dict(request))
-                if op == "balance":
-                    return make_success(op, "metatrader", "cents",
-                        balance=CanonicalBalance("12345", "USC"),
-                        portfolio_summary=CanonicalPortfolioSummary("23456", "10000", "1200", "30000", "USC"))
-                return make_success(op, "metatrader", "cents", positions=[
-                    CanonicalPosition("BTC", "long", "1", "50000", "250", mark="50250"),
-                    CanonicalPosition("ETH", "short", "1", "3000", "-125", mark="3125"),
-                ])
-        snap = collect_portfolio_snapshot(USCDesk(), max_workers=1)
-        account = snap.accounts[0]
-        self.assertEqual(str(account.equity), "234.56")
-        self.assertEqual(account.equity_unit, "USD")
-        self.assertEqual(str(account.positions[0].pnl), "2.50")
-        self.assertEqual(str(account.positions[1].pnl), "-1.25")
-        self.assertEqual(account.positions[0].native_pnl_unit, "USC")
-        self.assertEqual(str(account.positions[0].native_pnl), "250")
 
     def test_position_failure_marks_coverage_partial_not_zero(self) -> None:
         class PartialDesk(ReportDesk):

@@ -311,7 +311,7 @@ class ProgressiveDispatchTests(unittest.TestCase):
     def test_one_slow_account_does_not_break_dispatch(self) -> None:
         """A single slow account must not block the dashboard forever."""
         # 5 fast + 1 slow; serialised via max_workers=1.
-        exchanges = {"bulk": ["main"], "metatrader": ["main"],
+        exchanges = {"bulk": ["main"], "hedgedvenue": ["main"],
                      "hyperliquid": ["main"], "aster": ["main"],
                      "weex": ["main"], "aftermath": ["main"]}
         _install_fake_extract(self, exchanges)

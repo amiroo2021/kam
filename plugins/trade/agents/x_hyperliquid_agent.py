@@ -639,7 +639,7 @@ def _fetch_perp_market_candidates() -> List[Dict[str, Any]]:
 
 def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a single Hyperliquid perp-market candidate to the
-    Fibo common schema.
+    shared normalized schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if
     the upstream payload doesn't supply them. The HL
@@ -651,7 +651,7 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
     Phase 2.4.1: the Hyperliquid ``/info metaAndAssetCtxs`` payload
     also returns spot markets via the ``cash`` dex. Those are
-    spot/cash instruments and MUST NOT be exposed to Fibo's
+    spot/cash instruments and MUST NOT be exposed to the
     GoldenFibo (which targets perpetuals only). Entries with
     ``route_symbol`` starting with ``cash:`` are filtered out by
     the caller; this function additionally tags each remaining
@@ -670,7 +670,7 @@ def _normalize_hyperliquid_market(candidate: Dict[str, Any]) -> Dict[str, Any]:
         return {"instrument": ""}
     # Phase 2.4.1 safety filter: spot markets live under the
     # ``cash`` dex namespace. ``resolve_instrument`` for those
-    # would succeed but the Fibo write paths target perpetuals
+    # would succeed but the write paths target perpetuals
     # only. Drop them at the normalize step so the picker never
     # offers them.
     if instrument.startswith("cash:"):
@@ -708,8 +708,8 @@ def _execute_list_instruments(
 ) -> CanonicalResponse:
     """Phase 2.4: read-only catalog enumeration for Hyperliquid.
 
-    Returns the normalized Fibo schema (see
-    ``plugins/trade/fibo/discovery.py``) inside
+    Returns the normalized schema (see
+    the shared instrument discovery layer) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id (the route_symbol used by the
     existing write paths). Mark price is attached when present on

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kamlib as K  # noqa: E402
 import kamconfig as C  # noqa: E402
 from patchspecs import all_specs, legacy_commands_specs  # noqa: E402
+from retired_seams import retired_fibo_adapter_specs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -117,8 +118,14 @@ def unpatch(
 
     by_file: Dict[Path, List] = {}
     # Include the retired commands.py spec so a block left by an older KAM
-    # version is still found and cleanly removed.
-    for spec in list(all_specs(hermes_root)) + list(legacy_commands_specs()):
+    # version is still found and cleanly removed.  The retired /fibo seams
+    # live in their own module and must be included too, otherwise a
+    # deployed adapter keeps a block that imports a deleted module.
+    for spec in (
+        list(all_specs(hermes_root))
+        + list(legacy_commands_specs())
+        + list(retired_fibo_adapter_specs(hermes_root))
+    ):
         by_file.setdefault(spec.relative_path, []).append(spec)
 
     backup = latest_backup(hermes_root) if use_backup else None

@@ -56,6 +56,17 @@ _EXCLUDED_PATTERNS = (
     re.compile(r"^[._].+"),  # dotfiles / private modules
 )
 
+# Retired venues. Their agent modules were removed from this repository, but
+# a deployment installed by an older KAM can still carry the file on disk.
+# The installer prunes them, but discovery also refuses them so a stale file
+# can never expose a retired venue even if the prune is skipped.
+_RETIRED_EXCHANGE_NAMES = frozenset(
+    {
+        "metatrader",
+        "mt5linux",
+    }
+)
+
 # Required contract on each agent module. We use duck typing intentionally
 # — no abstract base class imposed — so an agent can be a simple module
 # or a richer class-based implementation.
@@ -86,6 +97,9 @@ def _iter_agent_files(directory: Path) -> List[Path]:
         if any(pattern.match(path.name) for pattern in _EXCLUDED_PATTERNS):
             continue
         if not _AGENT_FILENAME_PATTERN.match(path.name):
+            continue
+        exchange = _exchange_name_from_filename(path.name)
+        if exchange is not None and exchange in _RETIRED_EXCHANGE_NAMES:
             continue
         candidates.append(path)
     return candidates

@@ -6,7 +6,7 @@ VWAP rule under test:
            / SUM(normalized_underlying_quantity)
 
 Every assertion here is about NOT producing a plausible-but-wrong number:
-  * VWAP must be built from normalized quantities, never raw MT5 lots.
+  * VWAP must be built from normalized quantities.
   * BUY and SELL must be averaged independently; net must never be used as
     the SELL quantity when BUY positions exist.
   * Both sides render as positive gross quantities.
@@ -35,7 +35,6 @@ def pos(
     account: str = "1",
     quantity_unit: Optional[str] = None,
     contract_multiplier: Optional[str] = None,
-    raw_lots: Optional[str] = None,
     market_type: Optional[str] = None,
 ) -> OpenPositionRow:
     key = portfolio.normalize_instrument_key(symbol, None)
@@ -56,7 +55,6 @@ def pos(
             None if contract_multiplier is None else Decimal(contract_multiplier)
         ),
         market_type=market_type,
-        raw_lots=None if raw_lots is None else Decimal(raw_lots),
         identity=f"{exchange}|{account}|{symbol}|{side}|{size}|{entry}",
     )
 
@@ -112,36 +110,20 @@ class TestSideVwapMath(unittest.TestCase):
 
 
 class TestVwapUsesNormalizedQuantities(unittest.TestCase):
-    def test_mt5_lot_row_vwap_uses_converted_quantity(self) -> None:
-        # 0.44 lots x 100 = 44 HYPE at 85, and 2 HYPE at 95.
+    def test_normalized_quantity_drives_vwap(self) -> None:
+        # 44 HYPE at 85 and 2 HYPE at 95.
         # VWAP = (44*85 + 2*95)/46 = 84.304347...
         row = only([
             pos("HYPEUSD", side="SELL", size="44", entry="85", account="A",
-                quantity_unit="HYPE", raw_lots="0.44", contract_multiplier="100"),
+                quantity_unit="HYPE"),
             pos("HYPE", side="SELL", size="2", entry="95", account="B",
                 quantity_unit="HYPE"),
         ])
         vwap = row["sell_vwap"]["vwap"]
         expected = (Decimal("44") * Decimal("85") + Decimal("2") * Decimal("95")) / Decimal("46")
         self.assertEqual(vwap, expected)
-        # A lot-weighted average would be 90; the quantity-weighted one is lower.
+        # A position-count average would be 90; the quantity-weighted one is lower.
         self.assertLess(vwap, Decimal("90"))
-
-    def test_raw_lots_never_enter_the_vwap(self) -> None:
-        # Same exposure expressed two ways.  Using raw lots (0.44) instead of
-        # the converted quantity (44) would drag the average toward the other
-        # leg; the normalized figure must not.
-        rows = [
-            pos("ZECUSD", side="SELL", size="123.1", entry="1000", account="A",
-                quantity_unit="ZEC", raw_lots="12.31", contract_multiplier="10"),
-            pos("ZEC", side="SELL", size="0.9", entry="2000", account="B",
-                quantity_unit="ZEC"),
-        ]
-        vwap = only(rows)["sell_vwap"]["vwap"]
-        expected = (
-            Decimal("123.1") * Decimal("1000") + Decimal("0.9") * Decimal("2000")
-        ) / Decimal("124")
-        self.assertEqual(vwap, expected)
 
 
 class TestVwapCoverageHonesty(unittest.TestCase):
@@ -183,13 +165,13 @@ class TestVwapCoverageHonesty(unittest.TestCase):
 
 class TestVwapGrouping(unittest.TestCase):
     def test_incompatible_units_do_not_share_a_vwap(self) -> None:
-        # Verified token row and an unverified lot row must stay in separate
+        # Token and contract rows must stay in separate
         # groups, each with its own VWAP.
         rows = [
             pos("ETH", side="SELL", size="10", entry="2000", account="1",
                 quantity_unit="ETH"),
             pos("ETHUSD", side="SELL", size="1", entry="2000", account="2",
-                raw_lots="1"),
+                quantity_unit="contracts"),
         ]
         result = portfolio.net_by_instrument(snap(rows))
         self.assertEqual(len(result), 2)

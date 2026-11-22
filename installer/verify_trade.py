@@ -127,7 +127,7 @@ def main(argv: List[str]) -> int:
     c.run("no invented plugin entry points", check_no_plugin_py)
 
     def check_register_registers_trade() -> str:
-        """register() must advertise /trade and /fibo via the supported plugin API."""
+        """register() must advertise /trade via the supported plugin API."""
         import json
         import os
         import tempfile
@@ -149,7 +149,7 @@ def main(argv: List[str]) -> int:
             home = Path(td)
             (home / "kam").mkdir(parents=True)
             (home / "kam" / "install_state.json").write_text(
-                json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                json.dumps({"capabilities": {"trade": True}})
             )
             old = os.environ.get("HERMES_HOME")
             os.environ["HERMES_HOME"] = str(home)
@@ -164,17 +164,15 @@ def main(argv: List[str]) -> int:
         names = [s["name"] for s in seen]
         if names.count("trade") != 1:
             raise AssertionError(f"expected one 'trade' registration, got {names}")
-        if names.count("fibo") != 1:
-            raise AssertionError(f"expected one 'fibo' registration, got {names}")
 
         class _Bare:
             pass
 
         mod.register(_Bare())
         mod.register(None)
-        return "registers 'trade' and 'fibo' once each; tolerates old contexts"
+        return "registers 'trade' once; tolerates old contexts"
 
-    c.run("plugin register() advertises /trade + /fibo", check_register_registers_trade)
+    c.run("plugin register() advertises /trade", check_register_registers_trade)
 
     # --- 7-8: exchange discovery -----------------------------------------
     discovered: List[str] = []
@@ -211,17 +209,14 @@ def main(argv: List[str]) -> int:
 
     # --- 9-11: Telegram integration --------------------------------------
     def check_entry_points() -> str:
-        from plugins.trade import fibo_wizard, wizard
+        from plugins.trade import wizard
 
         for fn in ("handle_trade_command", "handle_trade_callback", "handle_trade_text"):
             if not callable(getattr(wizard, fn, None)):
                 raise AssertionError(f"wizard.{fn} missing or not callable")
-        for fn in ("handle_fibo_command", "handle_fibo_callback", "handle_fibo_text"):
-            if not callable(getattr(fibo_wizard, fn, None)):
-                raise AssertionError(f"fibo_wizard.{fn} missing or not callable")
-        return "all /trade and /fibo adapter entry points present"
+        return "all /trade adapter entry points present"
 
-    c.run("/trade + /fibo entry points exist", check_entry_points)
+    c.run("/trade entry points exist", check_entry_points)
 
     def check_backtest_entry_points() -> str:
         from plugins.trade import backtest_wizard
@@ -249,7 +244,7 @@ def main(argv: List[str]) -> int:
 
     c.run("/backtest adapter seams present", check_backtest_adapter_wiring)
 
-    c.run("/trade + /fibo entry points exist", check_entry_points)
+    c.run("/trade entry points exist", check_entry_points)
 
     def check_initial_screen_has_keyboard() -> str:
         """The first /trade screen must carry text AND a non-empty keyboard.
@@ -312,9 +307,9 @@ def main(argv: List[str]) -> int:
             ]
             if missing:
                 raise AssertionError(f"adapter seams not wired: {missing}")
-            return "all /trade and /fibo adapter seams present"
+            return "all trade adapter seams present"
 
-        c.run("Telegram adapter dispatches /trade + /fibo", check_adapter_wired)
+        c.run("Telegram adapter dispatches trade commands", check_adapter_wired)
 
         def check_no_double_registration() -> str:
             adapter = hermes_root / adapter_specs()[0].relative_path
@@ -341,7 +336,7 @@ def main(argv: List[str]) -> int:
         c.run("handlers not registered twice", check_no_double_registration)
 
         def check_command_menu() -> str:
-            """/trade and /fibo must be advertised via the plugin API, not a commands.py patch."""
+            """/trade must be advertised via the plugin API, not a commands.py patch."""
             import inspect as _inspect
             import json
             import os
@@ -368,7 +363,7 @@ def main(argv: List[str]) -> int:
                 home = Path(td)
                 (home / "kam").mkdir(parents=True)
                 (home / "kam" / "install_state.json").write_text(
-                    json.dumps({"capabilities": {"trade": True, "fibo": True}})
+                    json.dumps({"capabilities": {"trade": True}})
                 )
                 old = os.environ.get("HERMES_HOME")
                 os.environ["HERMES_HOME"] = str(home)
@@ -383,14 +378,13 @@ def main(argv: List[str]) -> int:
             names = [r["name"] for r in recorded]
             if names.count("trade") != 1:
                 raise AssertionError(f"register() registered 'trade' {names.count('trade')}x")
-            if names.count("fibo") != 1:
-                raise AssertionError(f"register() registered 'fibo' {names.count('fibo')}x")
+
             missing_desc = [entry["name"] for entry in recorded if not callable(entry["handler"]) or not entry["description"].strip()]
             if missing_desc:
                 raise AssertionError(f"registered commands missing callable/description: {missing_desc}")
-            return "register_command('trade') and register_command('fibo') both present"
+            return "register_command('trade') present"
 
-        c.run("/trade + /fibo registered via plugin API exactly once", check_command_menu)
+        c.run("/trade registered via plugin API exactly once", check_command_menu)
 
         def check_register_tolerates_old_context() -> str:
             """An older Hermes whose context lacks register_command must not crash."""
@@ -519,8 +513,8 @@ def main(argv: List[str]) -> int:
 
         c.run("Hermes config enables trade exactly once", check_config_enables_trade)
 
-        def check_telegram_menu_includes_trade_and_fibo() -> str:
-            """Telegram command-menu config must leave room for both plugin commands."""
+        def check_telegram_menu_includes_trade() -> str:
+            """Telegram command-menu config must leave room for the trade command."""
             sys.path.insert(0, str(hermes_root))
             import hermes_cli.commands as HC  # type: ignore
             import hermes_cli.plugins as HP  # type: ignore
@@ -541,7 +535,7 @@ def main(argv: List[str]) -> int:
             except (TypeError, ValueError):
                 max_commands = 60
             # Core Hermes commands alone can exceed 60; require the Bot API ceiling
-            # (or at least enough headroom that prioritized /trade + /fibo fit).
+            # (or at least enough headroom that prioritized /trade fits).
             if max_commands < 100:
                 raise AssertionError(
                     f"Telegram command menu max_commands={max_commands} can still "
@@ -578,12 +572,12 @@ def main(argv: List[str]) -> int:
             finally:
                 HP.get_plugin_commands = original
             names = [name for name, _desc in commands]
-            missing = [name for name in ("trade", "fibo") if name not in names]
+            missing = [name for name in ("trade",) if name not in names]
             if missing:
                 raise AssertionError(f"Telegram menu still missing commands: {missing} (names={names[-5:]})")
-            return f"max_commands={max_commands}; Telegram menu includes /trade and /fibo"
+            return f"max_commands={max_commands}; Telegram menu includes /trade"
 
-        c.run("Telegram menu publishes /trade and /fibo", check_telegram_menu_includes_trade_and_fibo)
+        c.run("Telegram menu publishes /trade", check_telegram_menu_includes_trade)
 
         def check_other_commands_intact() -> str:
             spec = legacy_commands_specs()[0]

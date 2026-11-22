@@ -841,7 +841,7 @@ def _hibachi_live_descriptors(payload: Mapping[str, Any]) -> List[Dict[str, Any]
 
 def _normalize_hibachi_market(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a single Hibachi future-contract entry to the
-    Fibo common schema.
+    shared normalized schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if
     the upstream payload doesn't supply them. Hibachi carries
@@ -883,7 +883,7 @@ def _normalize_hibachi_market(contract: Dict[str, Any]) -> Dict[str, Any]:
         or raw_symbol.endswith("-P")
     ):
         out["market_type"] = "perp"
-    # No bundled price in exchange-info — Fibo will call
+    # No bundled price in exchange-info — the caller will fetch
     # ``market_price`` separately when supported (Hibachi does
     # not currently expose that operation).
     return out
@@ -894,8 +894,8 @@ def _execute_list_instruments(
 ) -> CanonicalResponse:
     """Phase 2.4: read-only catalog enumeration for Hibachi.
 
-    Returns the normalized Fibo schema (see
-    ``plugins/trade/fibo/discovery.py``) inside
+    Returns the normalized schema (see
+    the shared instrument discovery layer) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id. No price is attached —
     Hibachi does not currently expose a market_price operation.

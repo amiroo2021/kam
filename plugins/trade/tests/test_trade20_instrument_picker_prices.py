@@ -298,18 +298,6 @@ class TestTrade20InstrumentPickerPrices(unittest.TestCase):
         self.assertIn("XAU", keys)
         self.assertIn("XAU", _lighter_alias_keys("XAUUSD"))
 
-    def test_fibo_rank_gold_finds_xau_without_display_name(self) -> None:
-        from plugins.trade.fibo.candidates import rank_candidates, _search_hints
-
-        self.assertIn("XAU", _search_hints("GOLD"))
-        ranked = rank_candidates(
-            [{"instrument": "XAU", "base": "XAU", "market_type": "perp"}],
-            "GOLD",
-        )
-        self.assertTrue(ranked)
-        self.assertEqual(ranked[0].instrument, "XAU")
-        self.assertGreaterEqual(ranked[0].score, 95)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,7 @@
 Removes trade-only payloads and the webtrade systemd unit.
 
 Does NOT delete operator .env keys.
-Does NOT remove shared agents / tradedesk / canonical while fibo may remain
-(those are owned by uninstall_shared when no capabilities remain).
+Shared agents, TradeDesk, and canonical models are owned by uninstall_shared.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ from typing import Any, Dict, List, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from capabilities import capability_dir  # noqa: E402
+from retired_payload import prune_retired_payload  # noqa: E402
+from retired_units import retire_retired_systemd_units  # noqa: E402
 from trade_web_unit import uninstall_trade_web_unit  # noqa: E402
 from webbacktest_unit import uninstall_webbacktest_unit  # noqa: E402
 
@@ -29,7 +30,6 @@ TRADE_ONLY_REL_PATHS: List[Path] = [
     Path("instrument_picker.py"),
     Path("ladder_math.py"),
     Path("fibolearn_wizard.py"),
-    Path("fibo_wizard.py"),
 ]
 
 
@@ -70,8 +70,13 @@ def run(
         if not dry_run:
             shutil.rmtree(tests_dir, ignore_errors=True)
 
-    # fibo/ package if present under trade (fibo capability has its own installer too)
-    # leave plugins/trade/fibo to fibo uninstaller when present
+
+    # Prune payload owned by retired capabilities (their wizard and reader
+    # package plus their agent modules).  These are not in
+    # TRADE_ONLY_REL_PATHS because they are no longer shipped at all.  The
+    # retired path list lives in retired_payload.py so this module stays
+    # free of retired names.
+    record["retired_payload"] = prune_retired_payload(plugin_root, dry_run=dry_run)
 
     own_dir = capability_dir(hermes_home, "trade")
     if own_dir.is_dir():
@@ -88,23 +93,13 @@ def run(
         systemd_dir=sd, dry_run=dry_run, manage_webui=False,
     )
 
-    # Optional MT5Linux teardown: remove container + client state; preserve Wine volume.
-    purge_volume = "--mt5linux-purge-volume" in list(argv or [])
-    skip_mt5 = "--no-mt5linux" in list(argv or [])
-    if not skip_mt5:
-        try:
-            from mt5linux_provision import uninstall_mt5linux
-        except Exception as exc:  # noqa: BLE001
-            record["mt5linux"] = {"ok": False, "error": f"import failed: {exc}"}
-        else:
-            record["mt5linux"] = uninstall_mt5linux(
-                hermes_home=hermes_home,
-                dry_run=dry_run,
-                remove_container=True,
-                purge_volume=purge_volume,
-            )
-    else:
-        record["mt5linux"] = {"action": "skipped", "reason": "--no-mt5linux"}
+    # Retire the systemd units that belonged to the removed capabilities.
+    # A deployment that installed the retired capability keeps these units
+    # armed (a per-minute timer whose ExecStart points at a module that no
+    # longer exists), so they must be disabled, stopped and removed.
+    record["retired_units"] = retire_retired_systemd_units(
+        systemd_dir=sd, dry_run=dry_run,
+    )
 
     return record
 

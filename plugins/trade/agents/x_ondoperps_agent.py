@@ -1170,7 +1170,7 @@ def _normalize_positions(
                 sl_count=1 if sl_text else None,
                 # Phase 2.10.2 — expose the FULL canonical
                 # exchange instrument (e.g. ``ETH-USD.P``) so that
-                # downstream consumers (Fibo executor, shadow) can
+                # downstream consumers can
                 # correlate this position against the registration's
                 # ``exchange_instrument`` without any suffix handling.
                 # ``symbol`` remains the display-friendly short name
@@ -1919,7 +1919,7 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     if order_type not in {"limit", "market"}:
         # Phase 2: market orders are now supported through this path in
         # addition to limit. Any other type (e.g. stop) is still rejected
-        # at this boundary; if a future Fibo / robot needs stop variants
+        # at this boundary; if a future caller needs stop variants
         # the agent should be extended then.
         return make_failure(
             operation="new_order",
@@ -2099,7 +2099,7 @@ def _new_order(account: str, request: Dict[str, Any]) -> CanonicalResponse:
     #   - Market: when a clientOrderId is available, use the official exact
     #     lookup path ``GET /v1/perps/orders/client:<id>`` and verify the
     #     actual order object (market, side, size, status). Only then does
-    #     the Fibo engine proceed to cumulative-position confirmation.
+    #     the engine proceed to cumulative-position confirmation.
     #     Without a clientOrderId, fall back to the server-side ``orderId``
     #     presence check.
     raw_exchange_order_id = str(exchange_order_id or "").strip()
@@ -3525,7 +3525,7 @@ def _set_position_trigger(
 # ``_set_position_protections`` is a thin wrapper that drives the existing
 # ``_set_position_trigger`` helper twice (once per leg) and verifies both
 # fields are present in the resulting ``/v1/perps/stop_order`` snapshot.
-# The behaviour mirrors what Fibo needs for its 5-step handoff (steps 3–5):
+# The behaviour mirrors what the ladder flow needs for its 5-step handoff (steps 3–5):
 #   1. set TP, wait for it to be reflected on the snapshot
 #   2. set SL, wait for it to be reflected on the snapshot
 #   3. re-read the snapshot once more and confirm BOTH legs are at the
@@ -3537,7 +3537,7 @@ def _set_position_trigger(
 # leg is missing. We deliberately do NOT silently roll back the leg that
 # succeeded — once the TP lands on the exchange, removing it would
 # change the position's behaviour. The frozen-registration contract for
-# Fibo lives above this layer.
+# The ladder engine lives above this layer.
 
 
 def _set_position_protections(
@@ -3547,7 +3547,7 @@ def _set_position_protections(
 
     Request keys (all required):
 
-      - ``symbol``        : canonical Fibo symbol (e.g. ``"US100"``).
+      - ``symbol``        : canonical symbol (e.g. ``"US100"``).
       - ``take_profit``   : positive Decimal price for the TP trigger.
       - ``stop_loss``     : positive Decimal price for the SL trigger.
 
@@ -3614,7 +3614,7 @@ def _set_position_protections(
 
     # Step 3 — final verification: re-read the stop-order snapshot and
     # confirm both fields are at the requested prices. This is the
-    # "verify BOTH" pass Fibo's 5-step handoff demands.
+    # "verify BOTH" pass the 5-step handoff demands.
     credentials = _lookup_credentials(account)
     if credentials is None:
         return make_failure(
@@ -3766,7 +3766,7 @@ def _bubble_failure(
 # --- Read single position state --------------------------------------------
 #
 # Cheap lookup of a single (symbol) position row + its current TP / SL +
-# the live markPrice. Used by Fibo's "confirm_fill" and "quote" paths.
+# the live markPrice. Used by the "confirm_fill" and "quote" paths.
 
 
 def _position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
@@ -3826,7 +3826,7 @@ def _position_state(account: str, request: Dict[str, Any]) -> CanonicalResponse:
         break
     if row is None or direction is None:
         # No open position. We still succeed but with an empty list — the
-        # caller (Fibo's confirm_fill / quote adapter) treats this as
+        # caller (the confirm_fill / quote adapter) treats it as
         # "no position present yet."
         return make_success(
             operation="position_state",
@@ -3931,7 +3931,7 @@ def _fetch_ondoperps_trading_pairs_for(account: str) -> List[Dict[str, Any]]:
 
 def _normalize_ondoperps_market(entry: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a single Ondo ``/v1/markets`` ``tradingPairs`` entry
-    to the Fibo common schema.
+    to the shared normalized schema.
 
     Only ``instrument`` is required; the rest may be ``None`` if
     the upstream payload doesn't supply them. Ondo payload items
@@ -3967,8 +3967,8 @@ def _execute_list_instruments(
 ) -> CanonicalResponse:
     """Phase 2.4: read-only catalog enumeration for Ondo Perps.
 
-    Returns the normalized Fibo schema (see
-    ``plugins/trade/fibo/discovery.py``) inside
+    Returns the normalized schema (see
+    the shared instrument discovery layer) inside
     ``data["instruments"]``. Each record carries at minimum the
     venue-native ``instrument`` id.
     """

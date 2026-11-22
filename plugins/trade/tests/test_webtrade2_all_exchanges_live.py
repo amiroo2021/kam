@@ -9,7 +9,7 @@ that captures every canonical dispatch.
 
 Coverage:
   1. Each LIVE_ACCOUNTS entry must come from the runtime exchange matrix
-     (no fabricated accounts, no obsolete mt5, no binance).
+     (no fabricated accounts, no obsolete hedge, no binance).
   2. Each LIVE_ACCOUNTS entry must reach canonical dispatch under
      DRY_RUN=0 for at least one operation.
   3. The full LIVE_OPERATIONS set is reachable end-to-end (account +
@@ -17,7 +17,7 @@ Coverage:
   4. DRY_RUN=1 remains a hard boundary.
   5. LADDER_ENABLED=0 remains a hard boundary.
   6. capability-driven UI gating is preserved (LWC tab/buttons).
-  7. MetaTrader symbol+side identity is preserved through dispatch.
+  7. Hedged venue symbol+side identity is preserved through dispatch.
   8. cancel_order_group must NOT regress the matcher-fix behavior.
   9. Non-allowlisted account remains blocked (regression guard).
  10. Pre-LIVE hardening (LIVE_ACCOUNT_NOT_ALLOWED) audit semantics preserved.
@@ -50,8 +50,8 @@ ALLOWED_EXCLUDED = {
     # binance: agent advertises no write operations.
     "binance:futures",
     "binance:spot",
-    # mt5: obsolete alias; production is "metatrader".
-    "mt5:LITED91255328",
+    # hedge: obsolete alias; production is "hedgedvenue".
+    "hedge:LITED91255328",
 }
 
 
@@ -74,7 +74,7 @@ LIVE_ACCOUNTS: List[str] = [
     "lighter:amiroo",
     "lighter:bitget",
     "lighter:robin",
-    "metatrader:LITE7486706MT5",
+    "hedgedvenue:LITE7486706HEDGE",
     "mexc:amiroo",
     "nado:based",
     "nado:bitget",
@@ -126,7 +126,7 @@ _REAL_WRITE_CAPS: Dict[str, List[str]] = {
     "hibachi": ["new_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
     "hyperliquid": ["new_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
     "lighter": ["new_order", "cancel_orders", "ladder"],
-    "metatrader": ["new_order", "cancel_order", "cancel_orders", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
+    "hedgedvenue": ["new_order", "cancel_order", "cancel_orders", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
     "mexc": ["new_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
     "nado": ["new_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
     "ondoperps": ["new_order", "cancel_order", "cancel_order_group", "set_tp", "set_sl", "close_position", "ladder"],
@@ -417,7 +417,7 @@ class TestDryRunAndLadderStillHardBoundaries:
         client = TestClient(app)
         csrf = _login(client)
         prev = _post(client, csrf, "/api/trade/preview_order", {
-            "exchange": "metatrader", "account": "LITE7486706MT5",
+            "exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
             "symbol": "X", "side": "buy", "order_type": "limit",
             "size": "0.01", "price": "1.00", "market_type": "futures",
         })
@@ -443,7 +443,7 @@ class TestDryRunAndLadderStillHardBoundaries:
         client = TestClient(app)
         csrf = _login(client)
         prev = _post(client, csrf, "/api/trade/preview_ladder", {
-            "exchange": "metatrader", "account": "LITE7486706MT5",
+            "exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
             "symbol": "X", "side": "buy",
             "distribution": "uniform", "order_count": 3,
             "total_size": "0.03",
@@ -463,10 +463,10 @@ class TestDryRunAndLadderStillHardBoundaries:
         assert body.get("error", {}).get("code") in {"LADDER_NOT_ENABLED"}, body
 
 
-class TestMetaTraderHedgingIdentityPreserved:
-    """MetaTrader hedged positions need symbol+side identity."""
+class TestHedgedVenueIdentityPreserved:
+    """Hedged venue hedged positions need symbol+side identity."""
 
-    def test_metatrader_cancel_group_default_side_is_buy(self) -> None:
+    def test_hedgedvenue_cancel_group_default_side_is_buy(self) -> None:
         """The API layer defaults side=buy when the caller omits it. The
         downstream dispatch must preserve that identity verbatim, not
         silently coerce or fabricate a different value."""
@@ -478,7 +478,7 @@ class TestMetaTraderHedgingIdentityPreserved:
         client = TestClient(app)
         csrf = _login(client)
         r = _post(client, csrf, "/api/orders/cancel_group", {
-            "exchange": "metatrader", "account": "LITE7486706MT5",
+            "exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
             "symbol": "X",  # side omitted
             "order_type": "limit",
         })
@@ -495,7 +495,7 @@ class TestMetaTraderHedgingIdentityPreserved:
             f"default side must be 'buy' verbatim, got {cancel_call['request'].get('side')!r}"
         )
 
-    def test_metatrader_cancel_group_passes_side_through(self) -> None:
+    def test_hedgedvenue_cancel_group_passes_side_through(self) -> None:
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
             live_accounts=LIVE_ACCOUNTS,
@@ -504,14 +504,14 @@ class TestMetaTraderHedgingIdentityPreserved:
         client = TestClient(app)
         csrf = _login(client)
         r = _post(client, csrf, "/api/orders/cancel_group", {
-            "exchange": "metatrader", "account": "LITE7486706MT5",
+            "exchange": "hedgedvenue", "account": "LITE7486706HEDGE",
             "symbol": "X", "side": "buy",
             "order_type": "limit",
         })
         assert r.status_code == 200, r.text
         body = r.json()
         assert body.get("success") is True
-        # Confirm the FakeDesk saw both symbol AND side (MetaTrader identity).
+        # Confirm the FakeDesk saw both symbol AND side (Hedged venue identity).
         cancel_call = next(
             (c for c in desk.calls if c["operation"] == "cancel_order_group"),
             None,
@@ -535,7 +535,7 @@ class TestNonAllowlistedAccountStillBlocked:
         client = TestClient(app)
         csrf = _login(client)
         prev = _post(client, csrf, "/api/trade/preview_order", {
-            "exchange": "metatrader", "account": "NOT_IN_ALLOWLIST",
+            "exchange": "hedgedvenue", "account": "NOT_IN_ALLOWLIST",
             "symbol": "X", "side": "buy", "order_type": "limit",
             "size": "0.01", "price": "1.00", "market_type": "futures",
         })
@@ -566,7 +566,7 @@ class TestCapabilityDrivenUI:
         )
         # No exchange name in capability gate conditions.
         for banned in (
-            'state.exchange === "metatrader"',
+            'state.exchange === "hedgedvenue"',
             'state.exchange === "lighter"',
             'state.exchange === "apex"',
             'state.exchange === "hyperliquid"',

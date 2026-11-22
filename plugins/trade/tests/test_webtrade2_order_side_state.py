@@ -216,7 +216,7 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
     def test_positions_tab_uses_side_aware_identity(self) -> None:
         """The Positions tab must key rows by (symbol + side), never symbol alone.
 
-        MetaTrader is a hedging venue where the same symbol can hold
+        Hedged venue is a hedging venue where the same symbol can hold
         independent BUY and SELL groups. A symbol-only DOM key would
         let the second group overwrite the first.
         """
@@ -231,7 +231,7 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
         self.assertIn("side: positionSideForRequest(position)", app_js)
 
     def test_positions_tab_renders_count_and_sorts_alphabetical(self) -> None:
-        """MetaTrader is a hedging venue: the Positions tab must:
+        """Hedged venue is a hedging venue: the Positions tab must:
 
         - render ``BTCUSD (12) BUY`` when ``count`` is a positive integer
         - NOT render a parenthesized number when ``count`` is null
@@ -281,7 +281,7 @@ class WebTrade2OrderSideStateTests(unittest.TestCase):
         self.assertIn("caps.close_position", app_js)
         # 2) Each button is conditional on the gate; no exchange name in
         # the gate condition.
-        self.assertNotIn("state.exchange === \"metatrader\"", app_js)
+        self.assertNotIn("state.exchange === \"hedgedvenue\"", app_js)
         self.assertNotIn("state.exchange === \"lighter\"", app_js)
         # 3) The gate produces empty buttons (so the row shows "—") when
         # all three caps are false.

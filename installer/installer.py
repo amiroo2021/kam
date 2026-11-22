@@ -5,8 +5,7 @@ This module is the entry point for ./install.sh, ./verify.sh, and
 CLI flags:
 
   --trade            install/verify/uninstall the /trade capability
-  --fibo             install/verify/uninstall the /fibo capability
-  --trade --fibo     install/verify/uninstall both capabilities
+
 
 No flags = TRADE ONLY (locked backward-compatibility policy, Decision 1).
 
@@ -42,6 +41,7 @@ from capabilities import (  # noqa: E402
     INSTALLER_VERSION,
     KAM_VERSION,
     KNOWN_CAPABILITIES,
+    RETIRED_CAPABILITIES,
     SCHEMA_VERSION,
     any_capability_installed,
     capability_dir,
@@ -63,14 +63,13 @@ from capabilities import (  # noqa: E402
 
 # Recognized non-capability flags. Anything outside this set is rejected.
 RECOGNIZED_FLAGS = {
-    "--trade", "--fibo",
+    "--trade",
     "--hermes-root", "--hermes-home",
     "--dry-run", "--help", "-h",
     "--systemd-dir",
     "--no-restart", "--skip-deps", "--purge-state",
     "--action",
-    # Optional MT5Linux Docker provision (trade capability)
-    "--mt5linux", "--no-mt5linux", "--mt5linux-purge-volume",
+
 }
 
 
@@ -122,7 +121,7 @@ def _parse_args(argv: List[str], action: str) -> argparse.Namespace:
         add_help=False,
     )
     parser.add_argument("--trade", action="store_true")
-    parser.add_argument("--fibo", action="store_true")
+
     parser.add_argument("--hermes-root", default=None)
     parser.add_argument("--hermes-home", default=None)
     parser.add_argument("--systemd-dir", default=None)
@@ -130,13 +129,7 @@ def _parse_args(argv: List[str], action: str) -> argparse.Namespace:
     parser.add_argument("--no-restart", action="store_true")
     parser.add_argument("--skip-deps", action="store_true")
     parser.add_argument("--purge-state", action="store_true")
-    parser.add_argument("--mt5linux", action="store_true", help="Accepted for compatibility; MT5Linux is default-on with --trade")
-    parser.add_argument("--no-mt5linux", action="store_true", help="Opt out of MT5Linux Docker provision")
-    parser.add_argument(
-        "--mt5linux-purge-volume",
-        action="store_true",
-        help="Uninstall only: also delete the mt5-wine Docker volume",
-    )
+
     parser.add_argument("--action", default=action)
     return parser.parse_args(argv)
 
@@ -148,7 +141,7 @@ def _print_usage(action: str) -> None:
     print()
     print("Capabilities (at least one required for non-help invocations):")
     print("  --trade              install/verify/uninstall the /trade capability")
-    print("  --fibo               install/verify/uninstall the /fibo capability")
+
     print("  (no capability flag = TRADE ONLY, legacy compat)")
     print()
     print("Target paths:")
@@ -161,29 +154,9 @@ def _print_usage(action: str) -> None:
     print("  --no-restart         install but don't start/restart services")
     print("  --skip-deps          skip pip dependency install")
     print("  --purge-state        uninstall: also remove capability-owned state")
-    print("  --mt5linux           (compat) MT5Linux is default-on with --trade")
-    print("  --no-mt5linux        opt out of MT5Linux Docker provision")
-    print("  --mt5linux-purge-volume  uninstall: also delete mt5-wine volume (default: keep)")
     print("  --help, -h           show this help and exit 0 (zero mutation)")
     print()
-    print("MT5Linux (default with --trade):")
-    print("  Provisions Docker (if needed), mt5 container, Wine volume, RPyC, Python client.")
-    print("  Credentials optional at install time: mt5linux_<ALIAS>_{ACCOUNT,PASSWORD,SERVER} in .env.")
-    print("  Docker never receives broker passwords. Opt out with --no-mt5linux.")
-    print("  Existing healthy 'mt5' containers are reused; Wine volume survives uninstall by default.")
-    print()
     print("Exit codes: 0=ok, 2=usage error, 1=action error.")
-
-
-def _mt5linux_argv(args: argparse.Namespace) -> List[str]:
-    out: List[str] = []
-    if getattr(args, "mt5linux", False):
-        out.append("--mt5linux")
-    if getattr(args, "no_mt5linux", False):
-        out.append("--no-mt5linux")
-    if getattr(args, "mt5linux_purge_volume", False):
-        out.append("--mt5linux-purge-volume")
-    return out
 
 
 def _resolve_capabilities(args: argparse.Namespace) -> List[str]:
@@ -194,11 +167,9 @@ def _resolve_capabilities(args: argparse.Namespace) -> List[str]:
     caps: List[str] = []
     if args.trade:
         caps.append("trade")
-    if args.fibo:
-        caps.append("fibo")
+
     if not caps:
         caps = ["trade"]  # Decision 1: legacy no-flag = trade
-    # Stable order: trade before fibo (legacy stable ordering).
     return [c for c in KNOWN_CAPABILITIES if c in caps]
 
 
@@ -226,7 +197,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     # Lazy imports (avoid pulling capability modules unless needed).
     from installer_shared import install_shared as _install_shared
     from install_trade_capability import run as run_trade
-    from install_fibo_capability import run as run_fibo
+
 
     # Migrate legacy .kam-trade/ directory if present (once per install).
     if not dry_run:
@@ -289,24 +260,9 @@ def cmd_install(args: argparse.Namespace) -> int:
     # string means "skip systemd unit installation" (used by
     # tests that don't want a real /etc/systemd/system write).
     shared_record["systemd_dir"] = str(systemd_dir)
-    # MT5Linux force flags for the trade capability installer.
-    if getattr(args, "mt5linux", False) and getattr(args, "no_mt5linux", False):
-        print("ERROR: --mt5linux and --no-mt5linux are mutually exclusive", file=sys.stderr)
-        return 2
-    if getattr(args, "mt5linux", False):
-        shared_record["mt5linux_force"] = True
-    elif getattr(args, "no_mt5linux", False):
-        shared_record["mt5linux_force"] = False
-    # Build argv fragment so capability modules that inspect argv still see flags.
-    cap_argv = _mt5linux_argv(args)
     for cap in caps:
         if cap == "trade":
             res = run_trade(
-                argv=cap_argv, hermes_root=hermes_root, hermes_home=hermes_home,
-                shared=shared_record, dry_run=dry_run,
-            )
-        elif cap == "fibo":
-            res = run_fibo(
                 argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
                 shared=shared_record, dry_run=dry_run,
             )
@@ -315,7 +271,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         results.append(res)
 
     # Telegram adapter dispatch seams + plugins.enabled (REQUIRED for
-    # /trade and /fibo to work on a fresh Hermes install). Payload copy
+    # /trade to work on a fresh Hermes install). Payload copy
     # alone is not enough — the adapter must route slash/callback/text.
     from adapter_wiring import apply_adapter_wiring as _apply_adapter_wiring
 
@@ -404,7 +360,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     from verify_shared import run as run_verify_shared
     from verify_trade_capability import run as verify_trade
-    from verify_fibo_capability import run as verify_fibo
+
     from adapter_wiring import verify_adapter_wiring
 
     systemd_dir = Path(args.systemd_dir) if args.systemd_dir else Path("/etc/systemd/system")
@@ -419,13 +375,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for cap in caps:
         if cap == "trade":
             ok = verify_trade(
-                argv=_mt5linux_argv(args),
+                argv=[],
                 hermes_root=hermes_root,
                 hermes_home=hermes_home,
                 systemd_dir=systemd_dir,
             )
-        elif cap == "fibo":
-            ok = verify_fibo(argv=[], hermes_root=hermes_root, hermes_home=hermes_home)
+
         else:
             raise SystemExit(f"unknown capability: {cap}")
         if not ok:
@@ -473,7 +428,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     _print_banner("uninstall", caps, hermes_root, hermes_home, dry_run)
 
     from uninstall_trade_capability import run as uninstall_trade
-    from uninstall_fibo_capability import run as uninstall_fibo
+
     from uninstall_shared import run as uninstall_shared
     from adapter_wiring import remove_adapter_wiring
     from capabilities import is_installed as _is_installed
@@ -483,17 +438,13 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     for cap in reversed(caps):
         if cap == "trade":
             res = uninstall_trade(
-                argv=_mt5linux_argv(args),
+                argv=[],
                 hermes_root=hermes_root,
                 hermes_home=hermes_home,
                 dry_run=dry_run,
                 systemd_dir=systemd_dir,
             )
-        elif cap == "fibo":
-            res = uninstall_fibo(
-                argv=[], hermes_root=hermes_root, hermes_home=hermes_home,
-                dry_run=dry_run,
-            )
+
         else:
             raise SystemExit(f"unknown capability: {cap}")
         results.append(res)
@@ -527,6 +478,14 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     manifest = load_manifest(hermes_home)
     for cap in caps:
         clear_capability(manifest, cap)
+    # Clear any retired capability left behind in a manifest written by an
+    # older installer (e.g. a stale ``fibo: true``). It owns nothing that is
+    # still installed, and leaving it marked installed would make
+    # ``installed_capabilities``/``verify`` report a capability that no
+    # longer exists.
+    for retired in RETIRED_CAPABILITIES:
+        if manifest.get("capabilities", {}).get(retired):
+            clear_capability(manifest, retired)
     save_manifest(hermes_home, manifest)
     if not any_capability_installed(hermes_home):
         uninstall_shared(

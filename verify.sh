@@ -3,8 +3,6 @@
 #
 # Usage:
 #   ./verify.sh --trade
-#   ./verify.sh --fibo
-#   ./verify.sh --trade --fibo
 #   ./verify.sh                           # no-flag = --trade
 set -euo pipefail
 

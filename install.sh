@@ -3,8 +3,6 @@
 #
 # Usage:
 #   ./install.sh --trade
-#   ./install.sh --fibo
-#   ./install.sh --trade --fibo
 #   ./install.sh                          # no-flag = TRADE ONLY (legacy compat)
 #
 # Optional flags (forwarded):

@@ -11,7 +11,7 @@ CONTROLLED LIVE checkpoint:
   6. close_position cannot dispatch when only new_order is enabled.
   7. ladder remains blocked with LADDER_ENABLED=0.
   8. non-allowlisted account remains blocked (account gate still works).
-  9. MetaTrader symbol+side identity remains intact.
+  9. Hedged venue symbol+side identity remains intact.
   10. existing DRY_RUN hard-boundary tests remain green.
 
 Uses a recording TradeDesk (FakeDesk) that captures every dispatch.
@@ -123,14 +123,14 @@ def _hdr(csrf: str) -> Dict[str, str]:
 
 
 def _preview_order(client, csrf, **overrides):
-    body = {"exchange": "metatrader", "account": "acc1", "symbol": "BTCUSD",
+    body = {"exchange": "hedgedvenue", "account": "acc1", "symbol": "BTCUSD",
             "side": "buy", "size": "0.01", "price": "100", "type": "limit"}
     body.update(overrides)
     return client.post("/api/trade/preview_order", json=body, headers=_hdr(csrf))
 
 
 def _preview_ladder(client, csrf, **overrides):
-    body = {"exchange": "metatrader", "account": "acc1", "symbol": "BTCUSD",
+    body = {"exchange": "hedgedvenue", "account": "acc1", "symbol": "BTCUSD",
             "side": "buy", "distribution": "uniform", "order_count": 3,
             "total_size": "0.03", "start_price": "100", "end_price": "99"}
     body.update(overrides)
@@ -156,7 +156,7 @@ class TestOperationAllowlist:
     def test_1_empty_live_operations_blocks_every_mutation(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=[],
         )
         client = TestClient(app)
@@ -177,7 +177,7 @@ class TestOperationAllowlist:
     def test_2_new_order_allows_only_new_order(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["new_order"],
         )
         client = TestClient(app)
@@ -197,14 +197,14 @@ class TestOperationAllowlist:
     def test_3_cancel_order_allows_only_cancel_order(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["cancel_order"],
         )
         client = TestClient(app)
         csrf = _login(client)
         r = client.post(
             "/api/orders/cancel_group",
-            json={"exchange": "metatrader", "account": "acc1",
+            json={"exchange": "hedgedvenue", "account": "acc1",
                   "symbol": "BTCUSD", "side": "buy"},
             headers=_hdr(csrf),
         )
@@ -219,14 +219,14 @@ class TestOperationAllowlist:
     def test_4_set_tp_blocked_when_only_new_order_enabled(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["new_order"],
         )
         client = TestClient(app)
         csrf = _login(client)
         r = client.post(
             "/api/position/set_tp",
-            json={"exchange": "metatrader", "account": "acc1",
+            json={"exchange": "hedgedvenue", "account": "acc1",
                   "symbol": "BTCUSD", "side": "buy", "price": "110"},
             headers=_hdr(csrf),
         )
@@ -238,14 +238,14 @@ class TestOperationAllowlist:
     def test_5_set_sl_blocked_when_only_new_order_enabled(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["new_order"],
         )
         client = TestClient(app)
         csrf = _login(client)
         r = client.post(
             "/api/position/set_sl",
-            json={"exchange": "metatrader", "account": "acc1",
+            json={"exchange": "hedgedvenue", "account": "acc1",
                   "symbol": "BTCUSD", "side": "buy", "price": "90"},
             headers=_hdr(csrf),
         )
@@ -257,14 +257,14 @@ class TestOperationAllowlist:
     def test_6_close_position_blocked_when_only_new_order_enabled(self):
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["new_order"],
         )
         client = TestClient(app)
         csrf = _login(client)
         r = client.post(
             "/api/position/close",
-            json={"exchange": "metatrader", "account": "acc1",
+            json={"exchange": "hedgedvenue", "account": "acc1",
                   "symbol": "BTCUSD", "side": "buy"},
             headers=_hdr(csrf),
         )
@@ -278,7 +278,7 @@ class TestOperationAllowlist:
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
             ladder_enabled=False,  # the default
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["ladder", "new_order"],
         )
         client = TestClient(app)
@@ -301,7 +301,7 @@ class TestOperationAllowlist:
         # Allowlist has only "OTHER" account. Target "acc1".
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "OTHER")],
+            live_accounts=[("hedgedvenue", "OTHER")],
             live_operations=["new_order"],
         )
         client = TestClient(app)
@@ -317,14 +317,14 @@ class TestOperationAllowlist:
         assert body.get("error", {}).get("code") == "LIVE_ACCOUNT_NOT_ALLOWED"
         assert desk.mutation_calls == []
 
-    # ---- 9: MetaTrader symbol+side identity remains intact ------------
-    def test_9_metatrader_symbol_side_identity_intact(self):
+    # ---- 9: Hedged venue symbol+side identity remains intact ------------
+    def test_9_hedgedvenue_symbol_side_identity_intact(self):
         # Two same-symbol positions with opposite sides must be treated as
         # independent. With hedge ops allowed, both set_tp calls dispatch
         # with the correct side on each.
         app, _, desk = _build_app(
             dry_run=False, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["set_tp"],
         )
         client = TestClient(app)
@@ -332,7 +332,7 @@ class TestOperationAllowlist:
         for side in ("buy", "sell"):
             r = client.post(
                 "/api/position/set_tp",
-                json={"exchange": "metatrader", "account": "acc1",
+                json={"exchange": "hedgedvenue", "account": "acc1",
                       "symbol": "BTCUSD", "side": side, "price": "110"},
                 headers=_hdr(csrf),
             )
@@ -351,7 +351,7 @@ class TestOperationAllowlist:
         # allowlisted -> preview + execute must NEVER reach desk.execute.
         app, _, desk = _build_app(
             dry_run=True, write_enabled=True,
-            live_accounts=[("metatrader", "acc1")],
+            live_accounts=[("hedgedvenue", "acc1")],
             live_operations=["new_order", "set_tp", "set_sl",
                              "close_position", "cancel_order", "cancel_order_group",
                              "ladder"],

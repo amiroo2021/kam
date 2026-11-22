@@ -298,18 +298,17 @@ class TestFreshInstall(FixtureCase):
         for rel in (
             "wizard.py",
             "backtest_wizard.py",
-            "fibo_wizard.py",
         ):
             self.assertTrue((self.hermes / "plugins" / "trade" / rel).is_file(), rel)
 
-        # all agents shipped — the kam currently supports 10
-        # exchanges (apex, arcus, edgex, hibachi, hyperliquid, lighter,
-        # ondoperps, pacifica, raydium, rise). Update this when adding or
-        # removing an exchange.
+        # Every source exchange agent is shipped.
         agents = sorted(
             p.name for p in (self.hermes / "plugins" / "trade" / "agents").glob("x_*_agent.py")
         )
-        self.assertEqual(len(agents), 10, agents)
+        source_agents = sorted(
+            p.name for p in (REPO_ROOT / "plugins" / "trade" / "agents").glob("x_*_agent.py")
+        )
+        self.assertEqual(agents, source_agents)
 
         # all adapter seams wired, each exactly once
         text = self.adapter.read_text()
@@ -385,7 +384,7 @@ class TestFreshInstall(FixtureCase):
         for entry in manifest["copied_files"]:
             self.assertIn("sha256_after", entry)
         patched = [p for p in manifest["patched_files"] if p["action"] == "patched"]
-        self.assertEqual(len(patched), 11, patched)
+        self.assertEqual(len(patched), 8, patched)
         seams = {p["seam"] for p in patched}
         self.assertEqual(
             seams,
@@ -394,9 +393,6 @@ class TestFreshInstall(FixtureCase):
                 "wizard text interception",
                 "backtest text interception",
                 "slash command dispatch",
-                "fibo callback dispatch",
-                "fibo text interception",
-                "fibo slash command dispatch",
                 "fibolearn callback dispatch",
                 "fibolearn text interception",
                 "fibolearn slash command dispatch",
@@ -444,17 +440,19 @@ class TestFreshInstall(FixtureCase):
 
 
 class TestSystemdUnitIsolation(FixtureCase):
-    def test_installer_does_not_install_fibo_service_unit(self):
-        """The /fibo capability is no longer shipped. The installer must NOT
-        write a fibo.service unit even when systemd_dir is the real /etc/systemd/system.
+    def test_installer_does_not_install_retired_service_units(self):
+        """Retired capability service units must never be written by the installer.
+
+        The unit names below belong to capabilities that are no longer
+        shipped; the installer must not create them even when
+        ``systemd_dir`` is the real /etc/systemd/system.
         """
-        real_unit = Path("/etc/systemd/system/fibo.service")
-        before_exists = real_unit.is_file()
-        proc = subprocess.run(_install_trade_cmd(self.hermes), capture_output=True, text=True)
-        # installer should succeed (it doesn't install fibo)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        # and must not have created the unit
-        self.assertFalse(real_unit.is_file() and not before_exists)
+        for unit_name in ("fibo.service", "fibo-converge.service", "fibo-mt4-reader.service"):
+            real_unit = Path("/etc/systemd/system") / unit_name
+            before_exists = real_unit.is_file()
+            proc = subprocess.run(_install_trade_cmd(self.hermes), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(real_unit.is_file() and not before_exists, unit_name)
 
 
 class TestInstallerTestIsolation(unittest.TestCase):

@@ -3,8 +3,6 @@
 #
 # Usage:
 #   ./uninstall.sh --trade
-#   ./uninstall.sh --fibo
-#   ./uninstall.sh --trade --fibo
 #   ./uninstall.sh                        # no-flag = --trade
 #
 # Optional flags (forwarded):

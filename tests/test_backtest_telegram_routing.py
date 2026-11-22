@@ -72,7 +72,7 @@ class BacktestTelegramRoutingTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             (home / "kam").mkdir(parents=True)
-            (home / "kam" / "install_state.json").write_text('{"capabilities":{"trade":true,"fibo":true}}')
+            (home / "kam" / "install_state.json").write_text('{"capabilities":{"trade":true}}')
             old = os.environ.get("HERMES_HOME")
             os.environ["HERMES_HOME"] = str(home)
             try:
@@ -86,7 +86,6 @@ class BacktestTelegramRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("trade", ctx.entries)
         self.assertIn("backtest", ctx.entries)
-        self.assertIn("fibo", ctx.entries)
 
 
 if __name__ == "__main__":

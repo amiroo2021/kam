@@ -11,22 +11,15 @@ Schema::
       "installer_version": "1.0.0",
       "kam_version": "1.0.0",
       "last_install_at": "2026-08-18T...",
-      "capabilities": {
-        "trade": true,
-        "fibo": false
-      },
-      "by_capability": {
-        "trade": {...},
-        "fibo":  {...}
-      },
+      "capabilities": {"trade": true},
+      "by_capability": {"trade": {...}},
       "shared": {...}
     }
 
 The manifest is the authoritative source of "what is installed on this
 server". Each capability owns exactly one folder under ``~/.hermes/``:
 
-    ~/.hermes/trade/    -- TRADE_ONLY state
-    ~/.hermes/fibo/     -- FIBO_ONLY state
+    ~/.hermes/trade/    -- TRADE state
 
 The folder is the owned runtime/state namespace; the manifest is the
 authoritative installation status. Verifiers must check both for
@@ -54,6 +47,14 @@ KAM_VERSION = "2.0.0"
 # Capability identifier -> owned state folder under ~/.hermes/.
 KNOWN_CAPABILITIES: Dict[str, str] = {
     "trade": "trade",
+}
+
+# Capabilities that used to exist and were removed. A deployment installed
+# by an older installer can still carry these keys in its install manifest.
+# They are no longer installable, but they must still be recognised so that
+# (a) uninstall clears them instead of leaving them stranded as "installed",
+# and (b) the shared teardown is not blocked by a stale ``true`` entry.
+RETIRED_CAPABILITIES: Dict[str, str] = {
     "fibo": "fibo",
 }
 
@@ -170,8 +171,8 @@ def _empty_manifest() -> Dict[str, Any]:
         "installer_version": INSTALLER_VERSION,
         "kam_version": KAM_VERSION,
         "last_install_at": None,
-        "capabilities": {"trade": False, "fibo": False},
-        "by_capability": {"trade": {}, "fibo": {}},
+        "capabilities": {"trade": False},
+        "by_capability": {"trade": {}},
         "shared": {},
     }
 
@@ -215,7 +216,7 @@ def set_capability(manifest: Dict[str, Any], capability: str, record: Dict[str, 
 
 def clear_capability(manifest: Dict[str, Any], capability: str) -> None:
     """Mark a capability uninstalled and clear its per-capability payload."""
-    if capability not in KNOWN_CAPABILITIES:
+    if capability not in KNOWN_CAPABILITIES and capability not in RETIRED_CAPABILITIES:
         raise ValueError(f"unknown capability: {capability!r}")
     manifest.setdefault("capabilities", {})[capability] = False
     manifest.setdefault("by_capability", {})[capability] = {}
@@ -235,7 +236,12 @@ def any_capability_installed(hermes_home: Path) -> bool:
     """Return True iff at least one KAM capability is installed."""
     m = load_manifest(hermes_home)
     caps = m.get("capabilities", {})
-    return any(bool(v) for v in caps.values())
+    # Retired capabilities can linger as ``true`` in a manifest written by an
+    # older installer. They own nothing that is still installed, so they must
+    # not keep the shared teardown from running.
+    return any(
+        bool(v) for k, v in caps.items() if k not in RETIRED_CAPABILITIES
+    )
 
 
 def installed_capabilities(hermes_home: Path) -> List[str]:
@@ -268,13 +274,13 @@ def capability_folder_consistent(hermes_home: Path, capability: str) -> Tuple[bo
 # CLI flag parsing helpers
 # ---------------------------------------------------------------------------
 
-CAPABILITY_FLAGS = ("--trade", "--fibo")
+CAPABILITY_FLAGS = ("--trade",)
 
 
 def parse_capability_flags(argv: List[str]) -> Tuple[List[str], List[str]]:
     """Split argv into (capabilities, rest).
 
-    Recognized flags: ``--trade``, ``--fibo``. Each may appear at most once.
+    Recognized flag: ``--trade``. It may appear at most once.
 
     Returns:
         (capabilities, rest)
@@ -287,7 +293,7 @@ def parse_capability_flags(argv: List[str]) -> Tuple[List[str], List[str]]:
     seen = set()
     caps: List[str] = []
     rest: List[str] = []
-    flag_to_cap = {"--trade": "trade", "--fibo": "fibo"}
+    flag_to_cap = {"--trade": "trade"}
     for arg in argv:
         if arg in flag_to_cap:
             cap = flag_to_cap[arg]

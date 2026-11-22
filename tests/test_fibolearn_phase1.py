@@ -168,8 +168,8 @@ def test_telegram_fibolearn_callbacks_and_study_setup(tmp_path: Path, monkeypatc
             "test_telegram_fibolearn_callbacks_and_study_setup opened the production FiboLearn DB"
 
 
-def test_patchspecs_include_fibolearn_when_fibo_capability_installs():
-    specs = specs_for_capabilities(["fibo"])
+def test_patchspecs_include_fibolearn_when_trade_capability_installs():
+    specs = specs_for_capabilities(["trade"])
     sentinels = {s.native_sentinel for s in specs}
     assert "from plugins.trade.fibolearn_wizard import handle_fibolearn_command" in sentinels
     assert "from plugins.trade.fibolearn_wizard import handle_fibolearn_callback" in sentinels

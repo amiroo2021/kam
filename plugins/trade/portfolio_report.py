@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -188,17 +187,8 @@ def _account_identity(exchange: str, entry: Any) -> str:
 
 
 def _monetary_normalization(exchange: str, unit: Optional[str]) -> Tuple[str, Decimal]:
-    """Return normalized currency + factor without global currency assumptions.
-
-    MetaTrader's documented ``USC`` denomination is cents, not an ISO
-    currency: only that confirmed exchange/unit pair converts 100 USC to USD.
-    Every other unit remains distinct.
-    """
+    """Return currency + factor without making global unit assumptions."""
     source = str(unit or "?").strip() or "?"
-    ex = str(exchange).strip().lower()
-    # USC is a cents denomination on some MetaTrader/MT5Linux brokers (e.g. PUPrime).
-    if ex in {"metatrader", "mt5linux"} and source.upper() == "USC":
-        return "USD", Decimal("0.01")
     return source, Decimal("1")
 
 
@@ -239,10 +229,9 @@ class OpenPositionRow:
     contract_spec: Optional[str] = None      # venue contract specification id
     # Original broker-native lot size, preserved whenever a conversion was
     # applied so the raw exposure is never lost or silently overwritten.
+    # Also marks a row whose native unit could not be verified, so it is
+    # never summed with a token-denominated row.
     raw_lots: Optional[Decimal] = None
-    broker_server: Optional[str] = None
-    broker_company: Optional[str] = None
-    calc_mode: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -270,9 +259,6 @@ class OpenPositionRow:
             ),
             "contract_spec": self.contract_spec,
             "raw_lots": None if self.raw_lots is None else format(self.raw_lots, "f"),
-            "broker_server": self.broker_server,
-            "broker_company": self.broker_company,
-            "calc_mode": self.calc_mode,
         }
 
 
@@ -344,118 +330,6 @@ class AccountSnapshot:
         }
 
 
-_CONTRACT_SPEC_TTL_SECONDS = 900.0
-_CONTRACT_SPEC_LOCK = threading.Lock()
-_CONTRACT_SPEC_CACHE: Dict[Tuple[str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
-
-# MT5 calc modes we can interpret as a linear underlying-quantity contract.
-# SYMBOL_CALC_MODE_FOREX (0) and SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE (1) are
-# currency-margin instruments; SYMBOL_CALC_MODE_FUTURES (2) is exchange
-# style.  Calc mode 5 (SYMBOL_CALC_MODE_EXCH_FUTURES) is also linear.
-# Anything else (e.g. CFD/quanto/synthetic) stays unverified by design.
-_LINEAR_CALC_MODES = frozenset({0, 1, 2, 5})
-
-
-def _contract_spec_key(exchange: str, account: str, symbol: str) -> Tuple[str, str, str]:
-    return (str(exchange or "").strip().lower(),
-            str(account or "").strip().upper(),
-            str(symbol or "").strip().upper())
-
-
-def resolve_contract_spec(
-    desk: Any,
-    exchange: str,
-    account: str,
-    symbol: str,
-    *,
-    now: Optional[float] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return broker contract metadata for one (exchange, account, symbol).
-
-    Read-only: issues a single ``symbol_info`` call through the existing
-    agent dispatch and caches the result briefly.  Returns ``None`` when the
-    venue has no contract specification concept or the lookup fails — never
-    a fabricated default.
-    """
-    key = _contract_spec_key(exchange, account, symbol)
-    if not key[1] or not key[2]:
-        return None
-    current = time.time() if now is None else now
-    with _CONTRACT_SPEC_LOCK:
-        cached = _CONTRACT_SPEC_CACHE.get(key)
-        if cached is not None and (current - cached[0]) < _CONTRACT_SPEC_TTL_SECONDS:
-            return cached[1]
-    try:
-        response = desk.execute(
-            {
-                "operation": "symbol_info",
-                "exchange": key[0],
-                "account": key[1],
-                "symbol": key[2],
-            }
-        )
-    except Exception:  # noqa: BLE001
-        response = None
-    spec: Optional[Dict[str, Any]] = None
-    if response is not None and getattr(response, "success", False):
-        data = getattr(response, "data", None) or {}
-        contract_size = _d(data.get("trade_contract_size"))
-        if contract_size is not None and contract_size > 0:
-            calc_mode = data.get("trade_calc_mode")
-            try:
-                calc_mode_int = int(calc_mode) if calc_mode is not None else None
-            except (TypeError, ValueError):
-                calc_mode_int = None
-            spec = {
-                "trade_contract_size": contract_size,
-                "trade_calc_mode": calc_mode_int,
-                "currency_base": data.get("currency_base"),
-                "currency_profit": data.get("currency_profit"),
-                "currency_margin": data.get("currency_margin"),
-                "volume_step": data.get("volume_step"),
-                "volume_min": data.get("volume_min"),
-                "volume_max": data.get("volume_max"),
-                "tick_size": data.get("tick_size"),
-                "server": data.get("server"),
-                "company": data.get("company"),
-                "broker": data.get("server"),
-            }
-    with _CONTRACT_SPEC_LOCK:
-        _CONTRACT_SPEC_CACHE[key] = (current, spec)
-    return spec
-
-
-def contract_spec_is_linear(spec: Optional[Dict[str, Any]]) -> bool:
-    """True only when the spec establishes a linear underlying quantity.
-
-    Requires a positive contract size AND a known calculation mode we can
-    interpret.  Unknown calc mode is treated as NOT linear: guessing here is
-    exactly what produced the original wrong aggregation.
-    """
-    if not spec:
-        return False
-    size = _d(spec.get("trade_contract_size"))
-    if size is None or size <= 0:
-        return False
-    mode = spec.get("trade_calc_mode")
-    if mode is None:
-        return False
-    return int(mode) in _LINEAR_CALC_MODES
-
-
-def underlying_quantity_from_lots(
-    lots: Optional[Decimal],
-    spec: Optional[Dict[str, Any]],
-) -> Optional[Decimal]:
-    """Convert MT5 lots to underlying units only for verified linear specs."""
-    if lots is None or not contract_spec_is_linear(spec):
-        return None
-    size = _d(spec.get("trade_contract_size"))
-    if size is None or size <= 0:
-        return None
-    return abs(lots) * size
-
-
 def is_account_eligible(account: AccountSnapshot) -> bool:
     """Return True when an account is relevant enough to display.
 
@@ -507,10 +381,9 @@ class SymbolSideAggregate:
 class SideVwap:
     """Quantity-weighted average entry price for one side of one group.
 
-    Built ONLY from normalized underlying quantities, so a MetaTrader lot is
-    never mixed with a token-denominated amount.  ``covered`` / ``total``
-    expose how many positions actually contributed, so an incomplete average
-    is reported as incomplete rather than silently looking authoritative.
+    Built only from normalized quantities. ``covered`` / ``total`` expose how
+    many positions contributed, so an incomplete average is reported as
+    incomplete rather than silently looking authoritative.
     """
 
     quantity: Decimal = Decimal("0")
@@ -817,29 +690,6 @@ def _extract_account_snapshot(
                 continue
             seen_pos.add(pid)
 
-            # MetaTrader reports `size` in lots.  Only for a verified linear
-            # contract specification from THIS account do we also derive an
-            # underlying-asset quantity; otherwise the row keeps its native
-            # lot unit and stays in its own aggregation group.
-            spec = None
-            underlying = None
-            if str(exchange or "").strip().lower() == "metatrader":
-                spec = resolve_contract_spec(desk, exchange, account, symbol)
-                underlying = underlying_quantity_from_lots(abs(size), spec)
-
-            quantity_unit = None
-            contract_multiplier = None
-            # market_type stays None: the EA does not report it, and inferring
-            # "perp" from a USD suffix is a guess that would wrongly separate
-            # converted MT5 rows from token-denominated venues.  Verified
-            # absence is not evidence.
-            market_type = None
-            contract_spec = None
-            if underlying is not None and spec is not None:
-                quantity_unit = key
-                contract_multiplier = _d(spec.get("trade_contract_size"))
-                contract_spec = str(spec.get("server") or spec.get("broker") or "") or None
-
             row = OpenPositionRow(
                 exchange=exchange,
                 account=account,
@@ -847,12 +697,7 @@ def _extract_account_snapshot(
                 symbol=symbol,
                 instrument_key=key,
                 side=side,
-                size=(underlying if underlying is not None else abs(size)),
-                # raw_lots is the MT5 lot size.  Only set it for a
-                # lot-denominated venue: on token venues `size` is already the
-                # asset, and marking it as "lots" would both mislabel the row
-                # and wrongly split it from other token rows.
-                raw_lots=(abs(size) if spec is not None else None),
+                size=abs(size),
                 entry_price=entry,
                 mark=mark,
                 pnl=pnl,
@@ -866,13 +711,6 @@ def _extract_account_snapshot(
                 # positions feed exposes no market_type / quantity_unit /
                 # multiplier, so these remain "unknown" for live positions and
                 # must never be inferred from the ticker.
-                quantity_unit=quantity_unit,
-                market_type=market_type,
-                contract_multiplier=contract_multiplier,
-                contract_spec=contract_spec,
-                broker_server=(str(spec.get("server")) if spec and spec.get("server") else None),
-                broker_company=(str(spec.get("company")) if spec and spec.get("company") else None),
-                calc_mode=(spec.get("trade_calc_mode") if spec else None),
             )
             positions.append(row)
             if pnl is not None:
@@ -1226,8 +1064,6 @@ def net_by_instrument(snapshot: PortfolioSnapshot) -> List[Dict[str, Any]]:
                 size_abs = abs(pos.size)
                 gross += size_abs
                 # VWAP is accumulated per side from normalized quantities only.
-                # `size` here is already the underlying quantity for converted
-                # MetaTrader rows, so lots never enter the average directly.
                 if pos.side == "BUY":
                     long_amt += size_abs
                     net += pos.size
@@ -1284,9 +1120,7 @@ def _quantity_unit_signature(row: Any) -> Optional[str]:
         # Lot-denominated position with no verified contract specification.
         # Distinct unit: it must never be summed with a token position.
         return f"__unverified_lots__:{getattr(row, 'symbol', '') or '?'}"
-    # Plain token-denominated position.  Its unit IS the instrument key, so a
-    # converted MetaTrader row declaring quantity_unit="HYPE" and a perp venue
-    # row with no metadata both denote HYPE and belong in one group.
+    # Plain token-denominated position.  Its unit IS the instrument key.
     key = str(getattr(row, "instrument_key", "") or "")
     return key or None
 
@@ -1296,9 +1130,8 @@ def _compatibility_subgroups(
 ) -> List[Tuple[List[OpenPositionRow], set]]:
     """Split rows into quantity-summable subgroups.
 
-    Rows are grouped by their verified quantity denomination.  Unverified
-    lot-denominated rows get a sentinel unit so they stay separate from
-    token rows instead of silently merging (or silently defaulting to 1).
+    Rows are grouped by their verified quantity denomination so incompatible
+    units are never silently merged.
     """
     groups: Dict[Tuple[Any, ...], List[OpenPositionRow]] = {}
     order: List[Tuple[Any, ...]] = []

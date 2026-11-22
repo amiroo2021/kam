@@ -127,12 +127,12 @@ class PortfolioProgressTests(unittest.TestCase):
     def _desk(self) -> _DeskStub:
         positions = [
             _PositionStub("bulk", "main", "BTC", side="BUY", size="0.1", pnl="12", pnl_unit="USDT"),
-            _PositionStub("metatrader", "cents", "BTC", side="SELL", size="0.05", pnl="-3", pnl_unit="USC"),
+            _PositionStub("hedgedvenue", "cents", "BTC", side="SELL", size="0.05", pnl="-3", pnl_unit="USC"),
             _PositionStub("hyperliquid", "flex", "SOL", side="BUY", size="2", pnl="40", pnl_unit="USDC"),
         ]
         return _DeskStub({
             "bulk": ["main"],
-            "metatrader": ["cents"],
+            "hedgedvenue": ["cents"],
             "hyperliquid": ["flex"],
         })
 
@@ -140,7 +140,7 @@ class PortfolioProgressTests(unittest.TestCase):
         positions = [
             pos for pos in [
                 _PositionStub("bulk", "main", "BTC", side="BUY", size="0.1"),
-                _PositionStub("metatrader", "cents", "BTC", side="SELL", size="0.05"),
+                _PositionStub("hedgedvenue", "cents", "BTC", side="SELL", size="0.05"),
                 _PositionStub("hyperliquid", "flex", "SOL", side="BUY", size="2"),
             ] if pos.exchange == exchange and pos.account == account
         ]
@@ -296,7 +296,7 @@ class ChecklistTests(unittest.TestCase):
         self._state = _make_state()
         self._desk = _DeskStub({
             "bulk": ["main"],
-            "metatrader": ["cents"],
+            "hedgedvenue": ["cents"],
             "hyperliquid": ["flex"],
         })
 
@@ -366,7 +366,7 @@ class ChecklistTests(unittest.TestCase):
         from plugins.trade import portfolio_report as portfolio
         positions = [
             _PositionStub("bulk", "main", "BTC", side="BUY", size="0.4", pnl="12", pnl_unit="USDT"),
-            _PositionStub("metatrader", "cents", "BTC", side="SELL", size="0.1", pnl="-3", pnl_unit="USC"),
+            _PositionStub("hedgedvenue", "cents", "BTC", side="SELL", size="0.1", pnl="-3", pnl_unit="USC"),
         ]
         original = portfolio._extract_account_snapshot
 
