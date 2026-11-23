@@ -15,6 +15,27 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
+INSTRUMENT_LOOKUP_INFRASTRUCTURE_ERRORS = frozenset(
+    {
+        "AGENT_EXCEPTION",
+        "ACCOUNT_MISMATCH",
+        "INVALID_AGENT_RESPONSE",
+        "UNKNOWN_EXCHANGE",
+        "ACCOUNT_NOT_CONFIGURED",
+    }
+)
+
+
+def is_instrument_lookup_unavailable(code: Any, data: Any = None) -> bool:
+    """True when lookup did not complete and must not be reported as not-found."""
+    if isinstance(data, dict):
+        if data.get("lookup_performed") is False:
+            return True
+        if str(data.get("status") or "").strip().lower() == "unavailable":
+            return True
+    normalized = str(code or "").strip().upper()
+    return normalized in INSTRUMENT_LOOKUP_INFRASTRUCTURE_ERRORS
+
 # Single shared safety cap for Telegram /trade and WebTrade candidate chips.
 # Must stay identical so both surfaces show the same native list (e.g. silver → 5).
 INSTRUMENT_PICK_MAX = 5

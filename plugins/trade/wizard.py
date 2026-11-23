@@ -716,6 +716,26 @@ class TradeWizard:
         caps = self._agent_capabilities(exchange)
         return "resolve_instrument" in caps or "list_instruments" in caps
 
+    def _instrument_lookup_capabilities(
+        self, exchange: Optional[str]
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """Read lookup capabilities while preserving discovery failures."""
+        if not exchange:
+            return [], None
+        caps_fn = getattr(self._desk, "capabilities", None)
+        if not callable(caps_fn):
+            return [], None
+        try:
+            caps = caps_fn(exchange) or []
+        except Exception as exc:  # noqa: BLE001
+            return [], ("AGENT_EXCEPTION", str(exc) or "Capability lookup failed.")
+        if not isinstance(caps, list):
+            return [], (
+                "INVALID_AGENT_RESPONSE",
+                "Instrument capability lookup returned an invalid response.",
+            )
+        return [c for c in caps if isinstance(c, str)], None
+
     def _call_resolve_instrument(
         self,
         exchange: str,
@@ -1054,6 +1074,7 @@ class TradeWizard:
         *,
         primary_native: Optional[str] = None,
         agent_candidates: Optional[List[Any]] = None,
+        capabilities: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Delegate to shared picker (identical candidates for WebTrade)."""
         from plugins.trade.instrument_picker import (
@@ -1069,7 +1090,11 @@ class TradeWizard:
             primary_native=primary_native,
             agent_candidates=agent_candidates,
             limit=INSTRUMENT_PICK_MAX_TELEGRAM,
-            capabilities=self._agent_capabilities(exchange),
+            capabilities=(
+                list(capabilities)
+                if capabilities is not None
+                else self._agent_capabilities(exchange)
+            ),
         )
 
     def _instrument_button_label(self, entry: Dict[str, Any]) -> str:
@@ -1177,10 +1202,22 @@ class TradeWizard:
 
         exchange = str(state.exchange or "").strip()
         account = str(state.account or "").strip()
-        if (
-            not exchange
-            or not account
-            or not self._agent_supports_instrument_lookup(exchange)
+        lookup_caps, capability_error = self._instrument_lookup_capabilities(exchange)
+        if capability_error is not None:
+            error_code, error_message = capability_error
+            state.resolved_instrument = {
+                "requested_symbol": requested,
+                "error_code": error_code,
+                "error_message": error_message,
+                "lookup_data": {
+                    "status": "unavailable",
+                    "lookup_performed": False,
+                },
+                "candidates": [],
+            }
+            return self._render_instrument_unresolved(chat_key)
+        if not exchange or not account or not (
+            "resolve_instrument" in lookup_caps or "list_instruments" in lookup_caps
         ):
             # No resolver/catalog — keep legacy /trade pass-through.
             self._commit_native_symbol(chat_key, requested)
@@ -1191,8 +1228,9 @@ class TradeWizard:
         agent_error_candidates: List[Any] = []
         resolve_error_code: Optional[str] = None
         resolve_error_message: Optional[str] = None
+        resolve_data: Any = None
 
-        if self._agent_supports_resolve(exchange):
+        if "resolve_instrument" in lookup_caps:
             try:
                 response = self._call_resolve_instrument(exchange, account, requested)
             except Exception as exc:  # noqa: BLE001
@@ -1219,18 +1257,27 @@ class TradeWizard:
                         getattr(err, "message", "") or "Instrument not found."
                     )
                     data = getattr(response, "data", None)
+                    resolve_data = data
                     if isinstance(data, dict):
                         raw_cands = data.get("candidates")
                         if isinstance(raw_cands, list):
                             agent_error_candidates = list(raw_cands)
 
-        candidates = self._build_priced_candidates(
-            exchange,
-            account,
-            requested,
-            primary_native=primary_native,
-            agent_candidates=agent_error_candidates,
+        from plugins.trade.instrument_picker import is_instrument_lookup_unavailable
+
+        lookup_unavailable = is_instrument_lookup_unavailable(
+            resolve_error_code, resolve_data
         )
+        candidates = []
+        if not lookup_unavailable:
+            candidates = self._build_priced_candidates(
+                exchange,
+                account,
+                requested,
+                primary_native=primary_native,
+                agent_candidates=agent_error_candidates,
+                capabilities=lookup_caps,
+            )
         state.instrument_candidates = list(candidates)
 
         if candidates:
@@ -1247,6 +1294,7 @@ class TradeWizard:
             "requested_symbol": requested,
             "error_code": resolve_error_code or "INSTRUMENT_NOT_FOUND",
             "error_message": resolve_error_message or "Instrument not found.",
+            "lookup_data": resolve_data,
             "candidates": [],
         }
         return self._render_instrument_unresolved(chat_key)
@@ -1316,6 +1364,13 @@ class TradeWizard:
         source = str(state.requested_symbol or info.get("requested_symbol") or "").strip()
         code = str(info.get("error_code") or "INSTRUMENT_NOT_FOUND")
         message = str(info.get("error_message") or "Instrument not found.")
+        from plugins.trade.instrument_picker import is_instrument_lookup_unavailable
+
+        resolution = (
+            "lookup unavailable"
+            if is_instrument_lookup_unavailable(code, info.get("lookup_data"))
+            else "not found"
+        )
         candidates = list(state.instrument_candidates or info.get("candidates") or [])
         title = self._flow_title(chat_key)
         lines = [
@@ -1323,7 +1378,7 @@ class TradeWizard:
             "",
             "Instrument Resolution",
             f"Source: {source}",
-            "Resolved: (not found)",
+            f"Resolved: ({resolution})",
             "",
             message,
             f"({code})",

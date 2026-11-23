@@ -98,22 +98,48 @@ class AggTradeCache:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(agg_trades)").fetchall()}
             if "id_domain" not in cols:
                 conn.execute("ALTER TABLE agg_trades ADD COLUMN id_domain TEXT NOT NULL DEFAULT 'aggtrade'")
-            conn.execute("UPDATE agg_trades SET id_domain='trade' WHERE source='ws'")
-            conn.execute("UPDATE agg_trades SET id_domain='aggtrade' WHERE source IN ('rest', 'archive') OR id_domain='' OR id_domain IS NULL")
-            # Raw @trade IDs and aggregate-trade IDs are separate domains, but
-            # the legacy SQLite PK is (market, symbol, agg_trade_id). Store raw
-            # trade IDs in a negative keyspace while preserving the real raw ID
-            # in first_trade_id/last_trade_id. This avoids a rebuild and
-            # prevents cross-domain numeric collisions.
+
             conn.execute(
                 """
-                UPDATE agg_trades
-                SET agg_trade_id = -ABS(agg_trade_id),
-                    first_trade_id = ABS(first_trade_id),
-                    last_trade_id = ABS(last_trade_id)
-                WHERE id_domain='trade' AND agg_trade_id > 0
+                CREATE TABLE IF NOT EXISTS cache_migrations (
+                    migration_key TEXT PRIMARY KEY,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    completed_at_ms INTEGER NOT NULL DEFAULT 0
+                )
                 """
             )
+            migration_key = "agg_trades_id_domain_v1"
+            migrated = conn.execute(
+                "SELECT 1 FROM cache_migrations WHERE migration_key=? AND completed=1",
+                (migration_key,),
+            ).fetchone()
+            if migrated is None:
+                conn.execute("UPDATE agg_trades SET id_domain='trade' WHERE source='ws'")
+                conn.execute("UPDATE agg_trades SET id_domain='aggtrade' WHERE source IN ('rest', 'archive') OR id_domain='' OR id_domain IS NULL")
+                # Raw @trade IDs and aggregate-trade IDs are separate domains, but
+                # the legacy SQLite PK is (market, symbol, agg_trade_id). Store raw
+                # trade IDs in a negative keyspace while preserving the real raw ID
+                # in first_trade_id/last_trade_id. This avoids a rebuild and
+                # prevents cross-domain numeric collisions.
+                conn.execute(
+                    """
+                    UPDATE agg_trades
+                    SET agg_trade_id = -ABS(agg_trade_id),
+                        first_trade_id = ABS(first_trade_id),
+                        last_trade_id = ABS(last_trade_id)
+                    WHERE id_domain='trade' AND agg_trade_id > 0
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO cache_migrations(migration_key, completed, completed_at_ms)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(migration_key) DO UPDATE SET
+                        completed=excluded.completed,
+                        completed_at_ms=excluded.completed_at_ms
+                    """,
+                    (migration_key, int(time.time() * 1000)),
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS coverage_intervals (

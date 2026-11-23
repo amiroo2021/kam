@@ -1,0 +1,18 @@
+{
+  "component": "hermes-webui",
+  "repository": "https://github.com/nesquena/hermes-webui.git",
+  "checkout_root": "/opt/hermes-webui",
+  "revision": "556c69fecdfcdb3bd5a5475c155c9f1d639caa93",
+  "verified_on": "2026-11-22",
+  "notes": [
+    "KAM does not fork, vendor, or patch the Hermes WebUI.",
+    "The checkout MUST be pristine: `git status --porcelain` must print nothing.",
+    "Pin this revision instead of tracking upstream main; upstream moves and an",
+    "unpinned clone silently changes behaviour on the next `git pull`.",
+    "To advance the pin, change `revision` in the same commit that verifies the",
+    "new upstream revision against the WebChat checks in",
+    "docs/NEW_SERVER_INSTALL.md section 15.",
+    "The systemd unit is installed separately by installer/install_webchat.py,",
+    "which is the only entry point allowed to manage webchat.service."
+  ]
+}

@@ -57,8 +57,13 @@ class HistoricalOhlcFeeder:
         for candle in self.candles:
             yield from self._events_for_candle(candle, shadow)
 
-    def collect(self) -> List[MarketEvent]:
-        return list(self.iter_events())
+    def collect(self, *, max_events: int | None = None) -> List[MarketEvent]:
+        out: List[MarketEvent] = []
+        for event in self.iter_events():
+            out.append(event)
+            if max_events is not None and len(out) > max_events:
+                raise RuntimeError(f"historical replay exceeded max_events={max_events}")
+        return out
 
     def _events_for_candle(self, candle: Sequence[Any], shadow: GoldenFiboEngine, domain_out: List[Any] | None = None) -> Iterator[MarketEvent]:
         ts, o, h, l, c = _parse_candle(candle)
@@ -162,8 +167,9 @@ def collect_ohlc_events(
     config: EngineConfig,
     *,
     mode: OhlcResolveMode = OhlcResolveMode.LEGACY,
+    max_events: int | None = None,
 ) -> List[MarketEvent]:
-    return HistoricalOhlcFeeder(candles, config, mode=mode).collect()
+    return HistoricalOhlcFeeder(candles, config, mode=mode).collect(max_events=max_events)
 
 
 def count_ambiguous(events: Sequence[MarketEvent]) -> int:

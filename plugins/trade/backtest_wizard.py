@@ -10,9 +10,9 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 # GoldenFibo legacy engine lives in the repo checkout.
 _GF_LEGACY_ROOT = Path("/root/kam/GoldenFibo/reference/legacy_research")
@@ -27,13 +27,44 @@ if str(_GF_ROOT) not in sys.path:
 from golden_fibo.constants import Side  # noqa: E402
 from goldenfibo.backtest import run_finite_backtest  # noqa: E402
 from goldenfibo.marketdata.aggtrade_cache import AggTradeCache  # noqa: E402
+from goldenfibo.marketdata.dukascopy_cache import DukascopyKlineCache  # noqa: E402
+from goldenfibo.marketdata.dukascopy_provider import (  # noqa: E402
+    DukascopyInvalidRangeError,
+    DukascopyNoDataError,
+    DukascopyProvider,
+)
+from goldenfibo.marketdata.historical import HistoricalRequest  # noqa: E402
 from goldenfibo.marketdata.kline_cache import CachePolicy, KlineCache, fetch_range_cached  # noqa: E402
 from plugins.trade.tradedesk import TradeDesk  # noqa: E402
 
 _BACKTEST_CACHE: Optional[KlineCache] = None
+_BACKTEST_DUKASCOPY_CACHE: Optional[DukascopyKlineCache] = None
 _BACKTEST_AGGTRADE_CACHE: Optional[AggTradeCache] = None
-_BACKTEST_CACHE_PATH = Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite")
+_BACKTEST_INITIALIZATION_TASK: Optional[asyncio.Task] = None
+_BACKTEST_DUKASCOPY_INITIALIZATION_TASK: Optional[asyncio.Task] = None
+_CACHE_ENV_NAMES = {
+    "binance": "GOLDENFIBO_BACKTEST_BINANCE_CACHE_PATH",
+    "dukascopy": "GOLDENFIBO_BACKTEST_DUKASCOPY_CACHE_PATH",
+}
+
+
+def _configured_cache_path(name: str, default: Path, environ: Mapping[str, str] | None = None) -> Path:
+    values = os.environ if environ is None else environ
+    return Path(values.get(name, str(default)))
+
+
+_BACKTEST_CACHE_PATH = _configured_cache_path(
+    _CACHE_ENV_NAMES["binance"], Path("/root/kam/GoldenFibo/data/backtest_klines.sqlite")
+)
+_BACKTEST_DUKASCOPY_CACHE_PATH = _configured_cache_path(
+    _CACHE_ENV_NAMES["dukascopy"], Path("/root/kam/GoldenFibo/data/dukascopy_klines.sqlite")
+)
 _BACKTEST_AGGTRADE_CACHE_PATH = Path("/root/kam/GoldenFibo/data/aggtrades.sqlite")
+_BACKTEST_AGGRESSOR_SOURCE = os.environ.get(
+    "GOLDENFIBO_BACKTEST_AGGRESSOR_SOURCE", "candle"
+).strip().lower()
+if _BACKTEST_AGGRESSOR_SOURCE not in {"candle", "aggtrade"}:
+    _BACKTEST_AGGRESSOR_SOURCE = "candle"
 _BACKTEST_TIMEFRAME = "1m"
 _BACKTEST_REFRESH_TAIL_MS = 0
 _BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS = 15
@@ -42,35 +73,124 @@ INCOMPLETE_AGGTRADE_COVERAGE = "INCOMPLETE_AGGTRADE_COVERAGE"
 logger = logging.getLogger(__name__)
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today_utc() -> date:
+    return _now_utc().date()
+
+
 class BacktestCacheUnavailable(RuntimeError):
     """Backtest cache initialization failed without blocking Telegram routing."""
 
 
-def _initialize_backtest_caches() -> tuple[KlineCache, AggTradeCache]:
-    """Open SQLite caches only when a Backtest run actually needs them.
+def _initialize_backtest_kline_cache() -> KlineCache:
+    """Open only the historical OHLCV cache required by /backtest.
 
-    Call this from a worker thread: cache constructors may acquire SQLite locks
-    or perform schema compatibility work.
+    Call this from a worker thread: the KlineCache constructor may acquire
+    SQLite locks or perform schema compatibility work. AggTradeCache remains
+    reserved for explicit trade-level workflows and is intentionally not
+    touched by ordinary historical backtests.
     """
-    global _BACKTEST_CACHE, _BACKTEST_AGGTRADE_CACHE
+    global _BACKTEST_CACHE
     if _BACKTEST_CACHE is None:
         _BACKTEST_CACHE = KlineCache(_BACKTEST_CACHE_PATH)
+    return _BACKTEST_CACHE
+
+
+def _initialize_backtest_aggtrade_cache() -> AggTradeCache:
+    """Open the Binance AggTrade cache used by aggressive-flow summaries."""
+    global _BACKTEST_AGGTRADE_CACHE
     if _BACKTEST_AGGTRADE_CACHE is None:
         _BACKTEST_AGGTRADE_CACHE = AggTradeCache(_BACKTEST_AGGTRADE_CACHE_PATH)
-    return _BACKTEST_CACHE, _BACKTEST_AGGTRADE_CACHE
+    return _BACKTEST_AGGTRADE_CACHE
 
 
-async def initialize_backtest_caches_off_loop() -> tuple[KlineCache, AggTradeCache]:
-    """Initialize caches on a worker thread with a bounded Telegram-facing wait."""
+def _initialize_backtest_dukascopy_cache() -> DukascopyKlineCache:
+    global _BACKTEST_DUKASCOPY_CACHE
+    if _BACKTEST_DUKASCOPY_CACHE is None:
+        _BACKTEST_DUKASCOPY_CACHE = DukascopyKlineCache(_BACKTEST_DUKASCOPY_CACHE_PATH)
+    return _BACKTEST_DUKASCOPY_CACHE
+
+
+async def initialize_backtest_dukascopy_cache_off_loop() -> DukascopyKlineCache:
+    """Initialize only the Dukascopy cache, sharing one worker per process."""
+    global _BACKTEST_DUKASCOPY_INITIALIZATION_TASK
+    loop = asyncio.get_running_loop()
+    task = _BACKTEST_DUKASCOPY_INITIALIZATION_TASK
+    if task is None or task.done():
+        task = loop.create_task(asyncio.to_thread(_initialize_backtest_dukascopy_cache))
+        _BACKTEST_DUKASCOPY_INITIALIZATION_TASK = task
+    elif task.get_loop() is not loop:
+        raise BacktestCacheUnavailable("Dukascopy cache initialization belongs to another event loop.")
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        raise BacktestCacheUnavailable("Dukascopy cache initialization timed out. Please try again shortly.") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise BacktestCacheUnavailable(f"Dukascopy cache is unavailable: {type(exc).__name__}: {exc}") from exc
+
+
+async def _initialize_backtest_caches_task() -> KlineCache:
+    started = time.monotonic()
+    logger.warning("backtest cache initialization start")
+    try:
+        result = await asyncio.to_thread(_initialize_backtest_kline_cache)
+    except BaseException as exc:
+        logger.warning(
+            "backtest cache initialization failure duration=%.3fs error=%s: %s",
+            time.monotonic() - started,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+    logger.warning(
+        "backtest cache initialization complete duration=%.3fs",
+        time.monotonic() - started,
+    )
+    return result
+
+
+def _finish_backtest_cache_initialization(task: asyncio.Task) -> None:
+    global _BACKTEST_INITIALIZATION_TASK
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        # The waiter receives the original exception; this also prevents an
+        # unobserved exception warning when every caller timed out.
+        pass
+    if _BACKTEST_INITIALIZATION_TASK is task:
+        _BACKTEST_INITIALIZATION_TASK = None
+
+
+async def initialize_backtest_caches_off_loop() -> KlineCache:
+    """Share one KlineCache initializer across callers and bound each wait."""
+    global _BACKTEST_INITIALIZATION_TASK
+    loop = asyncio.get_running_loop()
+    task = _BACKTEST_INITIALIZATION_TASK
+    if task is None or task.done():
+        task = loop.create_task(_initialize_backtest_caches_task())
+        _BACKTEST_INITIALIZATION_TASK = task
+        task.add_done_callback(_finish_backtest_cache_initialization)
+    elif task.get_loop() is not loop:
+        raise BacktestCacheUnavailable("Backtest cache initialization belongs to another event loop.")
+
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_initialize_backtest_caches),
+            asyncio.shield(task),
             timeout=_BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError as exc:
+        logger.warning(
+            "backtest cache initialization timeout after %.3fs; shared worker continues",
+            _BACKTEST_CACHE_INITIALIZATION_TIMEOUT_SECONDS,
+        )
         raise BacktestCacheUnavailable(
             "Backtest cache initialization timed out. Please try again shortly."
         ) from exc
+    except BacktestCacheUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise BacktestCacheUnavailable(
             f"Backtest cache is unavailable: {type(exc).__name__}: {exc}"
@@ -102,6 +222,9 @@ class Screen:
 class State:
     step: str = "mode"
     ladder: str = ""
+    data_source: str = "binance"
+    price_side: str = "bid"
+    provider_instrument: str = ""
     market: str = ""
     requested: str = ""
     symbol: str = ""
@@ -111,6 +234,8 @@ class State:
     day: Optional[int] = None
     month: Optional[int] = None
     year: Optional[int] = None
+    end_mode: str = "today"
+    end_date: Optional[date] = None
     awaiting_text: Optional[str] = None
 
 
@@ -134,6 +259,7 @@ class BacktestWizard:
         labels = {
             "loading_cache": "Checking Historical Cache",
             "downloading_gaps": "Downloading Gaps",
+            "validating": "Validating Historical Data",
             "cache_ready": "Historical Data Ready",
             "backtest": "Running Backtest",
             "acquiring_aggtrades": "Acquiring Aggressive Trade Data",
@@ -256,7 +382,14 @@ class BacktestWizard:
 
     def open(self, key: Tuple[Any, ...]) -> Screen:
         self._states[key] = State()
-        return self._screen_ladder()
+        return self._screen_source()
+
+    def _screen_source(self) -> Screen:
+        return Screen(
+            "Choose historical data source:",
+            [[_button("Binance", "source:binance"), _button("Dukascopy", "source:dukascopy")], self._nav()],
+            "source",
+        )
 
     def _screen_ladder(self) -> Screen:
         return Screen(
@@ -268,6 +401,23 @@ class BacktestWizard:
                 self._nav(),
             ],
             "ladder",
+        )
+
+    def _screen_dukascopy_symbol(self) -> Screen:
+        return Screen(
+            "Choose Dukascopy instrument:",
+            [[_button("BTC/USD", "dsymbol:btcusd"), _button("XAU/USD", "dsymbol:xauusd")],
+             [_button("XAG/USD", "dsymbol:xagusd"), _button("EUR/USD", "dsymbol:eurusd")],
+             [_button("USD/JPY", "dsymbol:usdjpy"), _button("Other", "dsymbol:other")],
+             self._nav("ladder")],
+            "dukascopy_symbol",
+        )
+
+    def _screen_dukascopy_side(self) -> Screen:
+        return Screen(
+            "Choose Dukascopy replay price side (Bid / Ask):",
+            [[_button("Bid", "dside:bid"), _button("Ask", "dside:ask")], self._nav("dukascopy_symbol")],
+            "dukascopy_side",
         )
 
     def _screen_market(self) -> Screen:
@@ -315,6 +465,28 @@ class BacktestWizard:
             "percentage",
         )
 
+    def _screen_end_date(self) -> Screen:
+        return Screen(
+            "Choose backtest end date:",
+            [
+                [_button("📅 Today", "end:today")],
+                [_button("📆 Choose End Date", "end:custom")],
+                self._nav("day"),
+            ],
+            "end_date",
+        )
+
+    def _screen_confirm_run(self, st: State) -> Screen:
+        start = datetime(st.year or 2026, st.month or 1, st.day or 1, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        end = "Today" if st.end_mode == "today" else (st.end_date.isoformat() if st.end_date else "")
+        source_line = f"Source: {st.data_source.title()}"
+        market_line = f"Market: {st.market}" if st.data_source == "binance" else f"Price side: {st.price_side.title()}"
+        return Screen(
+            f"Run {st.ladder.upper()} backtest?\n{source_line}\n{st.symbol}\n{market_line}\nPercentage: {st.percentage:g}\nStart: {start}\nEnd: {end}",
+            [[_button("▶️ Run backtest", "run")], self._nav("end_date")],
+            "confirm_run",
+        )
+
     def handle_callback(self, key: Tuple[Any, ...], suffix: str) -> Screen:
         st = self._state(key)
         if suffix == "exit":
@@ -323,6 +495,8 @@ class BacktestWizard:
             target = suffix.split(":", 1)[1]
             if target == "symbol": return self._screen_symbol()
             if target == "instrument" and st.symbol:
+                if st.data_source == "dukascopy":
+                    return self._screen_dukascopy_side()
                 return Screen(
                     f"Confirm instrument:\n\n{st.display}\nPrice: {st.price}\nMarket: {st.market}",
                     [[_button(f"✅ {st.symbol} @ {st.price}", "confirm:instrument")], self._nav("symbol")],
@@ -332,14 +506,32 @@ class BacktestWizard:
             if target == "day":
                 st.awaiting_text = "day"
                 return Screen("Enter start day of month (1–31):", [self._nav("pct")], "await_day")
+            if target == "end_date": return self._screen_end_date()
             if target == "market": return self._screen_market()
+            return self._screen_ladder()
+        if suffix.startswith("source:"):
+            st.data_source = suffix.split(":", 1)[1]
             return self._screen_ladder()
         if suffix.startswith("ladder:"):
             st.ladder = suffix.split(":",1)[1]
+            if st.data_source == "dukascopy":
+                return self._screen_dukascopy_symbol()
             return self._screen_market()
         if suffix.startswith("market:"):
             st.market = suffix.split(":",1)[1]
             return self._screen_symbol()
+        if suffix.startswith("dsymbol:"):
+            sym = suffix.split(":", 1)[1]
+            if sym == "other":
+                st.awaiting_text = "dukascopy_symbol"
+                return Screen("Type a validated Dukascopy instrument (example: EURUSD).", [self._nav("dukascopy_symbol")], "await_dukascopy_symbol")
+            st.provider_instrument = sym.lower().replace("/", "")
+            st.symbol = st.provider_instrument.upper()
+            st.display = st.provider_instrument.upper()
+            return self._screen_dukascopy_side()
+        if suffix.startswith("dside:"):
+            st.price_side = suffix.split(":", 1)[1]
+            return self._screen_percentage()
         if suffix.startswith("symbol:"):
             sym = suffix.split(":",1)[1]
             if sym == "other":
@@ -361,6 +553,14 @@ class BacktestWizard:
                 return self._screen_percentage()
             st.awaiting_text = "day"
             return Screen(f"Percentage set to {st.percentage:g}.\n\nEnter start day of month (1–31):", [self._nav("pct")], "await_day")
+        if suffix == "end:today":
+            st.end_mode = "today"
+            st.end_date = None
+            return self._screen_confirm_run(st)
+        if suffix == "end:custom":
+            st.end_mode = "custom"
+            st.awaiting_text = "end_date"
+            return Screen("Enter end date (YYYY-MM-DD):", [self._nav("end_date")], "await_end_date")
         if suffix.startswith("month:"):
             st.month = int(suffix.split(":",1)[1])
             st.awaiting_text = "year"
@@ -375,6 +575,15 @@ class BacktestWizard:
         if not what:
             return None
         text = (text or "").strip()
+        if what == "dukascopy_symbol":
+            st.awaiting_text = None
+            normalized = text.strip().upper().replace("/", "")
+            if not normalized or not normalized.isalnum():
+                return Screen("Invalid Dukascopy instrument. Type a symbol like EURUSD:", [self._nav("dukascopy_symbol")], "await_dukascopy_symbol")
+            st.provider_instrument = normalized.lower()
+            st.symbol = normalized
+            st.display = normalized
+            return self._screen_dukascopy_side()
         if what == "symbol":
             st.awaiting_text = None
             return self._resolve_and_price(st, text)
@@ -406,64 +615,129 @@ class BacktestWizard:
                 datetime(year, st.month or 1, st.day or 1, 0, 1, tzinfo=timezone.utc)
             except Exception:
                 return Screen("Invalid year/date. Enter a valid year (example: 2026):", [self._nav("day")], "await_year")
+            start_date = date(year, st.month or 1, st.day or 1)
+            if start_date > _today_utc():
+                return Screen("Start date cannot be in the future. Enter a valid year:", [self._nav("day")], "await_year")
             st.year = year; st.awaiting_text = None
-            start = datetime(st.year, st.month or 1, st.day or 1, 0, 1, tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
-            return Screen(f"Run {st.ladder.upper()} backtest?\n{st.symbol} {st.market}\nPercentage: {st.percentage:g}\nStart: {start}", [[_button("▶️ Run backtest", "run")], self._nav("day")], "confirm_run")
+            return self._screen_end_date()
+        if what == "end_date":
+            try:
+                end_date = datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                return Screen("Invalid end date. Use YYYY-MM-DD:", [self._nav("end_date")], "await_end_date")
+            start_date = date(st.year or 2026, st.month or 1, st.day or 1)
+            if end_date > _today_utc():
+                return Screen("End date cannot be in the future. Use YYYY-MM-DD:", [self._nav("end_date")], "await_end_date")
+            if end_date < start_date:
+                return Screen("End date must be on or after the start date. Use YYYY-MM-DD:", [self._nav("end_date")], "await_end_date")
+            st.end_date = end_date
+            st.end_mode = "custom"
+            st.awaiting_text = None
+            return self._screen_confirm_run(st)
         return None
 
     def _run_backtest(self, st: State, *, on_progress=None) -> Screen:
-        cache, aggtrade_cache = _initialize_backtest_caches()
-        start_dt = datetime(st.year or 2026, st.month or 1, st.day or 1, 0, 1, tzinfo=timezone.utc)
+        now = _now_utc()
+        start_dt = datetime(st.year or 2026, st.month or 1, st.day or 1, tzinfo=timezone.utc)
+        if start_dt > now:
+            return Screen("Start date cannot be in the future.", [self._nav("end_date")], "error")
+        start_ms = int(start_dt.timestamp() * 1000)
+        if st.end_mode == "today":
+            if st.data_source == "dukascopy":
+                # Dukascopy daily artifacts are not complete/published for the
+                # current UTC day. Use the preceding fully closed UTC day.
+                end_dt = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+                effective_end_label = (now.date() - timedelta(days=1)).isoformat()
+            else:
+                end_dt = now
+                effective_end_label = end_dt.isoformat().replace("+00:00", "Z")
+            end_label = "Today"
+        else:
+            if st.end_date is None:
+                return Screen("Choose a valid end date before running.", [self._nav("end_date")], "error")
+            if st.end_date > now.date():
+                return Screen("End date cannot be in the future.", [self._nav("end_date")], "error")
+            end_dt = datetime.combine(st.end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+            end_label = st.end_date.isoformat()
+            effective_end_label = end_label
+        end_ms = int(end_dt.timestamp() * 1000)
+        if end_ms <= start_ms:
+            return Screen("End date must be on or after the start date.", [self._nav("end_date")], "error")
+        logger.warning(
+            "backtest initiation instrument=%s source=%s price_side=%s direction=%s percentage=%s requested_start=%s requested_end=%s effective_start=%s effective_end_exclusive=%s",
+            st.provider_instrument or st.symbol,
+            st.data_source,
+            st.price_side.upper() if st.data_source == "dukascopy" else "n/a",
+            st.ladder,
+            st.percentage,
+            start_dt.date().isoformat(),
+            end_label,
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+        )
         sides = [Side.BUY, Side.SELL] if st.ladder == "both" else ([Side.BUY] if st.ladder == "buy" else [Side.SELL])
         total_sides = max(1, len(sides))
-        if on_progress:
-            on_progress(
-                {
-                    "stage": "download",
-                    "pct": 0.0,
-                    "bars_done": 0,
-                    "bars_est": 1,
-                    "stats": {"path": str(cache.path), "bars_total": 0},
-                    "detail": "Loading cached candles",
-                }
-            )
-        candles = _fetch_klines(
-            st.symbol, st.market, int(start_dt.timestamp() * 1000), cache=cache, on_progress=on_progress
-        )
+        aggtrade_cache: Optional[AggTradeCache] = None
+        if st.data_source == "dukascopy":
+            cache = _initialize_backtest_dukascopy_cache()
+            provider = DukascopyProvider(cache, fetch_artifact=_fetch_dukascopy_artifact, refresh_tail_days=0)
+            try:
+                candles = provider.fetch_range(
+                    HistoricalRequest(st.provider_instrument or st.symbol, start_ms, end_ms, st.price_side),
+                    on_progress=on_progress,
+                )
+            except DukascopyInvalidRangeError as exc:
+                return Screen(f"Invalid historical interval: {exc}", [self._nav("end_date")], "error")
+            except DukascopyNoDataError as exc:
+                if exc.reason == "verified_closure_only":
+                    message = "No replay data: the requested interval contains only verified market-closure days."
+                else:
+                    message = "No verified Dukascopy candles are available for the requested interval."
+                return Screen(
+                    f"{message}\nRequested end: {end_label}\nEffective replay end: {effective_end_label}",
+                    [self._nav("end_date")],
+                    "error",
+                )
+            source_label = "Dukascopy"
+            market_label = f"{st.price_side.title()} prices"
+        else:
+            cache = _initialize_backtest_kline_cache()
+            if _BACKTEST_AGGRESSOR_SOURCE == "aggtrade":
+                aggtrade_cache = _initialize_backtest_aggtrade_cache()
+            if on_progress:
+                on_progress({"stage": "download", "pct": 0.0, "bars_done": 0, "bars_est": 1, "stats": {"path": str(cache.path), "bars_total": 0}, "detail": "Loading cached Binance candles"})
+            candles = _fetch_klines(st.symbol, st.market, start_ms, end_ms, cache=cache, on_progress=on_progress)
+            source_label = "Binance"
+            market_label = st.market
         if not candles:
-            return Screen("No Binance candles returned for that request.", [self._nav("symbol")], "error")
-        stats = cache.stats_for(st.symbol, _BACKTEST_TIMEFRAME, market="futures" if st.market == "futures" else "spot")
+            return Screen(f"No {source_label} candles returned for that request.", [self._nav("symbol")], "error")
+        stats_for = getattr(cache, "stats_for", None)
+        if st.data_source == "binance" and callable(stats_for):
+            stats = stats_for(st.symbol, _BACKTEST_TIMEFRAME, market="futures" if st.market == "futures" else "spot")
+        else:
+            stats = {"path": str(cache.path), "bars": len(candles)}
         if on_progress:
-            on_progress(
-                {
-                    "stage": "backtest",
-                    "pct": 0.0,
-                    "bars_done": 0,
-                    "bars_est": total_sides,
-                    "stats": stats,
-                    "detail": "Running replay",
-                }
-            )
+            on_progress({"stage": "backtest", "provider": st.data_source, "pct": 0.0, "bars_done": 0, "bars_est": total_sides, "stats": stats, "detail": "Running replay"})
         start_iso = datetime.fromtimestamp(int(candles[0][0]) / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         end_iso = datetime.fromtimestamp(int(candles[-1][0]) / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-        parts=[f"Backtest complete: {st.symbol} {st.market}\nPercentage: {st.percentage:g}\nData: {start_iso} → {end_iso}\nCandles: {len(candles):,}\nCache: {stats['path']}\nCached bars: {stats['bars']}\n"]
-        attachments=[]
+        parts = [f"Backtest complete: {st.symbol} {market_label}\nSource: {source_label}\nPercentage: {st.percentage:g}\nRequested end: {end_label}\nEffective replay end: {effective_end_label}\nData: {start_iso} → {end_iso}\nCandles: {len(candles):,}\nCache: {stats['path']}\nCached bars: {stats.get('bars', len(candles)):,}\n"]
+        if st.data_source == "dukascopy":
+            parts.append("Dukascopy volume only; Binance taker-buy aggressive-flow metrics unavailable.")
+        attachments = []
         for idx, side in enumerate(sides, start=1):
             if on_progress:
-                on_progress(
-                    {
-                        "stage": "backtest",
-                        "pct": min(100.0, 100.0 * idx / total_sides),
-                        "bars_done": idx,
-                        "bars_est": total_sides,
-                        "stats": stats,
-                        "detail": f"Running {idx}/{total_sides} sides",
-                    }
-                )
-            result = _summarize_side(candles, side, st.symbol, st.market, st.percentage, aggtrade_cache=aggtrade_cache)
+                on_progress({"stage": "backtest", "provider": st.data_source, "pct": min(100.0, 100.0 * idx / total_sides), "bars_done": idx, "bars_est": total_sides, "stats": stats, "detail": f"Running {idx}/{total_sides} sides"})
+            result = _summarize_side(
+                candles,
+                side,
+                st.symbol,
+                market_label,
+                st.percentage,
+                data_source=st.data_source,
+                aggtrade_cache=aggtrade_cache,
+            )
             parts.append(result["text"])
             attachments.append(result["svg"])
-        self.reset(_DUMMY_KEY) if False else None
         return Screen("\n\n".join(parts), [[_button("New backtest", "restart"), _button("Exit", "exit")]], "done", attachments)
 
 
@@ -478,15 +752,26 @@ def _fetch_json(base: str, path: str, params: Dict[str, Any]):
         return json.loads(resp.read().decode())
 
 
-def _fetch_klines(symbol: str, market: str, start_ms: int, *, cache: KlineCache, on_progress=None):
-    end = int(datetime.now(timezone.utc).timestamp() * 1000)
+def _dukascopy_artifact_url(instrument: str, day, side: str) -> str:
+    month0 = int(day.month) - 1
+    return f"https://datafeed.dukascopy.com/datafeed/{instrument.upper()}/{day.year}/{month0:02d}/{day.day:02d}/{side.upper()}_candles_min_1.bi5"
+
+
+def _fetch_dukascopy_artifact(instrument: str, day, side: str) -> bytes:
+    url = _dukascopy_artifact_url(instrument, day, side)
+    req = urllib.request.Request(url, headers={"User-Agent": "HermesBacktest/1.0"})
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310 public HTTPS datafeed
+        return resp.read()
+
+
+def _fetch_klines(symbol: str, market: str, start_ms: int, end_ms: int, *, cache: KlineCache, on_progress=None):
     source_market = "futures" if market == "futures" else "spot"
     if on_progress:
         on_progress(
             {
                 "stage": "download",
                 "bars_done": 0,
-                "bars_est": max(1, (end - int(start_ms)) // 60_000),
+                "bars_est": max(1, (int(end_ms) - int(start_ms)) // 60_000),
                 "stats": {"path": str(cache.path), "bars_total": 0},
                 "detail": "Loading cached candles",
             }
@@ -496,14 +781,14 @@ def _fetch_klines(symbol: str, market: str, start_ms: int, *, cache: KlineCache,
         symbol,
         _BACKTEST_TIMEFRAME,
         int(start_ms),
-        end,
+        int(end_ms),
         cache=cache,
         policy=CachePolicy.AUTO,
         refresh_tail_ms=_BACKTEST_REFRESH_TAIL_MS,
         base_url=base_url,
         fetch=None,
         sleep_s=0.015,
-        closed_only_before_ms=end,
+        closed_only_before_ms=int(end_ms),
         market=source_market,
         on_progress=on_progress,
     )
@@ -813,7 +1098,9 @@ def _aggressor_metrics_from_candles(
         if end is not None and ts >= end:
             continue
         base = _safe_float(k[5])
-        if base <= 0:
+        if base <= 0 or len(k) <= 10:
+            # Older test/cache rows may omit Binance taker-buy fields. The
+            # replay remains valid, but candle-derived flow is unavailable.
             continue
         tbb = _safe_float(k[9])
         tbq = _safe_float(k[10])
@@ -938,7 +1225,11 @@ def _per_step_aggressor_table(candles, state) -> Dict[int, Dict[str, Any]]:
 
 
 def _aggressor_summary_lines_v2(
-    *, ladder: Dict[str, Any], step: Dict[str, Any], side: Side
+    *,
+    ladder: Dict[str, Any],
+    step: Dict[str, Any],
+    side: Side,
+    metric_source: str = "candle",
 ) -> List[str]:
     """Canonical /backtest aggressive-flow summary lines (File 2 §7).
 
@@ -963,9 +1254,14 @@ def _aggressor_summary_lines_v2(
             return f"{label}: nan"
         return f"{label}: {_fmt_delta(v)}"
 
+    source_label = (
+        "exact trade-level AggTrade data"
+        if metric_source == "aggtrade"
+        else "candle-derived OHLCV estimate; not exact trade-level data"
+    )
     lines = [
         "",
-        "AGGRESSIVE FLOW (canonical /backtest, base volume)",
+        f"AGGRESSIVE FLOW ({source_label})",
         "",
         "Whole Ladder (P0 -> now)",
         _line("  Buy VWAP", ladder, "buy_vwap"),
@@ -1180,10 +1476,9 @@ def _summarize_side(
     market: str,
     percentage: float,
     *,
+    data_source: str = "binance",
     aggtrade_cache: Optional[AggTradeCache] = None,
 ):
-    if aggtrade_cache is None:
-        _, aggtrade_cache = _initialize_backtest_caches()
     result = run_finite_backtest(
         candles,
         side=side,
@@ -1204,37 +1499,53 @@ def _summarize_side(
     step_poc = result.metric_display.step_poc
     ladder_val = result.metric_display.ladder_val
     ladder_vah = result.metric_display.ladder_vah
-    ladder_start_ts = _active_ladder_start_ts(result.engine.state)
-    step_start_ts = _active_step_start_ts(result.engine.state)
-    aggtrade_end_ts = int(candles[-1][0]) + 60_000 - 1
     ladder_window = {"all_vwap": ladder_vwap}
     step_window = {"all_vwap": step_vwap}
-    ladder_aggressor, step_aggressor, agg_meta = _aggtrade_aggressor_metrics_for_display(
-        aggtrade_cache,
-        market,
-        symbol,
-        ladder_start_ts,
-        step_start_ts,
-        aggtrade_end_ts,
-    )
-    per_step_aggressor: Dict[int, Dict[str, Any]] = {}
-    step_delta_ratios: Dict[int, float | None] = {}
-    if agg_meta.get("covered"):
-        try:
-            per_step_aggressor = _per_step_aggressor_table_from_cache(
-                aggtrade_cache,
-                market,
-                symbol,
-                result.engine.state,
-                aggtrade_end_ts,
-            )
-            step_delta_ratios = {
-                int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
-            }
-        except Exception as exc:
-            logger.warning("aggTrade per-step display unavailable for %s %s: %s", market, symbol, exc)
+    if data_source == "dukascopy":
+        ladder_aggressor = _unavailable_aggressor("DUKASCOPY_TAKER_SIDE_UNAVAILABLE")
+        step_aggressor = _unavailable_aggressor("DUKASCOPY_TAKER_SIDE_UNAVAILABLE")
+        per_step_aggressor = {}
+    elif aggtrade_cache is not None:
+        ladder_start_ts = _active_ladder_start_ts(result.engine.state)
+        step_start_ts = _active_step_start_ts(result.engine.state)
+        aggtrade_end_ts = int(candles[-1][0]) + 60_000 - 1
+        ladder_aggressor, step_aggressor, agg_meta = _aggtrade_aggressor_metrics_for_display(
+            aggtrade_cache,
+            market,
+            symbol,
+            ladder_start_ts,
+            step_start_ts,
+            aggtrade_end_ts,
+        )
+        per_step_aggressor: Dict[int, Dict[str, Any]] = {}
+        if agg_meta.get("covered"):
+            try:
+                per_step_aggressor = _per_step_aggressor_table_from_cache(
+                    aggtrade_cache,
+                    market,
+                    symbol,
+                    result.engine.state,
+                    aggtrade_end_ts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "aggTrade per-step display unavailable for %s %s: %s",
+                    market,
+                    symbol,
+                    exc,
+                )
+    else:
+        # Keep production's candle-derived path as a compatibility fallback for
+        # callers that do not provide an AggTrade cache.
+        ladder_aggressor = _ladder_aggressor_metrics_from_candles(candles, result.engine.state)
+        step_aggressor = _active_step_aggressor_metrics_from_candles(candles, result.engine.state)
+        per_step_aggressor = _per_step_aggressor_table(candles, result.engine.state)
+    step_delta_ratios: Dict[int, float | None] = {
+        int(s): row.get("delta_ratio") for s, row in per_step_aggressor.items()
+    }
     last = float(candles[-1][4])
     label = "BUY" if side is Side.BUY else "SELL"
+    history_source = "candle-derived " if data_source == "binance" and aggtrade_cache is None else ""
     lines = [
         f"{label} ladder",
         f"Cycle: {payload.get('cycle_id')}  Completed: {payload.get('closed_count')}",
@@ -1243,14 +1554,19 @@ def _summarize_side(
         f"TP/P(n-1): {_fmt(float(pnm1)) if pnm1 is not None else 'nan'}",
         f"Next P{n+1}: {_fmt(float(pn1)) if pn1 is not None else 'nan'}",
         f"P{n+2}: {_fmt(float(pn2)) if pn2 is not None else 'nan'}",
-        *_aggressor_summary_lines(side, ladder_window, step_window, ladder_aggressor, step_aggressor),
-        *_aggressor_summary_lines_v2(ladder=ladder_aggressor, step=step_aggressor, side=side),
+        *( ["Dukascopy volume only; Binance taker-buy aggressive-flow metrics unavailable."] if data_source == "dukascopy" else _aggressor_summary_lines(side, ladder_window, step_window, ladder_aggressor, step_aggressor) ),
+        *( [] if data_source == "dukascopy" else _aggressor_summary_lines_v2(
+            ladder=ladder_aggressor,
+            step=step_aggressor,
+            side=side,
+            metric_source="aggtrade" if aggtrade_cache is not None else "candle",
+        ) ),
         f"Ladder POC: {_fmt(float(ladder_poc)) if ladder_poc is not None else 'nan'}",
         f"Ladder Value Area: {_fmt(float(ladder_val)) if ladder_val is not None else 'nan'} → {_fmt(float(ladder_vah)) if ladder_vah is not None else 'nan'}",
         f"Step POC: {_fmt(float(step_poc)) if step_poc is not None else 'nan'}",
         f"Last close: {_fmt(last)}",
         "",
-        "Per-step aggressive-flow history (L = ladder cumulative, S = step window):",
+        f"Per-step {history_source}aggressive-flow history (L = ladder cumulative, S = step window):",
     ]
     # Append a compact per-step table.
     if per_step_aggressor:
@@ -1625,6 +1941,7 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
         try: await query.answer()
         except Exception: pass
         msg=getattr(query,"message",None); key=_chat_key_from_message(msg)
+        progress_terminal = False
         if suffix == "restart":
             screen=_WIZARD.open(key)
         elif suffix == "run":
@@ -1663,13 +1980,18 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Working…", callback_data="backtest:run")]])
                 async def _update():
                     async with progress_lock:
+                        if progress_terminal:
+                            return
                         try:
                             await query.edit_message_text(text, reply_markup=kb)
                         except Exception:
                             pass
                 asyncio.run_coroutine_threadsafe(_update(), loop)
             try:
-                await initialize_backtest_caches_off_loop()
+                if _WIZARD._state(key).data_source == "dukascopy":
+                    await initialize_backtest_dukascopy_cache_off_loop()
+                else:
+                    await initialize_backtest_caches_off_loop()
             except BacktestCacheUnavailable as exc:
                 screen = Screen(
                     str(exc),
@@ -1683,6 +2005,7 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
         else:
             screen=await asyncio.to_thread(_WIZARD.handle_callback,key,suffix)
         try:
+            progress_terminal = True
             from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup
         except Exception:
             class InlineKeyboardButton:  # type: ignore
@@ -1716,19 +2039,26 @@ async def handle_backtest_callback(adapter: Any, query: Any, data: str) -> None:
                 doc=getattr(adapter,"send_document",None)
                 if callable(doc): await doc(chat_id=cid,file_path=path,caption=Path(path).name,metadata=_metadata_from_message(msg))
     except Exception as exc:
+        progress_terminal = True
         logger.error("backtest callback failed: %s", exc, exc_info=True)
         try:
             msg = getattr(query, "message", None)
             cid = _chat_id_from_message(msg)
-            error_text = f"Backtest failed:\n{type(exc).__name__}: {exc}"
+            error_text = (
+                f"Backtest failed:\n{type(exc).__name__}: {exc}\n\n"
+                "Completed cached history is preserved; retry will download only missing coverage."
+            )
             if getattr(query, "edit_message_text", None):
                 try:
                     await query.edit_message_text(error_text, reply_markup=None)
                     return
-                except Exception:
-                    pass
+                except Exception as edit_exc:
+                    logger.warning("backtest terminal edit failed; sending new failure message error=%s", type(edit_exc).__name__)
             if cid:
-                await _send_screen(adapter, cid, Screen(error_text, [ _WIZARD._screen_ladder().buttons[-1] ], "error"), metadata=_metadata_from_message(msg))
+                try:
+                    await _send_screen(adapter, cid, Screen(error_text, [_WIZARD._screen_ladder().buttons[-1]], "error"), metadata=_metadata_from_message(msg))
+                except Exception as send_exc:
+                    logger.error("backtest terminal failure message send failed error=%s", type(send_exc).__name__)
         except Exception:
             pass
 

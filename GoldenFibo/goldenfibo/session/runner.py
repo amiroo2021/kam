@@ -37,10 +37,11 @@ def run_ohlc_on_engine(
     event_log: Optional[EventLog] = None,
     progress_every: int = 0,
     on_progress: Optional[ProgressCb] = None,
+    max_events: int | None = None,
 ) -> HistRunResult:
     """Apply OHLC-derived MarketEvents to an existing engine (no new engine object)."""
     cfg = engine.config
-    events = collect_ohlc_events(candles, cfg, mode=mode)
+    events = collect_ohlc_events(candles, cfg, mode=mode, max_events=max_events)
     domain: List[DomainEvent] = []
     total = len(events)
     for i, ev in enumerate(events):

@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from goldenfibo.marketdata.dukascopy_provider import DukascopyProviderError
 from plugins.trade import backtest_wizard as wizard
 
 
@@ -23,16 +24,25 @@ class _DummyQuery:
         self.edits.append(text)
 
 
+class _FailingEditQuery(_DummyQuery):
+    async def edit_message_text(self, text: str, reply_markup=None) -> None:
+        raise RuntimeError("edit failed")
+
+
 class BacktestCallbackFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_backtest_failure_is_visible_to_user(self) -> None:
         query = _DummyQuery()
         adapter = SimpleNamespace(send_inline_keyboard=None, send=None, send_image_file=None, send_document=None)
         with mock.patch.object(wizard, "initialize_backtest_caches_off_loop", new=mock.AsyncMock()), mock.patch.object(
-            wizard._WIZARD, "_run_backtest", side_effect=RuntimeError("boom")
+            wizard._WIZARD,
+            "_run_backtest",
+            side_effect=DukascopyProviderError("Dukascopy xauusd 2026-01-12 failed: timeout"),
         ):
             await wizard.handle_backtest_callback(adapter, query, "backtest:run")
         self.assertTrue(query.answered)
         self.assertTrue(any("Backtest failed:" in text for text in query.edits), query.edits)
+        self.assertTrue(any("2026-01-12" in text for text in query.edits), query.edits)
+        self.assertTrue(any("completed cached history is preserved" in text.lower() for text in query.edits), query.edits)
 
     async def test_cache_initialization_failure_is_visible_without_running_backtest(self) -> None:
         query = _DummyQuery()
@@ -45,6 +55,21 @@ class BacktestCallbackFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(query.answered)
         self.assertFalse(run_backtest.called)
         self.assertTrue(any("cache initialization timed out" in text.lower() for text in query.edits), query.edits)
+
+    async def test_failure_sends_new_message_when_progress_edit_fails(self) -> None:
+        query = _FailingEditQuery()
+        sent: list[str] = []
+
+        async def send_inline_keyboard(**kwargs):
+            sent.append(kwargs["text"])
+
+        adapter = SimpleNamespace(send_inline_keyboard=send_inline_keyboard, send=None, send_image_file=None, send_document=None)
+        with mock.patch.object(wizard, "initialize_backtest_caches_off_loop", new=mock.AsyncMock()), mock.patch.object(
+            wizard._WIZARD, "_run_backtest", side_effect=RuntimeError("terminal failure")
+        ):
+            await wizard.handle_backtest_callback(adapter, query, "backtest:run")
+        self.assertTrue(any("Backtest failed:" in text for text in sent), sent)
+        self.assertTrue(any("completed cached history is preserved" in text.lower() for text in sent), sent)
 
 
 if __name__ == "__main__":

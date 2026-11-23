@@ -71,8 +71,7 @@ class BacktestYearRoutingTests(unittest.TestCase):
         self.assertTrue(adapter.sent)
         sent = adapter.sent[-1]
         self.assertEqual(sent[0], "123")
-        self.assertIn("Run SELL backtest?", sent[1])
-        self.assertIn("Start: 2026-06-01T00:01:00Z", sent[1])
+        self.assertIn("Choose backtest end date:", sent[1])
 
     def test_invalid_year_stays_on_year_prompt(self) -> None:
         msg = _DummyMsg("/backtest", thread_id=456)
@@ -97,8 +96,7 @@ class BacktestYearRoutingTests(unittest.TestCase):
         self.assertTrue(adapter.sent)
         sent = adapter.sent[-1]
         self.assertEqual(sent[0], "123")
-        self.assertIn("Run SELL backtest?", sent[1])
-        self.assertIn("Start: 2026-06-01T00:01:00Z", sent[1])
+        self.assertIn("Choose backtest end date:", sent[1])
 
     def test_thread_none_and_threaded_sessions_do_not_collide(self) -> None:
         msg_none = _DummyMsg("/backtest", thread_id=None)

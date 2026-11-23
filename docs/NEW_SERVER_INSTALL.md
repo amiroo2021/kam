@@ -150,6 +150,15 @@ Backtest source lives under:
 Behavior to preserve:
 
 - canonical cached 1-minute candles drive the run
+- Binance and Dukascopy use separate SQLite caches
+- Binance defaults to candle-derived aggressive-flow metrics and therefore does
+  not open the large AggTrade cache during an ordinary replay
+- set `GOLDENFIBO_BACKTEST_AGGRESSOR_SOURCE=aggtrade` only when GitHub's
+  trade-level AggTrade metrics are explicitly required; accepted values are
+  `candle` (default) and `aggtrade`
+- optional cache overrides are
+  `GOLDENFIBO_BACKTEST_BINANCE_CACHE_PATH` and
+  `GOLDENFIBO_BACKTEST_DUKASCOPY_CACHE_PATH`
 - detailed text summary is returned
 - ladder image is returned
 - no Step Value Area requirement
@@ -187,6 +196,7 @@ WebChat is the clean upstream Hermes WebUI clone:
 - systemd unit: `webchat.service`
 - port: `9000`
 - checkout root: `/opt/hermes-webui`
+- upstream repository: `https://github.com/nesquena/hermes-webui.git`
 
 Unit template source:
 
@@ -199,6 +209,75 @@ Environment:
 - `WEB_PASSWORD=<set manually>`
 - `WEB_HINT=<set manually>`
 - `HERMES_WEBUI_STATE_DIR=/root/.hermes/webui`
+
+### 10.1 WebChat is NOT part of this repository
+
+The WebUI is deliberately kept in its own upstream repository. KAM does not
+fork it, vendor it, or patch it. The live `/opt/hermes-webui` checkout must be
+a pristine clone with **zero local modifications**:
+
+```
+cd /opt/hermes-webui
+git status --porcelain      # MUST print nothing
+```
+
+If that prints anything, the checkout has drifted and must be re-cloned from
+upstream rather than repaired locally.
+
+### 10.2 Clone the WebUI at the tested revision
+
+The revision KAM was verified against is pinned in
+`installer/webui_revision.json`. Clone and check out exactly that revision —
+do **not** track upstream `main`, because upstream moves and an unpinned
+clone will silently change behaviour on the next `git pull`.
+
+```
+git clone https://github.com/nesquena/hermes-webui.git /opt/hermes-webui
+cd /opt/hermes-webui
+git checkout <revision from installer/webui_revision.json>
+pip install -r requirements.txt
+```
+
+To move to a newer upstream revision later, update
+`installer/webui_revision.json` in the same commit that changes the pin, and
+re-run the WebChat verification in §15.
+
+### 10.3 Install the systemd unit
+
+`installer/install_webchat.py` is the ONLY entry point allowed to manage
+`webchat.service`. Routine KAM capability install/update
+(`install_trade.py`, `install_trade_capability.py`) MUST NOT touch it — they
+pass `manage_webui=False`.
+
+```
+# Dry-run first
+python3 installer/install_webchat.py --dry-run
+
+# Real install
+python3 installer/install_webchat.py
+```
+
+The script renders `installer/systemd/webchat.service` into
+`/etc/systemd/system/webchat.service`, substituting `__WEBUI_ROOT__`,
+`__HERMES_HOME__`, `__WEBCHAT_PORT__` and `__PYTHON__`, then enables the
+unit. It does not clone the WebUI, does not touch `plugins/trade`, does not
+patch the Telegram adapter, and does not restart the Hermes gateway.
+
+It will NOT start the unit unless a WebChat password is supplied, because the
+WebUI must fail closed without one:
+
+```
+export WEBCHAT_PASSWORD='<set manually>'
+python3 installer/install_webchat.py
+```
+
+### 10.4 What WebChat must never do
+
+- Never modify, disable, or stop `webchat.service` from a KAM trade
+  install/update/uninstall path. `tests/test_installation.py` asserts this.
+- Never be used as a place to carry KAM-specific patches. If the WebUI needs
+  a change, it is an upstream contribution to `nesquena/hermes-webui`, not a
+  commit here.
 
 Health check:
 
@@ -263,6 +342,41 @@ Run these after installation:
 - confirm Hermes gateway is running
 - confirm `/trade` and `/backtest` respond in Telegram
 
+### 15.1 WebChat revision check
+
+The WebUI must be at the pinned revision and must be pristine:
+
+```
+cd /opt/hermes-webui
+git status --porcelain                     # MUST print nothing
+git rev-parse HEAD                         # MUST equal installer/webui_revision.json -> revision
+```
+
+If the revision differs, either re-checkout the pinned revision or update the
+pin in `installer/webui_revision.json` in the same commit that verifies the
+new revision.
+
+### 15.2 Backtest provider check
+
+Both historical backtest sources must be present and importable:
+
+```
+cd /root/kam/GoldenFibo
+PYTHONPATH=. python -c "import goldenfibo.marketdata.dukascopy_provider, goldenfibo.marketdata.binance_provider; print('ok')"
+```
+
+Offline validation of both providers:
+
+```
+cd /root/kam/GoldenFibo
+PYTHONPATH=. python -m pytest -q \
+  tests/test_dukascopy_format.py \
+  tests/test_dukascopy_cache_provider.py \
+  tests/test_dukascopy_authentic_fixture.py \
+  tests/test_dukascopy_xauusd_authentic_fixture.py \
+  tests/test_binance_provider.py
+```
+
 ## 16. Config vs code
 
 Code is in GitHub.
@@ -281,4 +395,12 @@ Secrets must never be committed.
 
 ## 17. Old-server state to preserve in GitHub
 
-The current GitHub source already contains the live /trade, WebTrade, /backtest, WebBacktest, and WebChat integration code and the installer/systemd templates that recreate the services. The new-server job is to supply the private config and persistent data.
+The current GitHub source contains the live /trade, WebTrade, /backtest,
+WebBacktest integration code, the GoldenFibo market-data providers (Binance and
+Dukascopy), and the installer/systemd templates that recreate the services.
+The new-server job is to supply the private config and persistent data.
+
+The one deliberate exception is WebChat: the Hermes WebUI stays in its own
+upstream repository at the revision pinned in
+`installer/webui_revision.json` (see §10). Nothing WebUI-specific is
+committed here, and nothing here may modify the WebUI checkout.
