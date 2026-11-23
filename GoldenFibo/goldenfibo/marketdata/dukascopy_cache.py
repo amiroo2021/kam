@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -131,12 +132,41 @@ class DukascopyKlineCache:
                 db.execute("ALTER TABLE coverage_days ADD COLUMN bid_status TEXT NOT NULL DEFAULT ''")
             if "ask_status" not in columns:
                 db.execute("ALTER TABLE coverage_days ADD COLUMN ask_status TEXT NOT NULL DEFAULT ''")
+            # The backfill runs ONCE, guarded by a migration marker. Running
+            # it on every initialization would re-apply it to every existing
+            # row forever, so a future rename of a status value could
+            # silently rewrite historical coverage.
             db.execute(
-                "UPDATE coverage_days SET bid_status=status WHERE bid_status='' AND bid_complete=1"
+                """
+                CREATE TABLE IF NOT EXISTS cache_migrations (
+                    migration_key TEXT PRIMARY KEY,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    completed_at_ms INTEGER NOT NULL DEFAULT 0
+                )
+                """
             )
-            db.execute(
-                "UPDATE coverage_days SET ask_status=status WHERE ask_status='' AND ask_complete=1"
-            )
+            migration_key = "coverage_days_side_status_v1"
+            migrated = db.execute(
+                "SELECT 1 FROM cache_migrations WHERE migration_key=? AND completed=1",
+                (migration_key,),
+            ).fetchone()
+            if migrated is None:
+                db.execute(
+                    "UPDATE coverage_days SET bid_status=status WHERE bid_status='' AND bid_complete=1"
+                )
+                db.execute(
+                    "UPDATE coverage_days SET ask_status=status WHERE ask_status='' AND ask_complete=1"
+                )
+                db.execute(
+                    """
+                    INSERT INTO cache_migrations(migration_key, completed, completed_at_ms)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(migration_key) DO UPDATE SET
+                        completed=excluded.completed,
+                        completed_at_ms=excluded.completed_at_ms
+                    """,
+                    (migration_key, int(time.time() * 1000)),
+                )
 
     def upsert_side(self, instrument: str, candles: Iterable[DukascopyCandle], *, volume_units: str = "provider") -> int:
         rows = list(candles)
