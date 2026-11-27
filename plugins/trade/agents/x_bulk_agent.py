@@ -7,11 +7,28 @@ Credentials (``.env`` / environment):
   Optional: ``BULK_<ALIAS>_BASE_URL``  default https://mainnet-api1.bulk.trade/api/v1
 
 Reads use unsigned POST /account {type: fullAccount, user}.
-Writes use signed POST /order (new_order, ladder, cancel_order_group, close_position).
+Writes use signed POST /order (new_order, ladder, cancel_order_group, close_position,
+set_tp, set_sl).
 
 Wizard Positions Management lists via operation ``positions_management``,
 which is an alias of the same fullAccount snapshot as ``positions_orders``.
-Bulk-native ``close_position`` is supported; ``set_tp`` / ``set_sl`` are not.
+Bulk-native ``close_position``, ``set_tp`` and ``set_sl`` are supported.
+
+Signing
+-------
+Transactions are signed with the Bulk "wincode" canonical binary format, the
+same layout the official ``bulk-keychain`` SDK produces. The 4 October 2026
+upgrade moved the wire to transaction ``version 12``: the signed message is
+prefixed with ``0c 00 00 00`` (u32 LE version 12) and the JSON envelope
+declares ``"version": 12``. Version 11 (and an omitted version) uses the
+versionless framing ``[u64 count][actions][u64 nonce][32 account][1 domain]``.
+
+The two framings are mutually exclusive: the node selects its parser from the
+envelope's ``version`` field, so v12 bytes sent without ``"version": 12`` are
+parsed as v11 and rejected. Conditional actions (``st``/``tp``) additionally
+carry trailing ``commission``/``slippage`` Option tags that the pre-upgrade
+layout lacked, so a pre-upgrade conditional encoder is rejected under both
+framings.
 """
 
 from __future__ import annotations
@@ -40,6 +57,7 @@ from ..canonical import (
     CanonicalOrderResult,
     CanonicalPortfolioSummary,
     CanonicalPosition,
+    CanonicalPositionActionResult,
     CanonicalResponse,
     make_failure,
     make_success,
@@ -67,6 +85,21 @@ CANCEL_BATCH_SIZE = 50
 CANCEL_BATCH_PAUSE_SECONDS = 5.0
 CANCEL_BATCH_MAX_RETRIES = 3
 CANCEL_BATCH_RETRY_BASE_SECONDS = 5.0
+
+# Bulk transaction wire/signing schema version.
+#
+# The 4 October 2026 upgrade moved the exchange to version 12: the signed
+# message is prefixed with the u32 LE version (0c 00 00 00) and the JSON
+# envelope declares "version": 12. Version 11 (or an omitted version) uses the
+# versionless framing. The node picks its parser from the envelope field, so
+# the signed bytes and the declared version must always agree.
+#
+# Set to None to fall back to the legacy versionless framing (v11). That
+# framing is NOT compatible with conditional (st/tp) actions: the upgraded
+# conditional schema carries trailing commission/slippage Option tags that the
+# pre-upgrade layout lacked, and the node rejects the older encoder under
+# both versions.
+_TRANSACTION_VERSION = 12
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _BASE58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
@@ -174,7 +207,8 @@ def list_accounts() -> list[str]:
 
 def capabilities() -> list[str]:
     # positions_management is the wizard list op (alias of positions_orders).
-    # set_tp / set_sl / close_position are intentionally absent until implemented.
+    # set_tp / set_sl use Bulk's native conditional orders (tp/st) on the
+    # exchange trigger book; close_position submits a reduce-only market order.
     return [
         "balance",
         "positions_orders",
@@ -185,6 +219,8 @@ def capabilities() -> list[str]:
         "resolve_instrument",
         "list_instruments",
         "market_price",
+        "set_tp",
+        "set_sl",
         "close_position",
     ]
 
@@ -290,6 +326,34 @@ def _account_query(credentials: Mapping[str, str], query_type: str = "fullAccoun
         "/account",
         {"type": query_type, "user": str(credentials.get("account_pubkey") or "")},
     )
+
+
+def _conditional_orders(credentials: Mapping[str, str]) -> list[Dict[str, Any]]:
+    """Return every live conditional (trigger-book) order for the account.
+
+    Bulk keeps conditional orders on a separate trigger book. The dedicated
+    ``openOrders`` query is documented to include "conditional orders parked
+    in conditional books", so it is the authoritative source for TP/SL state;
+    the ``fullAccount`` snapshot may not carry them.
+    """
+    payload = _account_query(credentials, "openOrders")
+    rows: list[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            row = item.get("openOrder")
+            rows.append(dict(row) if isinstance(row, dict) else dict(item))
+    elif isinstance(payload, dict):
+        raw = payload.get("openOrders")
+        if isinstance(raw, list):
+            rows.extend(dict(r) for r in raw if isinstance(r, dict))
+        else:
+            for item in payload.get("data") or []:
+                if isinstance(item, dict):
+                    row = item.get("openOrder")
+                    rows.append(dict(row) if isinstance(row, dict) else dict(item))
+    return rows
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -501,10 +565,11 @@ def _portfolio_from_account(full_account: Mapping[str, Any]) -> CanonicalPortfol
 
 
 def _protection_prices_from_orders(full_account: Mapping[str, Any]) -> Dict[tuple[str, str], Dict[str, Any]]:
-    """Derive display TP/SL from Bulk openOrders conditional/reduce-only rows.
+    """Derive display TP/SL from Bulk's conditional (trigger book) rows.
 
-    Keyed by (display_symbol, position_side long|short). For a long, protective
-    sells are TP/SL; for a short, protective buys are TP/SL.
+    Keyed by (display_symbol, position_side long|short). A take profit above
+    the mark protects a long and a stop below it protects a long; a short is
+    the mirror.
     """
     raw_rows = full_account.get("openOrders")
     rows: Iterable[Any] = raw_rows if isinstance(raw_rows, list) else []
@@ -515,12 +580,21 @@ def _protection_prices_from_orders(full_account: Mapping[str, Any]) -> Dict[tupl
         size = _decimal(row.get("size") if row.get("size") is not None else row.get("originalSize"))
         if size == 0:
             continue
-        order_side = "buy" if size > 0 else "sell"
         classification = _classification(str(row.get("orderType") or ""), bool(row.get("reduceOnly")))
         if classification not in {"take_profit", "stop_loss"}:
             continue
-        # Protective order side is opposite the position side.
-        position_side = "long" if order_side == "sell" else "short"
+        # The resting book's size sign is the TRIGGER LEG, not the position
+        # side. The position a conditional protects is identified by the
+        # trigger direction together with the action kind:
+        #   take profit above -> protects a long    (take profit below -> short)
+        #   stop below        -> protects a long    (stop above -> short)
+        is_above = _conditional_is_above(row)
+        if is_above is None:
+            continue
+        if classification == "take_profit":
+            position_side = "long" if is_above else "short"
+        else:
+            position_side = "short" if is_above else "long"
         key = (_display_symbol(row.get("symbol")), position_side)
         bucket = buckets.setdefault(key, {"tp": [], "sl": []})
         price = _plain_decimal(row.get("price") if row.get("price") is not None else row.get("triggerPrice"))
@@ -865,16 +939,82 @@ def _write_scaled(value: Any) -> bytes:
     return struct.pack("<Q", scaled)
 
 
+def _write_scaled_option(value: Any) -> bytes:
+    """Option<scaled f64>: 1-byte tag (0=None, 1=Some) + u64 LE when Some."""
+    if value is None:
+        return b"\x00"
+    return b"\x01" + _write_scaled(value)
+
+
+def _write_option_commission(row: Mapping[str, Any]) -> bytes:
+    """Optional builderCode: absent contributes no bytes, present is
+    tag(1) + recipient pubkey(32) + fee bps(u8)."""
+    code = row.get("builderCode")
+    if not isinstance(code, Mapping):
+        return b"\x00"
+    recipient = str(code.get("to") or "").strip()
+    if not recipient:
+        return b"\x00"
+    fee = int(code.get("fee") or 0)
+    if fee < 1 or fee > 15:
+        raise ValueError("Bulk builder-code fee must be 1..=15 bps")
+    return b"\x01" + _b58decode(recipient) + struct.pack("<B", fee)
+
+
+def _write_conditional_action(discriminant: int, row: Mapping[str, Any]) -> bytes:
+    """Encode a conditional action (``st``=5 / ``tp``=6).
+
+    Layout (canonical wincode, matching bulk-keychain v0.1.32):
+        disc u32 LE | symbol (u64 len + utf8) | d u8 | size u64 scaled
+        | threshold u64 scaled | limit Option<scaled> | iso u8
+        | commission Option | slippage Option<scaled>
+
+    ``d`` is the TRIGGER DIRECTION (true = at/above the threshold, false =
+    at/below). The official SDK calls this field ``is_buy``, which is
+    misleading: Bulk gives each action type its own meaning for ``d`` and
+    for ``st``/``tp`` it selects the trigger direction. The exchange executes
+    a fired conditional as a reduce-only close against the position, so the
+    executed side is always protective.
+
+    A conditional that is already satisfied when it is submitted fires
+    immediately and is then cancelled as IOC, so the trigger price must be
+    placed on the side of the market that has not been reached yet.
+    """
+    symbol = str(row.get("c") or "").strip()
+    if not symbol:
+        raise ValueError("Bulk conditional action requires a symbol")
+    size = _write_scaled(row.get("sz"))
+    threshold = _write_scaled(row.get("tr"))
+    limit = row.get("lim")
+    limit_bytes = b"\x00" if limit is None else b"\x01" + _write_scaled(limit)
+    commission_bytes = _write_option_commission(row)
+    slippage = row.get("slippage")
+    slippage_bytes = b"\x00" if slippage is None else b"\x01" + _write_scaled(slippage)
+    return b"".join([
+        struct.pack("<I", discriminant),
+        _write_string(symbol),
+        _write_bool(bool(row.get("d"))),
+        size,
+        threshold,
+        limit_bytes,
+        _write_bool(bool(row.get("i", False))),
+        commission_bytes,
+        slippage_bytes,
+    ])
+
+
 def _encode_action(action: Mapping[str, Any]) -> bytes:
     if "m" in action:
         row = action["m"]
         return b"".join([
             struct.pack("<I", 0), _write_string(row["c"]), _write_bool(bool(row["b"])),
             _write_scaled(row["sz"]), _write_bool(bool(row.get("r", False))), _write_bool(bool(row.get("i", False))),
+            _write_option_commission(row),
+            b"\x00" if row.get("slippage") is None else b"\x01" + _write_scaled(row.get("slippage")),
         ])
     if "l" in action:
         row = action["l"]
-        tif_map = {"GTC": 0, "IOC": 1, "ALO": 2}
+        tif_map = {"GTC": 0, "IOC": 1, "ALO": 2, "ALO_SLIDE": 3, "ALO_JOIN": 4}
         tif = tif_map.get(str(row.get("tif") or "GTC").upper())
         if tif is None:
             raise ValueError("Unsupported Bulk time-in-force")
@@ -882,7 +1022,12 @@ def _encode_action(action: Mapping[str, Any]) -> bytes:
             struct.pack("<I", 1), _write_string(row["c"]), _write_bool(bool(row["b"])),
             _write_scaled(row["px"]), _write_scaled(row["sz"]), struct.pack("<I", tif),
             _write_bool(bool(row.get("r", False))), _write_bool(bool(row.get("i", False))),
+            _write_option_commission(row),
         ])
+    if "st" in action:
+        return _write_conditional_action(5, action["st"])
+    if "tp" in action:
+        return _write_conditional_action(6, action["tp"])
     if "cx" in action:
         row = action["cx"]
         return b"".join([struct.pack("<I", 3), _write_string(row["c"]), _b58decode(str(row["oid"]))])
@@ -913,7 +1058,10 @@ def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str,
     if configured_signer and configured_signer != derived_signer:
         raise ValueError("Configured Bulk agent public key does not match the private key")
     tx_nonce = int(nonce if nonce is not None else time.time_ns())
+    version = _TRANSACTION_VERSION
+    prefix = b"" if version is None else struct.pack("<I", version)
     message = b"".join([
+        prefix,
         struct.pack("<Q", len(actions)),
         *[_encode_action(a) for a in actions],
         struct.pack("<Q", tx_nonce),
@@ -921,13 +1069,23 @@ def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str,
         bytes([_domain_byte(credentials)]),
     ])
     signature = signing_key.sign(message).signature
-    return {
+    envelope: Dict[str, Any] = {}
+    # The node selects its transaction parser from this field: absent (or 11)
+    # means the versionless framing, 12 means the prefixed framing. The two are
+    # mutually exclusive, so the field and the signed bytes must agree.
+    #
+    # The field MUST come first in the JSON object: Bulk deserializes the
+    # envelope as a struct and rejects "version must precede actions".
+    if version is not None:
+        envelope["version"] = version
+    envelope.update({
         "actions": [dict(a) for a in actions],
         "nonce": str(tx_nonce),
         "account": account_pubkey,
         "signer": signer_pubkey,
         "signature": _b58encode(signature),
-    }
+    })
+    return envelope
 
 
 def _submit_order(credentials: Mapping[str, str], actions: list[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -1572,6 +1730,29 @@ def _positions_orders(
             code="ACCOUNT_NOT_FOUND",
             message="Bulk account snapshot was empty.",
         )
+    # Conditional orders live on Bulk's separate trigger book, which the
+    # dedicated openOrders query exposes. Merge them into the snapshot so
+    # the position rows can carry their live TP and SL.
+    try:
+        conditional_rows = _conditional_orders(credentials)
+    except Exception:  # noqa: BLE001 - the snapshot alone is still usable
+        conditional_rows = []
+    if conditional_rows:
+        merged = dict(full_account)
+        existing = list(full_account.get("openOrders") or [])
+        seen = {str(r.get("orderId") or r.get("oid") or "") for r in existing}
+        for row in conditional_rows:
+            oid = str(row.get("orderId") or row.get("oid") or "")
+            if oid and oid in seen:
+                continue
+            # Only conditional rows belong on the trigger book; anything else
+            # is already represented in the account snapshot.
+            if _classification(str(row.get("orderType") or ""), bool(row.get("reduceOnly"))) \
+                    not in {"take_profit", "stop_loss"}:
+                continue
+            existing.append(row)
+        merged["openOrders"] = existing
+        full_account = merged
     summary = _portfolio_from_account(full_account)
     positions = _positions_from_account(full_account)
     # Wizard Positions Management only needs the position rows; still include
@@ -1704,8 +1885,519 @@ def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
     return _decimal(lane_rows[0].get("size")) if lane_rows else Decimal("0")
 
 
+def _conditional_rows(full_account: Mapping[str, Any], symbol: str) -> list[Dict[str, Any]]:
+    """Return the live conditional (TP/SL) rows for one native symbol.
+
+    Bulk keeps conditional orders on a separate trigger book, but they are
+    still reported in ``openOrders`` with an ``orderType`` of ``stop`` or
+    ``takeProfit`` and a populated ``trigger`` block.
+    """
+    raw_rows = full_account.get("openOrders")
+    rows: Iterable[Any] = raw_rows if isinstance(raw_rows, list) else []
+    out: list[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol") or "").strip().upper() != symbol.upper():
+            continue
+        if _classification(str(row.get("orderType") or ""), bool(row.get("reduceOnly"))) not in {"take_profit", "stop_loss"}:
+            continue
+        out.append(row)
+    return out
+
+
+def _protection_rows(
+    credentials: Mapping[str, str], symbol: str
+) -> dict[str, list[Dict[str, Any]]]:
+    """Bucket the account's live TP and SL conditionals for one symbol.
+
+    Reads the dedicated ``openOrders`` query, which is the authoritative view
+    of the conditional trigger book, and falls back to the account snapshot's
+    own ``openOrders`` when the query is unavailable.
+    """
+    rows: list[Dict[str, Any]] = []
+    try:
+        rows = _conditional_orders(credentials)
+    except Exception:  # noqa: BLE001 - fall back to the snapshot below
+        rows = []
+    if not rows:
+        try:
+            rows = _conditional_rows(_live_account(credentials), symbol)
+        except Exception:  # noqa: BLE001
+            rows = []
+    return _bucket_protection_rows(rows, symbol)
+
+
+def _bucket_protection_rows(
+    rows: Iterable[Any], symbol: str
+) -> dict[str, list[Dict[str, Any]]]:
+    """Split conditional rows into take-profit and stop-loss buckets."""
+    buckets: dict[str, list[Dict[str, Any]]] = {"tp": [], "sl": []}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol") or "").strip().upper() != symbol.upper():
+            continue
+        classification = _classification(
+            str(row.get("orderType") or ""), bool(row.get("reduceOnly"))
+        )
+        if classification not in {"take_profit", "stop_loss"}:
+            continue
+        buckets["tp" if classification == "take_profit" else "sl"].append(row)
+    return buckets
+
+
+def _conditional_trigger_price(row: Mapping[str, Any]) -> Optional[Decimal]:
+    """Read a conditional's trigger price (the ``trigger.px`` block first)."""
+    trigger = row.get("trigger")
+    if isinstance(trigger, Mapping):
+        raw = trigger.get("px")
+        if raw is not None:
+            return _decimal(raw)
+    for key in ("triggerPrice", "price"):
+        raw = row.get(key)
+        if raw is not None:
+            return _decimal(raw)
+    return None
+
+
+def _conditional_is_above(row: Mapping[str, Any]) -> Optional[bool]:
+    """Read a conditional's trigger direction (``trigger.isAbove``)."""
+    trigger = row.get("trigger")
+    if isinstance(trigger, Mapping) and trigger.get("isAbove") is not None:
+        return bool(trigger.get("isAbove"))
+    return None
+
+
+def _protection_rows_for_position(
+    credentials: Mapping[str, str],
+    full_account: Mapping[str, Any],
+    symbol: str,
+    isolated: bool,
+) -> dict[str, list[Dict[str, Any]]]:
+    """Bucket the live TP/SL conditionals that protect one position lane.
+
+    The order side is not used to select the rows: on the trigger book the
+    stored size sign reflects the trigger leg, while the exchange executes a
+    fired conditional as a reduce-only close against the position, so every
+    conditional resting here protects the position.
+
+    The lane is what separates them: a base-account position is not protected
+    by a conditional that lives in an isolated account, and vice versa.
+    """
+    buckets: dict[str, list[Dict[str, Any]]] = {"tp": [], "sl": []}
+    for bucket, rows in _protection_rows(credentials, symbol).items():
+        for row_item in rows:
+            size = _decimal(row_item.get("size") if row_item.get("size") is not None else row_item.get("originalSize"))
+            if size == 0:
+                continue
+            row_iso = row_item.get("iso")
+            if isinstance(row_iso, bool) and row_iso != isolated:
+                continue
+            buckets[bucket].append(row_item)
+    return buckets
+
+
+def _bulk_conditional_action(
+    *,
+    kind: str,
+    symbol: str,
+    size: Decimal,
+    threshold: Decimal,
+    trigger_above: bool,
+    isolated: bool,
+) -> Dict[str, Any]:
+    """Build a native Bulk conditional action (``tp`` / ``st``).
+
+    ``d`` is the TRIGGER DIRECTION: ``true`` fires at/above the threshold,
+    ``false`` fires at/below it. This is verified against the exchange - a
+    conditional only rests when its trigger sits on the side of the mark that
+    has not been reached yet, and it fires the moment that side is crossed.
+
+    The official bulk-keychain SDK names the same field ``is_buy``, which is
+    misleading: Bulk gives each action type its own meaning for ``d`` (for
+    ``rng`` it is the position direction), and for ``st``/``tp`` it selects
+    the trigger direction. The exchange executes a fired conditional as a
+    reduce-only close against the position, so the executed side is always
+    protective regardless of the trigger direction.
+
+    A protective conditional must trigger against the position, never with
+    it: a long takes profit above and stops below, a short is the mirror.
+    """
+    row = {
+        "c": symbol,
+        "d": bool(trigger_above),
+        "sz": float(size),
+        "tr": float(threshold),
+        "lim": None,
+        "i": bool(isolated),
+    }
+    return {kind: row}
+
+
+def _restore_protection(
+    credentials: Mapping[str, str],
+    kind: str,
+    symbol: str,
+    size: Decimal,
+    threshold: Optional[Decimal],
+    trigger_above: bool,
+    isolated: bool,
+) -> bool:
+    """Re-place a protection order that was cancelled by a failed update.
+
+    Returns True when the replacement was accepted. A failed restore means the
+    position is left without this protection, which the caller must report.
+    """
+    if threshold is None or threshold <= 0:
+        return False
+    action = _bulk_conditional_action(
+        kind=kind, symbol=symbol, size=size,
+        threshold=threshold, trigger_above=trigger_above, isolated=isolated,
+    )
+    try:
+        response = _submit_order(credentials, [action])
+    except Exception:  # noqa: BLE001
+        return False
+    parsed = _position_action_status(response)
+    return parsed["classification"] != "rejected"
+
+
+def _bulk_protection_action(
+    credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]
+) -> CanonicalResponse:
+    """Create, replace or remove a native Bulk take-profit / stop-loss.
+
+    Uses Bulk's own conditional orders (``tp`` / ``st``) on the exchange's
+    trigger book. A price of ``0`` removes only the requested protection and
+    leaves the other one untouched.
+    """
+    is_tp = operation == "set_tp"
+    kind = "tp" if is_tp else "st"
+    label = "Take Profit" if is_tp else "Stop Loss"
+    other_label = "Stop Loss" if is_tp else "Take Profit"
+
+    requested = str(request.get("symbol") or "").strip()
+    if not requested:
+        return make_failure(operation, name, account, "MISSING_SYMBOL", "Symbol is required for position action.")
+
+    raw_price = request.get("price")
+    price_text = str(raw_price if raw_price is not None else "").strip().replace(",", "")
+    if price_text == "":
+        return make_failure(
+            operation, name, account,
+            "INVALID_TP_PRICE" if is_tp else "INVALID_SL_PRICE",
+            f"{label} price must be numeric and non-negative.",
+        )
+    try:
+        requested_price = Decimal(price_text)
+    except (InvalidOperation, ValueError, TypeError):
+        return make_failure(
+            operation, name, account,
+            "INVALID_TP_PRICE" if is_tp else "INVALID_SL_PRICE",
+            f"{label} price must be numeric and non-negative.",
+        )
+    if requested_price < 0:
+        return make_failure(
+            operation, name, account,
+            "INVALID_TP_PRICE" if is_tp else "INVALID_SL_PRICE",
+            f"{label} price must be numeric and non-negative.",
+        )
+
+    try:
+        market = _find_market(credentials, requested)
+    except Exception:  # noqa: BLE001
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", f"Bulk market {requested!r} was not found.")
+    symbol = str(market.get("symbol") or "").strip()
+    if not symbol:
+        return make_failure(operation, name, account, "UNKNOWN_SYMBOL", "Bulk market row has no symbol.")
+
+    try:
+        before_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+    except PermissionError as exc:
+        return make_failure(operation, name, account, "ACCOUNT_IDENTITY_INVALID", sanitize_error_message(str(exc)))
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(operation, name, account, "ACCOUNT_SNAPSHOT_INVALID", sanitize_error_message(str(exc)))
+
+    positions = _position_rows(before_account, symbol)
+    if not positions:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if len(positions) != 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_POSITION", f"Multiple open Bulk rows match {symbol}; refusing to choose a lane.")
+    position = positions[0]
+    size = _decimal(position.get("size"))
+    if size == 0:
+        return make_failure(operation, name, account, "POSITION_NOT_FOUND", f"No open Bulk position for {symbol} in account {account!r}.")
+    if not isinstance(position.get("iso"), bool):
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk position snapshot omitted its base/isolated routing flag.")
+    isolated = position["iso"]
+    if isolated and not str(position.get("isoPubkey") or "").strip():
+        return make_failure(operation, name, account, "POSITION_ROUTING_UNKNOWN", "Bulk isolated position omitted isoPubkey; refusing to route a protection order.")
+
+    position_side = "long" if size > 0 else "short"
+    abs_size = abs(size)
+
+    increment = _decimal(market.get("sizeIncrement", market.get("lotSize")), "0")
+    precision_raw = market.get("sizeDecimals")
+    if increment <= 0 or precision_raw is None:
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_MISSING", "Bulk market omitted valid size increment/precision metadata.")
+    try:
+        precision = int(precision_raw)
+    except (ValueError, TypeError):
+        return make_failure(operation, name, account, "MARKET_SIZE_METADATA_INVALID", "Bulk market sizeDecimals is invalid.")
+    precision_step = Decimal(1).scaleb(-precision)
+    if precision < 0 or abs_size % increment != 0 or abs_size % precision_step != 0:
+        return make_failure(operation, name, account, "POSITION_SIZE_INVALID", "Live Bulk position size does not conform to market increment/precision.")
+
+    tick_raw = market.get("tickSize")
+    tick = _decimal(tick_raw, "0") if tick_raw is not None else Decimal("0")
+    if tick <= 0:
+        return make_failure(operation, name, account, "MARKET_TICK_METADATA_MISSING", "Bulk market omitted a valid tick size.")
+
+    protection = _protection_rows_for_position(credentials, before_account, symbol, isolated)
+    target_bucket = "tp" if is_tp else "sl"
+    existing_rows = list(protection.get(target_bucket) or [])
+    other_rows = list(protection.get("sl" if is_tp else "tp") or [])
+    if len(existing_rows) > 1:
+        return make_failure(operation, name, account, "AMBIGUOUS_PROTECTION_STATE", f"Multiple matching {label} orders were found.")
+
+    current_side = position_side
+    current_size_text = _plain_decimal(abs_size)
+
+    def _action_result(**kwargs: Any) -> CanonicalPositionActionResult:
+        return CanonicalPositionActionResult(
+            operation=operation,
+            symbol=_display_symbol(symbol),
+            **kwargs,
+        )
+
+    # ---- Removal (price == 0) -------------------------------------------
+    if requested_price == 0:
+        if not existing_rows:
+            return make_success(
+                operation, name, account,
+                position_action=_action_result(
+                    verified=True, removed=False, current_side=current_side,
+                    current_size=current_size_text,
+                    message=f"No {label} was set.",
+                ),
+            )
+        target = existing_rows[0]
+        oid = str(target.get("orderId") or target.get("oid") or "").strip()
+        if not oid:
+            return make_failure(operation, name, account, "PROTECTION_ORDER_ID_MISSING", f"The live {label} order has no order id to cancel.")
+        try:
+            response = _submit_order(credentials, [{"cx": {"c": symbol, "oid": oid}}])
+        except Exception as exc:  # noqa: BLE001 - outcome may be unknown
+            return make_failure(
+                operation, name, account, "PROTECTION_REMOVAL_UNCERTAIN",
+                "Bulk did not confirm the cancellation. No automatic retry was made.",
+                data={"retry_safe": False, "order_id": oid, "error_type": type(exc).__name__},
+            )
+        parsed = _position_action_status(response)
+        if parsed["classification"] == "rejected":
+            return make_failure(operation, name, account, "PROTECTION_REMOVAL_REJECTED", f"Bulk rejected the {label} cancellation.", data={"order_ids": parsed["order_ids"]})
+
+        try:
+            after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+            after_protection = _protection_rows_for_position(credentials, after_account, symbol, isolated)
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation, name, account, "PROTECTION_VERIFICATION_UNAVAILABLE",
+                f"Bulk returned a response but a valid, account-bound snapshot could not verify the {label} removal; no retry was made.",
+                data={"retry_safe": False, "order_id": oid, "verification_error": sanitize_error_message(str(exc))},
+            )
+        after_rows = list(after_protection.get(target_bucket) or [])
+        still_present = any(str(r.get("orderId") or r.get("oid") or "") == oid for r in after_rows)
+        other_preserved = len(list(after_protection.get("sl" if is_tp else "tp") or [])) == len(other_rows)
+        if still_present:
+            return make_failure(
+                operation, name, account, "PROTECTION_REMOVAL_NOT_VERIFIED",
+                f"The {label} order is still present after the cancellation.",
+                data={"retry_safe": False, "order_id": oid},
+            )
+        if not other_preserved:
+            return make_failure(
+                operation, name, account, "PROTECTION_STATE_CHANGED",
+                f"The {other_label} was affected by the {label} removal.",
+                data={"retry_safe": False, "order_id": oid},
+            )
+        return make_success(
+            operation, name, account,
+            position_action=_action_result(
+                verified=True, removed=True, current_side=current_side,
+                current_size=current_size_text, exchange_order_id=oid,
+                message=f"{label} removed.",
+            ),
+        )
+
+    # ---- Create / replace -----------------------------------------------
+    quantized_price = (requested_price / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+    if quantized_price <= 0:
+        return make_failure(operation, name, account, "TP_PRICE_BELOW_TICK" if is_tp else "SL_PRICE_BELOW_TICK", f"{label} price is below the market tick size.")
+
+    # A protective conditional must trigger against the position, never with
+    # it: a long takes profit above / stops below, a short is the mirror.
+    #
+    # ``d`` is the trigger direction: a long takes profit above the mark and
+    # stops below it, a short is the mirror.
+    trigger_above = (position_side == "long") if is_tp else (position_side == "short")
+
+    # A conditional whose trigger is already satisfied fires the moment it is
+    # submitted and is then cancelled as IOC, so it would never protect the
+    # position. Refuse rather than place an order that cannot work.
+    #
+    # The trigger is compared against the MARK price (Bulk conditions on the
+    # fair/mark price, not the last trade), so the mark is what matters here -
+    # not the position's entry price.
+    reference_price = _decimal(position.get("fairPrice") or 0)
+    if reference_price <= 0:
+        reference_price = _decimal(position.get("price") or 0)
+    if reference_price > 0:
+        if trigger_above and quantized_price <= reference_price:
+            return make_failure(
+                operation, name, account,
+                "TP_PRICE_NOT_ABOVE_MARK" if is_tp else "SL_PRICE_NOT_BELOW_MARK",
+                f"A {label} must be placed beyond the current mark price "
+                f"({_plain_decimal(reference_price)}); Bulk fires a satisfied trigger immediately.",
+            )
+        if not trigger_above and quantized_price >= reference_price:
+            return make_failure(
+                operation, name, account,
+                "TP_PRICE_NOT_ABOVE_MARK" if is_tp else "SL_PRICE_NOT_BELOW_MARK",
+                f"A {label} must be placed beyond the current mark price "
+                f"({_plain_decimal(reference_price)}); Bulk fires a satisfied trigger immediately.",
+            )
+
+    actions: list[Mapping[str, Any]] = []
+    # The previous protection, captured before it is cancelled, so a failed
+    # replacement can restore it instead of leaving the position unprotected.
+    replaced_oid = ""
+    replaced_price: Optional[Decimal] = None
+    if existing_rows:
+        # Replace: cancel the previous conditional first so the update never
+        # leaves a duplicate protection behind.
+        target = existing_rows[0]
+        old_oid = str(target.get("orderId") or target.get("oid") or "").strip()
+        if not old_oid:
+            return make_failure(operation, name, account, "PROTECTION_ORDER_ID_MISSING", f"The live {label} order has no order id to cancel.")
+        replaced_oid = old_oid
+        replaced_price = _conditional_trigger_price(target)
+        try:
+            cancel_response = _submit_order(credentials, [{"cx": {"c": symbol, "oid": old_oid}}])
+        except Exception as exc:  # noqa: BLE001
+            return make_failure(
+                operation, name, account, "PROTECTION_REPLACEMENT_UNCERTAIN",
+                "Bulk did not confirm the previous cancellation. No automatic retry was made.",
+                data={"retry_safe": False, "order_id": old_oid, "error_type": type(exc).__name__},
+            )
+        cancel_parsed = _position_action_status(cancel_response)
+        if cancel_parsed["classification"] == "rejected":
+            return make_failure(operation, name, account, "PROTECTION_REPLACEMENT_REJECTED", f"Bulk rejected the replacement of the existing {label}.", data={"order_ids": cancel_parsed["order_ids"]})
+
+    action = _bulk_conditional_action(
+        kind=kind, symbol=symbol, size=abs_size,
+        threshold=quantized_price, trigger_above=trigger_above, isolated=isolated,
+    )
+    actions.append(action)
+    try:
+        response = _submit_order(credentials, actions)
+    except Exception as exc:  # noqa: BLE001 - outcome may be unknown
+        restored = _restore_protection(
+            credentials, kind, symbol, abs_size, replaced_price, trigger_above, isolated
+        )
+        return make_failure(
+            operation, name, account, "PROTECTION_SUBMISSION_UNCERTAIN",
+            f"Bulk did not confirm the {label} submission. No automatic retry was made."
+            + ("" if restored else " The previous protection could NOT be restored, so the position is currently UNPROTECTED."),
+            data={
+                "retry_safe": False,
+                "requested_price": _plain_decimal(quantized_price),
+                "error_type": type(exc).__name__,
+                "previous_protection_restored": restored,
+                "position_unprotected": bool(replaced_oid) and not restored,
+            },
+        )
+    parsed = _position_action_status(response)
+    if parsed["classification"] == "rejected":
+        restored = _restore_protection(
+            credentials, kind, symbol, abs_size, replaced_price, trigger_above, isolated
+        )
+        return make_failure(
+            operation, name, account, "PROTECTION_REJECTED",
+            f"Bulk rejected the {label} order."
+            + ("" if restored else " The previous protection could NOT be restored, so the position is currently UNPROTECTED."),
+            data={
+                "order_ids": parsed["order_ids"],
+                "requested_price": _plain_decimal(quantized_price),
+                "previous_protection_restored": restored,
+                "position_unprotected": bool(replaced_oid) and not restored,
+            },
+        )
+
+    try:
+        after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
+        after_protection = _protection_rows_for_position(credentials, after_account, symbol, isolated)
+    except Exception as exc:  # noqa: BLE001
+        return make_failure(
+            operation, name, account, "PROTECTION_VERIFICATION_UNAVAILABLE",
+            f"Bulk returned a response but a valid, account-bound snapshot could not verify the {label}; no retry was made.",
+            data={"retry_safe": False, "order_ids": parsed["order_ids"], "verification_error": sanitize_error_message(str(exc))},
+        )
+    after_rows = list(after_protection.get(target_bucket) or [])
+    if len(after_rows) != 1:
+        unprotected = len(after_rows) == 0
+        return make_failure(
+            operation, name, account, "PROTECTION_NOT_VERIFIED",
+            f"Expected exactly one {label} order after the update but found {len(after_rows)}."
+            + (" The position is currently UNPROTECTED." if unprotected else ""),
+            data={
+                "retry_safe": False,
+                "order_ids": parsed["order_ids"],
+                "position_unprotected": unprotected,
+                "found_count": len(after_rows),
+            },
+        )
+    placed = after_rows[0]
+    placed_price = _conditional_trigger_price(placed)
+    placed_above = _conditional_is_above(placed)
+    placed_oid = str(placed.get("orderId") or placed.get("oid") or "")
+    price_matches = placed_price is not None and placed_price == quantized_price
+    direction_matches = placed_above is None or placed_above == trigger_above
+    if not price_matches or not direction_matches:
+        return make_failure(
+            operation, name, account, "PROTECTION_NOT_VERIFIED",
+            f"The live {label} order does not match the requested price and direction.",
+            data={
+                "retry_safe": False,
+                "order_id": placed_oid,
+                "expected_price": _plain_decimal(quantized_price),
+                "live_price": _plain_decimal(placed_price) if placed_price is not None else None,
+                "expected_trigger_above": trigger_above,
+                "live_trigger_above": placed_above,
+            },
+        )
+    other_after = list(after_protection.get("sl" if is_tp else "tp") or [])
+    if len(other_after) != len(other_rows):
+        return make_failure(
+            operation, name, account, "PROTECTION_STATE_CHANGED",
+            f"The {other_label} was affected by the {label} update.",
+            data={"retry_safe": False, "order_id": placed_oid},
+        )
+    return make_success(
+        operation, name, account,
+        position_action=_action_result(
+            verified=True, price=_plain_decimal(quantized_price), removed=False,
+            current_side=current_side, current_size=current_size_text,
+            exchange_order_id=placed_oid or None,
+            message=f"{label} updated.",
+        ),
+    )
+
+
 def _bulk_position_action(credentials: Mapping[str, str], account: str, operation: str, request: Mapping[str, Any]) -> CanonicalResponse:
-    """Close a Bulk position natively; TP/SL remain intentionally unsupported."""
+    """Close a Bulk position natively; TP/SL are handled by
+    :func:`_bulk_protection_action`."""
     if operation != "close_position":
         return make_failure(operation, name, account, "NOT_IMPLEMENTED", f"Bulk {operation} is not implemented.")
     requested = str(request.get("symbol") or "").strip()
@@ -1846,7 +2538,9 @@ def execute(request: Dict[str, Any]) -> CanonicalResponse:
             return _ladder(credentials, account, request)
         if operation == "cancel_order_group":
             return _cancel_order_group(credentials, account, request)
-        if operation in ("set_tp", "set_sl", "close_position"):
+        if operation in ("set_tp", "set_sl"):
+            return _bulk_protection_action(credentials, account, operation, request)
+        if operation in ("close_position",):
             return _bulk_position_action(credentials, account, operation, request)
         return make_failure(
             operation=operation,

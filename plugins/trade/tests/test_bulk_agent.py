@@ -141,17 +141,20 @@ class TestBulkAgent(unittest.TestCase):
                 self.assertEqual((p.symbol, p.side, p.size, p.entry_price, p.mark, p.pnl), single)
 
         self.assertIn("positions_management", bulk.capabilities())
-        self.assertNotIn("set_tp", bulk.capabilities())
-        self.assertNotIn("set_sl", bulk.capabilities())
+        self.assertIn("set_tp", bulk.capabilities())
+        self.assertIn("set_sl", bulk.capabilities())
         self.assertIn("close_position", bulk.capabilities())
 
-        # TP/SL remain NOT_IMPLEMENTED and must not enter the write path.
+        # TP/SL now use Bulk's native conditional orders. A write with no
+        # position must still fail closed before anything is submitted.
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value={"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3, "tickSize": 0.1}), \
+             mock.patch.object(bulk, "_live_account", return_value={"positions": [], "openOrders": []}), \
              mock.patch.object(bulk, "_submit_order") as submit:
             for op in ("set_tp", "set_sl"):
                 bad = bulk.execute({"operation": op, "exchange": "bulk", "account": "main", "symbol": "BTC", "side": "long", "price": "1"})
                 self.assertFalse(bad.success)
-                self.assertEqual(bad.error.code, "NOT_IMPLEMENTED")
+                self.assertEqual(bad.error.code, "POSITION_NOT_FOUND")
                 self.assertNotIn("read-only adapter", bad.error.message)
         submit.assert_not_called()
 
@@ -388,14 +391,43 @@ class TestBulkAgent(unittest.TestCase):
         self.assertNotEqual(result.data.get("close_status"), "fully_closed")
         submit.assert_called_once()
 
-    def test_close_position_returns_not_implemented_for_tp_sl(self) -> None:
-        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
-        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
-             mock.patch.object(bulk, "_submit_order") as submit:
-            for operation in ("set_tp", "set_sl"):
-                resp = bulk.execute({"operation": operation, "exchange": "bulk", "account": "main", "symbol": "BTC"})
+    def test_set_tp_and_set_sl_are_advertised_as_capabilities(self) -> None:
+        caps = bulk.capabilities()
+        self.assertIn("set_tp", caps)
+        self.assertIn("set_sl", caps)
+        self.assertIn("close_position", caps)
+
+    def test_set_tp_rejects_missing_and_negative_prices_before_write(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmzjgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        for operation in ("set_tp", "set_sl"):
+            for price, code in (
+                ("", "INVALID_TP_PRICE" if operation == "set_tp" else "INVALID_SL_PRICE"),
+                ("abc", "INVALID_TP_PRICE" if operation == "set_tp" else "INVALID_SL_PRICE"),
+                ("-1", "INVALID_TP_PRICE" if operation == "set_tp" else "INVALID_SL_PRICE"),
+            ):
+                with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+                     mock.patch.object(bulk, "_submit_order") as submit:
+                    resp = bulk.execute({
+                        "operation": operation, "exchange": "bulk", "account": "main",
+                        "symbol": "BTC", "price": price,
+                    })
                 self.assertFalse(resp.success)
-                self.assertEqual(resp.error.code, "NOT_IMPLEMENTED")
+                self.assertEqual(resp.error.code, code)
+                submit.assert_not_called()
+
+    def test_set_tp_requires_an_open_position_before_write(self) -> None:
+        creds = {"account": "main", "account_pubkey": "FuueqefENiGEW6uMqZQgmzjgpnb85EgUcZa5Em4PQh7", "agent_private_key": "secret-main", "base_url": bulk.DEFAULT_API_BASE}
+        market = {"symbol": "BTC-USD", "sizeIncrement": 0.001, "sizeDecimals": 3, "tickSize": 0.1}
+        with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
+             mock.patch.object(bulk, "_find_market", return_value=market), \
+             mock.patch.object(bulk, "_live_account", return_value={"positions": [], "openOrders": []}), \
+             mock.patch.object(bulk, "_submit_order") as submit:
+            resp = bulk.execute({
+                "operation": "set_tp", "exchange": "bulk", "account": "main",
+                "symbol": "BTC", "price": "120000",
+            })
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error.code, "POSITION_NOT_FOUND")
         submit.assert_not_called()
 
     def test_positions_management_attaches_tp_sl_from_open_orders(self) -> None:
@@ -412,10 +444,14 @@ class TestBulkAgent(unittest.TestCase):
                 {"symbol": "BTC-USD", "size": 1, "price": 100, "fairPrice": 105, "unrealizedPnl": 5},
             ],
             "openOrders": [
-                # protective sell TP on long
-                {"symbol": "BTC-USD", "orderId": "tp1", "price": 120, "size": -1, "orderType": "takeProfit", "reduceOnly": True},
-                # protective sell SL on long
-                {"symbol": "BTC-USD", "orderId": "sl1", "price": 90, "size": -1, "orderType": "stop", "reduceOnly": True},
+                # A take profit ABOVE the mark protects the long.
+                {"symbol": "BTC-USD", "orderId": "tp1", "price": 120, "size": -1,
+                 "orderType": "takeProfit", "reduceOnly": True,
+                 "trigger": {"isAbove": True, "px": 120}},
+                # A stop BELOW the mark protects the long.
+                {"symbol": "BTC-USD", "orderId": "sl1", "price": 90, "size": -1,
+                 "orderType": "stop", "reduceOnly": True,
+                 "trigger": {"isAbove": False, "px": 90}},
             ],
         }}]
         with mock.patch.object(bulk, "_lookup_credentials", return_value=creds), \
