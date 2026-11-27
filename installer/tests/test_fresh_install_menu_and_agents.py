@@ -361,8 +361,8 @@ class RetiredFiboCapabilityCleanupTests(unittest.TestCase):
         stale_pkg.mkdir(parents=True, exist_ok=True)
         (stale_pkg / "mt4_reader.py").write_text("# stale reader\n", encoding="utf-8")
 
-        stale_mt5_agent = plugin_root / "agents" / "x_mt5_agent.py"
-        stale_mt5_agent.write_text("# stale MT5 agent\n", encoding="utf-8")
+        stale_linux = plugin_root / "agents" / "x_mt5linux_agent.py"
+        stale_linux.write_text("# stale MT5linux agent\n", encoding="utf-8")
 
         stale_bridge = plugin_root / "mt5_bridge"
         stale_bridge.mkdir(parents=True, exist_ok=True)
@@ -382,13 +382,17 @@ class RetiredFiboCapabilityCleanupTests(unittest.TestCase):
             stale_pkg.exists(),
             "the retired /fibo package must be pruned on upgrade",
         )
+        self.assertTrue(
+            (plugin_root / "agents" / "x_mt5_agent.py").exists(),
+            "the live MT5 agent must be installed, not pruned",
+        )
         self.assertFalse(
-            stale_mt5_agent.exists(),
-            "the retired MT5 agent must be pruned on upgrade",
+            stale_linux.exists(),
+            "the retired MT5linux agent must be pruned on upgrade",
         )
         self.assertFalse(
             stale_bridge.exists(),
-            "the retired MT5 bridge payload must be pruned on upgrade",
+            "the retired HermesBridge payload must be pruned on upgrade",
         )
 
     def test_retired_fibo_seams_are_stripped_on_upgrade_install(self):

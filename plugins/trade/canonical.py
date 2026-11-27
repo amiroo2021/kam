@@ -116,9 +116,13 @@ class CanonicalPosition:
     # means the provider did not report it; the UI must never derive this from
     # size or pending orders, and must never fabricate ``count=1`` when unavailable.
     count: Optional[int] = None
+    # Additive aggregation metadata. Absent (None) keeps older agents unchanged.
+    min_price: Optional[str] = None
+    max_price: Optional[str] = None
+    tickets: Optional[list] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "symbol": self.symbol,
             "side": self.side,
             "size": self.size,
@@ -132,6 +136,13 @@ class CanonicalPosition:
             "mark": self.mark,
             "count": self.count,
         }
+        if self.min_price is not None:
+            data["min_price"] = self.min_price
+        if self.max_price is not None:
+            data["max_price"] = self.max_price
+        if self.tickets is not None:
+            data["tickets"] = list(self.tickets)
+        return data
 
 
 @dataclass(frozen=True)

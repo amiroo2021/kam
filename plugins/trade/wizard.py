@@ -38,10 +38,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from difflib import SequenceMatcher
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote, unquote
 
 from .canonical import (
@@ -219,13 +220,31 @@ def _account_option_parts(entry: Any) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _rounded_money_display(value: Any) -> str:
-    """Render price-like values to at most two decimals for compact menus."""
+    """Render price-like values to at most two decimals for compact menus.
+
+    Sub-cent values keep up to 8 decimals so cheap assets never collapse to
+    ``0.00``; everything at or above 0.01 is capped at two decimals.
+    """
     try:
         number = Decimal(str(value))
-        rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return f"{rounded:,.2f}"
     except Exception:
         return _display_or_dash(value)
+    if not number.is_finite():
+        return _display_or_dash(value)
+    if abs(number) < Decimal("0.01"):
+        quantum = Decimal("0.00000001")
+    else:
+        quantum = Decimal("0.01")
+    rounded = number.quantize(quantum, rounding=ROUND_HALF_UP)
+    text = format(rounded, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".") or "0"
+    integer, dot, fraction = text.partition(".")
+    try:
+        integer = f"{int(integer):,}"
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{integer}{dot}{fraction}"
 
 
 def _order_group_summary_line(group: Any) -> str:
@@ -234,8 +253,8 @@ def _order_group_summary_line(group: Any) -> str:
     count = int(getattr(group, "order_count", 0) or 0)
     total_size = _display_or_dash(getattr(group, "total_size", ""))
     vwap = _rounded_money_display(getattr(group, "vwap", ""))
-    min_price = _display_or_dash(getattr(group, "min_price", ""))
-    max_price = _display_or_dash(getattr(group, "max_price", ""))
+    min_price = _rounded_money_display(getattr(group, "min_price", ""))
+    max_price = _rounded_money_display(getattr(group, "max_price", ""))
     display_type = str(getattr(group, "display_type", "") or "").strip()
     classification = str(getattr(group, "classification", "") or "").strip()
     kind_label = display_type or (
@@ -278,6 +297,44 @@ def _order_group_button_text(group: Any) -> str:
         else side
     )
     return f"{_direction_emoji(getattr(group, 'side', ''))} {symbol} {kind} -- {count} orders"
+
+
+def _position_field(position: Any, key: str, default: Any = None) -> Any:
+    if isinstance(position, dict):
+        return position.get(key, default)
+    return getattr(position, key, default)
+
+
+def _position_group_summary_line(position: Any) -> str:
+    symbol = str(_position_field(position, "symbol") or "").strip() or "Symbol"
+    side = str(_position_field(position, "side") or "").strip()
+    count = int(_position_field(position, "count") or 0)
+    size = str(_position_field(position, "size") or "").strip() or "—"
+    min_price = str(_position_field(position, "min_price") or "").strip()
+    max_price = str(_position_field(position, "max_price") or "").strip()
+    vwap = str(_position_field(position, "entry_price") or _position_field(position, "vwap") or "").strip() or "—"
+    if not min_price:
+        min_price = vwap
+    if not max_price:
+        max_price = min_price
+    # Prices/VWAP are broker values: cap at two decimals so long Decimal
+    # divisions (VWAP) never leak 28 significant digits into the menu.
+    min_price = _rounded_money_display(min_price)
+    max_price = _rounded_money_display(max_price)
+    vwap = _rounded_money_display(vwap)
+    # Group PnL is the sum of every position on this symbol+side.
+    pnl = _pnl_format(_position_field(position, "pnl"))
+    return (
+        f"{_direction_emoji(side)} {symbol} ({count}) vol:{size} "
+        f"range:{min_price}–{max_price} vwap:{vwap} pnl:{pnl}"
+    )
+
+
+def _position_group_button_text(position: Any) -> str:
+    symbol = str(_position_field(position, "symbol") or "").strip() or "Symbol"
+    side = str(_position_field(position, "side") or "").strip()
+    count = int(_position_field(position, "count") or 0)
+    return f"{_direction_emoji(side)} {symbol} ({count})"
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +384,12 @@ class WizardState:
     positions: List[Dict[str, Any]] = field(default_factory=list)
     position: Dict[str, Any] = field(default_factory=dict)
     position_action: Dict[str, Any] = field(default_factory=dict)
+    position_legs: List[Dict[str, Any]] = field(default_factory=list)
+    position_group: Dict[str, Any] = field(default_factory=dict)
     # Summative Report navigation context (indices into the cached snapshot).
     report: Dict[str, Any] = field(default_factory=dict)
+    # Cached list screens so Back/Exit never re-hit the exchange.
+    menu_cache: Dict[str, Any] = field(default_factory=dict)
 
 
 class TradeWizard:
@@ -358,6 +419,38 @@ class TradeWizard:
 
     def reset(self, chat_key: Tuple[Any, ...]) -> None:
         self._states.pop(chat_key, None)
+
+    def _cached_list_screen(self, chat_key: Tuple[Any, ...], name: str) -> Optional[Screen]:
+        state = self._state_for(chat_key)
+        entry = state.menu_cache.get(name)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("exchange") != state.exchange or entry.get("account") != state.account:
+            return None
+        screen = entry.get("screen")
+        if not isinstance(screen, Screen):
+            return None
+        state.state = screen.state
+        if name == "cancel_orders" and entry.get("pending") is not None:
+            state.cancel["_pending"] = list(entry.get("pending") or [])
+        if name in {"positions_orders", "positions_management"}:
+            if entry.get("positions") is not None:
+                state.positions = list(entry.get("positions") or [])
+            if entry.get("position_legs") is not None:
+                state.position_legs = list(entry.get("position_legs") or [])
+        return screen
+
+    def _store_list_screen(self, chat_key: Tuple[Any, ...], name: str, screen: Screen, **extra: Any) -> Screen:
+        state = self._state_for(chat_key)
+        payload = {"exchange": state.exchange, "account": state.account, "screen": screen}
+        payload.update(extra)
+        state.menu_cache[name] = payload
+        return screen
+
+    def _invalidate_list_screens(self, chat_key: Tuple[Any, ...]) -> None:
+        state = self._state_for(chat_key)
+        for name in ("cancel_orders", "positions_orders", "positions_management"):
+            state.menu_cache.pop(name, None)
 
     # -- public entry points --------------------------------------------
 
@@ -396,13 +489,28 @@ class TradeWizard:
         chat_key: Tuple[Any, ...],
         callback_suffix: str,
     ) -> Screen:
+        t0 = time.perf_counter()
+        suffix = (callback_suffix or "").strip()
+        try:
+            return self._dispatch_callback(chat_key, suffix)
+        finally:
+            logger.info(
+                "trade wizard callback suffix=%s elapsed_ms=%.0f",
+                suffix[:48],
+                (time.perf_counter() - t0) * 1000,
+            )
+
+    def _dispatch_callback(
+        self,
+        chat_key: Tuple[Any, ...],
+        suffix: str,
+    ) -> Screen:
         """Advance the wizard based on a callback suffix from a button.
 
         The direct-dispatch helper passes the already-stripped
         suffix (everything after ``trade:``). The wizard never
         inspects exchange names.
         """
-        suffix = (callback_suffix or "").strip()
         state = self._state_for(chat_key)
 
         if suffix == "exit":
@@ -427,6 +535,8 @@ class TradeWizard:
             return self._handle_positions_orders(chat_key, suffix)
         if state.state == "positions_management":
             return self._handle_positions_management(chat_key, suffix)
+        if state.state == "position_group":
+            return self._handle_position_group(chat_key, suffix)
         if state.state == "position_detail":
             return self._handle_position_detail(chat_key, suffix)
         if state.state == "awaiting_tp_price":
@@ -470,6 +580,10 @@ class TradeWizard:
             return self._handle_ladder_result(chat_key, suffix)
         if state.state == "cancel_orders":
             return self._handle_cancel_orders(chat_key, suffix)
+        if state.state == "cancel_group":
+            return self._handle_mt5_cancel_group(chat_key, suffix)
+        if state.state == "cancel_ticket_confirm":
+            return self._handle_mt5_cancel_ticket_confirm(chat_key, suffix)
         if state.state == "cancel_group_confirm":
             return self._handle_cancel_group_confirm(chat_key, suffix)
         if state.state == "cancel_result":
@@ -1099,10 +1213,20 @@ class TradeWizard:
 
     def _instrument_button_label(self, entry: Dict[str, Any]) -> str:
         sym = self._candidate_symbol(entry) or "?"
-        price = entry.get("price")
-        if price is None or str(price).strip() == "":
-            return sym
-        return f"{sym} · {_comma_format(price)}"
+        bid = entry.get("bid")
+        ask = entry.get("ask")
+        contract = entry.get("contract_size")
+        if bid not in (None, "") and ask not in (None, ""):
+            label = f"{sym}  {_comma_format(bid)}/{_comma_format(ask)}"
+        else:
+            price = entry.get("price")
+            if price is None or str(price).strip() == "":
+                label = sym
+            else:
+                label = f"{sym} · {_comma_format(price)}"
+        if contract not in (None, ""):
+            label = f"{label}  csz {contract}"
+        return label
 
     def _commit_native_symbol(self, chat_key: Tuple[Any, ...], native: str) -> None:
         """Store the exchange-native instrument for all downstream /trade ops."""
@@ -1147,7 +1271,21 @@ class TradeWizard:
             try:
                 data = inst.to_dict()
                 if isinstance(data, dict):
-                    return dict(data)
+                    payload = dict(data)
+                    extra = getattr(response, "data", None)
+                    if isinstance(extra, dict):
+                        for key in (
+                            "contract_size",
+                            "volume_min",
+                            "volume_max",
+                            "volume_step",
+                            "currency_base",
+                            "tick_size",
+                            "digits",
+                        ):
+                            if extra.get(key) not in (None, ""):
+                                payload.setdefault(key, extra.get(key))
+                    return payload
             except Exception:  # noqa: BLE001
                 pass
         if isinstance(inst, dict):
@@ -1229,6 +1367,7 @@ class TradeWizard:
         resolve_error_code: Optional[str] = None
         resolve_error_message: Optional[str] = None
         resolve_data: Any = None
+        response: Any = None
 
         if "resolve_instrument" in lookup_caps:
             try:
@@ -1268,6 +1407,80 @@ class TradeWizard:
         lookup_unavailable = is_instrument_lookup_unavailable(
             resolve_error_code, resolve_data
         )
+
+        if str(exchange).strip().lower() == "mt5":
+            # MT5 resolves against the broker's own Market Watch names. Keep
+            # the broker symbol verbatim and surface contract metadata so the
+            # wizard can size LIMIT orders without inventing a ticker.
+            mt5_data = resolve_data
+            if mt5_data is None and response is not None:
+                mt5_data = getattr(response, "data", None)
+            if primary_native:
+                cand = {
+                    "symbol": primary_native,
+                    "native_symbol": primary_native,
+                }
+                if isinstance(mt5_data, dict):
+                    for key in (
+                        "bid",
+                        "ask",
+                        "price",
+                        "contract_size",
+                        "volume_step",
+                        "volume_min",
+                        "tick_size",
+                        "currency_base",
+                    ):
+                        if mt5_data.get(key) not in (None, ""):
+                            cand[key] = mt5_data.get(key)
+                    raw_cands = mt5_data.get("candidates")
+                    if isinstance(raw_cands, list) and raw_cands:
+                        mt5_candidates = []
+                        for item in raw_cands:
+                            if isinstance(item, dict) and self._candidate_symbol(item):
+                                mt5_candidates.append(dict(item))
+                            elif str(item or "").strip():
+                                mt5_candidates.append({"symbol": str(item).strip()})
+                    else:
+                        mt5_candidates = [cand]
+                else:
+                    mt5_candidates = [cand]
+                if response is not None and getattr(response, "success", False):
+                    payload = self._instrument_payload(response)
+                payload["requested_symbol"] = requested
+                payload["symbol"] = primary_native
+                if isinstance(mt5_data, dict):
+                    for key, value in mt5_data.items():
+                        if key != "candidates" and key not in payload:
+                            payload[key] = value
+                state.resolved_instrument = payload
+                state.instrument_candidates = list(mt5_candidates)
+                return self._render_instrument_confirm(chat_key)
+            mt5_candidates = []
+            for item in agent_error_candidates:
+                if isinstance(item, dict):
+                    sym = self._candidate_symbol(item)
+                    if sym:
+                        mt5_candidates.append(dict(item))
+                elif str(item or "").strip():
+                    mt5_candidates.append({"symbol": str(item).strip()})
+            if mt5_candidates:
+                state.instrument_candidates = list(mt5_candidates)
+                state.resolved_instrument = {
+                    "requested_symbol": requested,
+                    "symbol": self._candidate_symbol(mt5_candidates[0]),
+                    "candidates": mt5_candidates,
+                }
+                return self._render_instrument_confirm(chat_key)
+            state.resolved_instrument = {
+                "requested_symbol": requested,
+                "error_code": resolve_error_code or "INSTRUMENT_NOT_FOUND",
+                "error_message": resolve_error_message or "Instrument not found.",
+                "lookup_data": resolve_data,
+                "candidates": [],
+            }
+            return self._render_instrument_unresolved(chat_key)
+
         candidates = []
         if not lookup_unavailable:
             candidates = self._build_priced_candidates(
@@ -1322,9 +1535,17 @@ class TradeWizard:
                 sym = self._candidate_symbol(entry)
                 price = entry.get("price")
                 if price is not None and str(price).strip() != "":
-                    lines.append(f"{idx}. {sym}  ·  {_comma_format(price)}")
+                    extra = f"  ·  {_comma_format(price)}"
                 else:
-                    lines.append(f"{idx}. {sym}")
+                    extra = ""
+                bid = entry.get("bid")
+                ask = entry.get("ask")
+                contract = entry.get("contract_size")
+                if bid not in (None, "") and ask not in (None, ""):
+                    extra = f"  bid {_comma_format(bid)}  ask {_comma_format(ask)}"
+                if contract not in (None, ""):
+                    extra += f"  csz {contract}"
+                lines.append(f"{idx}. {sym}{extra}")
         else:
             resolved = str(info.get("symbol") or "").strip()
             if resolved:
@@ -1459,9 +1680,20 @@ class TradeWizard:
             return self._render_instrument_unresolved(chat_key)
         info = dict(state.resolved_instrument or {})
         info["symbol"] = native
-        if isinstance(entry, dict) and entry.get("price") is not None:
-            info["price"] = entry.get("price")
+        if isinstance(entry, dict):
+            for key, value in entry.items():
+                if value not in (None, "") and key != "candidates":
+                    info[key] = value
         state.resolved_instrument = info
+        if self._is_mt5(state) and isinstance(entry, dict):
+            if state.flow == "ladder":
+                for key in ("contract_size", "volume_step", "bid", "ask", "tick_size"):
+                    if entry.get(key) not in (None, ""):
+                        state.ladder[key] = entry.get(key)
+            else:
+                for key in ("bid", "ask"):
+                    if entry.get(key) not in (None, ""):
+                        state.order[key] = str(entry.get(key))
         self._commit_native_symbol(chat_key, native)
         return self._continue_after_symbol(chat_key)
 
@@ -1609,15 +1841,18 @@ class TradeWizard:
         state = self._state_for(chat_key)
         state.state = "new_order_side"
         state.flow = "new_order"
-        symbol = str(state.symbol or state.order.get("symbol") or "").strip()
+        symbol = self._new_order_symbol_line(state)
         exchange = state.exchange or ""
         account = state.account or ""
+        quote = "\n".join(self._mt5_live_quote_lines(state))
+        extra = f"{quote}\n\n" if quote else ""
         return Screen(
             text=(
                 "New Order\n\n"
-                f"Exchange: {exchange[:1].upper() + exchange[1:] if exchange else exchange}\n"
+                f"Exchange: {self._exchange_display(exchange)}\n"
                 f"Account: {account}\n"
-                f"Symbol: {symbol}\n\n"
+                f"Symbol: {symbol}\n"
+                f"{extra}"
                 "Select Side:"
             ),
             buttons=[
@@ -1673,25 +1908,165 @@ class TradeWizard:
             rendered = rendered.rstrip("0").rstrip(".")
         return rendered or "0"
 
+    def _mt5_live_quote_lines(self, state: WizardState) -> List[str]:
+        if not self._is_mt5(state):
+            return []
+        info = state.resolved_instrument or {}
+        bid = state.order.get("bid") or state.ladder.get("bid") or info.get("bid")
+        ask = state.order.get("ask") or state.ladder.get("ask") or info.get("ask")
+        lines: List[str] = []
+        if bid not in (None, "") or ask not in (None, ""):
+            parts = []
+            if bid not in (None, ""):
+                parts.append(f"Bid {_comma_format(bid)}")
+            if ask not in (None, ""):
+                parts.append(f"Ask {_comma_format(ask)}")
+            lines.append("  ".join(parts))
+        contract = info.get("contract_size") or state.ladder.get("contract_size")
+        if contract not in (None, ""):
+            lines.append(f"Contract size: {contract}")
+        return lines
+
+    def _is_mt5(self, state: WizardState) -> bool:
+        return str(state.exchange or "").strip().lower() == "mt5"
+
+    def _exchange_display(self, exchange: Optional[str]) -> str:
+        ex = str(exchange or "").strip()
+        if ex.lower() == "mt5":
+            return "MT5"
+        return (ex[:1].upper() + ex[1:]) if ex else ex
+
+    def _new_order_symbol_line(self, state: WizardState) -> str:
+        native = str(state.order.get("symbol") or state.symbol or "").strip()
+        requested = str(state.requested_symbol or "").strip()
+        if self._is_mt5(state) and requested and native and requested.upper() != native.upper():
+            return f"{requested} ({native})"
+        return native or requested
+
+    def _mt5_token_code(self, state: WizardState) -> str:
+        requested = str(state.requested_symbol or "").strip()
+        if requested:
+            return requested.upper()
+        info = state.resolved_instrument or {}
+        base = str(info.get("base") or info.get("currency_base") or "").strip()
+        return base.upper() if base else ""
+
+    def _refresh_mt5_quote(self, state: WizardState) -> None:
+        symbol = str(state.order.get("symbol") or state.symbol or "").strip()
+        exchange = str(state.exchange or "").strip()
+        account = str(state.account or "").strip()
+        if not symbol or not exchange or not account:
+            return
+        try:
+            response = self._desk.execute(
+                {
+                    "operation": "market_price",
+                    "exchange": exchange,
+                    "account": account,
+                    "symbol": symbol,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mt5 market_price failed: %s", exc)
+            return
+        if not getattr(response, "success", False):
+            return
+        data = getattr(response, "data", None)
+        bid = ask = None
+        if isinstance(data, dict):
+            bid = data.get("bid")
+            ask = data.get("ask")
+        if bid not in (None, ""):
+            state.order["bid"] = self._decimal_text(bid) or str(bid).strip()
+        if ask not in (None, ""):
+            state.order["ask"] = self._decimal_text(ask) or str(ask).strip()
+
+    def _mt5_limit_price_error(self, state: WizardState, price_text: str) -> Optional[str]:
+        try:
+            price = Decimal(str(price_text))
+        except Exception:
+            return None
+        side = str(state.order.get("side") or "").strip().lower()
+        bid_raw = state.order.get("bid")
+        ask_raw = state.order.get("ask")
+        try:
+            bid = Decimal(str(bid_raw)) if bid_raw not in (None, "") else Decimal("0")
+        except Exception:
+            bid = Decimal("0")
+        try:
+            ask = Decimal(str(ask_raw)) if ask_raw not in (None, "") else Decimal("0")
+        except Exception:
+            ask = Decimal("0")
+        info = state.resolved_instrument or {}
+        tick_raw = info.get("price_increment") or info.get("tick_size")
+        if tick_raw not in (None, ""):
+            try:
+                tick = Decimal(str(tick_raw))
+            except Exception:
+                tick = Decimal("0")
+            if tick > 0 and (price / tick) != (price / tick).to_integral_value(rounding=ROUND_DOWN):
+                return (
+                    f"Price {price_text} is not a valid tick size ({tick}). "
+                    "Enter a revised limit price."
+                )
+        if side == "buy" and ask > 0 and price >= ask:
+            return (
+                f"BUY LIMIT price must be below ask ({_comma_format(ask)}). "
+                "Enter a revised limit price; it will not be converted to a market order."
+            )
+        if side == "sell" and bid > 0 and price <= bid:
+            return (
+                f"SELL LIMIT price must be above bid ({_comma_format(bid)}). "
+                "Enter a revised limit price; it will not be converted to a market order."
+            )
+        return None
+
 
     def _format_order_volume_line(self, state: WizardState) -> str:
-        return f"Volume: {_comma_format(state.order.get('volume') or '')}"
+        volume = _comma_format(state.order.get("volume") or "")
+        if self._is_mt5(state):
+            token = self._mt5_token_code(state)
+            return f"Volume: {volume} {token}".rstrip()
+        return f"Volume: {volume}"
 
     def _format_order_volume_confirm_lines(self, state: WizardState) -> list:
-        return [f"Volume: {_comma_format(state.order.get('volume') or '')}"]
+        lines = [self._format_order_volume_line(state)]
+        if self._is_mt5(state):
+            lots = self._mt5_preview_lots(state)
+            if lots:
+                lines.append(f"Lots: {lots}")
+            lines.append("Type: LIMIT")
+        return lines
+
+    def _mt5_preview_lots(self, state: WizardState) -> Optional[str]:
+        info = state.resolved_instrument or {}
+        contract_raw = info.get("contract_size")
+        volume_raw = state.order.get("volume")
+        if contract_raw in (None, "", "0") or volume_raw in (None, ""):
+            return None
+        try:
+            contract = Decimal(str(contract_raw))
+            token_qty = Decimal(str(volume_raw))
+            if contract <= 0 or token_qty <= 0:
+                return None
+            lots = token_qty / contract
+            text = format(lots.normalize(), "f")
+            if "." in text:
+                text = text.rstrip("0").rstrip(".") or "0"
+            return text
+        except Exception:
+            return None
 
 
     def _render_new_order_volume(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
         state.state = "awaiting_volume"
-        symbol = str(state.order.get("symbol") or state.symbol or "").strip()
+        symbol = self._new_order_symbol_line(state)
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
-        ex = state.exchange or ""
-        ex_label = ex[:1].upper() + ex[1:] if ex else ex
         header = (
             "New Order\n\n"
-            f"Exchange: {ex_label}\n"
+            f"Exchange: {self._exchange_display(state.exchange)}\n"
             f"Account: {state.account}\n"
             f"Symbol: {symbol}\n"
             f"Side: {side_label}\n\n"
@@ -1705,19 +2080,31 @@ class TradeWizard:
     def _render_new_order_price(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
         state.state = "awaiting_price"
-        symbol = str(state.order.get("symbol") or state.symbol or "").strip()
+        symbol = self._new_order_symbol_line(state)
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
         volume_line = self._format_order_volume_line(state)
+        quote_lines = ""
+        if self._is_mt5(state):
+            self._refresh_mt5_quote(state)
+            bits = []
+            if state.order.get("bid") not in (None, ""):
+                bits.append(f"Bid: {_comma_format(state.order.get('bid'))}")
+            if state.order.get("ask") not in (None, ""):
+                bits.append(f"Ask: {_comma_format(state.order.get('ask'))}")
+            if bits:
+                quote_lines = "\n".join(bits) + "\n"
+        price_prompt = "Enter Limit Price:" if self._is_mt5(state) else "Enter Price:"
         return Screen(
             text=(
                 "New Order\n\n"
-                f"Exchange: {state.exchange[:1].upper() + state.exchange[1:] if state.exchange else state.exchange}\n"
+                f"Exchange: {self._exchange_display(state.exchange)}\n"
                 f"Account: {state.account}\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {side_label}\n"
-                f"{volume_line}\n\n"
-                "Enter Price:"
+                f"{volume_line}\n"
+                f"{quote_lines}\n"
+                f"{price_prompt}"
             ),
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
             state="awaiting_price",
@@ -1725,20 +2112,21 @@ class TradeWizard:
 
     def _render_new_order_confirm(self, chat_key: Tuple[Any, ...]) -> Screen:
         state = self._state_for(chat_key)
-        symbol = str(state.order.get("symbol") or state.symbol or "").strip()
+        symbol = self._new_order_symbol_line(state)
         side = str(state.order.get("side") or "").strip().lower()
         side_label = "🔵 Buy" if side == "buy" else "🔴 Sell" if side == "sell" else side.title()
         price = _comma_format(state.order.get("price") or "")
         lines = [
             "⚠️ Confirm New Order",
             "",
-            f"Exchange: {state.exchange[:1].upper() + state.exchange[1:] if state.exchange else state.exchange}",
+            f"Exchange: {self._exchange_display(state.exchange)}",
             f"Account: {state.account}",
             "",
             f"Symbol: {symbol}",
             f"Side: {side_label}",
         ]
         lines.extend(self._format_order_volume_confirm_lines(state))
+        lines.extend(self._mt5_live_quote_lines(state))
         lines.append(f"Price: {price}")
         state.state = "new_order_confirm"
         return Screen(
@@ -1782,8 +2170,14 @@ class TradeWizard:
             state="new_order_result",
         )
 
-    def _render_new_order_text_error(self, field: str, message: str) -> Screen:
-        label = "Enter Volume:" if field == "volume" else "Enter Price:"
+    def _render_new_order_text_error(self, chat_key: Tuple[Any, ...], field: str, message: str) -> Screen:
+        state = self._state_for(chat_key)
+        if field == "volume":
+            label = "Enter Volume:"
+        elif self._is_mt5(state):
+            label = "Enter Limit Price:"
+        else:
+            label = "Enter Price:"
         return Screen(
             text=f"New Order\n\n{message}\n\n{label}",
             buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
@@ -1810,11 +2204,15 @@ class TradeWizard:
         value = self._decimal_text(text)
         if value is None:
             field = "volume" if state.state == "awaiting_volume" else "price"
-            return self._render_new_order_text_error(field, "Please enter a positive numeric value.")
+            return self._render_new_order_text_error(chat_key, field, "Please enter a positive numeric value.")
         if state.state == "awaiting_volume":
             state.order["volume"] = value
             return self._render_new_order_price(chat_key)
         if state.state == "awaiting_price":
+            if self._is_mt5(state):
+                limit_error = self._mt5_limit_price_error(state, value)
+                if limit_error:
+                    return self._render_new_order_text_error(chat_key, "price", limit_error)
             state.order["price"] = value
             return self._render_new_order_confirm(chat_key)
         return self._render_new_order(chat_key)
@@ -1858,6 +2256,7 @@ class TradeWizard:
             "volume": state.order.get("volume") or "",
             "price": state.order.get("price") or "",
         }
+        self._invalidate_list_screens(chat_key)
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_new_order_result(chat_key, response)
 
@@ -1989,10 +2388,14 @@ class TradeWizard:
         state = self._state_for(chat_key)
         state.state = "ladder_side"
         state.flow = "ladder"
+        symbol = self._new_order_symbol_line(state) if self._is_mt5(state) else (state.symbol or "")
+        quote = "\n".join(self._mt5_live_quote_lines(state))
+        extra = f"{quote}\n" if quote else ""
         return Screen(
             text=(
                 "Ladder\n\n"
-                f"Symbol: {state.symbol or ''}\n"
+                f"Symbol: {symbol}\n"
+                f"{extra}"
                 "Select Side:"
             ),
             buttons=[
@@ -2068,26 +2471,64 @@ class TradeWizard:
         total_volume = ladder.get("total_volume", "")
         start_price = ladder.get("start_price", "")
         end_price = ladder.get("end_price", "")
-        lines = [
-            "⚠️ Confirm Ladder",
-            "",
-            f"Exchange: {state.exchange}",
-            f"Account: {state.account}",
-            f"Symbol: {symbol}",
-            f"Side: {side_label}",
-            f"Distribution: {'Half Gaussian' if distribution == 'half_gaussian' else 'Uniform' if distribution == 'uniform' else distribution}",
-            f"Orders: {requested_count}",
-        ]
-        lines.append(f"Total Volume: {_comma_format(total_volume)}")
-        lines.extend(
-            [
-                f"Start Price: {_comma_format(start_price)}",
-                f"End Price: {_comma_format(end_price)}",
+        if self._is_mt5(state):
+            symbol = self._new_order_symbol_line(state) or symbol
+            lines = [
+                "⚠️ Confirm Ladder",
                 "",
-                "Smallest size near Start",
-                "Largest size near End",
+                f"Exchange: {self._exchange_display(state.exchange)}",
+                f"Account: {state.account}",
+                f"Symbol: {symbol}",
+                f"Side: {side_label}",
+                "Type: LIMIT",
+                f"Distribution: {'Half Gaussian' if distribution == 'half_gaussian' else 'Uniform' if distribution == 'uniform' else distribution}",
+                f"Orders: {requested_count}",
             ]
-        )
+            token = self._mt5_token_code(state)
+            lines.append(f"Total volume: {_comma_format(total_volume)} {token}".rstrip())
+            info = state.resolved_instrument or {}
+            contract = info.get("contract_size") or ladder.get("contract_size")
+            if contract not in (None, "") and total_volume not in (None, ""):
+                try:
+                    lots = Decimal(str(total_volume)) / Decimal(str(contract))
+                    lot_txt = format(lots.normalize(), "f")
+                    if "." in lot_txt:
+                        lot_txt = lot_txt.rstrip("0").rstrip(".") or "0"
+                    lines.append(f"Total lots: {lot_txt}")
+                except Exception:
+                    pass
+            lines.extend(self._mt5_live_quote_lines(state))
+            lines.extend(
+                [
+                    f"Start Price: {_comma_format(start_price)}",
+                    f"End Price: {_comma_format(end_price)}",
+                    f"Price range: {_comma_format(start_price)} – {_comma_format(end_price)}",
+                    "",
+                    "Smallest size near Start",
+                    "Largest size near End",
+                ]
+            )
+        else:
+            lines = [
+                "⚠️ Confirm Ladder",
+                "",
+                f"Exchange: {state.exchange}",
+                f"Account: {state.account}",
+                f"Symbol: {symbol}",
+                f"Side: {side_label}",
+                f"Distribution: {'Half Gaussian' if distribution == 'half_gaussian' else 'Uniform' if distribution == 'uniform' else distribution}",
+                f"Orders: {requested_count}",
+            ]
+            lines.append(f"Total Volume: {_comma_format(total_volume)}")
+            lines.extend(
+                [
+                    f"Start Price: {_comma_format(start_price)}",
+                    f"End Price: {_comma_format(end_price)}",
+                    "",
+                    "Smallest size near Start",
+                    "Largest size near End",
+                ]
+            )
         state.state = "ladder_confirm"
         return Screen(
             text="\n".join(lines).rstrip(),
@@ -2318,9 +2759,17 @@ class TradeWizard:
 
     def _render_cancel_orders(self, chat_key: Tuple[Any, ...], refresh: bool) -> Screen:
         state = self._state_for(chat_key)
+        if not refresh:
+            cached = self._cached_list_screen(chat_key, "cancel_orders")
+            if cached is not None:
+                logger.info("trade wizard cache hit screen=cancel_orders")
+                return cached
         state.state = "cancel_orders"
         state.flow = "cancel_orders"
+        pending_keep = list(state.cancel.get("_pending") or [])
         state.cancel.clear()
+        if pending_keep and not refresh:
+            state.cancel["_pending"] = pending_keep
         exchange = state.exchange or ""
         account = state.account or ""
         request = {
@@ -2328,12 +2777,22 @@ class TradeWizard:
             "exchange": exchange,
             "account": account,
         }
+        t0 = time.perf_counter()
         response: CanonicalResponse = self._desk.execute(request)
+        logger.info(
+            "trade wizard fetch screen=cancel_orders account=%s elapsed_ms=%.0f success=%s",
+            account,
+            (time.perf_counter() - t0) * 1000,
+            bool(response.success),
+        )
         header = f"❌ Cancel Orders -- {exchange} / {account}"
         lines: List[str] = [header, "", "Select orders to cancel:", ""]
         buttons: List[List[Dict[str, str]]] = []
         if response.success:
             order_groups = response.order_groups or []
+            data = response.data if isinstance(getattr(response, "data", None), dict) else {}
+            pending = (data or {}).get("pending_orders")
+            state.cancel["_pending"] = list(pending) if isinstance(pending, list) else []
             lines.append(f"Open orders: {response.open_order_count or 0}")
             if order_groups:
                 lines.append("")
@@ -2372,11 +2831,19 @@ class TradeWizard:
             lines.extend(extra_lines)
         if refresh:
             state.cancel.pop("refreshed", None)
+        if self._is_mt5(state):
+            buttons.append([_button_row(*BUTTON_REFRESH)])
         buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
-        return Screen(
+        screen = Screen(
             text="\n".join(lines).rstrip(),
             buttons=buttons,
             state="cancel_orders",
+        )
+        return self._store_list_screen(
+            chat_key,
+            "cancel_orders",
+            screen,
+            pending=list(state.cancel.get("_pending") or []),
         )
 
     def _cancel_group_details(self, chat_key: Tuple[Any, ...]) -> Optional[Any]:
@@ -2428,7 +2895,7 @@ class TradeWizard:
                 "",
                 f"Orders: {getattr(group, 'order_count', 0)}",
                 f"Total size: {_display_or_dash(getattr(group, 'total_size', ''))}",
-                f"VWAP: {_display_or_dash(getattr(group, 'vwap', ''))}",
+                f"VWAP: {_rounded_money_display(getattr(group, 'vwap', ''))}",
             ])
             min_price = _display_or_dash(getattr(group, 'min_price', ''))
             max_price = _display_or_dash(getattr(group, 'max_price', ''))
@@ -2466,22 +2933,202 @@ class TradeWizard:
                 return self._render_cancel_orders(chat_key, refresh=False)
             _prefix, symbol, side = parts[0], parts[1], parts[2]
             order_type = parts[3] if len(parts) == 4 else ""
+            pending = list(state.cancel.get("_pending") or [])
             state.cancel = {
                 "symbol": unquote(symbol),
                 "side": side,
                 "order_type": unquote(order_type) if order_type else "",
+                "_pending": pending,
             }
+            if self._is_mt5(state):
+                legs = self._mt5_pending_legs(state)
+                state.cancel["tickets"] = [leg.get("ticket") for leg in legs if leg.get("ticket") not in (None, "")]
+                total = Decimal("0")
+                for leg in legs:
+                    try:
+                        total += Decimal(str(leg.get("volume") or leg.get("size") or "0"))
+                    except Exception:
+                        pass
+                state.cancel["total_volume"] = format(total, "f").rstrip("0").rstrip(".") or "0"
+                return self._render_mt5_group_confirm(chat_key)
             return self._render_cancel_confirm(chat_key)
         return self._render_cancel_orders(chat_key, refresh=False)
 
-    def _handle_cancel_group_confirm(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+    def _mt5_pending_legs(self, state: WizardState) -> List[Dict[str, Any]]:
+        symbol = str(state.cancel.get("symbol") or "").strip()
+        side = str(state.cancel.get("side") or "").strip().lower()
+        legs: List[Dict[str, Any]] = []
+        for row in state.cancel.get("_pending") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol") or "").strip() != symbol:
+                continue
+            if str(row.get("side") or "").strip().lower() != side:
+                continue
+            legs.append(dict(row))
+        return legs
+
+    def _render_mt5_group_confirm(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "cancel_group_confirm"
+        symbol = str(state.cancel.get("symbol") or "").strip()
+        side = str(state.cancel.get("side") or "").strip().lower()
+        tickets = [str(t) for t in (state.cancel.get("tickets") or []) if t not in (None, "")]
+        ticket_line = ", ".join(f"#{t}" for t in tickets) if tickets else "—"
+        lines = [
+            "⚠️ Confirm Cancellation",
+            "",
+            f"Exchange: {self._exchange_display(state.exchange)}",
+            f"Account: {state.account}",
+            "",
+            f"{_direction_emoji(side)} {symbol} {side}",
+            f"Orders: {len(tickets)}",
+            f"Total volume: {_display_or_dash(state.cancel.get('total_volume'))}",
+            f"Tickets: {ticket_line}",
+            "",
+            "Cancel ALL pending tickets in this group?",
+        ]
+        return Screen(
+            text="\n".join(lines).rstrip(),
+            buttons=[
+                [_button_row("✅ Confirm Cancel", "confirm")],
+                [_button_row("Cancel one ticket…", "tickets")],
+                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
+            ],
+            state="cancel_group_confirm",
+        )
+
+    def _render_mt5_cancel_group(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "cancel_group"
+        symbol = str(state.cancel.get("symbol") or "").strip()
+        side = str(state.cancel.get("side") or "").strip().lower()
+        legs = self._mt5_pending_legs(state)
+        if len(legs) == 1:
+            state.cancel["ticket"] = legs[0].get("ticket")
+            state.cancel["volume"] = legs[0].get("volume") or legs[0].get("size")
+            state.cancel["price"] = legs[0].get("price") or legs[0].get("entry_price")
+            return self._render_mt5_cancel_ticket_confirm(chat_key)
+        lines = [
+            f"❌ Cancel Orders — {self._exchange_display(state.exchange)} / {state.account}",
+            "",
+            f"{_direction_emoji(side)} {symbol} {side}",
+            f"Orders: {len(legs)}",
+            "",
+            "Select a ticket to cancel:",
+        ]
+        buttons: List[List[Dict[str, str]]] = []
+        for leg in legs:
+            ticket = leg.get("ticket")
+            size = str(leg.get("size") or leg.get("volume") or "").strip()
+            price = str(leg.get("entry_price") or leg.get("price") or "").strip()
+            buttons.append([_button_row(f"#{ticket} {size} @ {price}".strip(), f"cancel_ticket:{ticket}")])
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
+        return Screen(text="\n".join(lines).rstrip(), buttons=buttons, state="cancel_group")
+
+    def _handle_mt5_cancel_group(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
         state = self._state_for(chat_key)
         if suffix == "back":
-            return self._render_cancel_orders(chat_key, refresh=True)
+            if state.cancel.get("tickets"):
+                return self._render_mt5_group_confirm(chat_key)
+            return self._render_cancel_orders(chat_key, refresh=False)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix.startswith("cancel_ticket:"):
+            raw = suffix.split(":", 1)[1]
+            ticket: Any = int(raw) if raw.isdigit() else raw
+            leg = next(
+                (item for item in self._mt5_pending_legs(state) if str(item.get("ticket")) == str(ticket)),
+                {"ticket": ticket},
+            )
+            state.cancel["ticket"] = ticket
+            state.cancel["volume"] = leg.get("volume") or leg.get("size")
+            state.cancel["price"] = leg.get("price") or leg.get("entry_price")
+            return self._render_mt5_cancel_ticket_confirm(chat_key)
+        return self._render_mt5_cancel_group(chat_key)
+
+    def _render_mt5_cancel_ticket_confirm(self, chat_key: Tuple[Any, ...]) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "cancel_ticket_confirm"
+        symbol = str(state.cancel.get("symbol") or "").strip()
+        side = str(state.cancel.get("side") or "").strip().lower()
+        ticket = state.cancel.get("ticket")
+        lines = [
+            "⚠️ Confirm Cancellation",
+            "",
+            f"Exchange: {self._exchange_display(state.exchange)}",
+            f"Account: {state.account}",
+            "",
+            f"{_direction_emoji(side)} {symbol} {side}",
+            f"Ticket: #{ticket}",
+            f"Volume: {_display_or_dash(state.cancel.get('volume'))}",
+            f"Price: {_display_or_dash(state.cancel.get('price'))}",
+            "",
+            "Cancel this ticket only?",
+        ]
+        return Screen(
+            text="\n".join(lines).rstrip(),
+            buttons=[
+                [_button_row("✅ Confirm Cancel", "confirm")],
+                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
+            ],
+            state="cancel_ticket_confirm",
+        )
+
+    def _handle_mt5_cancel_ticket_confirm(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "back":
+            if len(self._mt5_pending_legs(state)) > 1:
+                return self._render_mt5_cancel_group(chat_key)
+            return self._render_cancel_orders(chat_key, refresh=False)
         if suffix == "exit":
             self.reset(chat_key)
             return Screen(text="Trade closed.", buttons=[], state="closed")
         if suffix != "confirm":
+            return self._render_mt5_cancel_ticket_confirm(chat_key)
+        request = {
+            "operation": "cancel_order",
+            "exchange": state.exchange or "",
+            "account": state.account or "",
+            "ticket": state.cancel.get("ticket"),
+            "symbol": state.cancel.get("symbol") or "",
+            "side": state.cancel.get("side") or "",
+        }
+        self._invalidate_list_screens(chat_key)
+        response: CanonicalResponse = self._desk.execute(request)
+        state.state = "cancel_result"
+        lines = ["Cancel Orders"]
+        if response.success:
+            lines.extend(
+                [
+                    "",
+                    "✅ Order Cancelled",
+                    f"Exchange: {self._exchange_display(state.exchange)}",
+                    f"Account: {state.account}",
+                    f"Ticket: #{state.cancel.get('ticket')}",
+                ]
+            )
+        else:
+            lines.extend(_render_error_lines(response.error, "Cancellation failed."))
+        return Screen(
+            text="\n".join(lines).rstrip(),
+            buttons=[[_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)]],
+            state="cancel_result",
+        )
+
+    def _handle_cancel_group_confirm(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        if suffix == "back":
+            return self._render_cancel_orders(chat_key, refresh=False)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix == "tickets" and self._is_mt5(state):
+            return self._render_mt5_cancel_group(chat_key)
+        if suffix != "confirm":
+            if self._is_mt5(state):
+                return self._render_mt5_group_confirm(chat_key)
             return self._render_cancel_confirm(chat_key)
         request = {
             "operation": "cancel_order_group",
@@ -2494,6 +3141,10 @@ class TradeWizard:
         order_type = str(state.cancel.get("order_type") or "").strip()
         if order_type:
             request["order_type"] = order_type
+        tickets = list(state.cancel.get("tickets") or [])
+        if tickets:
+            request["tickets"] = tickets
+        self._invalidate_list_screens(chat_key)
         response: CanonicalResponse = self._desk.execute(request)
         state.state = "cancel_result"
         lines = ["Cancel Orders"]
@@ -2520,7 +3171,7 @@ class TradeWizard:
             lines.extend([
                 "",
                 title,
-                f"Exchange: {state.exchange}",
+                f"Exchange: {self._exchange_display(state.exchange)}",
                 f"Account: {state.account}",
                 "",
                 f"{_direction_emoji(result.side)} {result.symbol} {result.side}",
@@ -2530,6 +3181,18 @@ class TradeWizard:
                 f"Failed: {failed}",
                 f"Verification: {'Passed' if verified else 'Failed'}",
             ])
+            data = response.data if isinstance(getattr(response, "data", None), dict) else {}
+            failed_rows = (data or {}).get("failed") or []
+            if isinstance(failed_rows, list) and failed_rows:
+                lines.append("")
+                lines.append("Failed tickets:")
+                for row in failed_rows:
+                    if isinstance(row, dict):
+                        lines.append(f"#{row.get('ticket')} {row.get('error') or ''}".rstrip())
+                    else:
+                        lines.append(str(row))
+            if result.exchange_reason:
+                lines.append(f"Reason: {result.exchange_reason}")
         else:
             error = response.error
             lines.extend(_render_error_lines(error, "Cancellation failed."))
@@ -2549,12 +3212,30 @@ class TradeWizard:
 
     # -- positions & orders screen --------------------------------------
 
+    def _store_position_snapshot(self, chat_key: Tuple[Any, ...], response: CanonicalResponse) -> List[Any]:
+        state = self._state_for(chat_key)
+        positions = list(response.positions or [])
+        state.positions = [pos.to_dict() if hasattr(pos, "to_dict") else dict(pos) for pos in positions]  # type: ignore[arg-type]
+        data = response.data if isinstance(getattr(response, "data", None), dict) else {}
+        state.position_legs = list((data or {}).get("position_legs") or [])
+        return positions
+
+    def _pending_orders_unimplemented(self, response: CanonicalResponse) -> bool:
+        data = response.data if isinstance(getattr(response, "data", None), dict) else {}
+        flag = str((data or {}).get("pending_orders") or "").strip().upper()
+        return flag in {"NOT_IMPLEMENTED", "UNSUPPORTED"}
+
     def _render_positions_orders(
         self,
         chat_key: Tuple[Any, ...],
         refresh: bool,
     ) -> Screen:
         state = self._state_for(chat_key)
+        if not refresh:
+            cached = self._cached_list_screen(chat_key, "positions_orders")
+            if cached is not None:
+                logger.info("trade wizard cache hit screen=positions_orders")
+                return cached
         state.state = "positions_orders"
         exchange = state.exchange or ""
         account = state.account or ""
@@ -2563,44 +3244,65 @@ class TradeWizard:
             "exchange": exchange,
             "account": account,
         }
+        t0 = time.perf_counter()
         response: CanonicalResponse = self._desk.execute(request)
+        logger.info(
+            "trade wizard fetch screen=positions_orders account=%s elapsed_ms=%.0f success=%s",
+            account,
+            (time.perf_counter() - t0) * 1000,
+            bool(response.success),
+        )
         header = f"📋 Open Orders & 💼 Positions — {exchange} / {account}"
+        buttons: List[List[Dict[str, str]]] = []
         if response.success:
-            positions = response.positions or []
+            positions = self._store_position_snapshot(chat_key, response)
             order_groups = response.order_groups or []
             lines: List[str] = [header, "", "Current Positions", ""]
 
             if positions:
                 for position in positions:
-                    lines.append(
-                        " ".join(
-                            [
-                                f"{_direction_emoji(position.side)} {position.symbol}",
-                            ]
+                    if _position_field(position, "count") is not None:
+                        lines.append(_position_group_summary_line(position))
+                        lines.append("")
+                        buttons.append([
+                            _button_row(
+                                _position_group_button_text(position),
+                                f"position:{getattr(position, 'symbol', '')}:{getattr(position, 'side', '')}",
+                            )
+                        ])
+                    else:
+                        lines.append(
+                            " ".join(
+                                [
+                                    f"{_direction_emoji(position.side)} {position.symbol}",
+                                ]
+                            )
                         )
-                    )
-                    lines.append(
-                        " ".join(
-                            [
-                                f"Size: {_display_or_dash(position.size)}",
-                                f"Entry: {_display_or_dash(position.entry_price)}",
-                                f"PnL: {_pnl_format(position.pnl)}",
-                                f"TP: {_display_protection(position.tp, getattr(position, 'tp_count', None))}",
-                                f"SL: {_display_protection(position.sl, getattr(position, 'sl_count', None))}",
-                            ]
+                        lines.append(
+                            " ".join(
+                                [
+                                    f"Size: {_display_or_dash(position.size)}",
+                                    f"Entry: {_display_or_dash(position.entry_price)}",
+                                    f"PnL: {_pnl_format(position.pnl)}",
+                                    f"TP: {_display_protection(position.tp, getattr(position, 'tp_count', None))}",
+                                    f"SL: {_display_protection(position.sl, getattr(position, 'sl_count', None))}",
+                                ]
+                            )
                         )
-                    )
-                    lines.append("")
+                        lines.append("")
             else:
                 lines.append("No open positions.")
                 lines.append("")
 
-            lines.append(f"Open orders: {response.open_order_count or 0}")
-            if order_groups:
-                for group in order_groups:
-                    lines.append(_order_group_summary_line(group))
+            if self._pending_orders_unimplemented(response):
+                lines.append("Pending orders: not implemented")
             else:
-                lines.append("No open orders.")
+                lines.append(f"Open orders: {response.open_order_count or 0}")
+                if order_groups:
+                    for group in order_groups:
+                        lines.append(_order_group_summary_line(group))
+                else:
+                    lines.append("No open orders.")
 
             text = "\n".join(lines).rstrip()
         else:
@@ -2616,13 +3318,19 @@ class TradeWizard:
                 lines.append(reason_line)
             lines.append(f"({err_code})")
             text = "\n".join(lines)
-        return Screen(
+        buttons.append([_button_row(*BUTTON_REFRESH)])
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
+        screen = Screen(
             text=text,
-            buttons=[
-                [_button_row(*BUTTON_REFRESH)],
-                [_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)],
-            ],
+            buttons=buttons,
             state="positions_orders",
+        )
+        return self._store_list_screen(
+            chat_key,
+            "positions_orders",
+            screen,
+            positions=list(state.positions or []),
+            position_legs=list(state.position_legs or []),
         )
 
     def _handle_positions_orders(
@@ -2639,16 +3347,26 @@ class TradeWizard:
         if suffix == "exit":
             self.reset(chat_key)
             return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix.startswith("position:"):
+            position = self._selected_position(chat_key, suffix)
+            if position is not None:
+                return self._render_position_group(chat_key, position, origin="positions_orders")
         return self._render_positions_orders(chat_key, refresh=False)
 
     def _render_positions_management(self, chat_key: Tuple[Any, ...], refresh: bool) -> Screen:
         state = self._state_for(chat_key)
+        if not refresh:
+            cached = self._cached_list_screen(chat_key, "positions_management")
+            if cached is not None:
+                logger.info("trade wizard cache hit screen=positions_management")
+                return cached
         state.state = "positions_management"
         state.flow = "positions_management"
         state.position.clear()
         state.order.clear()
         exchange = state.exchange or ""
         account = state.account or ""
+        t0 = time.perf_counter()
         response: CanonicalResponse = self._desk.execute(
             {
                 "operation": "positions_management",
@@ -2656,37 +3374,57 @@ class TradeWizard:
                 "account": account,
             }
         )
+        logger.info(
+            "trade wizard fetch screen=positions_management account=%s elapsed_ms=%.0f success=%s",
+            account,
+            (time.perf_counter() - t0) * 1000,
+            bool(response.success),
+        )
         header = f"💼 Positions Management — {exchange} / {account}"
         if response.success:
-            positions = list(response.positions or [])
-            state.positions = [pos.to_dict() if hasattr(pos, "to_dict") else dict(pos) for pos in positions]  # type: ignore[arg-type]
+            positions = self._store_position_snapshot(chat_key, response)
             lines: List[str] = [header, "", "Current Positions", ""]
             buttons: List[List[Dict[str, str]]] = []
             if positions:
                 for position in positions:
                     side = str(getattr(position, "side", "")).strip().lower()
                     symbol = str(getattr(position, "symbol", "")).strip()
-                    lines.extend(
-                        [
-                            f"{_direction_emoji(side)} {symbol}",
-                            (
-                                f"Size: {_display_or_dash(getattr(position, 'size', None))}"
-                                f"  Entry: {_display_or_dash(getattr(position, 'entry_price', None))}"
-                                f"  PnL: {_pnl_format(getattr(position, 'pnl', None))}"
-                            ),
-                            f"TP: {_display_protection(getattr(position, 'tp', None), getattr(position, 'tp_count', None))}",
-                            f"SL: {_display_protection(getattr(position, 'sl', None), getattr(position, 'sl_count', None))}",
-                            "",
-                        ]
-                    )
-                    buttons.append([
-                        _button_row(f"{_direction_emoji(side)} {symbol} {side.title()}", f"position:{symbol}:{side}"),
-                    ])
+                    if _position_field(position, "count") is not None:
+                        lines.extend([_position_group_summary_line(position), ""])
+                        buttons.append([
+                            _button_row(_position_group_button_text(position), f"position:{symbol}:{side}"),
+                        ])
+                    else:
+                        lines.extend(
+                            [
+                                f"{_direction_emoji(side)} {symbol}",
+                                (
+                                    f"Size: {_display_or_dash(getattr(position, 'size', None))}"
+                                    f"  Entry: {_display_or_dash(getattr(position, 'entry_price', None))}"
+                                    f"  PnL: {_pnl_format(getattr(position, 'pnl', None))}"
+                                ),
+                                f"TP: {_display_protection(getattr(position, 'tp', None), getattr(position, 'tp_count', None))}",
+                                f"SL: {_display_protection(getattr(position, 'sl', None), getattr(position, 'sl_count', None))}",
+                                "",
+                            ]
+                        )
+                        buttons.append([
+                            _button_row(f"{_direction_emoji(side)} {symbol} {side.title()}", f"position:{symbol}:{side}"),
+                        ])
             else:
                 lines.append("No open positions.")
                 lines.append("")
+            if self._is_mt5(state):
+                buttons.append([_button_row(*BUTTON_REFRESH)])
             buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
-            return Screen(text="\n".join(lines).rstrip(), buttons=buttons, state="positions_management")
+            screen = Screen(text="\n".join(lines).rstrip(), buttons=buttons, state="positions_management")
+            return self._store_list_screen(
+                chat_key,
+                "positions_management",
+                screen,
+                positions=list(state.positions or []),
+                position_legs=list(state.position_legs or []),
+            )
 
         err_code = response.error.code if response.error else "POSITIONS_UNAVAILABLE"
         err_msg = response.error.message if response.error else "Positions unavailable."
@@ -2699,7 +3437,7 @@ class TradeWizard:
         if reason_line is not None:
             lines.append(reason_line)
         lines.append(f"({err_code})")
-        return Screen(
+        screen = Screen(
             text="\n".join(lines),
             buttons=[
                 [_button_row(*BUTTON_REFRESH)],
@@ -2707,6 +3445,7 @@ class TradeWizard:
             ],
             state="positions_management",
         )
+        return self._store_list_screen(chat_key, "positions_management", screen)
 
     def _selected_position(self, chat_key: Tuple[Any, ...], suffix: str = "") -> Optional[Dict[str, Any]]:
         state = self._state_for(chat_key)
@@ -2748,6 +3487,8 @@ class TradeWizard:
         side = str(position.get("side", "")).strip().lower()
         side_label = "Long" if side == "long" else "Short" if side == "short" else side.title()
         header = f"💼 {symbol} Position — {state.exchange} / {state.account}"
+        is_group = self._is_mt5(state) and self._position_is_group(position)
+        tickets = [str(t) for t in (position.get("tickets") or []) if t not in (None, "")]
         lines = [
             header,
             "",
@@ -2757,9 +3498,15 @@ class TradeWizard:
             f"PnL: {_pnl_format(position.get('pnl'))}",
             f"TP: {_display_protection(position.get('tp'), position.get('tp_count'))}",
             f"SL: {_display_protection(position.get('sl'), position.get('sl_count'))}",
-            "",
-            "What would you like to do?",
         ]
+        if is_group:
+            lines.extend(
+                [
+                    f"Positions: {position.get('count') or len(tickets)}",
+                    f"Tickets: {', '.join('#' + t for t in tickets) if tickets else '—'}",
+                ]
+            )
+        lines.extend(["", "What would you like to do?"])
         # Gate mutation buttons by agent capabilities. Empty caps (test stubs /
         # unknown desks) keep the legacy full button set so existing wizard
         # tests stay green; real agents that omit set_tp/set_sl/close_position
@@ -2772,13 +3519,15 @@ class TradeWizard:
         buttons: List[List[Dict[str, str]]] = []
         action_row: List[Dict[str, str]] = []
         if show_tp:
-            action_row.append(_button_row("Set TP", "set_tp"))
+            action_row.append(_button_row("Set/Change/Remove TP", "set_tp") if is_group else _button_row("Set TP", "set_tp"))
         if show_sl:
-            action_row.append(_button_row("Set SL", "set_sl"))
+            action_row.append(_button_row("Set/Change/Remove SL", "set_sl") if is_group else _button_row("Set SL", "set_sl"))
         if action_row:
             buttons.append(action_row)
         if show_close:
-            buttons.append([_button_row("Close Position", "close_position")])
+            buttons.append([_button_row("Close All" if is_group else "Close Position", "close_position")])
+        if is_group:
+            buttons.append([_button_row("Individual tickets…", "tickets")])
         if not show_tp and not show_sl and not show_close:
             lines[-1] = "No position actions available on this exchange."
         buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
@@ -2862,6 +3611,7 @@ class TradeWizard:
                     f"Account: {state.account}",
                     f"Position: {_direction_emoji(side)} {symbol} {side_label}",
                     f"Current Size: {_display_or_dash(position.get('size'))}",
+                    *self._mt5_group_confirm_lines(position),
                     f"Current TP: {current_tp}",
                     new_line,
                 ]
@@ -2909,6 +3659,7 @@ class TradeWizard:
                     f"Account: {state.account}",
                     f"Position: {_direction_emoji(side)} {symbol} {side_label}",
                     f"Current Size: {_display_or_dash(position.get('size'))}",
+                    *self._mt5_group_confirm_lines(position),
                     f"Current SL: {current_sl}",
                     new_line,
                 ]
@@ -2927,18 +3678,21 @@ class TradeWizard:
         symbol = str(position.get("symbol", "")).strip()
         side = str(position.get("side", "")).strip().lower()
         side_label = "Long" if side == "long" else "Short" if side == "short" else side.title()
+        extra = self._mt5_group_confirm_lines(position)
+        close_label = "This will close ALL tickets in this group." if extra else "This will close the entire current position."
         return Screen(
             text="\n".join(
                 [
-                    "⚠️ Confirm Close Position",
+                    "⚠️ Confirm Close All" if extra else "⚠️ Confirm Close Position",
                     "",
                     f"Exchange: {state.exchange}",
                     f"Account: {state.account}",
                     "",
                     f"{_direction_emoji(side)} {symbol} {side_label}",
                     f"Displayed Size: {_display_or_dash(position.get('size'))}",
+                    *extra,
                     "",
-                    "This will close the entire current position.",
+                    close_label,
                 ]
             ),
             buttons=[
@@ -2953,7 +3707,7 @@ class TradeWizard:
         action = getattr(response, "position_action", None)
         action_dict = action.to_dict() if action is not None and hasattr(action, "to_dict") else (dict(action) if isinstance(action, dict) else {})
         action_dict["operation"] = operation
-        action_dict["return_target"] = "positions_management" if operation == "close_position" else "position_detail"
+        action_dict["return_target"] = "positions_management" if operation == "close_position" or self._is_mt5(state) else "position_detail"
         state.position_action = action_dict
         state.state = "position_action_result"
 
@@ -2982,6 +3736,24 @@ class TradeWizard:
             if action_dict.get("message"):
                 lines.append(str(action_dict.get("message")))
             lines.append(f"Verified: {'Passed' if action_dict.get('verified') else 'Failed'}")
+            data = response.data if isinstance(getattr(response, "data", None), dict) else {}
+            if isinstance(data, dict):
+                targeted = data.get("targeted")
+                succeeded = data.get("succeeded")
+                if targeted is not None:
+                    lines.append(f"Targeted: {targeted}")
+                if succeeded is not None:
+                    lines.append(f"Succeeded: {succeeded}")
+                failed_rows = data.get("failed") or []
+                if isinstance(failed_rows, list) and failed_rows:
+                    lines.append("Failed tickets:")
+                    for row in failed_rows:
+                        if isinstance(row, dict):
+                            lines.append(f"#{row.get('ticket')} {row.get('error') or ''} retcode={row.get('retcode')}".rstrip())
+                        else:
+                            lines.append(str(row))
+                if data.get("exchange_reason"):
+                    lines.append(f"Reason: {data.get('exchange_reason')}")
         else:
             title = "Position Action Failed"
             if operation == "set_tp":
@@ -3013,12 +3785,137 @@ class TradeWizard:
         if suffix.startswith("position:"):
             position = self._selected_position(chat_key, suffix)
             if position is not None:
-                return self._render_position_detail(chat_key, position)
+                if self._is_mt5(state) and self._position_is_group(position):
+                    return self._render_position_detail(chat_key, position)
+                if self._position_is_group(position):
+                    return self._render_position_group(chat_key, position, origin="positions_management")
+                return self._render_position_detail(chat_key, self._position_with_ticket(position))
         return self._render_positions_management(chat_key, refresh=False)
+
+    def _position_is_group(self, position: Mapping[str, Any]) -> bool:
+        tickets = position.get("tickets") if isinstance(position, dict) else None
+        if isinstance(tickets, list) and len(tickets) > 1:
+            return True
+        try:
+            return int(position.get("count") or 0) > 1
+        except Exception:
+            return False
+
+    def _mt5_group_confirm_lines(self, position: Mapping[str, Any]) -> List[str]:
+        tickets = [str(t) for t in (position.get("tickets") or []) if t not in (None, "")]
+        if not self._position_is_group(position) and len(tickets) <= 1:
+            return []
+        return [
+            f"Positions: {position.get('count') or len(tickets)}",
+            f"Total lots: {_display_or_dash(position.get('size'))}",
+            f"Tickets: {', '.join('#' + t for t in tickets) if tickets else '—'}",
+        ]
+
+    def _position_request_tickets(self, state: WizardState) -> List[Any]:
+        tickets = list(state.position.get("tickets") or [])
+        if len(tickets) > 1:
+            return tickets
+        return []
+
+    def _position_with_ticket(self, position: Mapping[str, Any]) -> Dict[str, Any]:
+        row = dict(position)
+        if row.get("ticket") not in (None, ""):
+            return row
+        tickets = row.get("tickets") or []
+        if isinstance(tickets, list) and len(tickets) == 1:
+            row["ticket"] = tickets[0]
+        return row
+
+    def _leg_rows_for_group(self, chat_key: Tuple[Any, ...], group: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        state = self._state_for(chat_key)
+        symbol = str(group.get("symbol") or "").strip()
+        side = str(group.get("side") or "").strip().lower()
+        legs = []
+        for leg in state.position_legs:
+            if str(leg.get("symbol") or "").strip() != symbol:
+                continue
+            if str(leg.get("side") or "").strip().lower() != side:
+                continue
+            legs.append(dict(leg))
+        if legs:
+            return legs
+        tickets = group.get("tickets") or []
+        return [{"ticket": ticket, "symbol": symbol, "side": side} for ticket in tickets]
+
+    def _render_position_group(
+        self,
+        chat_key: Tuple[Any, ...],
+        group: Mapping[str, Any],
+        origin: str,
+    ) -> Screen:
+        state = self._state_for(chat_key)
+        state.state = "position_group"
+        state.position_group = dict(group)
+        state.position_group["_origin"] = origin
+        exchange = state.exchange or ""
+        account = state.account or ""
+        lines = [
+            f"💼 {group.get('symbol')} Positions — {exchange} / {account}",
+            "",
+            _position_group_summary_line(group),
+            "",
+            "Select a position:",
+        ]
+        buttons: List[List[Dict[str, str]]] = []
+        for leg in self._leg_rows_for_group(chat_key, group):
+            ticket = leg.get("ticket")
+            size = str(leg.get("size") or "").strip()
+            entry = str(leg.get("entry_price") or "").strip()
+            label = f"#{ticket} {_direction_emoji(leg.get('side') or group.get('side'))} {size} @ {entry}".strip()
+            leg_pnl = leg.get("pnl")
+            if leg_pnl not in (None, ""):
+                label = f"{label}  pnl {_pnl_format(leg_pnl)}"
+            buttons.append([_button_row(label, f"leg:{ticket}")])
+        buttons.append([_button_row(*BUTTON_BACK), _button_row(*BUTTON_EXIT)])
+        return Screen(text="\n".join(lines).rstrip(), buttons=buttons, state="position_group")
+
+    def _handle_position_group(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
+        state = self._state_for(chat_key)
+        origin = str(state.position_group.get("_origin") or "positions_management")
+        if suffix == "back":
+            if origin == "group_actions":
+                group = dict(state.position_group)
+                group.pop("_origin", None)
+                return self._render_position_detail(chat_key, group)
+            if origin == "positions_orders":
+                return self._render_positions_orders(chat_key, refresh=False)
+            return self._render_positions_management(chat_key, refresh=False)
+        if suffix == "exit":
+            self.reset(chat_key)
+            return Screen(text="Trade closed.", buttons=[], state="closed")
+        if suffix.startswith("leg:"):
+            raw = suffix.split(":", 1)[1]
+            ticket: Any = int(raw) if raw.isdigit() else raw
+            group = state.position_group
+            leg = next(
+                (
+                    item
+                    for item in self._leg_rows_for_group(chat_key, group)
+                    if item.get("ticket") == ticket or str(item.get("ticket")) == str(ticket)
+                ),
+                {"ticket": ticket, "symbol": group.get("symbol"), "side": group.get("side")},
+            )
+            detail = dict(group)
+            detail.update(leg)
+            detail["ticket"] = ticket
+            detail["count"] = 1
+            return self._render_position_detail(chat_key, detail)
+        return self._render_position_group(chat_key, state.position_group, origin=origin)
 
     def _handle_position_detail(self, chat_key: Tuple[Any, ...], suffix: str) -> Screen:
         state = self._state_for(chat_key)
         if suffix == "back":
+            if state.position_group:
+                return self._render_position_group(
+                    chat_key,
+                    state.position_group,
+                    origin=str(state.position_group.get("_origin") or "positions_management"),
+                )
             return self._render_positions_management(chat_key, refresh=False)
         if suffix == "exit":
             self.reset(chat_key)
@@ -3029,6 +3926,8 @@ class TradeWizard:
             return self._render_position_sl_input(chat_key)
         if suffix == "close_position":
             return self._render_position_close_confirm(chat_key)
+        if suffix == "tickets":
+            return self._render_position_group(chat_key, state.position, origin="group_actions")
         if suffix == "confirm":
             return self._render_position_detail(chat_key, state.position)
         return self._render_position_detail(chat_key, state.position)
@@ -3058,6 +3957,13 @@ class TradeWizard:
             "side": _request_side(state.position.get("side")),
             "price": state.position.get("tp_price_input") if state.position.get("tp_price_input") is not None else "",
         }
+        ticket = state.position.get("ticket")
+        if ticket not in (None, ""):
+            request["ticket"] = ticket
+        tickets = self._position_request_tickets(state)
+        if tickets:
+            request["tickets"] = tickets
+        self._invalidate_list_screens(chat_key)
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "set_tp")
 
@@ -3086,6 +3992,13 @@ class TradeWizard:
             "side": _request_side(state.position.get("side")),
             "price": state.position.get("sl_price_input") if state.position.get("sl_price_input") is not None else "",
         }
+        ticket = state.position.get("ticket")
+        if ticket not in (None, ""):
+            request["ticket"] = ticket
+        tickets = self._position_request_tickets(state)
+        if tickets:
+            request["tickets"] = tickets
+        self._invalidate_list_screens(chat_key)
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "set_sl")
 
@@ -3105,6 +4018,13 @@ class TradeWizard:
             "symbol": state.position.get("symbol") or "",
             "side": _request_side(state.position.get("side")),
         }
+        ticket = state.position.get("ticket")
+        if ticket not in (None, ""):
+            request["ticket"] = ticket
+        tickets = self._position_request_tickets(state)
+        if tickets:
+            request["tickets"] = tickets
+        self._invalidate_list_screens(chat_key)
         response: CanonicalResponse = self._desk.execute(request)
         return self._render_position_action_result(chat_key, response, "close_position")
 

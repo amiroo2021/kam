@@ -4,17 +4,15 @@ A deployment installed by an older KAM version still carries the files that
 this repository no longer ships.  The install path only copies files, it
 never deletes, so those orphans survive an upgrade:
 
-* ``plugins/trade/agents/x_metatrader_agent.py``,
-  ``plugins/trade/agents/x_mt5linux_agent.py`` and
-  ``plugins/trade/agents/x_mt5_agent.py`` are discovered at runtime by
-  ``TradeDesk._iter_agent_files()``, so a stale copy keeps exposing the
-  retired venue in the /trade menu even though the repository removed it.
+* ``plugins/trade/agents/x_metatrader_agent.py`` and
+  ``plugins/trade/agents/x_mt5linux_agent.py`` are discovered at runtime by
+  ``TradeDesk._iter_agent_files()``, so a stale copy keeps exposing a
+  retired venue. ``x_mt5_agent.py`` is live again (Phase 1 socket bridge)
+  and must not be pruned.
 * ``plugins/trade/fibo_wizard.py`` and the ``plugins/trade/fibo/`` package
   are the removed /fibo capability's wizard and MT4 reader.
-* ``plugins/trade/mt5_bridge/`` holds the ``HermesBridge.mq5`` expert
-  advisor source that the removed MT5 agent published requests to.  The
-  running bridge inside the independently managed MT5 Docker volume is a
-  separate file and is never touched by this prune.
+* ``plugins/trade/mt5_bridge/`` holds the old ``HermesBridge.mq5`` payload.
+  The live vendor copy lives at ``plugins/trade/vendor/mt5_bridge/``.
 
 These paths are relative to ``plugins/trade/``.  ``None`` marks a retired
 directory (removed recursively).
@@ -29,7 +27,6 @@ from typing import Dict, List
 RETIRED_PAYLOAD_FILES: List[Path] = [
     Path("agents/x_metatrader_agent.py"),
     Path("agents/x_mt5linux_agent.py"),
-    Path("agents/x_mt5_agent.py"),
     Path("fibo_wizard.py"),
 ]
 
