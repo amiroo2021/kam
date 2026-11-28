@@ -88,18 +88,56 @@ CANCEL_BATCH_RETRY_BASE_SECONDS = 5.0
 
 # Bulk transaction wire/signing schema version.
 #
-# The 4 October 2026 upgrade moved the exchange to version 12: the signed
-# message is prefixed with the u32 LE version (0c 00 00 00) and the JSON
-# envelope declares "version": 12. Version 11 (or an omitted version) uses the
-# versionless framing. The node picks its parser from the envelope field, so
-# the signed bytes and the declared version must always agree.
+# Bulk's own signed-message formula (docs.bulk.trade/api-reference/signing.md)
+# has NO version prefix:
 #
-# Set to None to fall back to the legacy versionless framing (v11). That
-# framing is NOT compatible with conditional (st/tp) actions: the upgraded
-# conditional schema carries trailing commission/slippage Option tags that the
-# pre-upgrade layout lacked, and the node rejects the older encoder under
-# both versions.
-_TRANSACTION_VERSION = 12
+#     binary_message = wincode_serialize(actions)
+#                   || nonce_le_u64 || account_pubkey_32_bytes || domain_u8
+#
+# and the published request envelope has no "version" field. The 4 October
+# 2026 upgrade note only requires the CONDITIONAL-action schema to change
+# (trailing commission/slippage Option tags); it does not document a version
+# prefix on the signed bytes.
+#
+# The two framings are:
+#   * "versionless" (version 11): no u32 prefix, no "version" envelope field.
+#   * "version 12":  u32 LE prefix 0c 00 00 00 + "version": 12 in the envelope
+#                   (the field MUST be first in the JSON object - Bulk
+#                   deserializes the envelope as a struct and rejects
+#                   "version must precede actions").
+#
+# The two networks verify DIFFERENT framings. Both facts were established
+# live, with real orders:
+#   * TESTNET  (exchange-api.bulk.trade) accepts the version-12-prefixed
+#               bytes and REJECTS the versionless bytes with
+#               {"error":{"message":"bad signature"}}.
+#   * MAINNET  (mainnet-api1.bulk.trade) verifies the VERSIONLESS bytes
+#               (commit f288175 confirmed this with a live order) and rejects
+#               the version-12-prefixed bytes with "bad signature".
+#
+# This split is what made the 2026-11-27 18:39 production take-profit fail:
+# the revision that deployed version 12 to mainnet produced a signature the
+# mainnet node refused, so the transaction never reached order admission and
+# no order row was ever created.
+#
+# A signature failure happens BEFORE order admission and therefore creates
+# NO order history row, so re-signing the same actions with the other framing
+# can never duplicate an order.
+_TRANSACTION_VERSION_MAINNET = None   # versionless framing on mainnet
+_TRANSACTION_VERSION_TESTNET = 12     # version-12 framing on testnet
+
+# Transaction-level error messages that mean "the node refused the signed
+# bytes" rather than "the order was rejected by a business rule". These are
+# returned as HTTP 200 with status "error" and create NO order history row.
+_SIGNATURE_ERROR_MESSAGES = ("bad signature", "unauthorized signer")
+
+# A per-account override lets an operator pin the framing for a specific
+# account without a code change: BULK_<ALIAS>_TRANSACTION_VERSION=11 or 12.
+_TRANSACTION_VERSION_SUFFIXES = ("TRANSACTION_VERSION", "TX_VERSION", "WIRE_VERSION")
+
+# Sentinel so ``version=None`` can mean "versionless framing" while the
+# default ("use the account/module default") stays distinguishable.
+_VERSION_UNSET = object()
 
 _ALIAS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _BASE58_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
@@ -155,7 +193,11 @@ def _parse_alias_and_suffix(upper_key: str) -> Optional[Tuple[str, str]]:
         return None
     rest = upper_key[len("BULK_") :]
     suffixes = sorted(
-        set(_ACCOUNT_SUFFIXES + _PRIVATE_KEY_SUFFIXES + _BASE_URL_SUFFIXES + _AGENT_PUBLIC_KEY_SUFFIXES + _SIGNATURE_DOMAIN_SUFFIXES),
+        set(
+            _ACCOUNT_SUFFIXES + _PRIVATE_KEY_SUFFIXES + _BASE_URL_SUFFIXES
+            + _AGENT_PUBLIC_KEY_SUFFIXES + _SIGNATURE_DOMAIN_SUFFIXES
+            + _TRANSACTION_VERSION_SUFFIXES
+        ),
         key=len,
         reverse=True,
     )
@@ -191,6 +233,8 @@ def _discover_credential_map() -> Dict[str, Dict[str, str]]:
             slot.setdefault("agent_public_key", val)
         elif suffix in _SIGNATURE_DOMAIN_SUFFIXES:
             slot.setdefault("signature_domain", val.lower())
+        elif suffix in _TRANSACTION_VERSION_SUFFIXES:
+            slot.setdefault("transaction_version", val.strip())
 
     complete: Dict[str, Dict[str, str]] = {}
     for alias, fields in buckets.items():
@@ -225,6 +269,41 @@ def capabilities() -> list[str]:
     ]
 
 
+def _is_testnet_endpoint(base_url: Any) -> bool:
+    """True when the base URL points at Bulk's testnet."""
+    return "exchange-api.bulk.trade" in str(base_url or "").lower()
+
+
+def _default_transaction_version(credentials: Mapping[str, str]) -> Optional[int]:
+    """The framing this endpoint is expected to verify.
+
+    Mainnet verifies the versionless bytes, testnet verifies the version-12
+    bytes. Both were established live with real orders.
+    """
+    base = str((credentials or {}).get("base_url") or DEFAULT_API_BASE)
+    if _is_testnet_endpoint(base):
+        return _TRANSACTION_VERSION_TESTNET
+    return _TRANSACTION_VERSION_MAINNET
+
+
+def _transaction_version_for(credentials: Mapping[str, str]) -> Optional[int]:
+    """Resolve the transaction framing version for one account.
+
+    An explicit per-account override (``BULK_<ALIAS>_TRANSACTION_VERSION``)
+    wins; otherwise the endpoint's default framing is used. ``11``,
+    ``versionless`` and ``none`` select the legacy versionless framing.
+    """
+    raw = str((credentials or {}).get("transaction_version") or "").strip().lower()
+    if raw:
+        if raw in {"none", "versionless", "legacy", "v11", "11"}:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _default_transaction_version(credentials)
+
+
 def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
     alias = str(account or "").strip().lower()
     if not alias:
@@ -243,6 +322,7 @@ def _lookup_credentials(account: str) -> Optional[Dict[str, str]]:
         "agent_public_key": str(fields.get("agent_public_key") or "").strip(),
         "signature_domain": str(fields.get("signature_domain") or "").strip().lower(),
         "base_url": fields.get("base_url") or DEFAULT_API_BASE,
+        "transaction_version": str(fields.get("transaction_version") or "").strip(),
     }
 
 
@@ -588,13 +668,9 @@ def _protection_prices_from_orders(full_account: Mapping[str, Any]) -> Dict[tupl
         # trigger direction together with the action kind:
         #   take profit above -> protects a long    (take profit below -> short)
         #   stop below        -> protects a long    (stop above -> short)
-        is_above = _conditional_is_above(row)
-        if is_above is None:
+        position_side = _conditional_protected_side(row)
+        if position_side is None:
             continue
-        if classification == "take_profit":
-            position_side = "long" if is_above else "short"
-        else:
-            position_side = "short" if is_above else "long"
         key = (_display_symbol(row.get("symbol")), position_side)
         bucket = buckets.setdefault(key, {"tp": [], "sl": []})
         price = _plain_decimal(row.get("price") if row.get("price") is not None else row.get("triggerPrice"))
@@ -1038,7 +1114,12 @@ def _encode_action(action: Mapping[str, Any]) -> bytes:
     raise ValueError("Unsupported Bulk action for signing")
 
 
-def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str, Any]], nonce: Optional[int] = None) -> Dict[str, Any]:
+def _sign_transaction(
+    credentials: Mapping[str, str],
+    actions: list[Mapping[str, Any]],
+    nonce: Optional[int] = None,
+    version: Any = _VERSION_UNSET,
+) -> Dict[str, Any]:
     from nacl.signing import SigningKey  # type: ignore
     import base58  # type: ignore
 
@@ -1058,7 +1139,8 @@ def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str,
     if configured_signer and configured_signer != derived_signer:
         raise ValueError("Configured Bulk agent public key does not match the private key")
     tx_nonce = int(nonce if nonce is not None else time.time_ns())
-    version = _TRANSACTION_VERSION
+    if version is _VERSION_UNSET:
+        version = _transaction_version_for(credentials)
     prefix = b"" if version is None else struct.pack("<I", version)
     message = b"".join([
         prefix,
@@ -1088,10 +1170,85 @@ def _sign_transaction(credentials: Mapping[str, str], actions: list[Mapping[str,
     return envelope
 
 
+def _transaction_error_message(payload: Any) -> Optional[str]:
+    """Return the node's transaction-level error message, if any.
+
+    Bulk answers a signature/authorisation failure as HTTP 200 with
+    ``status: "error"`` and ``statuses: [{"error": {"message": "..."}}]``.
+    Such a response means the signed bytes never reached order admission, so
+    NO order was created - it is safe to retry with a different framing.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    if str(payload.get("status") or "").lower() != "error":
+        return None
+    found: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, inner in value.items():
+                if key == "error" and isinstance(inner, Mapping):
+                    msg = inner.get("message") or inner.get("reason")
+                    if msg:
+                        found.append(str(msg))
+                visit(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                visit(inner)
+
+    visit(payload)
+    return "; ".join(dict.fromkeys(found)) or None
+
+
+def _is_signature_error(message: Optional[str]) -> bool:
+    if not message:
+        return False
+    lowered = str(message).lower()
+    return any(marker in lowered for marker in _SIGNATURE_ERROR_MESSAGES)
+
+
 def _submit_order(credentials: Mapping[str, str], actions: list[Mapping[str, Any]]) -> Dict[str, Any]:
-    signed = _sign_transaction(credentials, actions)
-    payload = _post_json(str(credentials.get("base_url") or DEFAULT_API_BASE), "/order", signed)
+    """Sign and submit one Bulk transaction.
+
+    The framing is chosen per endpoint: mainnet verifies the versionless
+    bytes, testnet verifies the version-12 bytes. When the node refuses the
+    signed bytes the node's own message is surfaced verbatim - the rejection
+    reason is never swallowed or replaced with a generic text.
+    """
+    base = str(credentials.get("base_url") or DEFAULT_API_BASE)
+    version = _transaction_version_for(credentials)
+    signed = _sign_transaction(credentials, actions, version=version)
+    payload = _post_json(base, "/order", signed)
+
+    message = _transaction_error_message(payload)
+    if _is_signature_error(message):
+        # The node refused the signed bytes. Surface the exact reason; the
+        # framing is a deliberate per-network decision, so it is never
+        # silently switched behind the operator's back.
+        logger.warning(
+            "Bulk transaction rejected by the node: %s (framing=%s, endpoint=%s)",
+            message,
+            "versionless" if version is None else f"v{version}",
+            base,
+        )
+        return {
+            "status": "error",
+            "response": {
+                "type": "order",
+                "data": {"statuses": [{"error": {"message": message}}]},
+            },
+        }
     return payload if isinstance(payload, dict) else {"response": payload}
+
+
+# Records the framing an endpoint verified, for diagnostics only.
+_TRANSACTION_VERSION_CACHE: Dict[str, Optional[int]] = {}
+
+
+def _remember_transaction_version(credentials: Mapping[str, str], version: Optional[int]) -> None:
+    """Record the framing an endpoint verified (kept for diagnostics)."""
+    key = str((credentials or {}).get("base_url") or DEFAULT_API_BASE)
+    _TRANSACTION_VERSION_CACHE[key] = version
 
 
 def _native_symbol(symbol: Any) -> str:
@@ -1858,7 +2015,8 @@ def _position_action_status(payload: Any) -> Dict[str, Any]:
         "renameSubAccountFailed": "unknown",
     }
     statuses: list[str] = []
-    ids = [str(x) for x in _bulk_order_ids_from_payload(payload)]
+    ids: list[str] = [str(x) for x in _bulk_order_ids_from_payload(payload)]
+    reasons: list[str] = []
 
     def visit(value: Any) -> None:
         if isinstance(value, Mapping):
@@ -1873,9 +2031,42 @@ def _position_action_status(payload: Any) -> Dict[str, Any]:
                 visit(child)
 
     visit(payload)
+
+    # Collect the exchange's own rejection reasons. Bulk reports them in two
+    # shapes:
+    #   * order-level: {"rejectedInvalid": {"oid": "...", "reason": "..."}}
+    #   * transaction-level: {"error": {"message": "..."}}
+    def collect_reasons(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, inner in value.items():
+                if isinstance(inner, Mapping):
+                    for reason_key in ("reason", "message"):
+                        reason = inner.get(reason_key)
+                        if reason:
+                            text = str(reason).strip()
+                            if text:
+                                reasons.append(text)
+                elif isinstance(inner, list):
+                    collect_reasons(inner)
+                elif key in {"reason", "message"} and isinstance(inner, str):
+                    text = inner.strip()
+                    if text:
+                        reasons.append(text)
+                collect_reasons(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                collect_reasons(inner)
+
+    collect_reasons(payload)
+
     unique = list(dict.fromkeys(statuses))
     classification = status_classes[unique[0]] if len(unique) == 1 else "unknown"
-    return {"classification": classification, "statuses": unique, "order_ids": ids}
+    return {
+        "classification": classification,
+        "statuses": unique,
+        "order_ids": ids,
+        "reasons": list(dict.fromkeys(reasons)),
+    }
 
 
 def _lane_position_size(rows: list[Dict[str, Any]], isolated: bool) -> Decimal:
@@ -1931,7 +2122,20 @@ def _protection_rows(
 def _bucket_protection_rows(
     rows: Iterable[Any], symbol: str
 ) -> dict[str, list[Dict[str, Any]]]:
-    """Split conditional rows into take-profit and stop-loss buckets."""
+    """Split conditional rows into take-profit and stop-loss buckets.
+
+    A row is bucketed by its ACTION KIND (``takeProfit`` / ``stop``), not by
+    its trigger direction and not by the sign of its resting size:
+
+    * the action kind is what the exchange set the order up as;
+    * the trigger direction says WHICH side of the mark the order waits on
+      and, together with the kind, which position it protects;
+    * the resting size sign reflects the trigger leg, not the position
+      side, so it must not be used to tell a take profit from a stop loss.
+
+    A row whose kind is unknown is not bucketed: guessing would let the
+    agent cancel the wrong protection.
+    """
     buckets: dict[str, list[Dict[str, Any]]] = {"tp": [], "sl": []}
     for row in rows:
         if not isinstance(row, dict):
@@ -1961,6 +2165,64 @@ def _conditional_trigger_price(row: Mapping[str, Any]) -> Optional[Decimal]:
     return None
 
 
+def _protection_trigger_direction(kind: str, position_side: str) -> bool:
+    """The trigger direction (``d``) of a protective conditional.
+
+    ``d`` is the TRIGGER DIRECTION on the wire, not the closing side:
+    ``true`` fires at/above the threshold, ``false`` fires at/below it.
+    Bulk's own docs and a live testnet check agree:
+
+        take profit : fires ABOVE for a long, BELOW for a short
+        stop loss   : fires BELOW for a long, ABOVE for a short
+
+    The official bulk-keychain SDK calls the same field ``is_buy``, which is
+    misleading for ``st``/``tp``: for those actions the exchange reads it as
+    the trigger direction. The executed order is always a reduce-only close,
+    so the side that actually closes the position is a separate calculation
+    (see :func:`_protection_closing_side`).
+    """
+    if kind == "tp":
+        return position_side == "long"
+    if kind == "st":
+        return position_side == "short"
+    raise ValueError(f"Unsupported Bulk protection kind: {kind!r}")
+
+
+def _protection_closing_side(position_side: str) -> str:
+    """The order side that closes a position.
+
+    A long is closed by selling, a short by buying. This is deliberately
+    kept apart from the trigger direction: the two answer different
+    questions, and conflating them is what produced inverted take-profits.
+    """
+    return "sell" if position_side == "long" else "buy"
+
+
+def _conditional_protected_side(row: Mapping[str, Any]) -> Optional[str]:
+    """Which position side a live conditional protects.
+
+    Derived from the action kind together with the trigger direction, which
+    is what the exchange itself pairs them with:
+
+        take profit above -> protects a long    (take profit below -> short)
+        stop        below -> protects a long    (stop        above -> short)
+
+    Returns ``None`` when the row is not a conditional or does not carry a
+    usable trigger direction.
+    """
+    classification = _classification(
+        str(row.get("orderType") or ""), bool(row.get("reduceOnly"))
+    )
+    if classification not in {"take_profit", "stop_loss"}:
+        return None
+    is_above = _conditional_is_above(row)
+    if is_above is None:
+        return None
+    if classification == "take_profit":
+        return "long" if is_above else "short"
+    return "short" if is_above else "long"
+
+
 def _conditional_is_above(row: Mapping[str, Any]) -> Optional[bool]:
     """Read a conditional's trigger direction (``trigger.isAbove``)."""
     trigger = row.get("trigger")
@@ -1974,6 +2236,7 @@ def _protection_rows_for_position(
     full_account: Mapping[str, Any],
     symbol: str,
     isolated: bool,
+    position_side: Optional[str] = None,
 ) -> dict[str, list[Dict[str, Any]]]:
     """Bucket the live TP/SL conditionals that protect one position lane.
 
@@ -1984,6 +2247,13 @@ def _protection_rows_for_position(
 
     The lane is what separates them: a base-account position is not protected
     by a conditional that lives in an isolated account, and vice versa.
+
+    The PROTECTED SIDE is what separates a take profit from a stop loss for
+    a given position. A long is protected by a take profit above the mark
+    and a stop loss below it; a short is the mirror. A conditional whose
+    trigger direction does not match the position is therefore NOT a
+    protection for it and is excluded - otherwise the agent could report a
+    take profit for a short position that is really a stop loss.
     """
     buckets: dict[str, list[Dict[str, Any]]] = {"tp": [], "sl": []}
     for bucket, rows in _protection_rows(credentials, symbol).items():
@@ -1993,6 +2263,14 @@ def _protection_rows_for_position(
                 continue
             row_iso = row_item.get("iso")
             if isinstance(row_iso, bool) and row_iso != isolated:
+                continue
+            protected_side = _conditional_protected_side(row_item)
+            if (
+                position_side
+                and protected_side is not None
+                and protected_side != position_side
+            ):
+                # Protects the opposite side of the market - not ours.
                 continue
             buckets[bucket].append(row_item)
     return buckets
@@ -2010,9 +2288,11 @@ def _bulk_conditional_action(
     """Build a native Bulk conditional action (``tp`` / ``st``).
 
     ``d`` is the TRIGGER DIRECTION: ``true`` fires at/above the threshold,
-    ``false`` fires at/below it. This is verified against the exchange - a
-    conditional only rests when its trigger sits on the side of the mark that
-    has not been reached yet, and it fires the moment that side is crossed.
+    ``false`` fires at/below it. This is what the exchange reads it as, and
+    it is confirmed both by Bulk's docs and by a live testnet check - a
+    conditional only rests when its trigger sits on the side of the mark
+    that has not been reached yet, and it fires the moment that side is
+    crossed.
 
     The official bulk-keychain SDK names the same field ``is_buy``, which is
     misleading: Bulk gives each action type its own meaning for ``d`` (for
@@ -2021,13 +2301,26 @@ def _bulk_conditional_action(
     reduce-only close against the position, so the executed side is always
     protective regardless of the trigger direction.
 
+    ``size`` is sent as an absolute quantity: the wire field is an unsigned
+    fixed-point number, so the closing side is expressed by the exchange
+    through the reduce-only routing, not by a sign on the size.
+
+    MEASURED on Bulk testnet: when a conditional fires, the exchange
+    submits its own reduce-only market order and chooses the closing side
+    ITSELF - ``side: "sell"`` for a long position and ``side: "buy"`` for
+    a short position, in all four long/short x TP/SL combinations,
+    independent of ``d``. The trigger direction therefore selects WHEN
+    the protection fires, and the exchange derives WHICH SIDE closes the
+    position. That is why the two must stay separate: the agent supplies
+    the trigger direction, and the closing side is the exchange's job.
+
     A protective conditional must trigger against the position, never with
     it: a long takes profit above and stops below, a short is the mirror.
     """
     row = {
         "c": symbol,
         "d": bool(trigger_above),
-        "sz": float(size),
+        "sz": float(abs(size)),
         "tr": float(threshold),
         "lim": None,
         "i": bool(isolated),
@@ -2043,14 +2336,24 @@ def _restore_protection(
     threshold: Optional[Decimal],
     trigger_above: bool,
     isolated: bool,
-) -> bool:
+) -> Optional[bool]:
     """Re-place a protection order that was cancelled by a failed update.
 
-    Returns True when the replacement was accepted. A failed restore means the
-    position is left without this protection, which the caller must report.
+    Returns:
+        ``True``  - the replacement was accepted.
+        ``False`` - there was a previous protection to restore and the
+                    restore FAILED (the position lost this protection).
+        ``None``  - there was nothing to restore (no previous protection
+                    existed), so nothing was lost and nothing was restored.
+
+    The ``None`` case matters: reporting it as a failure made the caller
+    claim the position was UNPROTECTED even when no protection had ever
+    been cancelled.
     """
     if threshold is None or threshold <= 0:
-        return False
+        # No previous protection existed -> nothing was cancelled, so
+        # nothing can be lost. Distinguish this from a failed restore.
+        return None
     action = _bulk_conditional_action(
         kind=kind, symbol=symbol, size=size,
         threshold=threshold, trigger_above=trigger_above, isolated=isolated,
@@ -2061,6 +2364,80 @@ def _restore_protection(
         return False
     parsed = _position_action_status(response)
     return parsed["classification"] != "rejected"
+
+
+def _reason_suffix(parsed: Mapping[str, Any]) -> str:
+    """The exchange's own rejection reason, appended to a message.
+
+    Bulk states the reason inside the status payload (for example
+    ``rejectedRiskLimit`` with a ``reason`` string, or a transaction-level
+    ``error`` with a ``message``). Reporting it verbatim is what makes a
+    rejection diagnosable instead of a bare "Bulk rejected the order".
+    """
+    reasons = [str(r).strip() for r in (parsed or {}).get("reasons") or [] if str(r).strip()]
+    if not reasons:
+        return ""
+    return " Bulk said: " + "; ".join(dict.fromkeys(reasons))
+
+
+def _unprotected_note(restored: Optional[bool], had_previous: bool, label: str) -> str:
+    """Whether the position lost its protection, stated honestly.
+
+    ``restored`` is the three-state result of :func:`_restore_protection`:
+
+    * ``None``  - there was no previous protection, so nothing was
+                  cancelled and nothing was lost.
+    * ``True``  - the previous protection was put back.
+    * ``False`` - there WAS a previous protection, it was cancelled, and it
+                  could NOT be put back: the position lost it.
+
+    Only the last case may claim the position is unprotected, and it must
+    name which protection was lost (Take Profit vs Stop Loss).
+    """
+    if restored is True:
+        return ""
+    if restored is None:
+        # No previous protection existed -> nothing was lost.
+        return ""
+    if not had_previous:
+        return ""
+    return f" The previous {label} was cancelled and could NOT be restored, so the position is currently UNPROTECTED."
+
+
+def _protection_min_notional_note(
+    market: Mapping[str, Any], size: Decimal, threshold: Decimal, kind_label: str
+) -> Optional[str]:
+    """Whether a protective conditional would breach the minimum notional.
+
+    Bulk publishes ``minNotional`` per market in ``exchangeInfo``. It is
+    enforced on ordinary (non-reduce-only) orders - the production order
+    history shows "notional 21.27 too small, < minimum 50" - but it is NOT
+    enforced on conditional orders: a testnet take profit whose notional was
+    32.00 against a 40.00 minimum rested without complaint, and every
+    conditional carries ``reduceOnly: true``.
+
+    Because the exemption is only observed (not documented), the check is
+    advisory: it warns instead of blocking, so a valid protective order is
+    never refused on the strength of an inferred rule.
+    """
+    raw_min = market.get("minNotional")
+    if raw_min is None:
+        return None
+    try:
+        minimum = _decimal(raw_min)
+    except Exception:  # noqa: BLE001 - unparsable metadata is not fatal
+        return None
+    if minimum <= 0:
+        return None
+    notional = abs(size) * abs(threshold)
+    if notional >= minimum:
+        return None
+    return (
+        f"The {kind_label} notional {_plain_decimal(notional)} is below the market's "
+        f"minimum notional {_plain_decimal(minimum)}. Bulk does not enforce "
+        f"minNotional on reduce-only conditional orders, so this was submitted "
+        f"anyway - but the exchange may reject it."
+    )
 
 
 def _bulk_protection_action(
@@ -2154,7 +2531,9 @@ def _bulk_protection_action(
     if tick <= 0:
         return make_failure(operation, name, account, "MARKET_TICK_METADATA_MISSING", "Bulk market omitted a valid tick size.")
 
-    protection = _protection_rows_for_position(credentials, before_account, symbol, isolated)
+    protection = _protection_rows_for_position(
+        credentials, before_account, symbol, isolated, position_side
+    )
     target_bucket = "tp" if is_tp else "sl"
     existing_rows = list(protection.get(target_bucket) or [])
     other_rows = list(protection.get("sl" if is_tp else "tp") or [])
@@ -2179,7 +2558,10 @@ def _bulk_protection_action(
                 position_action=_action_result(
                     verified=True, removed=False, current_side=current_side,
                     current_size=current_size_text,
-                    message=f"No {label} was set.",
+                    message=(
+                        f"No {label} was set for the {position_side} position, so "
+                        f"nothing was removed and no other protection was touched."
+                    ),
                 ),
             )
         target = existing_rows[0]
@@ -2196,11 +2578,17 @@ def _bulk_protection_action(
             )
         parsed = _position_action_status(response)
         if parsed["classification"] == "rejected":
-            return make_failure(operation, name, account, "PROTECTION_REMOVAL_REJECTED", f"Bulk rejected the {label} cancellation.", data={"order_ids": parsed["order_ids"]})
+            return make_failure(
+                operation, name, account, "PROTECTION_REMOVAL_REJECTED",
+                f"Bulk rejected the {label} cancellation." + _reason_suffix(parsed),
+                data={"order_ids": parsed["order_ids"], "bulk_reasons": parsed["reasons"]},
+            )
 
         try:
             after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
-            after_protection = _protection_rows_for_position(credentials, after_account, symbol, isolated)
+            after_protection = _protection_rows_for_position(
+                credentials, after_account, symbol, isolated, position_side
+            )
         except Exception as exc:  # noqa: BLE001
             return make_failure(
                 operation, name, account, "PROTECTION_VERIFICATION_UNAVAILABLE",
@@ -2227,7 +2615,10 @@ def _bulk_protection_action(
             position_action=_action_result(
                 verified=True, removed=True, current_side=current_side,
                 current_size=current_size_text, exchange_order_id=oid,
-                message=f"{label} removed.",
+                message=(
+                    f"{label} removed. The {other_label} was left untouched, so the "
+                    f"{position_side} position is still protected by it."
+                ),
             ),
         )
 
@@ -2239,9 +2630,11 @@ def _bulk_protection_action(
     # A protective conditional must trigger against the position, never with
     # it: a long takes profit above / stops below, a short is the mirror.
     #
-    # ``d`` is the trigger direction: a long takes profit above the mark and
-    # stops below it, a short is the mirror.
-    trigger_above = (position_side == "long") if is_tp else (position_side == "short")
+    # The trigger direction (``d`` on the wire) and the closing side are two
+    # different questions and are computed separately. Conflating them is
+    # what produced inverted take-profits.
+    trigger_above = _protection_trigger_direction(kind, position_side)
+    closing_side = _protection_closing_side(position_side)
 
     # A conditional whose trigger is already satisfied fires the moment it is
     # submitted and is then cancelled as IOC, so it would never protect the
@@ -2293,29 +2686,38 @@ def _bulk_protection_action(
             )
         cancel_parsed = _position_action_status(cancel_response)
         if cancel_parsed["classification"] == "rejected":
-            return make_failure(operation, name, account, "PROTECTION_REPLACEMENT_REJECTED", f"Bulk rejected the replacement of the existing {label}.", data={"order_ids": cancel_parsed["order_ids"]})
+            return make_failure(
+                operation, name, account, "PROTECTION_REPLACEMENT_REJECTED",
+                f"Bulk rejected the replacement of the existing {label}."
+                + _reason_suffix(cancel_parsed),
+                data={"order_ids": cancel_parsed["order_ids"], "bulk_reasons": cancel_parsed["reasons"]},
+            )
 
     action = _bulk_conditional_action(
         kind=kind, symbol=symbol, size=abs_size,
         threshold=quantized_price, trigger_above=trigger_above, isolated=isolated,
     )
     actions.append(action)
+    min_notional_note = _protection_min_notional_note(
+        market, abs_size, quantized_price, label
+    )
     try:
         response = _submit_order(credentials, actions)
     except Exception as exc:  # noqa: BLE001 - outcome may be unknown
         restored = _restore_protection(
             credentials, kind, symbol, abs_size, replaced_price, trigger_above, isolated
         )
+        unprotected = bool(replaced_oid) and restored is False
         return make_failure(
             operation, name, account, "PROTECTION_SUBMISSION_UNCERTAIN",
             f"Bulk did not confirm the {label} submission. No automatic retry was made."
-            + ("" if restored else " The previous protection could NOT be restored, so the position is currently UNPROTECTED."),
+            + _unprotected_note(restored, bool(replaced_oid), label),
             data={
                 "retry_safe": False,
                 "requested_price": _plain_decimal(quantized_price),
                 "error_type": type(exc).__name__,
                 "previous_protection_restored": restored,
-                "position_unprotected": bool(replaced_oid) and not restored,
+                "position_unprotected": unprotected,
             },
         )
     parsed = _position_action_status(response)
@@ -2323,21 +2725,27 @@ def _bulk_protection_action(
         restored = _restore_protection(
             credentials, kind, symbol, abs_size, replaced_price, trigger_above, isolated
         )
+        unprotected = bool(replaced_oid) and restored is False
         return make_failure(
             operation, name, account, "PROTECTION_REJECTED",
             f"Bulk rejected the {label} order."
-            + ("" if restored else " The previous protection could NOT be restored, so the position is currently UNPROTECTED."),
+            + _reason_suffix(parsed)
+            + _unprotected_note(restored, bool(replaced_oid), label),
             data={
                 "order_ids": parsed["order_ids"],
                 "requested_price": _plain_decimal(quantized_price),
                 "previous_protection_restored": restored,
-                "position_unprotected": bool(replaced_oid) and not restored,
+                "position_unprotected": unprotected,
+                "bulk_reasons": parsed["reasons"],
+                "native_statuses": parsed["statuses"],
             },
         )
 
     try:
         after_account = _validate_close_snapshot(credentials, account, _live_account(credentials))
-        after_protection = _protection_rows_for_position(credentials, after_account, symbol, isolated)
+        after_protection = _protection_rows_for_position(
+            credentials, after_account, symbol, isolated, position_side
+        )
     except Exception as exc:  # noqa: BLE001
         return make_failure(
             operation, name, account, "PROTECTION_VERIFICATION_UNAVAILABLE",
@@ -2346,7 +2754,7 @@ def _bulk_protection_action(
         )
     after_rows = list(after_protection.get(target_bucket) or [])
     if len(after_rows) != 1:
-        unprotected = len(after_rows) == 0
+        unprotected = len(after_rows) == 0 and bool(replaced_oid)
         return make_failure(
             operation, name, account, "PROTECTION_NOT_VERIFIED",
             f"Expected exactly one {label} order after the update but found {len(after_rows)}."
@@ -2390,7 +2798,12 @@ def _bulk_protection_action(
             verified=True, price=_plain_decimal(quantized_price), removed=False,
             current_side=current_side, current_size=current_size_text,
             exchange_order_id=placed_oid or None,
-            message=f"{label} updated.",
+            message=(
+                f"{label} updated. It triggers {'at or above' if trigger_above else 'at or below'} "
+                f"{_plain_decimal(quantized_price)} and closes the {position_side} position "
+                f"with a {closing_side} order (reduce-only)."
+                + (f" {min_notional_note}" if min_notional_note else "")
+            ),
         ),
     )
 

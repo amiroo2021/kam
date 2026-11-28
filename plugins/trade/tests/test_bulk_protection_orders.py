@@ -67,7 +67,12 @@ def _snapshot(positions, open_orders=()) -> dict:
 
 
 class TestBulkSigningFrame(unittest.TestCase):
-    """The 4 October 2026 upgrade moved the wire to transaction version 12."""
+    """The two Bulk transaction framings: versionless and version 12.
+
+    Mainnet verifies the versionless bytes, testnet verifies the version-12
+    bytes. Both were established live with real orders, so the framing is
+    selected per endpoint and can be overridden per account.
+    """
 
     def setUp(self) -> None:
         import base58 as _b58
@@ -77,7 +82,7 @@ class TestBulkSigningFrame(unittest.TestCase):
         self.creds["agent_private_key"] = _b58.b58encode(bytes(range(32))).decode()
         self._seed = bytes(range(32))
 
-    def _sign_and_capture(self, actions, version=bulk._TRANSACTION_VERSION, nonce=7):
+    def _sign_and_capture(self, actions, version=bulk._VERSION_UNSET, nonce=7, creds=None):
         """Run the real _sign_transaction and capture the signed message."""
         import nacl.signing as real_signing
 
@@ -97,18 +102,46 @@ class TestBulkSigningFrame(unittest.TestCase):
 
         fake_signing = type("s", (), {"SigningKey": _RecordingSK})
         fake_nacl = type("m", (), {"signing": fake_signing})
-        with mock.patch.object(bulk, "_TRANSACTION_VERSION", version), \
-             mock.patch.dict(sys.modules, {"nacl": fake_nacl, "nacl.signing": fake_signing}):
-            envelope = bulk._sign_transaction(self.creds, actions, nonce=nonce)
+        with mock.patch.dict(sys.modules, {"nacl": fake_nacl, "nacl.signing": fake_signing}):
+            envelope = bulk._sign_transaction(
+                creds if creds is not None else self.creds, actions,
+                nonce=nonce, version=version,
+            )
         return envelope, captured["message"]
 
-    def test_transaction_version_is_12(self) -> None:
-        self.assertEqual(bulk._TRANSACTION_VERSION, 12)
+    def test_mainnet_defaults_to_the_versionless_framing(self) -> None:
+        """Mainnet verifies the versionless bytes (verified live)."""
+        self.assertIsNone(bulk._TRANSACTION_VERSION_MAINNET)
+        self.assertEqual(
+            bulk._default_transaction_version({"base_url": bulk.DEFAULT_API_BASE}), None
+        )
+
+    def test_testnet_defaults_to_the_version_12_framing(self) -> None:
+        """Testnet verifies the version-12-prefixed bytes (verified live)."""
+        self.assertEqual(bulk._TRANSACTION_VERSION_TESTNET, 12)
+        self.assertEqual(
+            bulk._default_transaction_version(
+                {"base_url": "https://exchange-api.bulk.trade/api/v1"}
+            ),
+            12,
+        )
+
+    def test_per_account_override_wins_over_the_endpoint_default(self) -> None:
+        self.assertIsNone(bulk._transaction_version_for({
+            "base_url": bulk.DEFAULT_API_BASE, "transaction_version": "11",
+        }))
+        self.assertEqual(bulk._transaction_version_for({
+            "base_url": "https://exchange-api.bulk.trade/api/v1", "transaction_version": "12",
+        }), 12)
+        # A word form for the legacy framing.
+        self.assertIsNone(bulk._transaction_version_for({
+            "base_url": bulk.DEFAULT_API_BASE, "transaction_version": "versionless",
+        }))
 
     def test_signed_message_carries_the_version_12_prefix(self) -> None:
         envelope, message = self._sign_and_capture(
             [{"m": {"c": "BTC-USD", "b": True, "sz": 0.1, "r": False, "i": False}}],
-            nonce=42,
+            version=12, nonce=42,
         )
         self.assertEqual(envelope["version"], 12)
         self.assertEqual(envelope["nonce"], "42")
@@ -119,6 +152,7 @@ class TestBulkSigningFrame(unittest.TestCase):
         so the envelope field and the signed prefix must never diverge."""
         envelope, message = self._sign_and_capture(
             [{"m": {"c": "BTC-USD", "b": True, "sz": 0.1, "r": False, "i": False}}],
+            version=12,
         )
         self.assertEqual(envelope["version"], 12)
         self.assertEqual(message[:4], struct.pack("<I", 12))
@@ -141,6 +175,7 @@ class TestBulkSigningFrame(unittest.TestCase):
         with "version must precede actions" if the field comes later."""
         envelope, _message = self._sign_and_capture(
             [{"m": {"c": "BTC-USD", "b": True, "sz": 0.1, "r": False, "i": False}}],
+            version=12,
         )
         keys = list(envelope.keys())
         self.assertEqual(keys[0], "version")
@@ -163,6 +198,20 @@ class TestBulkSigningFrame(unittest.TestCase):
         # Verify with the real public key derived from the seed.
         signing_key = nacl.signing.SigningKey(self._seed)
         signing_key.verify_key.verify(message, signature)
+
+    def test_signature_is_also_valid_in_the_versionless_framing(self) -> None:
+        """Both framings must produce a genuine signature over their own bytes."""
+        import base58 as _b58
+        import nacl.signing
+
+        envelope, message = self._sign_and_capture(
+            [{"m": {"c": "BTC-USD", "b": True, "sz": 0.1, "r": False, "i": False}}],
+            version=None,
+        )
+        signature = _b58.b58decode(envelope["signature"])
+        signing_key = nacl.signing.SigningKey(self._seed)
+        signing_key.verify_key.verify(message, signature)
+        self.assertNotIn("version", envelope)
 
 
 class TestBulkConditionalEncoding(unittest.TestCase):
